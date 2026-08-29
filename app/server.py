@@ -18,8 +18,14 @@ from fastapi.templating import Jinja2Templates
 from app.recorder import StreamFailoverRecorder
 from app.naming import StorageManager, generate_sports_filename, probe_video_resolution
 from app.cleanup import register_signal_handlers
+from app.tuner import generate_m3u_playlist, generate_xmltv_epg
+from app.notifications import NotificationManager
+from app.post_processor import remux_recording
 
-app = FastAPI(title="Stream Failover Studio", version="1.0.0")
+app = FastAPI(title="PVArr - Personal Video Recorder", version="1.0.0")
+
+notifier = NotificationManager()
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "app" / "templates"
@@ -38,7 +44,11 @@ register_signal_handlers(active_recorders)
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
+    fav_path = BASE_DIR / "app" / "static" / "favicon.svg"
+    if fav_path.exists():
+        return FileResponse(fav_path, media_type="image/svg+xml")
     return Response(status_code=204)
+
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -58,7 +68,23 @@ async def index(request: Request):
 
 
 
-@app.get("/api/status")
+@app.get("/live/playlist.m3u8")
+@app.get("/live/playlist.m3u")
+async def get_tuner_m3u(request: Request):
+    """Return dynamic M3U tuner playlist for IPTV clients (Plex / Emby)."""
+    active_sessions = [r.get_status_summary() for r in active_recorders.values()]
+    base_url = str(request.base_url)
+    m3u_content = generate_m3u_playlist(active_sessions, base_url)
+    return Response(content=m3u_content, media_type="application/x-mpegurl")
+
+
+@app.get("/live/epg.xml")
+async def get_tuner_epg():
+    """Return XMLTV EPG data for active tuner channels."""
+    active_sessions = [r.get_status_summary() for r in active_recorders.values()]
+    xml_content = generate_xmltv_epg(active_sessions)
+    return Response(content=xml_content, media_type="application/xml")
+
 async def get_system_status():
     """Return JSON summary of all active recorders."""
     sessions = [r.get_status_summary() for r in active_recorders.values()]
@@ -96,13 +122,27 @@ async def start_recording(
     )
 
     port = 8090 + (len(active_recorders) * 2)
+
+    def _on_complete(filepath):
+        sz = round(Path(filepath).stat().st_size / (1024*1024), 2) if Path(filepath).exists() else 0
+        notifier.notify_recording_finished(recording_id, Path(filepath).name, sz)
+        remux_recording(filepath, target_format="mp4", delete_source=True)
+
+    def _on_failover(rec_id, next_name):
+        notifier.notify_failover_triggered(rec_id, next_name)
+
     recorder = StreamFailoverRecorder(
         recording_id=recording_id,
         candidates=candidates,
         output_filepath=str(output_path),
         base_port=port,
-        freeze_timeout_sec=freeze_timeout
+        freeze_timeout_sec=freeze_timeout,
+        on_completion_callback=_on_complete,
+        on_failover_callback=_on_failover
     )
+
+    notifier.notify_recording_started(recording_id, output_path.name, candidates[0])
+
 
     active_recorders[recording_id] = recorder
     recorder.start_recording()

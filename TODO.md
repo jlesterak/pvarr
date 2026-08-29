@@ -1,41 +1,34 @@
-# Stream Failover Studio - Implementation TODO
+# PVArr - Implementation TODO
 
-## Tasks
+## Phase 1: Core Failover Engine & Studio Foundations
 - [x] **Task 1: Environment, Project Structure & Dependency Setup**
-  - Initialize clean repository structure in `stream-failover-studio/`
-  - Create `.gitignore` and `requirements.txt`
-  - Initialize fresh `git` repository
-  - Create dependency checker for `ffmpeg` and `hls-proxy` / `detect-headers` CLI tools
-
 - [x] **Task 2: Core Failover Engine (`stream-recorder.py` / `app/recorder.py`)**
-  - Support up to 3 candidate `m3u8` URLs (Primary, Backup 1, Backup 2)
-  - Dynamic HTTP header detection per stream candidate (`detect-headers` subprocess call)
-  - Seamless stream failover triggering on HTTP errors, stream freeze (stale segment write), or proxy exit
-  - Binary segment appending into a single continuous output `.ts` file without stream interruption
-
 - [x] **Task 3: Sports File-Naming & Storage Module (`app/naming.py`)**
-  - Standardized filename generator: `YYYY-MM-DD_[Sport]_[TeamA_vs_TeamB]_[Resolution].ts`
-  - Sanitization of user input strings and resolution probing via `ffprobe`
-  - Directory storage management for completed recordings
-
 - [x] **Task 4: Web Server Backend (`app/server.py`)**
-  - FastAPI / Uvicorn server providing endpoints for recording lifecycle management
-  - Multi-stream active recorder controller & status monitor
-  - Real-time logging streaming endpoint (SSE / WebSockets)
-  - Force-failover trigger endpoint (`/api/recordings/{id}/failover`)
-  - Updated `templates.TemplateResponse()` to modern Starlette signature (`request=request, name=..., context=...`) to resolve 500 error
-  - Added lightweight `/favicon.ico` handler
-
 - [x] **Task 5: Web Management Dashboard UI (`app/templates/index.html`)**
-  - Single-page interface with Tailwind CSS and HTMX
-  - Live stream monitoring card showing active candidate stream, elapsed time, current file size, and live log tail
-  - New Recording Creation modal form with Category, Teams, Output Directory, and 3 URL fields
-  - Forced failover button for active recordings
-  - Recorded File Library view to browse, play preview, rename, and delete recordings
-
 - [x] **Task 6: Application Runner Script (`start.sh`) & Graceful Process Cleanup**
-  - Auto-creation and activation of Python virtual environment (`venv`) inside `start.sh`
-  - Auto-installation/verification of `requirements.txt` packages (FastAPI, Uvicorn, etc.)
-  - Default web port updated to `8999`
-  - Process lifecycle cleanup subroutines with `SIGINT` / `SIGTERM` handlers (`app/cleanup.py`)
-  - Standalone container/system runner script `start.sh` tested and verified
+
+## Phase 2: PVArr Branding, Direct FFmpeg Optimization & *Arr Ecosystem Integration
+- [x] **Task 1: Recorder Optimization & Proxy Fallback Logic (`app/recorder.py`)**
+  - Direct FFmpeg recording with headers (`-headers "User-Agent: ...\r\nReferer: ...\r\n"`)
+  - Automatic fallback to `hls-proxy-stream` loopback only if Direct Mode fails
+  - Seamless candidate failover across 3 backup URLs
+
+- [x] **Task 2: *Arr-Style UI & Favicon Integration (`app/templates/index.html` & `app/static/favicon.svg`)**
+  - Redesigned dashboard UI matching Sonarr/Radarr ecosystem visual design
+  - Custom SVG favicon served cleanly at `/favicon.ico` (200 OK)
+
+- [x] **Task 3: Post-Processing Engine (`app/post_processor.py`)**
+  - Container remuxing (`.ts` -> `.mp4` / `.mkv` with `-movflags +faststart`)
+  - Source file cleanup option post-verification
+
+- [x] **Task 4: Media Server & Notification Webhooks (`app/notifications.py`)**
+  - Webhooks for Discord & Telegram (Started, Finished, Failover Events)
+  - Plex / Emby library refresh API triggers
+
+- [x] **Task 5: Virtual IPTV / M3U Tuner Endpoint (`app/tuner.py` & `app/server.py`)**
+  - Exposes dynamic `/live/playlist.m3u8` (`.m3u`) and `/live/epg.xml` for Plex Live TV & Emby DVR tuners
+
+- [x] **Task 6: Dockerization & Deployment Assets (`Dockerfile` & `docker-compose.yml`)**
+  - Multi-stage Dockerfile with FFmpeg & Python runtime
+  - Production `docker-compose.yml` with `/config` and `/recordings` volume mounts

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Core Failover Engine Module - Stream Failover Studio
-Manages multi-candidate m3u8/HLS recordings with dynamic header detection,
-automatic freeze/crash failover, and continuous binary segment appending.
+PVArr Core Recorder & Multi-Stream Failover Engine
+Implements Direct-First FFmpeg connection with automatic fallback to hls-proxy-stream,
+dynamic HTTP header injection, freeze detection, and continuous segment appending.
 """
 
 import json
@@ -19,13 +19,12 @@ from typing import List, Optional, Callable, Dict, Any
 
 from app.check_deps import find_executable
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("FailoverEngine")
+logger = logging.getLogger("PVArrRecorder")
 
 
 class CandidateStream:
@@ -34,9 +33,10 @@ class CandidateStream:
         self.name = name
         self.m3u8_url: str = ""
         self.referer: str = ""
-        self.user_agent: str = ""
+        self.user_agent: str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         self.slug: str = ""
         self.detected: bool = False
+        self.used_proxy: bool = False
         self.fail_count: int = 0
         self.last_error: str = ""
 
@@ -46,7 +46,9 @@ class CandidateStream:
             "name": self.name,
             "m3u8_url": self.m3u8_url,
             "referer": self.referer,
+            "user_agent": self.user_agent,
             "detected": self.detected,
+            "used_proxy": self.used_proxy,
             "fail_count": self.fail_count,
             "last_error": self.last_error,
         }
@@ -61,6 +63,8 @@ class StreamFailoverRecorder:
         base_port: int = 8090,
         freeze_timeout_sec: int = 15,
         log_callback: Optional[Callable[[str], None]] = None,
+        on_completion_callback: Optional[Callable[[str], None]] = None,
+        on_failover_callback: Optional[Callable[[str, str], None]] = None
     ):
         self.recording_id = recording_id
         self.candidates: List[CandidateStream] = [
@@ -72,18 +76,18 @@ class StreamFailoverRecorder:
         self.base_port = base_port
         self.freeze_timeout_sec = freeze_timeout_sec
         self.log_callback = log_callback
+        self.on_completion_callback = on_completion_callback
+        self.on_failover_callback = on_failover_callback
 
         self.current_candidate_index: int = 0
         self.is_running: bool = False
-        self.is_stopped: bool = False
-        self.status: str = "initialized"  # initialized, detecting, recording, failing_over, completed, failed
+        self.status: str = "initialized"  # initialized, recording, failing_over, completed, failed
         self.start_time: Optional[float] = None
         self.stop_time: Optional[float] = None
         self.bytes_written: int = 0
         self.log_history: List[str] = []
 
         self._thread: Optional[threading.Thread] = None
-        self._monitor_thread: Optional[threading.Thread] = None
         self._ffmpeg_process: Optional[subprocess.Popen] = None
         self._proxy_process: Optional[subprocess.Popen] = None
         self._force_failover_flag: bool = False
@@ -111,7 +115,6 @@ class StreamFailoverRecorder:
     def detect_candidate_headers(self, candidate: CandidateStream) -> bool:
         """Run detect-headers CLI script to inspect m3u8 and required HTTP headers."""
         if not self.detect_headers_path or not os.path.exists(self.detect_headers_path):
-            self._log("detect-headers script not found. Using raw URL.", "WARN")
             candidate.m3u8_url = candidate.url
             candidate.slug = f"cand_{id(candidate)}"
             candidate.detected = True
@@ -133,31 +136,28 @@ class StreamFailoverRecorder:
                 data = json.loads(res.stdout.strip())
                 candidate.m3u8_url = data.get("m3u8_url", candidate.url)
                 candidate.referer = data.get("referer", "")
-                candidate.user_agent = data.get("user_agent", "")
+                if data.get("user_agent"):
+                    candidate.user_agent = data.get("user_agent")
                 candidate.slug = data.get("slug", f"cand_{self.current_candidate_index}")
                 candidate.detected = True
-                self._log(f"Header detection successful for {candidate.name}. m3u8: {candidate.m3u8_url[:60]}...")
+                self._log(f"Header detection successful for {candidate.name}.")
                 return True
             else:
                 candidate.last_error = res.stderr.strip() or "Detection failed"
-                self._log(f"Header detection failed for {candidate.name}: {candidate.last_error}", "WARN")
         except Exception as e:
             candidate.last_error = str(e)
-            self._log(f"Header detection error for {candidate.name}: {e}", "WARN")
 
-        # Fallback: assume URL is m3u8 directly if detection failed
         candidate.m3u8_url = candidate.url
         candidate.slug = f"cand_{self.current_candidate_index}"
         candidate.detected = True
         return True
 
     def start_proxy(self, candidate: CandidateStream) -> Optional[str]:
-        """Start dynamic hls-proxy instance for candidate stream."""
+        """Start local hls-proxy instance for candidate stream (Fallback Mode)."""
         if not self.hls_proxy_path or not os.path.exists(self.hls_proxy_path):
-            self._log("hls-proxy script not found. Using direct candidate URL.", "WARN")
             return candidate.m3u8_url
 
-        port = self.base_port
+        port = self.base_port + self.current_candidate_index
         conf_dir = self.output_filepath.parent / ".proxy_conf"
         conf_dir.mkdir(parents=True, exist_ok=True)
         conf_file = conf_dir / f"channels_{self.recording_id}.conf"
@@ -172,7 +172,7 @@ class StreamFailoverRecorder:
         if candidate.referer:
             env["HLS_PROXY_REFERER"] = candidate.referer
 
-        self._log(f"Starting hls-proxy on port {port} for {candidate.name}...")
+        self._log(f"[Fallback Mode] Launching hls-proxy on port {port} for {candidate.name}...")
         try:
             self._proxy_process = subprocess.Popen(
                 [sys.executable, self.hls_proxy_path],
@@ -181,9 +181,9 @@ class StreamFailoverRecorder:
                 stderr=subprocess.PIPE,
                 text=True
             )
-            time.sleep(1.5)  # Wait for proxy to bind port
-            proxy_url = f"http://127.0.0.1:{port}/channel/{candidate.slug}"
-            return proxy_url
+            time.sleep(1.5)
+            candidate.used_proxy = True
+            return f"http://127.0.0.1:{port}/channel/{candidate.slug}"
         except Exception as e:
             self._log(f"Failed to start hls-proxy: {e}", "ERROR")
             return candidate.m3u8_url
@@ -202,7 +202,7 @@ class StreamFailoverRecorder:
             self._proxy_process = None
 
     def start_recording(self):
-        """Start the recording thread."""
+        """Start recording thread."""
         if self.is_running:
             return
         self.is_running = True
@@ -213,7 +213,7 @@ class StreamFailoverRecorder:
         self._thread.start()
 
     def force_failover(self):
-        """User or API trigger to manually failover to next candidate."""
+        """Manual trigger to force switch to next stream candidate."""
         self._log("Manual force-failover requested!", "WARN")
         self._force_failover_flag = True
         if self._ffmpeg_process:
@@ -224,7 +224,7 @@ class StreamFailoverRecorder:
 
     def stop(self):
         """Gracefully stop recording."""
-        self._log("Stopping recorder gracefully...")
+        self._log("Stopping PVArr recorder gracefully...")
         self._stop_event.set()
         self.is_running = False
         self.status = "completed"
@@ -243,8 +243,79 @@ class StreamFailoverRecorder:
 
         self.stop_proxy()
 
+    def _build_ffmpeg_cmd(self, stream_url: str, referer: str = "", user_agent: str = "") -> List[str]:
+        """Build FFmpeg command line with custom HTTP headers if present."""
+        cmd = [
+            self.ffmpeg_path or "ffmpeg",
+            "-y",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-rw_timeout", "15000000",
+        ]
+
+        # Construct HTTP headers for Direct Mode
+        headers_str = ""
+        if user_agent:
+            headers_str += f"User-Agent: {user_agent}\r\n"
+        if referer:
+            headers_str += f"Referer: {referer}\r\n"
+
+        if headers_str:
+            cmd.extend(["-headers", headers_str])
+
+        cmd.extend([
+            "-i", stream_url,
+            "-c", "copy",
+            "-f", "mpegts",
+            "pipe:1"
+        ])
+
+        return cmd
+
+    def _stream_ffmpeg_process(self, ffmpeg_cmd: List[str], candidate: CandidateStream) -> bool:
+        """Stream chunks from FFmpeg stdout to destination file. Returns True if successful data was written."""
+        written_for_this_session = 0
+        last_write_time = time.time()
+
+        with open(self.output_filepath, "ab") as out_f:
+            self._ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=65536
+            )
+
+            while not self._stop_event.is_set():
+                if self._force_failover_flag:
+                    self._log(f"Forced failover triggered on {candidate.name}", "WARN")
+                    return False
+
+                chunk = self._ffmpeg_process.stdout.read(32768)
+                if chunk:
+                    out_f.write(chunk)
+                    out_f.flush()
+                    len_chunk = len(chunk)
+                    self.bytes_written += len_chunk
+                    written_for_this_session += len_chunk
+                    last_write_time = time.time()
+                else:
+                    ret_code = self._ffmpeg_process.poll()
+                    if ret_code is not None:
+                        if ret_code != 0 and written_for_this_session == 0:
+                            return False  # Failed immediately without writing data
+                        break
+
+                    if (time.time() - last_write_time) > self.freeze_timeout_sec:
+                        self._log(f"Stream freeze detected! No data received for {self.freeze_timeout_sec}s", "ERROR")
+                        candidate.fail_count += 1
+                        return False if written_for_this_session == 0 else True
+                    time.sleep(0.2)
+
+        return written_for_this_session > 0
+
     def _recording_loop(self):
-        """Main recording & failover monitoring loop."""
+        """Main recording & failover loop."""
         while not self._stop_event.is_set() and self.current_candidate_index < len(self.candidates):
             candidate = self.candidates[self.current_candidate_index]
             self._log(f"=== Active Stream: Candidate {self.current_candidate_index+1}/{len(self.candidates)} ({candidate.name}) ===")
@@ -252,99 +323,71 @@ class StreamFailoverRecorder:
             # 1. Detect headers
             self.detect_candidate_headers(candidate)
 
-            # 2. Start Proxy
-            stream_input_url = self.start_proxy(candidate)
-
-            # 3. Spawn FFmpeg & append output to destination .ts file
-            ffmpeg_cmd = [
-                self.ffmpeg_path or "ffmpeg",
-                "-y",
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-                "-rw_timeout", "15000000",
-                "-i", stream_input_url,
-                "-c", "copy",
-                "-f", "mpegts",
-                "pipe:1"
-            ]
-
-            self._log(f"Launching FFmpeg stream fetcher for {candidate.name}...")
+            # 2. Attempt Direct Mode (Direct FFmpeg with -headers)
+            self._log(f"[Direct Mode] Connecting FFmpeg directly to {candidate.m3u8_url[:70]}...")
+            direct_cmd = self._build_ffmpeg_cmd(candidate.m3u8_url, candidate.referer, candidate.user_agent)
             
-            try:
-                # Open main file in append binary mode ("ab")
-                with open(self.output_filepath, "ab") as out_f:
-                    self._ffmpeg_process = subprocess.Popen(
-                        ffmpeg_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        bufsize=65536
-                    )
+            success = self._stream_ffmpeg_process(direct_cmd, candidate)
 
-                    last_write_time = time.time()
-                    self._force_failover_flag = False
-
-                    # Monitor output chunk writing
-                    while not self._stop_event.is_set():
-                        if self._force_failover_flag:
-                            self._log(f"Forced failover triggered on {candidate.name}!", "WARN")
-                            break
-
-                        # Read binary segment chunk
-                        chunk = self._ffmpeg_process.stdout.read(32768)
-                        if chunk:
-                            out_f.write(chunk)
-                            out_f.flush()
-                            self.bytes_written += len(chunk)
-                            last_write_time = time.time()
-                        else:
-                            # stdout EOF or ffmpeg exited
-                            ret_code = self._ffmpeg_process.poll()
-                            if ret_code is not None:
-                                self._log(f"FFmpeg process exited with code {ret_code} for {candidate.name}", "WARN")
-                                break
-                            
-                            # Check freeze / stale timeout
-                            if (time.time() - last_write_time) > self.freeze_timeout_sec:
-                                self._log(f"STREAM FREEZE DETECTED! No data received for {self.freeze_timeout_sec}s on {candidate.name}", "ERROR")
-                                candidate.fail_count += 1
-                                break
-                            time.sleep(0.2)
-
-            except Exception as e:
-                self._log(f"Error during ffmpeg streaming for {candidate.name}: {e}", "ERROR")
-                candidate.fail_count += 1
-
-            # Cleanup current candidate FFmpeg and Proxy
+            # Clean up FFmpeg process
             if self._ffmpeg_process:
                 try:
                     self._ffmpeg_process.terminate()
-                    self._ffmpeg_process.wait(timeout=2)
                 except Exception:
                     pass
                 self._ffmpeg_process = None
 
-            self.stop_proxy()
+            # 3. Fallback Mode: If Direct Mode failed without yielding data, attempt hls-proxy-stream
+            if not success and not self._stop_event.is_set() and not self._force_failover_flag:
+                self._log(f"[Direct Mode Failed] Falling back to hls-proxy-stream for {candidate.name}...", "WARN")
+                proxy_url = self.start_proxy(candidate)
+                proxy_cmd = self._build_ffmpeg_cmd(proxy_url)
+                
+                success = self._stream_ffmpeg_process(proxy_cmd, candidate)
+
+                if self._ffmpeg_process:
+                    try:
+                        self._ffmpeg_process.terminate()
+                    except Exception:
+                        pass
+                    self._ffmpeg_process = None
+                self.stop_proxy()
 
             if self._stop_event.is_set():
                 break
 
-            # Move to next candidate for failover
-            self.current_candidate_index += 1
-            if self.current_candidate_index < len(self.candidates):
-                self.status = "failing_over"
-                self._log(f"Failing over to Candidate {self.current_candidate_index+1}...", "WARN")
-                time.sleep(1)
+            # If stream ended or failed, check if we need to failover to next candidate
+            if self._force_failover_flag or not success:
+                self.current_candidate_index += 1
+                if self.current_candidate_index < len(self.candidates):
+                    next_name = self.candidates[self.current_candidate_index].name
+                    self.status = "failing_over"
+                    self._log(f"Failing over to Candidate {self.current_candidate_index+1} ({next_name})...", "WARN")
+                    if self.on_failover_callback:
+                        try:
+                            self.on_failover_callback(self.recording_id, next_name)
+                        except Exception:
+                            pass
+                    time.sleep(1)
+                else:
+                    self._log("All stream candidates exhausted!", "ERROR")
+                    self.status = "failed"
+                    break
             else:
-                self._log("All stream candidates exhausted!", "ERROR")
-                self.status = "failed"
+                # Stream completed naturally
                 break
 
         if self.status != "failed":
             self.status = "completed"
+            if self.on_completion_callback:
+                try:
+                    self.on_completion_callback(str(self.output_filepath))
+                except Exception:
+                    pass
+
         self.is_running = False
         self.stop_time = time.time()
-        self._log(f"Recorder finished. Total bytes recorded: {self.bytes_written} bytes ({self.get_filesize_mb():.2f} MB)")
+        self._log(f"Recorder finished. Total recorded: {self.get_filesize_mb():.2f} MB ({self.bytes_written} bytes)")
 
     def get_elapsed_seconds(self) -> float:
         if not self.start_time:
