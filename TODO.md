@@ -32,5 +32,8 @@
   - Recorded File Library view to browse, play preview, rename, and delete recordings
 
 - [x] **Task 6: Application Runner Script (`start.sh`) & Graceful Process Cleanup**
+  - Auto-creation and activation of Python virtual environment (`venv`) inside `start.sh`
+  - Auto-installation/verification of `requirements.txt` packages (FastAPI, Uvicorn, etc.)
+  - Default web port updated to `8999`
   - Process lifecycle cleanup subroutines with `SIGINT` / `SIGTERM` handlers (`app/cleanup.py`)
-  - Standalone container/system runner script `start.sh`
+  - Standalone container/system runner script `start.sh` tested and verified

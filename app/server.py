@@ -21,10 +21,6 @@ from app.cleanup import register_signal_handlers
 
 app = FastAPI(title="Stream Failover Studio", version="1.0.0")
 
-# Register SIGINT / SIGTERM handlers for container & process safety
-register_signal_handlers(active_recorders)
-
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "app" / "templates"
 RECORDINGS_DIR = BASE_DIR / "recordings"
@@ -34,6 +30,10 @@ storage = StorageManager(record_dir=str(RECORDINGS_DIR))
 
 # Active recorder sessions: recording_id -> StreamFailoverRecorder
 active_recorders: Dict[str, StreamFailoverRecorder] = {}
+
+# Register SIGINT / SIGTERM handlers for container & process safety
+register_signal_handlers(active_recorders)
+
 
 
 @app.get("/", response_class=HTMLResponse)
