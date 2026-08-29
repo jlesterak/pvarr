@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Optional, List
 
 from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -36,17 +36,26 @@ register_signal_handlers(active_recorders)
 
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Render single-page management dashboard."""
     recordings_list = storage.list_recordings()
     active_list = [r.get_status_summary() for r in active_recorders.values()]
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "active_recordings": active_list,
-        "library": recordings_list,
-        "default_dir": str(RECORDINGS_DIR)
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={
+            "active_recordings": active_list,
+            "library": recordings_list,
+            "default_dir": str(RECORDINGS_DIR),
+        }
+    )
+
 
 
 @app.get("/api/status")

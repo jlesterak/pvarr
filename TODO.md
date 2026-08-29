@@ -23,6 +23,8 @@
   - Multi-stream active recorder controller & status monitor
   - Real-time logging streaming endpoint (SSE / WebSockets)
   - Force-failover trigger endpoint (`/api/recordings/{id}/failover`)
+  - Updated `templates.TemplateResponse()` to modern Starlette signature (`request=request, name=..., context=...`) to resolve 500 error
+  - Added lightweight `/favicon.ico` handler
 
 - [x] **Task 5: Web Management Dashboard UI (`app/templates/index.html`)**
   - Single-page interface with Tailwind CSS and HTMX
