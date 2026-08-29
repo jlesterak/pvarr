@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# Stream Failover Studio - Application Runner
+# PVArr - Application Runner
 # Launches FastAPI Web Server Dashboard & Stream Failover Manager
 # =============================================================================
 
@@ -14,12 +14,36 @@ PORT="${PORT:-8999}"
 VENV_DIR="venv"
 
 echo "================================================================="
-echo "       Stream Failover Studio — Application Launcher"
+echo "              PVArr — Application Launcher"
 echo "================================================================="
 
-# 1. Virtual Environment Check & Activation
-if [[ -f "${VENV_DIR}/bin/activate" ]]; then
-    # Activate existing venv
+# 1. Quick PATH check for required system binaries (fast fail before Python starts)
+if ! command -v ffmpeg &>/dev/null; then
+    echo "[!] ERROR: 'ffmpeg' not found in PATH. Please install ffmpeg." >&2
+    exit 1
+fi
+if ! command -v ffprobe &>/dev/null; then
+    echo "[!] ERROR: 'ffprobe' not found in PATH. Please install ffmpeg." >&2
+    exit 1
+fi
+
+# Informational check for optional proxy tools
+if command -v hls-proxy &>/dev/null || command -v hls-proxy.py &>/dev/null; then
+    echo "[+] hls-proxy      -> FOUND (proxy fallback enabled)"
+else
+    echo "[i] hls-proxy      -> not found (direct FFmpeg mode only — proxy fallback disabled)"
+fi
+if command -v detect-headers &>/dev/null || command -v detect-headers-py.py &>/dev/null; then
+    echo "[+] detect-headers -> FOUND (header auto-detection enabled)"
+else
+    echo "[i] detect-headers -> not found (manual header injection only)"
+fi
+
+# 2. Virtual Environment Check & Activation
+# Skip venv creation inside Docker (PVARR_NO_VENV=1 is set or venv doesn't make sense)
+if [[ "${PVARR_NO_VENV:-0}" == "1" ]]; then
+    echo "[+] Running in container mode — skipping venv."
+elif [[ -f "${VENV_DIR}/bin/activate" ]]; then
     # shellcheck disable=SC1091
     source "${VENV_DIR}/bin/activate"
 elif [[ -f ".venv/bin/activate" ]]; then
@@ -32,9 +56,9 @@ else
     source "${VENV_DIR}/bin/activate"
 fi
 
-# 2. Dependency Verification & Installation
+# 3. Dependency Verification & Installation
 if ! python3 -c "import uvicorn, fastapi" &>/dev/null; then
-    echo "[+] Missing required dependencies. Installing from requirements.txt..."
+    echo "[+] Missing required Python dependencies. Installing from requirements.txt..."
     python3 -m pip install --upgrade pip
     if ! python3 -m pip install -r requirements.txt; then
         echo "[!] ERROR: Failed to install Python dependencies from requirements.txt!" >&2
@@ -43,13 +67,13 @@ if ! python3 -c "import uvicorn, fastapi" &>/dev/null; then
     fi
 fi
 
-# 3. Run System Dependency Check
-python3 app/check_deps.py
+# 4. Run full Python dependency check (non-fatal for optional tools)
+python3 app/check_deps.py || true
 
-# 4. Ensure runtime directories exist
-mkdir -p recordings logs app/templates
+# 5. Ensure runtime directories exist
+mkdir -p recordings logs
 
-# 5. Start Uvicorn Web Dashboard Server
+# 6. Start Uvicorn Web Dashboard Server
 echo ""
 echo "[+] Starting Web Dashboard Server on http://${HOST}:${PORT}..."
 echo "[+] Press Ctrl+C to stop all active streams and exit gracefully."
