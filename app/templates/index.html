@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stream Failover Studio - Live HLS Recording & Failover Studio</title>
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+              900: '#312e81',
+            },
+            accent: {
+              red: '#ef4444',
+              emerald: '#10b981',
+              amber: '#f59e0b',
+              cyan: '#06b6d4',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Alpine.js CDN -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <style>
+    body {
+      background-color: #0b0f19;
+      color: #f3f4f6;
+    }
+    .glass-card {
+      background: rgba(17, 24, 39, 0.7);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .glass-input {
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .glass-input:focus {
+      border-color: #6366f1;
+      outline: none;
+      box-shadow: 0 0 12px rgba(99, 102, 241, 0.3);
+    }
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: rgba(15, 23, 42, 0.6);
+    }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(99, 102, 241, 0.5);
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body class="font-sans min-h-screen flex flex-col antialiased text-gray-100" x-data="dashboardApp()">
+
+  <!-- Top Navigation Header -->
+  <header class="glass-card sticky top-0 z-40 border-b border-gray-800/80 px-6 py-4">
+    <div class="max-w-7xl mx-auto flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-brand-600 to-accent-cyan flex items-center justify-center shadow-lg shadow-brand-500/20">
+          <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+          </svg>
+        </div>
+        <div>
+          <h1 class="text-xl font-bold bg-gradient-to-r from-white via-gray-200 to-gray-400 bg-clip-text text-transparent">Stream Failover Studio</h1>
+          <p class="text-xs text-gray-400 font-mono">Continuous Multi-Candidate HLS Recorder</p>
+        </div>
+      </div>
+
+      <div class="flex items-center space-x-4">
+        <div class="px-3 py-1.5 rounded-full text-xs font-semibold flex items-center space-x-2" 
+             :class="activeSessions.length > 0 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-gray-800 text-gray-400'">
+          <span class="w-2 h-2 rounded-full" :class="activeSessions.length > 0 ? 'bg-emerald-400 animate-ping' : 'bg-gray-500'"></span>
+          <span x-text="activeSessions.length > 0 ? activeSessions.length + ' Active Stream(s)' : 'Idle'"></span>
+        </div>
+
+        <button @click="openNewModal = true" class="bg-gradient-to-r from-brand-600 to-brand-500 hover:from-brand-500 hover:to-brand-600 text-white px-4 py-2 rounded-xl text-sm font-semibold shadow-lg shadow-brand-600/30 transition duration-200 flex items-center space-x-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
+          </svg>
+          <span>New Stream Recording</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="max-w-7xl mx-auto px-6 py-8 flex-1 w-full space-y-8">
+
+    <!-- Active Recording Sessions Section -->
+    <section class="space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-bold text-gray-100 flex items-center space-x-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-brand-500"></span>
+          <span>Live Streams & Active Recorders</span>
+        </h2>
+        <button @click="refreshStatus()" class="text-xs text-gray-400 hover:text-brand-400 transition flex items-center space-x-1">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+          <span>Refresh</span>
+        </button>
+      </div>
+
+      <template x-if="activeSessions.length === 0">
+        <div class="glass-card rounded-2xl p-10 text-center space-y-3">
+          <div class="w-12 h-12 rounded-full bg-gray-800/80 text-gray-500 mx-auto flex items-center justify-center">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+          </div>
+          <p class="text-gray-400 text-sm">No recording sessions currently active.</p>
+          <button @click="openNewModal = true" class="text-brand-400 hover:text-brand-300 text-xs font-semibold underline">Create a new stream recording session &rarr;</button>
+        </div>
+      </template>
+
+      <div class="grid grid-cols-1 gap-6">
+        <template x-for="session in activeSessions" :key="session.id">
+          <div class="glass-card rounded-2xl p-6 border border-gray-800 hover:border-brand-500/40 transition-all duration-300 space-y-6">
+            
+            <!-- Card Header -->
+            <div class="flex items-start justify-between flex-wrap gap-4 border-b border-gray-800 pb-4">
+              <div class="space-y-1">
+                <div class="flex items-center space-x-3">
+                  <span class="font-mono text-xs font-semibold px-2.5 py-1 rounded-md bg-brand-500/10 text-brand-400 border border-brand-500/20" x-text="session.id"></span>
+                  <h3 class="text-lg font-bold text-white truncate max-w-md" x-text="session.output_filename"></h3>
+                </div>
+                <p class="text-xs text-gray-400 font-mono" x-text="session.output_file"></p>
+              </div>
+
+              <!-- Action Controls -->
+              <div class="flex items-center space-x-3">
+                <button @click="triggerFailover(session.id)" 
+                        :disabled="!session.is_running"
+                        class="bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 px-3 py-1.5 rounded-xl text-xs font-semibold transition flex items-center space-x-1.5 disabled:opacity-50">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
+                  <span>Force Failover</span>
+                </button>
+
+                <button @click="stopSession(session.id)" 
+                        :disabled="!session.is_running"
+                        class="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-3 py-1.5 rounded-xl text-xs font-semibold transition flex items-center space-x-1.5 disabled:opacity-50">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"></path></svg>
+                  <span>Stop Recording</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Stats & Status Bar -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 bg-gray-900/60 p-4 rounded-xl border border-gray-800/80">
+              <div>
+                <span class="text-xs text-gray-500 block uppercase font-medium">Status</span>
+                <span class="text-sm font-bold capitalize flex items-center space-x-1.5"
+                      :class="session.is_running ? 'text-emerald-400' : 'text-gray-400'">
+                  <span class="w-2 h-2 rounded-full" :class="session.is_running ? 'bg-emerald-400 animate-pulse' : 'bg-gray-500'"></span>
+                  <span x-text="session.status"></span>
+                </span>
+              </div>
+              <div>
+                <span class="text-xs text-gray-500 block uppercase font-medium">Active Candidate</span>
+                <span class="text-sm font-bold text-brand-300" x-text="'Candidate ' + session.current_candidate + ' / ' + session.total_candidates"></span>
+              </div>
+              <div>
+                <span class="text-xs text-gray-500 block uppercase font-medium">Elapsed Time</span>
+                <span class="text-sm font-bold text-gray-200 font-mono" x-text="formatSeconds(session.elapsed_seconds)"></span>
+              </div>
+              <div>
+                <span class="text-xs text-gray-500 block uppercase font-medium">Recorded Size</span>
+                <span class="text-sm font-bold text-cyan-400 font-mono" x-text="session.filesize_mb + ' MB'"></span>
+              </div>
+            </div>
+
+            <!-- Candidate Stream Slots Badges -->
+            <div class="flex items-center space-x-3 overflow-x-auto pb-1">
+              <template x-for="(cand, idx) in session.candidates" :key="idx">
+                <div class="px-3 py-2 rounded-xl text-xs flex items-center space-x-2 border shrink-0"
+                     :class="(idx + 1) === session.current_candidate ? 'bg-brand-500/20 text-brand-300 border-brand-500/40 shadow-sm shadow-brand-500/20' : 'bg-gray-900/40 text-gray-500 border-gray-800'">
+                  <span class="w-2 h-2 rounded-full" :class="(idx + 1) === session.current_candidate ? 'bg-emerald-400 animate-ping' : 'bg-gray-600'"></span>
+                  <span class="font-semibold" x-text="cand.name + ': ' + (cand.url.length > 35 ? cand.url.slice(0, 35) + '...' : cand.url)"></span>
+                </div>
+              </template>
+            </div>
+
+            <!-- Real-Time Log Tailing -->
+            <div class="space-y-2">
+              <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center space-x-2">
+                <svg class="w-3.5 h-3.5 text-brand-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                <span>Live Event Logs</span>
+              </span>
+              <div class="bg-black/80 rounded-xl p-4 font-mono text-xs text-gray-300 h-40 overflow-y-auto border border-gray-800 space-y-1">
+                <template x-for="log in session.logs" :key="log">
+                  <p class="hover:bg-gray-900/50 px-1 py-0.5 rounded leading-relaxed text-gray-300" x-text="log"></p>
+                </template>
+              </div>
+            </div>
+
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- Recorded File Library Section -->
+    <section class="space-y-4 pt-6 border-t border-gray-800">
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-bold text-gray-100 flex items-center space-x-2">
+          <svg class="w-5 h-5 text-brand-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 8a2 2 0 012-2h10a2 2 0 012 2v10a2 2 0 01-2 2H7a2 2 0 01-2-2V8z"></path></svg>
+          <span>Recorded File Library (.ts)</span>
+        </h2>
+        <button @click="fetchLibrary()" class="text-xs text-gray-400 hover:text-brand-400 transition flex items-center space-x-1">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+          <span>Refresh Library</span>
+        </button>
+      </div>
+
+      <div class="glass-card rounded-2xl overflow-hidden border border-gray-800">
+        <table class="w-full text-left text-sm text-gray-300">
+          <thead class="bg-gray-900/80 text-xs uppercase font-semibold text-gray-400 border-b border-gray-800">
+            <tr>
+              <th class="px-6 py-4">Filename</th>
+              <th class="px-6 py-4">File Size</th>
+              <th class="px-6 py-4">Recorded Date</th>
+              <th class="px-6 py-4 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-800/60">
+            <template x-if="libraryFiles.length === 0">
+              <tr>
+                <td colspan="4" class="px-6 py-8 text-center text-gray-500">No recorded `.ts` files found in library directory.</td>
+              </tr>
+            </template>
+
+            <template x-for="item in libraryFiles" :key="item.filename">
+              <tr class="hover:bg-gray-900/40 transition">
+                <td class="px-6 py-4 font-mono font-medium text-white flex items-center space-x-2">
+                  <svg class="w-4 h-4 text-brand-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"></path></svg>
+                  <span x-text="item.filename"></span>
+                </td>
+                <td class="px-6 py-4 font-mono text-cyan-400" x-text="item.size_mb + ' MB'"></td>
+                <td class="px-6 py-4 text-gray-400" x-text="item.created_at"></td>
+                <td class="px-6 py-4 text-right space-x-2">
+                  <a :href="'/api/library/download/' + item.filename" download class="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs font-semibold text-gray-200 inline-flex items-center space-x-1">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                    <span>Download</span>
+                  </a>
+
+                  <button @click="promptRename(item.filename)" class="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs font-semibold text-gray-200 inline-flex items-center space-x-1">
+                    <span>Rename</span>
+                  </button>
+
+                  <button @click="deleteFile(item.filename)" class="px-3 py-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-xs font-semibold inline-flex items-center space-x-1">
+                    <span>Delete</span>
+                  </button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Modal: Create New Recording -->
+  <div x-show="openNewModal" 
+       x-transition:enter="transition ease-out duration-300"
+       x-transition:enter-start="opacity-0 scale-95"
+       x-transition:enter-end="opacity-100 scale-100"
+       x-transition:leave="transition ease-in duration-200"
+       x-transition:leave-start="opacity-100 scale-100"
+       x-transition:leave-end="opacity-0 scale-95"
+       class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" style="display: none;">
+
+    <div class="glass-card rounded-2xl w-full max-w-2xl p-6 space-y-6 border border-gray-700 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-gray-800 pb-4">
+        <h3 class="text-lg font-bold text-white flex items-center space-x-2">
+          <span class="w-3 h-3 rounded-full bg-brand-500"></span>
+          <span>New Failover Recording Session</span>
+        </h3>
+        <button @click="openNewModal = false" class="text-gray-400 hover:text-white">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+        </button>
+      </div>
+
+      <form @submit.prevent="submitRecording()" class="space-y-4">
+        <!-- Category & Teams -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label class="block text-xs font-semibold text-gray-400 mb-1">Sport / Category</label>
+            <input type="text" x-model="form.sport" required class="w-full px-3 py-2 rounded-xl text-sm glass-input text-white" placeholder="MLB / NBA / News">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-400 mb-1">Team A / Event</label>
+            <input type="text" x-model="form.team_a" required class="w-full px-3 py-2 rounded-xl text-sm glass-input text-white" placeholder="Yankees">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-400 mb-1">Team B / Rival</label>
+            <input type="text" x-model="form.team_b" required class="w-full px-3 py-2 rounded-xl text-sm glass-input text-white" placeholder="RedSox">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs font-semibold text-gray-400 mb-1">Resolution Tag</label>
+            <select x-model="form.resolution" class="w-full px-3 py-2 rounded-xl text-sm glass-input text-white bg-gray-900">
+              <option value="1080p">1080p Full HD</option>
+              <option value="720p">720p HD</option>
+              <option value="4K">4K Ultra HD</option>
+              <option value="480p">480p SD</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-400 mb-1">Freeze Timeout (sec)</label>
+            <input type="number" x-model="form.freeze_timeout" value="15" min="5" max="60" class="w-full px-3 py-2 rounded-xl text-sm glass-input text-white">
+          </div>
+        </div>
+
+        <!-- Candidate Streams -->
+        <div class="space-y-3 pt-2">
+          <label class="block text-xs font-bold text-brand-400 uppercase tracking-wider">Candidate Stream URLs (Up to 3)</label>
+          
+          <div>
+            <span class="text-xs text-gray-400">Primary Stream URL (Required)</span>
+            <input type="url" x-model="form.url_primary" required class="w-full px-3 py-2 rounded-xl text-sm glass-input font-mono text-emerald-400 mt-1" placeholder="https://stream-site.com/primary.m3u8">
+          </div>
+
+          <div>
+            <span class="text-xs text-gray-400">Backup Candidate 1 URL</span>
+            <input type="url" x-model="form.url_backup1" class="w-full px-3 py-2 rounded-xl text-sm glass-input font-mono text-amber-400 mt-1" placeholder="https://backup1-site.com/channel.php">
+          </div>
+
+          <div>
+            <span class="text-xs text-gray-400">Backup Candidate 2 URL</span>
+            <input type="url" x-model="form.url_backup2" class="w-full px-3 py-2 rounded-xl text-sm glass-input font-mono text-cyan-400 mt-1" placeholder="https://backup2-site.com/stream">
+          </div>
+        </div>
+
+        <div class="pt-4 flex justify-end space-x-3 border-t border-gray-800">
+          <button type="button" @click="openNewModal = false" class="px-4 py-2 rounded-xl text-sm text-gray-400 hover:text-white">Cancel</button>
+          <button type="submit" class="bg-gradient-to-r from-brand-600 to-brand-500 hover:from-brand-500 hover:to-brand-600 text-white px-5 py-2 rounded-xl text-sm font-semibold shadow-lg shadow-brand-600/30">
+            Start Failover Recording
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Dashboard Alpine.js Logic -->
+  <script>
+    function dashboardApp() {
+      return {
+        openNewModal: false,
+        activeSessions: [],
+        libraryFiles: [],
+        sseConnections: {},
+        form: {
+          sport: 'MLB',
+          team_a: 'Yankees',
+          team_b: 'RedSox',
+          resolution: '1080p',
+          freeze_timeout: 15,
+          url_primary: '',
+          url_backup1: '',
+          url_backup2: ''
+        },
+
+        init() {
+          this.refreshStatus();
+          this.fetchLibrary();
+          setInterval(() => {
+            this.refreshStatus();
+          }, 3000);
+        },
+
+        formatSeconds(sec) {
+          if (!sec) return '00:00:00';
+          const s = Math.floor(sec % 60);
+          const m = Math.floor((sec / 60) % 60);
+          const h = Math.floor(sec / 3600);
+          return [h, m, s].map(v => v < 10 ? '0' + v : v).join(':');
+        },
+
+        async refreshStatus() {
+          try {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            this.activeSessions = data.sessions || [];
+            
+            // Connect SSE for active sessions
+            this.activeSessions.forEach(session => {
+              if (session.is_running && !this.sseConnections[session.id]) {
+                this.connectSSE(session.id);
+              }
+            });
+          } catch (e) {
+            console.error('Failed to fetch status:', e);
+          }
+        },
+
+        connectSSE(sessionId) {
+          const eventSource = new EventSource(`/api/recordings/${sessionId}/logs`);
+          this.sseConnections[sessionId] = eventSource;
+
+          eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            const session = this.activeSessions.find(s => s.id === sessionId);
+            if (session) {
+              if (data.summary) {
+                Object.assign(session, data.summary);
+              }
+              if (data.log) {
+                session.logs = session.logs || [];
+                session.logs.push(data.log);
+                if (session.logs.length > 200) session.logs.shift();
+              }
+            }
+          };
+
+          eventSource.onerror = () => {
+            eventSource.close();
+            delete this.sseConnections[sessionId];
+          };
+        },
+
+        async fetchLibrary() {
+          try {
+            const res = await fetch('/api/library');
+            const data = await res.json();
+            this.libraryFiles = data.library || [];
+          } catch (e) {
+            console.error('Failed to fetch library:', e);
+          }
+        },
+
+        async submitRecording() {
+          const formData = new FormData();
+          Object.keys(this.form).forEach(k => formData.append(k, this.form[k]));
+
+          try {
+            const res = await fetch('/api/recordings/start', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (res.ok) {
+              this.openNewModal = false;
+              this.refreshStatus();
+              this.form.url_primary = '';
+              this.form.url_backup1 = '';
+              this.form.url_backup2 = '';
+            } else {
+              alert(data.detail || 'Failed to start recording');
+            }
+          } catch (e) {
+            alert('Error submitting recording: ' + e);
+          }
+        },
+
+        async triggerFailover(id) {
+          if (!confirm('Are you sure you want to force failover to the next candidate stream?')) return;
+          try {
+            await fetch(`/api/recordings/${id}/failover`, { method: 'POST' });
+            this.refreshStatus();
+          } catch (e) {
+            alert('Failover error: ' + e);
+          }
+        },
+
+        async stopSession(id) {
+          if (!confirm('Stop this recording session?')) return;
+          try {
+            await fetch(`/api/recordings/${id}/stop`, { method: 'POST' });
+            this.refreshStatus();
+            setTimeout(() => this.fetchLibrary(), 1500);
+          } catch (e) {
+            alert('Stop error: ' + e);
+          }
+        },
+
+        async promptRename(oldName) {
+          const newName = prompt('Enter new filename for recording:', oldName);
+          if (!newName || newName === oldName) return;
+
+          const formData = new FormData();
+          formData.append('old_name', oldName);
+          formData.append('new_name', newName);
+
+          try {
+            const res = await fetch('/api/library/rename', { method: 'POST', body: formData });
+            if (res.ok) {
+              this.fetchLibrary();
+            } else {
+              alert('Failed to rename file.');
+            }
+          } catch (e) {
+            alert('Rename error: ' + e);
+          }
+        },
+
+        async deleteFile(filename) {
+          if (!confirm(`Delete ${filename}?`)) return;
+          try {
+            const res = await fetch(`/api/library/${filename}`, { method: 'DELETE' });
+            if (res.ok) {
+              this.fetchLibrary();
+            } else {
+              alert('Delete failed.');
+            }
+          } catch (e) {
+            alert('Delete error: ' + e);
+          }
+        }
+      };
+    }
+  </script>
+</body>
+</html>
