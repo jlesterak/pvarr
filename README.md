@@ -14,6 +14,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 
 ## Features
 
+- **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
 - **3-stage failover** — a primary m3u8 URL plus two backups. If the active stream stalls or dies, the recorder advances to the next candidate automatically. Failover can also be forced manually from the dashboard.
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
 - **Sports-friendly auto-naming** — derives readable filenames for broadcasts instead of opaque timestamps.
@@ -46,9 +47,9 @@ Open <http://localhost:8999>.
 
 - **FFmpeg** — required. Does the actual recording.
 - **Python 3.8+** and the packages in `requirements.txt` (FastAPI, uvicorn, requests, jinja2).
-- **[hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy)** — *optional but recommended*. PVArr uses it as a dependency for fallback mode: when a direct FFmpeg connection fails because the upstream demands injected headers or has an expiring token, the recorder shells out to `hls-proxy` to bridge the stream, and to `detect-headers` to work out what those headers should be.
+- **[hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy)** — *optional*. Two fallbacks live here. `hls-proxy` bridges a stream when a direct FFmpeg connection fails despite correct headers, usually because the token needs continuous refreshing. `detect-headers` drives a real browser, and is tried only when PVArr's own probe cannot find the m3u8 — pages that build their URL in JavaScript.
 
-  PVArr resolves both on `PATH` at runtime and degrades gracefully if they're absent — direct recording still works, but streams that need header injection will fail over instead of recovering. The provided `Dockerfile` installs both into the image automatically.
+  PVArr resolves both on `PATH` at runtime and degrades gracefully if they're absent: header detection and direct recording are built in and need no external tools. The provided `Dockerfile` installs both into the image automatically.
 
 Verify the app is up by loading the dashboard:
 
@@ -60,57 +61,97 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8999/
 
 ## Finding Your Stream URL
 
-Most HLS sources reject requests that don't carry the headers a browser would send — usually `Referer` and `User-Agent` — and many embed a short-lived token in the m3u8 URL itself. Here's how to get what you need.
+Paste the URL into **Add Recording** and press start. PVArr works out the rest.
 
-### 1. Browser DevTools (works everywhere)
+Most HLS sources reject requests that don't carry the headers a browser would
+send — usually `Referer`, sometimes a `Cookie` — and many embed a short-lived
+token in the m3u8 URL itself. You do not have to find those headers by hand.
+When you paste a URL, PVArr:
 
-1. Open the streaming page in your browser.
-2. Press **F12** to open DevTools.
-3. Select the **Network** tab.
-4. Reload the page, then start playback.
-5. Type `m3u8` in the filter box.
-6. Click the `.m3u8` request. From the **Headers** panel, record:
-   - **Request URL** — the m3u8 itself
-   - **Referer** — under Request Headers
-   - **User-Agent** — under Request Headers
-7. If you see several m3u8 files, the first is usually the master playlist and the others are variants. Prefer the master.
+1. Resolves it to a playlist. An `.m3u8` is used directly; a page URL is
+   fetched and the m3u8 pulled out of the HTML or inline JavaScript.
+2. Tries the plausible header combinations against the real origin — no headers
+   first, then the embed page as `Referer`, then the site root, then any referer
+   the URL carries in its own query string.
+3. Keeps the first combination that returns an actual `#EXTM3U` body, and
+   fetches one media segment with those same headers to confirm the stream is
+   playable and not just the manifest.
+4. Reports back in the form: a green line with what it found (master or media
+   playlist, variant count, which headers were needed), or a red line saying
+   what the origin returned.
 
-### 2. Auto-detection with `detect-headers`
+The same probe runs again inside the recorder each time it connects to a
+candidate — including on failover an hour later — so an expired token is
+re-resolved rather than replayed.
 
-> **Note:** `detect-headers.sh` / `detect-headers-py.py` come from [hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy) (see [Requirements](#requirements)), not from PVArr itself. Run them from that checkout, or from anywhere if they're on your `PATH`.
+### Getting the URL to paste
+
+If the site plays the stream on a normal page, paste the page URL. If that
+comes back red, or the player builds its URL in JavaScript, take the m3u8 from
+the browser instead:
+
+1. Open the streaming page and press **F12**.
+2. Select the **Network** tab, reload, and start playback.
+3. Type `m3u8` in the filter box.
+4. Right-click the `.m3u8` request → **Copy → Copy link address**.
+
+Paste that into PVArr. Copying the `Referer` and `User-Agent` by hand is no
+longer part of the job — the probe derives them. If several m3u8 files appear,
+prefer the master playlist (usually the first, often named `master` or `index`);
+PVArr shows the variants it found so you can confirm you got the right one.
+
+### When the probe can't work it out
+
+Under each URL field is **Set headers manually**, with `Referer`, `User-Agent`,
+and `Cookie`. Anything the probe detected is filled in there, so you can correct
+one field rather than supply all three. A value you type wins, and is tried
+first on the next probe.
+
+Two cases genuinely need this:
+
+- **Cookie/session gated.** The stream needs a logged-in session. Copy the
+  `Cookie` request header from the same DevTools request. A probe that reports
+  *segments rejected* is usually this.
+- **Referer the probe cannot guess** — a third site's URL, unrelated to either
+  the page or the CDN.
+
+For pages that only assemble their m3u8 after running JavaScript, PVArr will
+also shell out to `detect-headers` from
+[hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy) when it is
+installed (see [Requirements](#requirements)); it drives a real browser and can
+see what a plain fetch cannot. It runs only after the built-in probe comes up
+empty, and is optional.
+
+### Checking a URL from the shell
+
+`POST /api/probe` is the same code path the dashboard uses:
 
 ```bash
-./detect-headers.sh "https://streaming-site.com/channel.php"
+curl -s -X POST http://localhost:8999/api/probe \
+     --data-urlencode "url=https://cdn.example.com/hls/stream.m3u8?token=xyz" | jq
 ```
 
-For pages that build the m3u8 in JavaScript, use the Playwright-backed variant:
-
-```bash
-./detect-headers-py.py "https://streaming-site.com/channel.php" --browser
+```json
+{
+  "ok": true,
+  "m3u8_url": "https://cdn.example.com/hls/stream.m3u8?token=xyz",
+  "referer": "https://streaming-site.com/",
+  "kind": "master",
+  "headers_required": ["Referer"],
+  "segment_ok": true,
+  "message": "Master playlist, 5 variants, needs Referer."
+}
 ```
 
-### 3. Verify with `curl` before committing
+A failed probe returns `ok: false` and the status it saw: `403` means every
+header combination was refused, `404` usually means the token has expired —
+re-copy it from DevTools.
 
-Confirm the URL and headers actually work:
+### Backups
 
-```bash
-curl -i -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-        -H "Referer: https://streaming-site.com/" \
-        "https://cdn.example.com/hls/stream.m3u8?token=xyz"
-```
-
-A `200` with a body starting `#EXTM3U` means you're good. A `403` means a header is missing or wrong; a `404` usually means the token expired — re-grab it from DevTools.
-
-### Common patterns
-
-- **Referer only** — the most common case. Set it to the embed/player page URL.
-- **Referer + User-Agent** — typical for sports streams; both are checked.
-- **Expiring token in the query string** — the URL works for minutes to hours. Configure a backup URL so failover covers the expiry, and re-scrape when both die.
-- **Cookie/session gated** — the stream needs a logged-in session. These are the least stable; expect to refresh manually.
-
-### Using it in PVArr
-
-Open the dashboard at <http://localhost:8999>, start a new recording, and paste the primary m3u8 URL plus up to two backups. PVArr tries them in order and advances on failure.
+The two backup slots are probed independently and recorded in order. Since
+tokens expire, a backup from a *different* source is worth more than a second
+URL from the same one.
 
 ---
 
@@ -147,6 +188,7 @@ and mounts `./recordings` there.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Dashboard |
+| `POST` | `/api/probe` | Resolve a URL to a playlist and detect the headers it needs |
 | `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs) |
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL |
@@ -194,6 +236,7 @@ when its recording stops. Completed recordings are in the library, not the tuner
 app/
 ├── server.py          FastAPI app — dashboard, REST API, tuner routes
 ├── recorder.py        Failover engine — direct FFmpeg first, proxy bridge fallback
+├── probe.py           Stream probe — URL → playlist + the headers it needs
 ├── post_processor.py  TS → MKV/MP4 remux on completion
 ├── naming.py          Sports-aware output filenames
 ├── tuner.py           M3U playlist + XMLTV EPG generation
@@ -204,15 +247,15 @@ app/
 └── static/            Favicon and assets
 ```
 
-`recorder.py` holds the core loop: it walks the candidate URL list, prefers a direct FFmpeg connection, drops to the proxy bridge when headers are required, and advances to the next candidate on stall, failure, or a forced failover.
+`recorder.py` holds the core loop: it walks the candidate URL list, prefers a direct FFmpeg connection, drops to the proxy bridge when headers are required, and advances to the next candidate on stall, failure, or a forced failover. Before each connection it calls `probe.py` to re-resolve that candidate — playlist URLs carry short-lived tokens, so a failover an hour in needs a fresh answer rather than the one the dashboard found at submit time.
 
 ---
 
 ## Troubleshooting
 
-**Recording drops repeatedly.** Confirm the primary URL still resolves (`curl` it, as above). Expiring tokens are the usual cause — configure backups.
+**Recording drops repeatedly.** Confirm the primary URL still resolves by pasting it back into Add Recording. Expiring tokens are the usual cause — configure backups from a different source.
 
-**`403` from the upstream.** A required header is missing. Re-check `Referer` and `User-Agent` in DevTools; sites change them without notice.
+**`403` from the upstream.** A required header is missing. Re-run the URL through `POST /api/probe` (or just re-paste it into Add Recording) — the message names the status the origin returned. If the probe reports *segments rejected*, the stream is session gated: copy the `Cookie` request header from DevTools into the manual header fields.
 
 **Tuner doesn't appear in Plex/Emby.** Confirm the media server can reach PVArr (`curl http://<pvarr-host>:8999/live/playlist.m3u`). The playlist is empty when nothing is recording — start a recording first.
 

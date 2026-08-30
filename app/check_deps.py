@@ -43,11 +43,19 @@ def find_executable(name: str, alt_names: list = None) -> str:
     return ""
 
 
+# Why each optional tool matters, so a WARN line says what is actually lost.
+OPTIONAL_NOTES = {
+    "hls-proxy": "no bridge for streams needing continuous token refresh",
+    "detect-headers": "built-in probe covers everything but JS-built URLs",
+}
+
+
 def check_dependencies(verbose: bool = True) -> dict:
     """
     Check all required dependencies and return a status dictionary.
     FFmpeg and FFprobe are REQUIRED (exit 1 if missing).
-    hls-proxy and detect-headers are OPTIONAL (warning only).
+    hls-proxy and detect-headers are OPTIONAL (warning only) -- header
+    detection is built in (app/probe.py) and needs neither.
     """
     required = {
         "ffmpeg":  find_executable("ffmpeg"),
@@ -72,7 +80,7 @@ def check_dependencies(verbose: bool = True) -> dict:
             if path:
                 print(f"  [OK]      {tool:20s} -> {path}")
             else:
-                print(f"  [WARN]    {tool:20s}  (optional — proxy fallback disabled)")
+                print(f"  [WARN]    {tool:20s}  (optional — {OPTIONAL_NOTES[tool]})")
 
         if not all_required_ok:
             print("\n[!] Required dependencies are missing. Please install ffmpeg.")

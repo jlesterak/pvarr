@@ -214,7 +214,49 @@
   keeps it valid after unlink, so the client reads the recording through to
   completion. Verified empirically. The earlier entry overstated the problem.
 
+## Phase 10: Paste-and-Record Header Detection
+- [x] **Built-in stream probe (`app/probe.py`).** Finding a stream used to be a
+      manual DevTools ritual: copy the m3u8, copy the `Referer`, copy the
+      `User-Agent`, verify with `curl`, then type all of it into the form. The
+      probe does that work server-side — resolves an m3u8 (or scrapes one out
+      of a page), tries the plausible header combinations against the real
+      origin, and keeps the first that returns an actual `#EXTM3U`. Covered by
+      42 tests driving a scripted fake HTTP layer; no network in the suite.
+
+- [x] **Segment verification.** A playlist that loads is not proof of a
+      recordable stream — origins routinely serve the manifest to anyone and
+      gate the segments. The probe fetches one segment (ranged, 2KB) with the
+      same headers, so a session-gated stream shows as a red field in the
+      browser instead of a recording that dies minutes in.
+
+- [x] **Detection moved to connect time (`app/recorder.py`).** The recorder
+      probes each candidate as it connects, not once at submit. Playlist tokens
+      expire, so a failover an hour into a recording needs a fresh resolution.
+      `detect-headers` is now the *second* choice, tried only when the built-in
+      probe finds nothing — it still earns its place on pages that assemble
+      their m3u8 in JavaScript, which needs a real browser.
+
+- [x] **Cookie support end to end.** Cookies picked up during a probe are
+      carried into FFmpeg's `-headers`, and are settable by hand. Session-gated
+      streams were previously unrecordable without the proxy.
+
+- [x] **Dashboard feedback (`app/templates/index.html`).** Each URL field probes
+      on paste (debounced, newest-answer-wins) and reports what was found:
+      playlist kind, variant count, headers required. Manual `Referer` /
+      `User-Agent` / `Cookie` fields sit under each field, prefilled from the
+      probe, and are sent as per-URL overrides keyed by URL rather than slot
+      position.
+
+### Deliberately not done
+- **No SSRF allowlist on `/api/probe`.** The endpoint fetches a caller-supplied
+  URL, which is the whole point of the feature, and PVArr is an unauthenticated
+  LAN service where blocking private addresses would break legitimate local
+  IPTV sources. Response bodies are capped at 512KB and non-http(s) schemes are
+  refused, so it cannot be turned into a local file reader. Do not expose PVArr
+  to the internet.
+
 ## Still open
 - Nothing tracked. Next candidates if the project continues: a retention/cleanup
-  policy for old recordings on disk, and integration coverage for the
-  notification webhooks (currently only exercised via mocks).
+  policy for old recordings on disk, integration coverage for the notification
+  webhooks (currently only exercised via mocks), and a headless-browser probe
+  path so JavaScript-built m3u8 URLs work without the external `detect-headers`.

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import List, Optional, Callable, Dict, Any
 
 from app.check_deps import find_executable
+from app.probe import DEFAULT_USER_AGENT, probe_stream
 
 logger = logging.getLogger("PVArrRecorder")
 
@@ -43,9 +44,13 @@ class CandidateStream:
         self.name = name
         self.m3u8_url: str = ""
         self.referer: str = ""
-        self.user_agent: str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        self.user_agent: str = DEFAULT_USER_AGENT
+        self.cookie: str = ""
         self.slug: str = ""
         self.detected: bool = False
+        # Which mechanism supplied the headers: probe, detect-headers, or none.
+        self.detect_source: str = ""
+        self.detect_note: str = ""
         self.used_proxy: bool = False
         self.fail_count: int = 0
         self.last_error: str = ""
@@ -57,7 +62,10 @@ class CandidateStream:
             "m3u8_url": self.m3u8_url,
             "referer": self.referer,
             "user_agent": self.user_agent,
+            "cookie": self.cookie,
             "detected": self.detected,
+            "detect_source": self.detect_source,
+            "detect_note": self.detect_note,
             "used_proxy": self.used_proxy,
             "fail_count": self.fail_count,
             "last_error": self.last_error,
@@ -74,14 +82,27 @@ class StreamFailoverRecorder:
         freeze_timeout_sec: int = 15,
         log_callback: Optional[Callable[[str], None]] = None,
         on_completion_callback: Optional[Callable[[str], None]] = None,
-        on_failover_callback: Optional[Callable[[str, str], None]] = None
+        on_failover_callback: Optional[Callable[[str, str], None]] = None,
+        header_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+        auto_probe: bool = True
     ):
         self.recording_id = recording_id
+        # Per-URL header overrides from the dashboard's "advanced" fields, keyed
+        # by URL rather than position so an empty backup slot cannot shift them
+        # onto the wrong candidate.
+        self.header_overrides: Dict[str, Dict[str, str]] = header_overrides or {}
+        self.auto_probe = auto_probe
         self.candidates: List[CandidateStream] = [
             CandidateStream(url, name=f"Candidate {i+1}")
             for i, url in enumerate(candidates)
             if url and url.strip()
         ]
+        for candidate in self.candidates:
+            override = self.header_overrides.get(candidate.url) or {}
+            candidate.referer = override.get("referer", "") or ""
+            candidate.cookie = override.get("cookie", "") or ""
+            if override.get("user_agent"):
+                candidate.user_agent = override["user_agent"]
         self.output_filepath = Path(output_filepath).resolve()
         # Set by the post-processor once the .ts has been remuxed. The original
         # .ts is deleted at that point, so size/name lookups must follow here.
@@ -126,14 +147,71 @@ class StreamFailoverRecorder:
                 pass
 
     def detect_candidate_headers(self, candidate: CandidateStream) -> bool:
-        """Run detect-headers CLI script to inspect m3u8 and required HTTP headers."""
-        if not self.detect_headers_path or not os.path.exists(self.detect_headers_path):
-            candidate.m3u8_url = candidate.url
-            candidate.slug = f"cand_{id(candidate)}"
-            candidate.detected = True
+        """Resolve a candidate URL to a playlist plus the headers it needs.
+
+        Detection runs here, at connect time, rather than reusing whatever the
+        dashboard found when the recording was created: playlist URLs carry
+        short-lived tokens, and a failover an hour in needs a fresh answer.
+
+        Order is in-process probe, then the external detect-headers script, then
+        the URL as given. The probe handles the ordinary cases with no extra
+        install; the script is worth keeping for pages that only assemble their
+        m3u8 in JavaScript, which needs a real browser.
+        """
+        candidate.slug = candidate.slug or f"cand_{self.current_candidate_index}"
+
+        if self.auto_probe and self._probe_candidate(candidate):
             return True
 
-        self._log(f"Detecting headers for {candidate.name}: {candidate.url[:70]}...")
+        if self._detect_via_script(candidate):
+            return True
+
+        candidate.m3u8_url = candidate.url
+        candidate.detected = True
+        candidate.detect_source = "raw"
+        candidate.detect_note = "Using the URL as given; no headers detected."
+        return True
+
+    def _probe_candidate(self, candidate: CandidateStream) -> bool:
+        """Try the built-in probe. Returns False so the caller can fall through."""
+        self._log(f"Probing {candidate.name}: {candidate.url[:70]}...")
+        try:
+            result = probe_stream(
+                candidate.url,
+                referer=candidate.referer or None,
+                user_agent=candidate.user_agent,
+                cookie=candidate.cookie or None,
+            )
+        except Exception as exc:  # a probe failure must never kill a recording
+            self._log(f"Probe error for {candidate.name}: {exc}", "WARN")
+            return False
+
+        if not result.get("ok"):
+            candidate.last_error = result.get("message", "Probe failed")
+            self._log(f"Probe found nothing playable for {candidate.name}: {candidate.last_error}", "WARN")
+            return False
+
+        candidate.m3u8_url = result["m3u8_url"]
+        candidate.referer = result.get("referer", "")
+        candidate.cookie = result.get("cookie", "")
+        if result.get("user_agent"):
+            candidate.user_agent = result["user_agent"]
+        candidate.detected = True
+        candidate.detect_source = "probe"
+        candidate.detect_note = result.get("message", "")
+        required = result.get("headers_required") or ["none"]
+        self._log(
+            f"Probe resolved {candidate.name}: {result.get('kind', 'playlist')}, "
+            f"headers {', '.join(required)}."
+        )
+        return True
+
+    def _detect_via_script(self, candidate: CandidateStream) -> bool:
+        """Fallback to the optional detect-headers CLI (browser-backed)."""
+        if not self.detect_headers_path or not os.path.exists(self.detect_headers_path):
+            return False
+
+        self._log(f"Falling back to detect-headers for {candidate.name}...")
         # check_deps also accepts detect-headers.sh, and upstream currently
         # ships only the shell version. Running that through sys.executable
         # makes Python choke on shell syntax, so every detection silently
@@ -151,22 +229,19 @@ class StreamFailoverRecorder:
             if res.returncode == 0 and res.stdout.strip():
                 data = json.loads(res.stdout.strip())
                 candidate.m3u8_url = data.get("m3u8_url", candidate.url)
-                candidate.referer = data.get("referer", "")
+                candidate.referer = data.get("referer", "") or candidate.referer
                 if data.get("user_agent"):
-                    candidate.user_agent = data.get("user_agent")
-                candidate.slug = data.get("slug", f"cand_{self.current_candidate_index}")
+                    candidate.user_agent = data["user_agent"]
+                candidate.slug = data.get("slug", candidate.slug)
                 candidate.detected = True
+                candidate.detect_source = "detect-headers"
+                candidate.detect_note = "Headers supplied by detect-headers."
                 self._log(f"Header detection successful for {candidate.name}.")
                 return True
-            else:
-                candidate.last_error = res.stderr.strip() or "Detection failed"
+            candidate.last_error = res.stderr.strip() or "Detection failed"
         except Exception as e:
             candidate.last_error = str(e)
-
-        candidate.m3u8_url = candidate.url
-        candidate.slug = f"cand_{self.current_candidate_index}"
-        candidate.detected = True
-        return True
+        return False
 
     def start_proxy(self, candidate: CandidateStream) -> Optional[str]:
         """Start local hls-proxy instance for candidate stream (Fallback Mode)."""
@@ -271,7 +346,9 @@ class StreamFailoverRecorder:
         self._reap_ffmpeg()
         self.stop_proxy()
 
-    def _build_ffmpeg_cmd(self, stream_url: str, referer: str = "", user_agent: str = "") -> List[str]:
+    def _build_ffmpeg_cmd(
+        self, stream_url: str, referer: str = "", user_agent: str = "", cookie: str = ""
+    ) -> List[str]:
         """Build FFmpeg command line with custom HTTP headers if present."""
         cmd = [
             self.ffmpeg_path or "ffmpeg",
@@ -288,6 +365,8 @@ class StreamFailoverRecorder:
             headers_str += f"User-Agent: {user_agent}\r\n"
         if referer:
             headers_str += f"Referer: {referer}\r\n"
+        if cookie:
+            headers_str += f"Cookie: {cookie}\r\n"
 
         if headers_str:
             cmd.extend(["-headers", headers_str])
@@ -376,7 +455,9 @@ class StreamFailoverRecorder:
 
             # 2. Attempt Direct Mode (Direct FFmpeg with -headers)
             self._log(f"[Direct Mode] Connecting FFmpeg directly to {candidate.m3u8_url[:70]}...")
-            direct_cmd = self._build_ffmpeg_cmd(candidate.m3u8_url, candidate.referer, candidate.user_agent)
+            direct_cmd = self._build_ffmpeg_cmd(
+                candidate.m3u8_url, candidate.referer, candidate.user_agent, candidate.cookie
+            )
             
             outcome = self._stream_ffmpeg_process(direct_cmd, candidate)
 

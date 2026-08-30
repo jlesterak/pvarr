@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.recorder import StreamFailoverRecorder
+from app.probe import probe_stream
 from app.naming import StorageManager, generate_sports_filename, probe_video_resolution
 from app.cleanup import register_signal_handlers
 from app.tuner import generate_m3u_playlist, generate_xmltv_epg
@@ -214,6 +215,20 @@ def _allocate_proxy_port(base: int = 8090) -> int:
     return port
 
 
+@app.post("/api/probe")
+async def probe_url(url: str = Form(...), referer: Optional[str] = Form(None)):
+    """Resolve a pasted URL to a playlist + headers, for the Add Recording form.
+
+    Runs off the event loop: a probe is several sequential HTTP requests to a
+    third-party origin and can sit on a timeout for seconds, which would stall
+    every other dashboard request if awaited inline.
+    """
+    if len(url) > 4096:
+        raise HTTPException(status_code=400, detail="URL is too long")
+    result = await asyncio.to_thread(probe_stream, url.strip(), referer=(referer or None))
+    return JSONResponse(content=result)
+
+
 @app.post("/api/recordings/start")
 async def start_recording(
     background_tasks: BackgroundTasks,
@@ -225,7 +240,8 @@ async def start_recording(
     url_primary: str = Form(...),
     url_backup1: Optional[str] = Form(None),
     url_backup2: Optional[str] = Form(None),
-    freeze_timeout: int = Form(15)
+    freeze_timeout: int = Form(15),
+    stream_headers: Optional[str] = Form(None)
 ):
     """Create and start a new failover recording session."""
     candidates = [u for u in [url_primary, url_backup1, url_backup2] if u and u.strip()]
@@ -256,6 +272,25 @@ async def start_recording(
             status_code=400, detail=f"Could not prepare output directory: {exc}"
         )
 
+    # Optional per-URL header overrides from the dashboard, keyed by URL:
+    # {"https://.../x.m3u8": {"referer": "...", "user_agent": "...", "cookie": "..."}}
+    # Malformed input is ignored rather than fatal -- the recorder probes each
+    # candidate itself, so these are a hint, not a requirement.
+    header_overrides: Dict[str, Dict[str, str]] = {}
+    if stream_headers:
+        try:
+            parsed = json.loads(stream_headers)
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if isinstance(value, dict):
+                        header_overrides[str(key).strip()] = {
+                            field: str(value[field])
+                            for field in ("referer", "user_agent", "cookie")
+                            if value.get(field)
+                        }
+        except (ValueError, TypeError):
+            logger.warning("Ignoring malformed stream_headers payload")
+
     _prune_finished_sessions()
     port = _allocate_proxy_port()
 
@@ -278,7 +313,8 @@ async def start_recording(
         base_port=port,
         freeze_timeout_sec=freeze_timeout,
         on_completion_callback=_on_complete,
-        on_failover_callback=_on_failover
+        on_failover_callback=_on_failover,
+        header_overrides=header_overrides
     )
 
     # Runs in the threadpool after the response is sent. Called inline this

@@ -442,8 +442,12 @@ class TestDetectHeadersInvocation(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        # auto_probe off: this case is specifically the external-script
+        # fallback, and leaving the probe on would put a real network call in
+        # front of every assertion.
         self.rec = StreamFailoverRecorder(
-            "test-id", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts")
+            "test-id", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"),
+            auto_probe=False,
         )
 
     def tearDown(self):
@@ -481,8 +485,12 @@ class TestDetectHeadersInvocation(unittest.TestCase):
 class TestFFmpegCommand(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        # auto_probe off: this case is specifically the external-script
+        # fallback, and leaving the probe on would put a real network call in
+        # front of every assertion.
         self.rec = StreamFailoverRecorder(
-            "test-id", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts")
+            "test-id", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"),
+            auto_probe=False,
         )
 
     def tearDown(self):
@@ -1398,6 +1406,424 @@ class TestPathHandling(ServerTestCase):
     def test_download_rejects_dotdot_traversal(self):
         r = self.client.get("/api/library/download/..%2F..%2Fetc%2Fpasswd")
         self.assertNotEqual(r.status_code, 200, "path traversal via %2F succeeded")
+
+
+# ---------------------------------------------------------------------------
+# Stream probe: paste a URL, get back a playlist plus the headers it needs.
+# Every test here drives a scripted fake HTTP layer -- no network.
+# ---------------------------------------------------------------------------
+
+MEDIA_PLAYLIST = b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg1.ts\n#EXTINF:6.0,\nseg2.ts\n"
+MASTER_PLAYLIST = (
+    b"#EXTM3U\n"
+    b'#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080\n720/index.m3u8\n'
+    b'#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1280x720\n480/index.m3u8\n'
+)
+
+
+class FakeResponse:
+    def __init__(self, url, status=200, body=b""):
+        self.url = url
+        self.status_code = status
+        self._body = body
+
+    @property
+    def ok(self):
+        return 200 <= self.status_code < 400
+
+    def iter_content(self, chunk_size):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+class FakeSession:
+    """Serves a handler(url, headers) -> FakeResponse and records every call."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.cookies = []
+        self.calls = []
+
+    def get(self, url, headers=None, timeout=None, stream=False, allow_redirects=True):
+        headers = dict(headers or {})
+        self.calls.append((url, headers))
+        return self.handler(url, headers)
+
+
+class ProbeTestCase(unittest.TestCase):
+    def probe(self, handler, url, **kwargs):
+        from unittest.mock import patch
+        import app.probe as probe_mod
+        self.session = FakeSession(handler)
+        with patch.object(probe_mod.requests, "Session", return_value=self.session):
+            return probe_mod.probe_stream(url, **kwargs)
+
+
+class TestProbeUrlCleaning(unittest.TestCase):
+    def test_strips_quotes_and_whitespace(self):
+        from app.probe import clean_url
+        self.assertEqual(
+            clean_url("  'https://a.example/x.m3u8'  "), "https://a.example/x.m3u8"
+        )
+
+    def test_protocol_relative_gets_scheme(self):
+        from app.probe import clean_url
+        self.assertEqual(clean_url("//a.example/x.m3u8"), "https://a.example/x.m3u8")
+
+    def test_rejects_non_http_scheme(self):
+        from app.probe import clean_url, ProbeError
+        # file:// would turn the probe endpoint into a local file reader.
+        for bad in ("file:///etc/passwd", "ftp://a/x.m3u8", "notaurl"):
+            with self.subTest(url=bad), self.assertRaises(ProbeError):
+                clean_url(bad)
+
+
+class TestProbeDirectPlaylist(ProbeTestCase):
+    def test_open_stream_needs_no_headers(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://cdn.example/hls/stream.m3u8",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["referer"], "")
+        self.assertEqual(result["headers_required"], [])
+        self.assertEqual(result["kind"], "media")
+
+    def test_bare_attempt_comes_first(self):
+        # Sending an invented Referer to a stream that does not want one is
+        # occasionally worse than sending none, so try clean first.
+        self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://cdn.example/hls/stream.m3u8",
+        )
+        self.assertNotIn("Referer", self.session.calls[0][1])
+
+    def test_referer_discovered_when_403_without_it(self):
+        def handler(url, headers):
+            if headers.get("Referer") != "https://cdn.example/":
+                return FakeResponse(url, 403, b"denied")
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+
+        result = self.probe(handler, "https://cdn.example/hls/stream.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["referer"], "https://cdn.example/")
+        self.assertIn("Referer", result["headers_required"])
+
+    def test_referer_taken_from_query_string(self):
+        def handler(url, headers):
+            if headers.get("Referer") != "https://player.example/embed":
+                return FakeResponse(url, 403, b"denied")
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+
+        result = self.probe(
+            handler,
+            "https://cdn.example/x.m3u8?referer=https://player.example/embed",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["referer"], "https://player.example/embed")
+
+    def test_caller_referer_is_tried_first(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://cdn.example/x.m3u8",
+            referer="https://mysite.example/game",
+        )
+        self.assertEqual(self.session.calls[0][1]["Referer"], "https://mysite.example/game")
+        self.assertEqual(result["referer"], "https://mysite.example/game")
+
+    def test_all_rejected_reports_403(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 403, b"denied"),
+            "https://cdn.example/x.m3u8",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("403", result["message"])
+
+    def test_expired_token_reads_as_404(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 404, b""),
+            "https://cdn.example/x.m3u8?token=old",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("expired", result["message"])
+
+    def test_non_playlist_body_is_not_accepted(self):
+        # A 200 that is actually an HTML error page must not pass as a stream.
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, b"<html>nope</html>"),
+            "https://cdn.example/x.m3u8",
+        )
+        self.assertFalse(result["ok"])
+
+
+class TestProbeMasterPlaylist(ProbeTestCase):
+    def handler(self, url, headers):
+        if url.endswith("master.m3u8"):
+            return FakeResponse(url, 200, MASTER_PLAYLIST)
+        if url.endswith("index.m3u8"):
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+        return FakeResponse(url, 200, b"\x47" * 512)
+
+    def test_variants_parsed(self):
+        result = self.probe(self.handler, "https://cdn.example/master.m3u8")
+        self.assertEqual(result["kind"], "master")
+        self.assertEqual(len(result["variants"]), 2)
+        self.assertEqual(result["variants"][0]["resolution"], "1920x1080")
+        self.assertEqual(result["variants"][0]["bandwidth"], 5000000)
+
+    def test_variant_urls_absolutised(self):
+        result = self.probe(self.handler, "https://cdn.example/master.m3u8")
+        self.assertEqual(
+            result["variants"][0]["url"], "https://cdn.example/720/index.m3u8"
+        )
+
+    def test_segment_reached_through_variant(self):
+        result = self.probe(self.handler, "https://cdn.example/master.m3u8")
+        self.assertTrue(result["segment_ok"])
+
+
+class TestProbeSegmentCheck(ProbeTestCase):
+    def test_gated_segments_flagged(self):
+        # The manifest is public, the segments are not: this is the failure
+        # that would otherwise show up minutes into a recording.
+        def handler(url, headers):
+            if url.endswith(".m3u8"):
+                return FakeResponse(url, 200, MEDIA_PLAYLIST)
+            return FakeResponse(url, 403, b"")
+
+        result = self.probe(handler, "https://cdn.example/x.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["segment_ok"])
+        self.assertIn("segments rejected", result["message"])
+
+    def test_segment_request_is_ranged(self):
+        def handler(url, headers):
+            if url.endswith(".m3u8"):
+                return FakeResponse(url, 200, MEDIA_PLAYLIST)
+            return FakeResponse(url, 206, b"\x47" * 1024)
+
+        self.probe(handler, "https://cdn.example/x.m3u8")
+        seg_call = [c for c in self.session.calls if c[0].endswith(".ts")][0]
+        self.assertEqual(seg_call[1]["Range"], "bytes=0-2047")
+
+
+class TestProbePageScraping(ProbeTestCase):
+    PAGE = (
+        b"<html><script>var src = 'https:\\/\\/cdn.example\\/hls\\/master.m3u8?t=9';"
+        b"</script></html>"
+    )
+
+    def handler(self, url, headers):
+        if url.endswith(".php"):
+            return FakeResponse(url, 200, self.PAGE)
+        if headers.get("Referer") != "https://site.example/watch.php":
+            return FakeResponse(url, 403, b"denied")
+        if ".m3u8" in url:
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+        return FakeResponse(url, 200, b"\x47" * 512)
+
+    def test_m3u8_extracted_from_page(self):
+        result = self.probe(self.handler, "https://site.example/watch.php")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["m3u8_url"], "https://cdn.example/hls/master.m3u8?t=9")
+
+    def test_page_becomes_the_referer(self):
+        result = self.probe(self.handler, "https://site.example/watch.php")
+        self.assertEqual(result["referer"], "https://site.example/watch.php")
+        self.assertEqual(result["page_url"], "https://site.example/watch.php")
+
+    def test_page_with_no_playlist_says_so(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, b"<html>nothing here</html>"),
+            "https://site.example/watch.php",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("No .m3u8", result["message"])
+
+    def test_url_serving_a_playlist_without_m3u8_suffix(self):
+        # Some hosts serve playlists from extensionless paths.
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://site.example/live/channel1",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["kind"], "media")
+
+
+class TestProbeBodyCap(ProbeTestCase):
+    def test_oversized_body_is_truncated(self):
+        import app.probe as probe_mod
+        huge = b"#EXTM3U\n" + b"x" * (probe_mod.MAX_BYTES * 3)
+        result = self.probe(lambda url, h: FakeResponse(url, 200, huge),
+                            "https://cdn.example/x.m3u8")
+        # Accepted, but the probe must not have grown with the response.
+        self.assertTrue(result["ok"])
+
+
+class TestRecorderProbeIntegration(unittest.TestCase):
+    """The recorder probes at connect time, then falls back to the script."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rec(self, **kwargs):
+        return StreamFailoverRecorder(
+            "test-id", ["https://cdn.example/x.m3u8"],
+            str(Path(self.tmp) / "out.ts"), **kwargs
+        )
+
+    def test_probe_result_populates_candidate(self):
+        from unittest.mock import patch
+        rec = self._rec()
+        fake = {
+            "ok": True,
+            "m3u8_url": "https://cdn.example/real.m3u8",
+            "referer": "https://site.example/",
+            "user_agent": "UA/9",
+            "cookie": "sid=abc",
+            "kind": "media",
+            "headers_required": ["Referer", "Cookie"],
+            "message": "Media playlist, needs Referer + Cookie.",
+        }
+        with patch("app.recorder.probe_stream", return_value=fake):
+            rec.detect_candidate_headers(rec.candidates[0])
+        cand = rec.candidates[0]
+        self.assertEqual(cand.m3u8_url, "https://cdn.example/real.m3u8")
+        self.assertEqual(cand.referer, "https://site.example/")
+        self.assertEqual(cand.cookie, "sid=abc")
+        self.assertEqual(cand.user_agent, "UA/9")
+        self.assertEqual(cand.detect_source, "probe")
+
+    def test_failed_probe_falls_back_to_raw_url(self):
+        from unittest.mock import patch
+        rec = self._rec()
+        rec.detect_headers_path = ""
+        with patch("app.recorder.probe_stream", return_value={"ok": False, "message": "nope"}):
+            rec.detect_candidate_headers(rec.candidates[0])
+        # A failed probe must still leave a recordable URL: the stream may well
+        # work under FFmpeg even when the probe cannot confirm it.
+        self.assertEqual(rec.candidates[0].m3u8_url, "https://cdn.example/x.m3u8")
+        self.assertEqual(rec.candidates[0].detect_source, "raw")
+
+    def test_probe_exception_does_not_kill_recording(self):
+        from unittest.mock import patch
+        rec = self._rec()
+        rec.detect_headers_path = ""
+        with patch("app.recorder.probe_stream", side_effect=RuntimeError("boom")):
+            self.assertTrue(rec.detect_candidate_headers(rec.candidates[0]))
+        self.assertEqual(rec.candidates[0].detect_source, "raw")
+
+    def test_script_used_only_after_probe_fails(self):
+        from unittest.mock import patch, MagicMock
+        rec = self._rec()
+        detector = Path(self.tmp) / "detect-headers.sh"
+        detector.write_text("#!/bin/sh\necho {}\n")
+        detector.chmod(0o755)
+        rec.detect_headers_path = str(detector)
+        good = {"ok": True, "m3u8_url": "https://cdn.example/x.m3u8", "referer": "",
+                "user_agent": "UA", "cookie": "", "kind": "media",
+                "headers_required": [], "message": "ok"}
+        with patch("app.recorder.probe_stream", return_value=good):
+            with patch("app.recorder.subprocess.run") as run:
+                rec.detect_candidate_headers(rec.candidates[0])
+        run.assert_not_called()
+
+    def test_auto_probe_can_be_disabled(self):
+        from unittest.mock import patch
+        rec = self._rec(auto_probe=False)
+        rec.detect_headers_path = ""
+        with patch("app.recorder.probe_stream") as probe:
+            rec.detect_candidate_headers(rec.candidates[0])
+        probe.assert_not_called()
+
+    def test_header_overrides_seed_candidates_by_url(self):
+        rec = StreamFailoverRecorder(
+            "test-id",
+            ["https://a.example/1.m3u8", "https://b.example/2.m3u8"],
+            str(Path(self.tmp) / "out.ts"),
+            header_overrides={"https://b.example/2.m3u8": {"referer": "https://b.example/"}},
+        )
+        # Keyed by URL, so the override lands on the second candidate only.
+        self.assertEqual(rec.candidates[0].referer, "")
+        self.assertEqual(rec.candidates[1].referer, "https://b.example/")
+
+    def test_cookie_reaches_ffmpeg_headers(self):
+        rec = self._rec(auto_probe=False)
+        cmd = rec._build_ffmpeg_cmd(
+            "https://cdn.example/x.m3u8", referer="https://s/", cookie="sid=abc"
+        )
+        headers = cmd[cmd.index("-headers") + 1]
+        self.assertIn("Cookie: sid=abc", headers)
+
+
+class TestProbeRoute(ServerTestCase):
+    def test_probe_endpoint_returns_result(self):
+        from unittest.mock import patch
+        fake = {"ok": True, "m3u8_url": "https://cdn.example/x.m3u8", "message": "fine"}
+        with patch("app.server.probe_stream", return_value=fake):
+            r = self.client.post("/api/probe", data={"url": "https://cdn.example/x.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["ok"])
+
+    def test_probe_passes_referer_hint(self):
+        from unittest.mock import patch
+        with patch("app.server.probe_stream", return_value={"ok": False}) as probe:
+            self.client.post(
+                "/api/probe",
+                data={"url": "https://cdn.example/x.m3u8", "referer": "https://site/"},
+            )
+        self.assertEqual(probe.call_args.kwargs["referer"], "https://site/")
+
+    def test_probe_rejects_absurd_url(self):
+        r = self.client.post("/api/probe", data={"url": "https://a/" + "x" * 5000})
+        self.assertEqual(r.status_code, 400)
+
+    def test_start_accepts_stream_headers(self):
+        from unittest.mock import patch, MagicMock
+        import json as _json
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        payload = _json.dumps({"https://cdn.example/x.m3u8": {"referer": "https://site/"}})
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "https://cdn.example/x.m3u8",
+                "stream_headers": payload,
+            })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            ctor.call_args.kwargs["header_overrides"],
+            {"https://cdn.example/x.m3u8": {"referer": "https://site/"}},
+        )
+
+    def test_malformed_stream_headers_ignored(self):
+        # A bad hint must not cost the user their recording.
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "https://cdn.example/x.m3u8",
+                "stream_headers": "{not json",
+            })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(ctor.call_args.kwargs["header_overrides"], {})
+
+    def test_non_dict_header_entries_dropped(self):
+        from unittest.mock import patch, MagicMock
+        import json as _json
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            self.client.post("/api/recordings/start", data={
+                "url_primary": "https://cdn.example/x.m3u8",
+                "stream_headers": _json.dumps({"https://cdn.example/x.m3u8": "nope"}),
+            })
+        self.assertEqual(ctor.call_args.kwargs["header_overrides"], {})
 
 
 if __name__ == "__main__":

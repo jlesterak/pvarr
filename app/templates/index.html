@@ -183,6 +183,7 @@
             <div class="flex items-center space-x-3 overflow-x-auto pb-1">
               <template x-for="(cand, idx) in session.candidates" :key="idx">
                 <div class="px-3 py-1.5 rounded-lg text-xs flex items-center space-x-2 border shrink-0"
+                     :title="cand.detect_note ? cand.detect_note + (cand.referer ? ' Referer: ' + cand.referer : '') : ''"
                      :class="(idx + 1) === session.current_candidate ? 'bg-arr-blue/20 text-arr-accent border-arr-blue/40 font-semibold' : 'bg-slate-900/60 text-slate-400 border-slate-800'">
                   <span class="w-2 h-2 rounded-full" :class="(idx + 1) === session.current_candidate ? 'bg-emerald-400 animate-ping' : 'bg-slate-600'"></span>
                   <span x-text="cand.name + ': ' + (cand.url.length > 40 ? cand.url.slice(0, 40) + '...' : cand.url)"></span>
@@ -298,19 +299,54 @@
         </div>
 
         <div class="space-y-3 pt-2">
-          <label class="block text-xs font-bold text-arr-accent uppercase tracking-wider">Candidate Stream URLs (Up to 3)</label>
-          <div>
-            <span class="text-xs text-slate-400">Primary Stream URL (Required)</span>
-            <input type="url" x-model="form.url_primary" required class="w-full px-3 py-2 rounded-lg text-sm arr-input font-mono text-emerald-400 mt-1" placeholder="https://stream-site.com/primary.m3u8">
+          <div class="flex items-baseline justify-between">
+            <label class="block text-xs font-bold text-arr-accent uppercase tracking-wider">Candidate Stream URLs (Up to 3)</label>
+            <span class="text-[11px] text-slate-500">Paste an m3u8 or the page that plays it — PVArr works out the headers.</span>
           </div>
-          <div>
-            <span class="text-xs text-slate-400">Backup Candidate 1 URL</span>
-            <input type="url" x-model="form.url_backup1" class="w-full px-3 py-2 rounded-lg text-sm arr-input font-mono text-amber-400 mt-1" placeholder="https://backup1-site.com/channel.php">
-          </div>
-          <div>
-            <span class="text-xs text-slate-400">Backup Candidate 2 URL</span>
-            <input type="url" x-model="form.url_backup2" class="w-full px-3 py-2 rounded-lg text-sm arr-input font-mono text-cyan-400 mt-1" placeholder="https://backup2-site.com/stream">
-          </div>
+
+          <template x-for="slot in slots" :key="slot.key">
+            <div class="space-y-1">
+              <span class="text-xs text-slate-400" x-text="slot.label"></span>
+              <input type="url" :required="slot.required" x-model="form[slot.key]"
+                     @input.debounce.700ms="probeSlot(slot.key)" @change="probeSlot(slot.key)"
+                     class="w-full px-3 py-2 rounded-lg text-sm arr-input font-mono mt-1"
+                     :class="slot.tone" :placeholder="slot.placeholder">
+
+              <!-- Probe verdict -->
+              <template x-if="probes[slot.key] && probes[slot.key].state !== 'idle'">
+                <div class="text-xs flex items-start space-x-2 px-1"
+                     :class="{ 'text-slate-400': probes[slot.key].state === 'probing',
+                               'text-emerald-400': probes[slot.key].state === 'ok',
+                               'text-rose-400': probes[slot.key].state === 'fail' }">
+                  <span x-show="probes[slot.key].state === 'probing'" class="animate-pulse">◌</span>
+                  <span x-show="probes[slot.key].state === 'ok'">✓</span>
+                  <span x-show="probes[slot.key].state === 'fail'">✕</span>
+                  <div class="space-y-0.5 min-w-0">
+                    <p x-text="probes[slot.key].message"></p>
+                    <p x-show="probes[slot.key].resolved" class="font-mono text-[11px] text-slate-500 truncate"
+                       x-text="'→ ' + probes[slot.key].resolved"></p>
+                  </div>
+                </div>
+              </template>
+
+              <div class="px-1">
+                <button type="button" @click="toggleAdvanced(slot.key)"
+                        class="text-[11px] text-slate-500 hover:text-arr-accent">
+                  <span x-text="advanced[slot.key] ? 'Hide headers' : 'Set headers manually'"></span>
+                </button>
+              </div>
+
+              <!-- Manual override: only needed when the probe cannot guess -->
+              <div x-show="advanced[slot.key]" class="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1" style="display:none;">
+                <input type="text" x-model="overrides[slot.key].referer" placeholder="Referer"
+                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+                <input type="text" x-model="overrides[slot.key].user_agent" placeholder="User-Agent"
+                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+                <input type="text" x-model="overrides[slot.key].cookie" placeholder="Cookie"
+                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+              </div>
+            </div>
+          </template>
         </div>
 
         <div class="pt-4 flex justify-end space-x-3 border-t border-slate-800">
@@ -341,6 +377,22 @@
           url_backup1: '',
           url_backup2: ''
         },
+        slots: [
+          { key: 'url_primary', label: 'Primary Stream URL (Required)', required: true,
+            tone: 'text-emerald-400', placeholder: 'https://cdn.example.com/hls/stream.m3u8?token=...' },
+          { key: 'url_backup1', label: 'Backup Candidate 1 URL', required: false,
+            tone: 'text-amber-400', placeholder: 'https://backup1-site.com/channel.php' },
+          { key: 'url_backup2', label: 'Backup Candidate 2 URL', required: false,
+            tone: 'text-cyan-400', placeholder: 'https://backup2-site.com/stream' }
+        ],
+        probes: { url_primary: null, url_backup1: null, url_backup2: null },
+        advanced: { url_primary: false, url_backup1: false, url_backup2: false },
+        overrides: {
+          url_primary: { referer: '', user_agent: '', cookie: '' },
+          url_backup1: { referer: '', user_agent: '', cookie: '' },
+          url_backup2: { referer: '', user_agent: '', cookie: '' }
+        },
+        probeSeq: { url_primary: 0, url_backup1: 0, url_backup2: 0 },
 
         init() {
           this.refreshStatus();
@@ -404,9 +456,91 @@
           }
         },
 
+        toggleAdvanced(key) {
+          this.advanced[key] = !this.advanced[key];
+        },
+
+        async probeSlot(key) {
+          const url = (this.form[key] || '').trim();
+          if (!url) { this.probes[key] = null; return; }
+          if (!/^https?:\/\//i.test(url)) {
+            this.probes[key] = { state: 'fail', message: 'URL must start with http:// or https://' };
+            return;
+          }
+
+          // Each keystroke can fire a probe; only the newest answer may win, or
+          // a slow early request would overwrite a later, correct one.
+          const seq = ++this.probeSeq[key];
+          this.probes[key] = { state: 'probing', message: 'Checking stream and working out headers...' };
+
+          const body = new FormData();
+          body.append('url', url);
+          if (this.overrides[key].referer) body.append('referer', this.overrides[key].referer);
+
+          try {
+            const res = await fetch('/api/probe', { method: 'POST', body });
+            const data = await res.json();
+            if (seq !== this.probeSeq[key]) return;
+
+            if (data.ok) {
+              this.probes[key] = {
+                state: 'ok',
+                message: data.message,
+                resolved: data.m3u8_url !== url ? data.m3u8_url : '',
+                data: data
+              };
+              // Show what was detected so it can be edited rather than retyped.
+              this.overrides[key].referer = data.referer || '';
+              this.overrides[key].cookie = data.cookie || '';
+            } else {
+              this.probes[key] = { state: 'fail', message: data.message || 'Could not verify this stream.', data: null };
+              this.advanced[key] = true;
+            }
+          } catch (e) {
+            if (seq !== this.probeSeq[key]) return;
+            this.probes[key] = { state: 'fail', message: 'Probe request failed: ' + e };
+          }
+        },
+
+        buildStreamHeaders() {
+          // Keyed by URL, not slot position: an empty backup slot must not
+          // shift headers onto the wrong candidate server-side.
+          const headers = {};
+          this.slots.forEach(slot => {
+            const url = (this.form[slot.key] || '').trim();
+            if (!url) return;
+            const o = this.overrides[slot.key];
+            const entry = {};
+            if (o.referer) entry.referer = o.referer;
+            if (o.user_agent) entry.user_agent = o.user_agent;
+            if (o.cookie) entry.cookie = o.cookie;
+            if (Object.keys(entry).length) headers[url] = entry;
+          });
+          return headers;
+        },
+
+        resetStreamForm() {
+          this.slots.forEach(slot => {
+            this.form[slot.key] = '';
+            this.probes[slot.key] = null;
+            this.advanced[slot.key] = false;
+            this.overrides[slot.key] = { referer: '', user_agent: '', cookie: '' };
+          });
+        },
+
         async submitRecording() {
+          const primary = this.probes.url_primary;
+          if (primary && primary.state === 'fail') {
+            if (!confirm('PVArr could not verify the primary stream:\n\n' + primary.message +
+                         '\n\nStart the recording anyway?')) return;
+          }
+
           const formData = new FormData();
           Object.keys(this.form).forEach(k => formData.append(k, this.form[k]));
+          const headers = this.buildStreamHeaders();
+          if (Object.keys(headers).length) {
+            formData.append('stream_headers', JSON.stringify(headers));
+          }
 
           try {
             const res = await fetch('/api/recordings/start', { method: 'POST', body: formData });
@@ -414,9 +548,7 @@
             if (res.ok) {
               this.openNewModal = false;
               this.refreshStatus();
-              this.form.url_primary = '';
-              this.form.url_backup1 = '';
-              this.form.url_backup2 = '';
+              this.resetStreamForm();
             } else {
               alert(data.detail || 'Failed to start recording');
             }
