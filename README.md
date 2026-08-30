@@ -277,7 +277,7 @@ app/
 ├── probe.py           Stream probe — URL → playlist + the headers it needs
 ├── post_processor.py  TS → MKV/MP4 remux on completion
 ├── naming.py          Sports-aware output filenames
-├── tuner.py           M3U playlist + XMLTV EPG generation
+├── tuner.py           M3U playlist, XMLTV EPG, HDHomeRun emulation
 ├── notifications.py   Discord / Telegram / Plex / Emby hooks
 ├── check_deps.py      Startup dependency validation (FFmpeg, Python packages)
 ├── cleanup.py         Graceful shutdown of child FFmpeg processes
