@@ -259,5 +259,5 @@ Go do it again somewhere else.
 ---
 
 **Status:** Phase 4 complete — tested, licensed, published
-**Maintainer:** Stream Failover Studio
+**Maintainer:** jlester.ak
 **License:** [The Unlicense](LICENSE) — public domain
