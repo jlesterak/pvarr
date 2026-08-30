@@ -1,0 +1,15 @@
+# Build-from-source override for docker-compose.yml.
+#
+# The base compose file pulls the published image from GHCR. Layer this file on
+# top to build the image locally from the checked-out source instead:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# The image name is kept identical to the base file so a local build simply
+# replaces the pulled tag.
+services:
+  pvarr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/jlesterak/pvarr:latest

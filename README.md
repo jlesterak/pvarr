@@ -29,11 +29,25 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 
 ### Docker Compose
 
+Pulls the published image from GHCR:
+
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 Open <http://localhost:8999>.
+
+To build from source instead of pulling, layer the build override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+The image is published as [`ghcr.io/jlesterak/pvarr`](https://github.com/jlesterak/pvarr/pkgs/container/pvarr):
+
+```bash
+docker pull ghcr.io/jlesterak/pvarr:latest
+```
 
 ### CLI
 
@@ -290,6 +304,41 @@ absent, so the core suite still runs with only `requirements.txt` installed.
 python3 -m py_compile app/*.py stream-recorder.py test_pvarr.py
 bash -n start.sh scripts/publish.sh
 ```
+
+### Releasing
+
+`scripts/publish.sh` commits the tree and publishes the container image in one
+step. The image version is `__version__` in `app/__init__.py`:
+
+```bash
+scripts/publish.sh --bump patch    # 1.0.0 -> 1.0.1, commit, build, push
+scripts/publish.sh --version 2.0.0 # set an explicit version
+scripts/publish.sh --skip-docker   # commit only, touch no registry
+```
+
+An already-published version tag is never overwritten silently — the script
+checks the registry *before* committing and refuses, so a rejected publish
+leaves no commit behind. Pass `--force` to overwrite deliberately. Set
+`PVARR_IMAGE` to publish a fork somewhere else.
+
+Pushing requires a token with `write:packages`:
+
+```bash
+echo $YOUR_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
+```
+
+CI publishes too, on a split tag policy that keeps it from fighting the script
+over an immutable tag:
+
+| Trigger | Tags published |
+| --- | --- |
+| `tests` passes on `main` | `:latest`, `:sha-<short>` |
+| version tag pushed (`v1.0.1`) | `:latest`, `:sha-<short>`, `:1.0.1` |
+| `scripts/publish.sh` | `:latest`, `:<version>` |
+
+Only moving tags are written on every green `main` build. A version tag push
+must match `__version__`, or the workflow fails rather than publishing a
+mislabelled image.
 
 ---
 
