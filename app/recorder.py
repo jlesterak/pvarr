@@ -318,6 +318,9 @@ class StreamFailoverRecorder:
         """Main recording & failover loop."""
         while not self._stop_event.is_set() and self.current_candidate_index < len(self.candidates):
             candidate = self.candidates[self.current_candidate_index]
+            # Clear any lingering "failing_over" from the previous iteration so
+            # the dashboard shows the candidate we are actually recording.
+            self.status = "recording"
             self._log(f"=== Active Stream: Candidate {self.current_candidate_index+1}/{len(self.candidates)} ({candidate.name}) ===")
 
             # 1. Detect headers
@@ -356,8 +359,15 @@ class StreamFailoverRecorder:
             if self._stop_event.is_set():
                 break
 
+            # Consume the force-failover request: it applies to the candidate we
+            # are leaving, not the one we are about to try. Leaving it latched
+            # makes every remaining candidate abort on entry, turning a single
+            # button press into a dead recording.
+            forced = self._force_failover_flag
+            self._force_failover_flag = False
+
             # If stream ended or failed, check if we need to failover to next candidate
-            if self._force_failover_flag or not success:
+            if forced or not success:
                 self.current_candidate_index += 1
                 if self.current_candidate_index < len(self.candidates):
                     next_name = self.candidates[self.current_candidate_index].name

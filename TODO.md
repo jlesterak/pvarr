@@ -50,7 +50,34 @@
   all three URLs verified live). The "we don't know and they won't say"
   position is unchanged; only the voice moved.
 
+## Phase 5: Failover Correctness
+- [x] **Failover state-machine coverage (`test_pvarr.py`)** — 22 tests driving
+      the real `_recording_loop` and `_stream_ffmpeg_process` against scripted
+      fakes; no FFmpeg spawned, no real timeouts waited out.
+
+- [x] **BUG FIX: force-failover latched forever (`recorder.py`)**
+      `_force_failover_flag` was set by `POST /api/recordings/{id}/failover`
+      and never cleared. Every subsequent candidate aborted on entry, so one
+      press of the dashboard failover button cascaded through all remaining
+      candidates and marked the recording `failed`. The button did the
+      opposite of its name. Now consumed once, on the candidate being left.
+
+- [x] **BUG FIX: status stuck on `failing_over` (`recorder.py`)**
+      After any failover the dashboard reported `failing_over` for the rest of
+      the recording, even while candidate 2 was recording normally.
+
+## Open design question — needs a decision, not a fix
+- [ ] **Mid-stream freeze ends the recording instead of failing over.**
+      `_stream_ffmpeg_process` returns `True` when a stream delivers data and
+      then stalls, so `_recording_loop` treats it as "completed naturally" and
+      stops. A stream that dies 10 minutes into a 3-hour event therefore yields
+      a 10-minute file, which is the exact scenario 3-stage failover exists to
+      survive. A clean FFmpeg exit is already distinguishable from a stall
+      (`poll()` is not None), so returning `False` on stall is implementable.
+      The tradeoff: a long recording that stalls near the end would roll onto
+      the next candidate and, if all candidates then exhaust, be marked
+      `failed` despite having captured almost everything. Current behaviour is
+      pinned by `TestFreezeDetection.test_mid_stream_freeze_after_data_reports_success`.
+
 ## Genuinely still open
 - [ ] Integration tests for `app/server.py` routes (needs FastAPI `TestClient`)
-- [ ] No test coverage for `recorder._recording_loop` failover transitions —
-      the core logic is exercised only at the unit level, not end to end
