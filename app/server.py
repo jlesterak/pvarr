@@ -311,6 +311,83 @@ async def stream_logs(recording_id: str):
     return StreamingResponse(log_generator(), media_type="text/event-stream")
 
 
+# How long to keep a tuner client connected while the recorder is running but
+# producing nothing. Generous: a failover cycle (freeze timeout, proxy retry,
+# candidate switch) can legitimately leave a gap of a minute or so.
+STREAM_IDLE_TIMEOUT_SEC = 300
+
+
+@app.get("/api/recordings/{recording_id}/stream")
+async def stream_recording(recording_id: str, live: bool = False):
+    """Serve an in-progress recording as a continuous MPEG-TS feed.
+
+    This is the URL the /live tuner playlist advertises: Plex and Emby open it
+    as a live channel and read until the far end stops sending. Because
+    failover appends to the same output file, a mid-event switch to a backup
+    URL is invisible to the client -- the bytes simply keep arriving.
+
+    By default the feed starts at the beginning of the recording, so a client
+    joining late still gets the whole event. Pass ?live=true to join at the
+    current write position instead.
+    """
+    recorder = active_recorders.get(recording_id)
+    if not recorder:
+        raise HTTPException(status_code=404, detail="Recording session not found")
+
+    path = Path(recorder.output_filepath)
+
+    # The file only appears once the first chunk lands.
+    for _ in range(100):
+        if path.exists():
+            break
+        if not recorder.is_running:
+            raise HTTPException(status_code=404, detail="Recording produced no data")
+        await asyncio.sleep(0.1)
+    else:
+        raise HTTPException(
+            status_code=503, detail="Recording has not started producing data yet"
+        )
+
+    async def tail():
+        handle = await asyncio.to_thread(open, path, "rb")
+        try:
+            if live:
+                await asyncio.to_thread(handle.seek, 0, os.SEEK_END)
+            idle = 0.0
+            while True:
+                chunk = await asyncio.to_thread(handle.read, 65536)
+                if chunk:
+                    idle = 0.0
+                    yield chunk
+                    continue
+                if not recorder.is_running:
+                    # Drain whatever was written between the last read and the
+                    # recorder stopping, then end the response cleanly.
+                    final = await asyncio.to_thread(handle.read, 65536)
+                    if final:
+                        yield final
+                        continue
+                    break
+                await asyncio.sleep(0.25)
+                idle += 0.25
+                if idle >= STREAM_IDLE_TIMEOUT_SEC:
+                    logger.warning(
+                        "Tuner stream %s idle for %ss; closing", recording_id, idle
+                    )
+                    break
+        except asyncio.CancelledError:
+            # Client hung up (Plex switching channels). Normal, not an error.
+            raise
+        finally:
+            await asyncio.to_thread(handle.close)
+
+    return StreamingResponse(
+        tail(),
+        media_type="video/mp2t",
+        headers={"Cache-Control": "no-cache, no-store", "Accept-Ranges": "none"},
+    )
+
+
 @app.get("/api/library")
 async def list_library(dir_path: Optional[str] = None):
     """List completed recordings in library."""

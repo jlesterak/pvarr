@@ -28,7 +28,7 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
-from app.recorder import CandidateStream, StreamFailoverRecorder
+from app.recorder import CandidateStream, StreamFailoverRecorder, StreamOutcome
 
 # The modules log at INFO on import; silence it so test output stays readable.
 logging.disable(logging.CRITICAL)
@@ -188,9 +188,83 @@ class TestTuner(unittest.TestCase):
 
     def test_playlist_excludes_stopped_sessions(self):
         out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
-        self.assertIn("game1.ts", out)
-        self.assertIn("game3.ts", out)
-        self.assertNotIn("game2.ts", out)
+        self.assertIn("game1", out)
+        self.assertIn("game3", out)
+        self.assertNotIn("game2", out)
+
+    def test_channel_titles_drop_the_ts_extension(self):
+        # Plex shows this string in the guide; ".ts" is noise there.
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        self.assertNotIn(".ts", out)
+
+    def test_playlist_points_at_the_stream_endpoint(self):
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        self.assertIn("/api/recordings/rec1/stream", out)
+
+    def test_quotes_in_filename_do_not_break_attributes(self):
+        sessions = [{"id": "r1", "output_filename": 'a "quoted" game.ts',
+                     "is_running": True}]
+        out = tuner.generate_m3u_playlist(sessions, "http://host:8999")
+        extinf = [l for l in out.splitlines() if l.startswith("#EXTINF")][0]
+        # Attribute values must stay balanced.
+        self.assertEqual(extinf.count("tvg-name="), 1)
+        self.assertIn("group-title=", extinf)
+
+    def test_epg_excludes_stopped_sessions(self):
+        # The guide must match the playlist. Advertising a channel here that
+        # the M3U omits leaves Plex with guide entries it cannot tune.
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        ids = {c.attrib["id"] for c in ET.fromstring(body).findall("channel")}
+        self.assertEqual(ids, {"rec1", "rec3"})
+        self.assertNotIn("rec2", ids)
+
+    def test_epg_escapes_xml_special_characters(self):
+        # An unescaped & or < in a filename produced invalid XML that Plex
+        # would reject outright.
+        import xml.etree.ElementTree as ET
+        sessions = [{"id": "r1", "output_filename": "Fish & Chips <live>.ts",
+                     "is_running": True, "started_at": 1756000000.0}]
+        xml = tuner.generate_xmltv_epg(sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        root = ET.fromstring(body)  # raises if escaping is wrong
+        self.assertEqual(root.find("channel/display-name").text,
+                         "Fish & Chips <live>")
+
+    def test_epg_includes_a_programme_per_channel(self):
+        # Plex will not display a channel with no programme in the guide.
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        root = ET.fromstring(body)
+        programmes = root.findall("programme")
+        self.assertEqual(len(programmes), 2)  # running only
+        for prog in programmes:
+            self.assertIn("start", prog.attrib)
+            self.assertIn("stop", prog.attrib)
+            self.assertIn("channel", prog.attrib)
+            self.assertTrue(prog.find("title").text)
+
+    def test_programme_times_are_xmltv_format(self):
+        import re, xml.etree.ElementTree as ET
+        sessions = [{"id": "r1", "output_filename": "g.ts", "is_running": True,
+                     "started_at": 1756000000.0}]
+        xml = tuner.generate_xmltv_epg(sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        prog = ET.fromstring(body).find("programme")
+        for attr in ("start", "stop"):
+            self.assertRegex(prog.attrib[attr], r"^\d{14} \+0000$")
+
+    def test_epg_channel_ids_match_playlist_tvg_ids(self):
+        # Plex maps guide to channel by this id; a mismatch means no guide.
+        m3u = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        epg_ids = {c.attrib["id"] for c in ET.fromstring(body).findall("channel")}
+        for cid in epg_ids:
+            self.assertIn(f'tvg-id="{cid}"', m3u)
 
     def test_playlist_stream_urls(self):
         out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
@@ -211,7 +285,7 @@ class TestTuner(unittest.TestCase):
         body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
         root = ET.fromstring(body)
         self.assertEqual(root.tag, "tv")
-        self.assertEqual(len(root.findall("channel")), 3)
+        self.assertEqual(len(root.findall("channel")), 2)  # running only
 
     def test_epg_empty_is_wellformed(self):
         import xml.etree.ElementTree as ET
@@ -532,9 +606,16 @@ class FailoverLoopTestCase(unittest.TestCase):
         def fake_stream(cmd, candidate):
             rec.attempts.append(candidate.name)
             if rec._force_failover_flag:
-                return False  # mirrors the real first-iteration check
-            outcome = script.pop(0) if script else False
-            return outcome(rec, candidate) if callable(outcome) else outcome
+                return StreamOutcome.INTERRUPTED  # mirrors the real check
+            outcome = script.pop(0) if script else StreamOutcome.FAILED
+            if callable(outcome):
+                outcome = outcome(rec, candidate)
+            # True/False remain shorthand for the two unambiguous outcomes.
+            if outcome is True:
+                return StreamOutcome.COMPLETED
+            if outcome is False:
+                return StreamOutcome.FAILED
+            return outcome
 
         def fake_detect(candidate):
             candidate.m3u8_url = candidate.url
@@ -626,6 +707,52 @@ class TestFailoverAdvance(FailoverLoopTestCase):
                         [False, False, True], on_failover_callback=boom)
         self.run_loop(rec)  # must not raise
         self.assertEqual(rec.status, "completed")
+
+
+class TestInterruptedFailover(FailoverLoopTestCase):
+    def test_interrupted_advances_to_next_candidate(self):
+        rec = self.make(
+            ["http://a/1.m3u8", "http://b/2.m3u8"],
+            [StreamOutcome.INTERRUPTED, StreamOutcome.INTERRUPTED, True],
+        )
+        self.run_loop(rec)
+        self.assertEqual(rec.current_candidate_index, 1)
+        self.assertEqual(rec.status, "completed")
+
+    def test_completed_does_not_advance(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [StreamOutcome.COMPLETED])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts, ["Candidate 1"])
+
+    def test_exhaustion_after_real_footage_is_partial_not_failed(self):
+        # A 3-hour recording whose stream dies near the end must not be thrown
+        # away: post-processing still needs to run on what was captured.
+        def wrote_then_died(rec, candidate):
+            rec.bytes_written += 500_000_000
+            return StreamOutcome.INTERRUPTED
+
+        seen = []
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [wrote_then_died] * 4,
+                        on_completion_callback=seen.append)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed_partial")
+        self.assertEqual(len(seen), 1, "post-processing skipped for partial recording")
+
+    def test_exhaustion_with_no_footage_is_failed(self):
+        seen = []
+        rec = self.make(["http://a/1.m3u8"], [StreamOutcome.FAILED] * 2,
+                        on_completion_callback=seen.append)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "failed")
+        self.assertEqual(seen, [])
+
+    def test_proxy_retried_on_interrupted(self):
+        # An expiring mid-stream token is exactly what the proxy re-scrapes.
+        rec = self.make(["http://a/1.m3u8"], [StreamOutcome.INTERRUPTED, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, ["Candidate 1"])
 
 
 class TestStopDuringRecording(FailoverLoopTestCase):
@@ -777,7 +904,7 @@ class TestFreezeDetection(unittest.TestCase):
 
     def test_stall_before_any_data_is_a_failure(self):
         rec, result = self.drive([])
-        self.assertFalse(result, "a stream that never delivered a byte reported success")
+        self.assertIs(result, StreamOutcome.FAILED)
         self.assertEqual(rec.candidates[0].fail_count, 1)
 
     def test_bytes_written_is_tracked(self):
@@ -788,11 +915,11 @@ class TestFreezeDetection(unittest.TestCase):
     def test_clean_exit_after_data_is_success(self):
         # FFmpeg exited 0 with data on disk: the stream genuinely ended.
         rec, result = self.drive([b"x" * 1024], returncode=0)
-        self.assertTrue(result)
+        self.assertIs(result, StreamOutcome.COMPLETED)
 
     def test_immediate_nonzero_exit_is_a_failure(self):
         rec, result = self.drive([], returncode=1)
-        self.assertFalse(result)
+        self.assertIs(result, StreamOutcome.FAILED)
 
     def test_stop_event_returns_without_writing(self):
         from unittest.mock import patch
@@ -800,22 +927,23 @@ class TestFreezeDetection(unittest.TestCase):
         rec._stop_event.set()
         with patch("app.recorder.subprocess.Popen", return_value=_FakeProc([b"x" * 100])):
             result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
-        self.assertFalse(result)
+        self.assertIs(result, StreamOutcome.FAILED)
         self.assertEqual(rec.bytes_written, 0)
 
-    def test_mid_stream_freeze_after_data_reports_success(self):
-        # DOCUMENTS CURRENT BEHAVIOUR, does not endorse it.
-        #
-        # A stream that delivered data and then stalled is reported as success,
-        # so _recording_loop treats it as "completed naturally" and stops
-        # instead of failing over. For a live event this ends the recording at
-        # the point of the stall. See TODO.md -- this is an open design
-        # question, not settled behaviour. If the semantics change, this test
-        # should flip to assertFalse.
+    def test_mid_stream_freeze_after_data_is_interrupted(self):
+        # A stall after data is NOT a clean finish. Reporting it as success is
+        # what used to truncate a recording at the point of the stall instead
+        # of failing over to a backup.
         rec, result = self.drive([b"x" * 2048])
-        self.assertTrue(result)
-        self.assertEqual(rec.candidates[0].fail_count, 1,
-                         "stall should still be counted against the candidate")
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    def test_nonzero_exit_after_data_is_interrupted(self):
+        # FFmpeg dying partway through a recording. Same class of bug as the
+        # stall: bytes had arrived, so it read as "completed naturally".
+        rec, result = self.drive([b"x" * 4096], returncode=1)
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertEqual(rec.candidates[0].fail_count, 1)
 
 
 # --------------------------------------------------------------------------
@@ -1042,6 +1170,61 @@ class TestMissingStatusRoute(ServerTestCase):
         body = r.json()
         for key in ("active_count", "total_sessions", "sessions"):
             self.assertIn(key, body)
+
+
+class TestTunerStream(ServerTestCase):
+    """The endpoint the tuner playlist advertises. It did not exist before, so
+    every channel Plex saw resolved to a 404."""
+
+    def _fake_recorder(self, data=b"", running=False):
+        from unittest.mock import MagicMock
+        path = Path(self.tmp) / "live.ts"
+        path.write_bytes(data)
+        rec = MagicMock()
+        rec.output_filepath = path
+        rec.is_running = running
+        return rec
+
+    def test_unknown_session_404s(self):
+        self.assertEqual(
+            self.client.get("/api/recordings/nope/stream").status_code, 404
+        )
+
+    def test_streams_the_recorded_bytes(self):
+        self.server.active_recorders["abc"] = self._fake_recorder(b"\x47" + b"payload")
+        r = self.client.get("/api/recordings/abc/stream")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "video/mp2t")
+        self.assertEqual(r.content, b"\x47" + b"payload")
+
+    def test_live_mode_starts_at_the_write_head(self):
+        # ?live=true joins at the current position instead of replaying.
+        self.server.active_recorders["abc"] = self._fake_recorder(b"old data here")
+        r = self.client.get("/api/recordings/abc/stream?live=true")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"")
+
+    def test_missing_file_on_stopped_recorder_404s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.output_filepath = Path(self.tmp) / "never-written.ts"
+        rec.is_running = False
+        self.server.active_recorders["abc"] = rec
+        self.assertEqual(
+            self.client.get("/api/recordings/abc/stream").status_code, 404
+        )
+
+    def test_playlist_url_resolves_to_a_real_route(self):
+        # Guards the exact regression: tuner advertising an unrouted path.
+        from app.tuner import generate_m3u_playlist
+        self.server.active_recorders["abc"] = self._fake_recorder(b"data")
+        m3u = generate_m3u_playlist(
+            [{"id": "abc", "output_filename": "g.ts", "is_running": True}],
+            "http://testserver",
+        )
+        url = [l for l in m3u.splitlines() if l.startswith("http")][0]
+        r = self.client.get(url.replace("http://testserver", ""))
+        self.assertEqual(r.status_code, 200, f"tuner URL {url} is not routable")
 
 
 class TestShutdown(ServerTestCase):

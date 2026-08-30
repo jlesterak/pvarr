@@ -66,18 +66,52 @@
       After any failover the dashboard reported `failing_over` for the rest of
       the recording, even while candidate 2 was recording normally.
 
-## Open design question — needs a decision, not a fix
-- [ ] **Mid-stream freeze ends the recording instead of failing over.**
-      `_stream_ffmpeg_process` returns `True` when a stream delivers data and
-      then stalls, so `_recording_loop` treats it as "completed naturally" and
-      stops. A stream that dies 10 minutes into a 3-hour event therefore yields
-      a 10-minute file, which is the exact scenario 3-stage failover exists to
-      survive. A clean FFmpeg exit is already distinguishable from a stall
-      (`poll()` is not None), so returning `False` on stall is implementable.
-      The tradeoff: a long recording that stalls near the end would roll onto
-      the next candidate and, if all candidates then exhaust, be marked
-      `failed` despite having captured almost everything. Current behaviour is
-      pinned by `TestFreezeDetection.test_mid_stream_freeze_after_data_reports_success`.
+## Phase 8: Stream Outcomes & Plex Live Tuner
+
+### Three-state outcome refactor (closes the freeze + partial-write items)
+- [x] `_stream_ffmpeg_process` returned a bool, so "did bytes arrive" stood in
+      for "did the stream finish". A mid-recording stall **and** a non-zero
+      FFmpeg exit after data both read as a clean finish, and the loop stopped
+      instead of failing over — silently truncating the recording at the point
+      of failure. Now returns `StreamOutcome`:
+      `COMPLETED` (exit 0) / `FAILED` (no bytes) / `INTERRUPTED` (data, then
+      stall or crash). Only `COMPLETED` ends the recording.
+- [x] Exhausting all candidates *after* capturing footage now yields
+      `completed_partial` rather than `failed`, so post-processing still runs
+      and the capture is kept. This was the tradeoff that made the original
+      decision look like a dilemma; tracking "did we ever get bytes" dissolves it.
+
+### Plex live tuner — the integration had never worked
+- [x] **`/api/recordings/{id}/stream` did not exist.** `tuner.py` advertised it
+      in every M3U entry, so every channel Plex saw resolved to a 404. Now
+      implemented as a tailing MPEG-TS feed: reads the file as it is written,
+      drains cleanly when the recorder stops, and survives failover invisibly
+      because failover appends to the same file. `?live=true` joins at the
+      write head. Idle cap of 300s so a wedged recorder cannot pin a client
+      open forever.
+- [x] **EPG had no `<programme>` entries.** Plex will not display a channel
+      with nothing in the guide. Each channel now gets a programme spanning a
+      6-hour window from the recording start.
+- [x] **EPG was not XML-escaped.** A filename containing `&` or `<` produced
+      malformed XML that Plex rejects outright. Now escaped, and M3U attributes
+      use `quoteattr` so a quoted filename cannot break the line.
+- [x] **EPG listed stopped sessions the M3U filtered out**, leaving Plex with
+      guide entries for channels it could not tune. Both now filter to running.
+- [x] Channel titles drop the `.ts` extension.
+- [x] `started_at` exposed in the status summary to drive programme times.
+
+### Verified end to end (not just unit-tested)
+- Recorded a real 30s MPEG-TS through the full pipeline; post-processor
+  remuxed to MP4; `ffprobe` confirmed 30.02s of valid video.
+- Against a throttled source simulating a live stream: playlist advertised the
+  channel, the advertised URL was pulled for 8s exactly as Plex would, and
+  `ffprobe` confirmed the received bytes were decodable h264 + aac.
+
+## Decisions
+- **Authentication: accepted risk, will not add.** Deployment is a trusted LAN
+  behind a firewall. Documented prominently in the README instead. Revisit only
+  if this is ever exposed — note that adding Basic auth would break the Plex and
+  Emby tuner fetches unless `/live/*` is exempted or given a token parameter.
 
 ## Phase 6: Route Coverage & Path Containment
 - [x] **Route integration tests** — 26 tests over every endpoint via FastAPI
@@ -153,9 +187,10 @@
   correctness gain. Added field-level validation and structured errors instead.
 
 ## Still open
-- [ ] **No authentication on any endpoint.** Anyone who can reach the port can
-      start, stop, and delete recordings. Fine on a trusted LAN, not fine if
-      exposed. Wants at minimum a shared-secret header or basic auth before
-      anyone puts this behind a public reverse proxy.
-- [ ] `_stream_ffmpeg_process` has no test for the partial-write path where
-      FFmpeg exits non-zero *after* writing data.
+- [ ] `get_filesize_mb()` reports 0.0 once post-processing has remuxed and
+      deleted the source `.ts`, because it still points at the original path.
+      Cosmetic — the dashboard shows 0 MB for a finished recording that has a
+      perfectly good `.mp4` beside it.
+- [ ] Tuner stream is served from the recorder's output path; once
+      post-processing deletes the `.ts`, an in-flight client is cut off at the
+      end of the recording rather than transitioning to the remuxed file.

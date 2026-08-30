@@ -151,6 +151,7 @@ and mounts `./recordings` there.
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
+| `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
 | `POST` | `/api/library/rename` | Rename a recording |
 | `DELETE` | `/api/library/{filename}` | Delete a recording |
@@ -171,6 +172,19 @@ PVArr exposes active recordings as a virtual tuner.
 3. EPG / XMLTV URL: `http://<pvarr-host>:8999/live/epg.xml`
 
 Set `PLEX_URL`/`PLEX_TOKEN` or `EMBY_URL`/`EMBY_API_KEY` to have PVArr trigger a library refresh once post-processing finishes.
+
+Each active recording appears as a live channel. The channel streams the file as
+it is being written, so you can start watching a game that is still recording.
+Because failover appends to the same file, a mid-event switch to a backup URL is
+invisible to the player — the feed just continues.
+
+The playlist and guide list **running** recordings only; a channel disappears
+when its recording stops. Completed recordings are in the library, not the tuner.
+
+> **No authentication.** Any client that can reach port 8999 has full control —
+> start, stop, and delete recordings — and the app binds `0.0.0.0` by default.
+> This is intended for a trusted LAN behind a firewall. Do not expose it
+> directly; put it behind a reverse proxy with auth if you need remote access.
 
 ---
 

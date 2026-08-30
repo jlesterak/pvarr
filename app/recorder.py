@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from enum import Enum
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Callable, Dict, Any
@@ -20,6 +21,20 @@ from typing import List, Optional, Callable, Dict, Any
 from app.check_deps import find_executable
 
 logger = logging.getLogger("PVArrRecorder")
+
+
+class StreamOutcome(str, Enum):
+    """Why a single FFmpeg attempt ended.
+
+    A bare bool cannot express this. Previously "did any bytes arrive" stood in
+    for "did the stream finish", so a mid-recording stall or crash looked
+    identical to a clean finish and the loop stopped instead of failing over --
+    silently truncating the recording at the point of failure.
+    """
+
+    COMPLETED = "completed"      # FFmpeg exited 0: the stream genuinely ended
+    FAILED = "failed"            # died without delivering a single byte
+    INTERRUPTED = "interrupted"  # delivered data, then stalled or exited non-zero
 
 
 class CandidateStream:
@@ -283,8 +298,10 @@ class StreamFailoverRecorder:
 
         return cmd
 
-    def _stream_ffmpeg_process(self, ffmpeg_cmd: List[str], candidate: CandidateStream) -> bool:
-        """Stream chunks from FFmpeg stdout to destination file. Returns True if successful data was written."""
+    def _stream_ffmpeg_process(
+        self, ffmpeg_cmd: List[str], candidate: CandidateStream
+    ) -> "StreamOutcome":
+        """Stream FFmpeg stdout to the output file and report how the attempt ended."""
         written_for_this_session = 0
         last_write_time = time.time()
 
@@ -299,7 +316,7 @@ class StreamFailoverRecorder:
             while not self._stop_event.is_set():
                 if self._force_failover_flag:
                     self._log(f"Forced failover triggered on {candidate.name}", "WARN")
-                    return False
+                    return StreamOutcome.INTERRUPTED
 
                 chunk = self._ffmpeg_process.stdout.read(32768)
                 if chunk:
@@ -309,20 +326,38 @@ class StreamFailoverRecorder:
                     self.bytes_written += len_chunk
                     written_for_this_session += len_chunk
                     last_write_time = time.time()
-                else:
-                    ret_code = self._ffmpeg_process.poll()
-                    if ret_code is not None:
-                        if ret_code != 0 and written_for_this_session == 0:
-                            return False  # Failed immediately without writing data
-                        break
+                    continue
 
-                    if (time.time() - last_write_time) > self.freeze_timeout_sec:
-                        self._log(f"Stream freeze detected! No data received for {self.freeze_timeout_sec}s", "ERROR")
-                        candidate.fail_count += 1
-                        return False if written_for_this_session == 0 else True
-                    time.sleep(0.2)
+                ret_code = self._ffmpeg_process.poll()
+                if ret_code is not None:
+                    if written_for_this_session == 0:
+                        return StreamOutcome.FAILED
+                    if ret_code == 0:
+                        return StreamOutcome.COMPLETED
+                    # Non-zero exit after delivering data: FFmpeg died partway
+                    # through. Previously indistinguishable from a clean finish.
+                    self._log(
+                        f"FFmpeg exited {ret_code} after {written_for_this_session} bytes "
+                        f"on {candidate.name}; treating as interrupted", "ERROR"
+                    )
+                    candidate.fail_count += 1
+                    return StreamOutcome.INTERRUPTED
 
-        return written_for_this_session > 0
+                if (time.time() - last_write_time) > self.freeze_timeout_sec:
+                    self._log(f"Stream freeze detected! No data received for {self.freeze_timeout_sec}s", "ERROR")
+                    candidate.fail_count += 1
+                    if written_for_this_session == 0:
+                        return StreamOutcome.FAILED
+                    return StreamOutcome.INTERRUPTED
+                time.sleep(0.2)
+
+        # Loop exited because stop() was requested -- an operator stop is a
+        # clean end, not a failure.
+        return (
+            StreamOutcome.COMPLETED
+            if written_for_this_session > 0
+            else StreamOutcome.FAILED
+        )
 
     def _recording_loop(self):
         """Main recording & failover loop."""
@@ -340,18 +375,23 @@ class StreamFailoverRecorder:
             self._log(f"[Direct Mode] Connecting FFmpeg directly to {candidate.m3u8_url[:70]}...")
             direct_cmd = self._build_ffmpeg_cmd(candidate.m3u8_url, candidate.referer, candidate.user_agent)
             
-            success = self._stream_ffmpeg_process(direct_cmd, candidate)
+            outcome = self._stream_ffmpeg_process(direct_cmd, candidate)
 
             # Clean up FFmpeg process
             self._reap_ffmpeg()
 
-            # 3. Fallback Mode: If Direct Mode failed without yielding data, attempt hls-proxy-stream
-            if not success and not self._stop_event.is_set() and not self._force_failover_flag:
+            # 3. Fallback Mode: direct attempt did not finish cleanly. Worth a
+            #    proxy retry either way -- FAILED usually means headers/token
+            #    were rejected, and INTERRUPTED often means a token expired
+            #    mid-stream, which is exactly what the proxy re-scrapes.
+            if (outcome is not StreamOutcome.COMPLETED
+                    and not self._stop_event.is_set()
+                    and not self._force_failover_flag):
                 self._log(f"[Direct Mode Failed] Falling back to hls-proxy-stream for {candidate.name}...", "WARN")
                 proxy_url = self.start_proxy(candidate)
                 proxy_cmd = self._build_ffmpeg_cmd(proxy_url)
                 
-                success = self._stream_ffmpeg_process(proxy_cmd, candidate)
+                outcome = self._stream_ffmpeg_process(proxy_cmd, candidate)
 
                 self._reap_ffmpeg()
                 self.stop_proxy()
@@ -366,8 +406,10 @@ class StreamFailoverRecorder:
             forced = self._force_failover_flag
             self._force_failover_flag = False
 
-            # If stream ended or failed, check if we need to failover to next candidate
-            if forced or not success:
+            # Anything short of a clean completion means try the next candidate.
+            # INTERRUPTED lands here now; it used to be read as success, which
+            # ended the recording at the point of the stall.
+            if forced or outcome is not StreamOutcome.COMPLETED:
                 self.current_candidate_index += 1
                 if self.current_candidate_index < len(self.candidates):
                     next_name = self.candidates[self.current_candidate_index].name
@@ -380,15 +422,29 @@ class StreamFailoverRecorder:
                             pass
                     time.sleep(1)
                 else:
-                    self._log("All stream candidates exhausted!", "ERROR")
-                    self.status = "failed"
+                    # Exhausting the list after capturing real footage is not
+                    # the same as never recording anything. Keeping these
+                    # distinct is what lets post-processing still run on a
+                    # long recording whose stream died near the end.
+                    if self.bytes_written > 0:
+                        self._log(
+                            "All stream candidates exhausted; keeping "
+                            f"{self.bytes_written} bytes already recorded.", "WARN"
+                        )
+                        self.status = "completed_partial"
+                    else:
+                        self._log("All stream candidates exhausted!", "ERROR")
+                        self.status = "failed"
                     break
             else:
                 # Stream completed naturally
                 break
 
         if self.status != "failed":
-            self.status = "completed"
+            # completed_partial must survive: it tells the caller the file is
+            # worth keeping but the stream did not run to its natural end.
+            if self.status != "completed_partial":
+                self.status = "completed"
             if self.on_completion_callback:
                 try:
                     self.on_completion_callback(str(self.output_filepath))
@@ -420,6 +476,7 @@ class StreamFailoverRecorder:
             "filesize_mb": self.get_filesize_mb(),
             "bytes_written": self.bytes_written,
             "elapsed_seconds": self.get_elapsed_seconds(),
+            "started_at": self.start_time,
             "current_candidate": self.current_candidate_index + 1,
             "total_candidates": len(self.candidates),
             "candidates": [c.to_dict() for c in self.candidates],
