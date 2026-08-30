@@ -260,6 +260,6 @@ Go do it again somewhere else.
 
 ---
 
-**Status:** Phase 4 complete — tested, licensed, published
+**Status:** Phase 6 complete — tested, licensed, published
 **Maintainer:** jlester.ak
 **License:** [The Unlicense](LICENSE) — public domain
