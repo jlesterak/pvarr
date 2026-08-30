@@ -44,14 +44,17 @@ echo "[+] Staging all project files..."
 git add \
     README.md \
     TODO.md \
+    LICENSE \
     .gitignore \
     requirements.txt \
     Dockerfile \
     docker-compose.yml \
     start.sh \
     stream-recorder.py \
+    test_pvarr.py \
     app/ \
-    scripts/
+    scripts/ \
+    .github/
 
 # 5. Commit
 COMMIT_MSG="chore: initial PVArr v1.0 release — AI-generated multi-stream HLS failover recorder"

@@ -205,12 +205,28 @@ app/
 
 ## Development
 
+### Tests
+
 ```bash
-python3 -m py_compile app/*.py stream-recorder.py   # syntax check
-bash -n start.sh scripts/publish.sh                 # shell syntax check
+python3 test_pvarr.py               # full suite, verbose
+python3 -m unittest discover        # quiet
 ```
 
-There is no automated test suite yet.
+58 tests covering filename sanitisation and collision handling, storage
+operations, M3U/XMLTV generation, dependency resolution, failover candidate
+parsing, and FFmpeg command construction. Stdlib `unittest` only — no extra
+dependencies.
+
+Most tests spawn no subprocesses. Two exercise a real remux end to end by
+encoding a one-second transport stream; they skip automatically when FFmpeg
+is not installed.
+
+### Syntax checks
+
+```bash
+python3 -m py_compile app/*.py stream-recorder.py test_pvarr.py
+bash -n start.sh scripts/publish.sh
+```
 
 ---
 

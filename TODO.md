@@ -27,8 +27,29 @@
   - `.gitignore` verified (excludes `venv/`, `__pycache__`, test recordings, logs, `.env`)
   - `scripts/publish.sh` stages, commits, and provides exact GitHub remote attach + push commands
 
-## Open Items (not blocking first push)
-- [x] Add a `LICENSE` file — The Unlicense (public domain)
-- [ ] Automated test suite (none exists yet)
-- [ ] Quantified AI footprint figures — deliberately omitted; the build was not
-      instrumented, so no measured token/energy/CO₂e/water numbers are available
+## Phase 4: Release Hardening
+- [x] **Task 1: `LICENSE`** — The Unlicense (public domain, no attribution required)
+
+- [x] **Task 2: Automated test suite (`test_pvarr.py`)**
+  - 58 tests, stdlib `unittest`, no new dependencies
+  - Covers: filename sanitisation + path-traversal rejection, output-path
+    collision handling, storage rename/delete guards, M3U + XMLTV generation,
+    dependency resolution, failover candidate parsing, FFmpeg argv construction
+  - Two end-to-end remux tests encode a real 1s transport stream; they skip
+    automatically when FFmpeg is absent
+  - CI: `.github/workflows/test.yml` runs the suite on Python 3.9 / 3.11 / 3.12
+
+## Closed by decision (not open work)
+- **Quantified AI footprint figures — will not add.** The build was never
+  instrumented: no token counts, inference wall-clock, or energy draw were
+  recorded while it happened, and providers do not publish per-token energy
+  for frontier models. Any gram-of-CO₂e or litre-of-water figure produced
+  now would be fabricated, which is exactly the failure mode a transparency
+  section exists to avoid. The README instead states what is unknown and why,
+  and notes that continuous 24/7 recording dominates the one-time build cost
+  regardless. Reopen only if real provider usage data becomes available.
+
+## Genuinely still open
+- [ ] Integration tests for `app/server.py` routes (needs FastAPI `TestClient`)
+- [ ] No test coverage for `recorder._recording_loop` failover transitions —
+      the core logic is exercised only at the unit level, not end to end
