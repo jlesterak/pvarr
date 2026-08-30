@@ -1,8 +1,11 @@
 services:
   pvarr:
-    # Published image. To build from source instead, layer the build override:
+    # Published image. Defaults to the newest release; pin a specific version
+    # by setting PVARR_TAG in .env (e.g. PVARR_TAG=1.0.0) so upgrades are
+    # deliberate and a rollback is a one-line change.
+    # To build from source instead, layer the build override:
     #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-    image: ghcr.io/jlesterak/pvarr:latest
+    image: ghcr.io/jlesterak/pvarr:${PVARR_TAG:-latest}
     container_name: pvarr
     restart: unless-stopped
     ports:

@@ -49,6 +49,19 @@ The image is published as [`ghcr.io/jlesterak/pvarr`](https://github.com/jlester
 docker pull ghcr.io/jlesterak/pvarr:latest
 ```
 
+### Pinning a version
+
+By default you track `latest`, so `docker compose pull` picks up new releases.
+On a machine doing real recording you probably want upgrades to be deliberate —
+set `PVARR_TAG` in `.env` to pin an exact version:
+
+```bash
+echo "PVARR_TAG=0.1.0" >> .env
+docker compose up -d
+```
+
+Rolling back is then a one-line edit. Unset it to follow `latest` again.
+
 ### CLI
 
 ```bash
@@ -289,7 +302,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-109 tests covering filename sanitisation and collision handling, storage
+178 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, freeze detection, FFmpeg command construction, and every HTTP route.
 

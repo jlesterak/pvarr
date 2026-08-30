@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSO
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from app import __version__
 from app.recorder import StreamFailoverRecorder
 from app.probe import probe_stream
 from app.naming import StorageManager, generate_sports_filename, probe_video_resolution
@@ -51,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PVArr - Personal Video Recorder",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
