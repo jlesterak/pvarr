@@ -28,7 +28,7 @@
   - `scripts/publish.sh` stages, commits, and provides exact GitHub remote attach + push commands
 
 ## Open Items (not blocking first push)
-- [ ] Add a `LICENSE` file — README currently states none is specified
+- [x] Add a `LICENSE` file — The Unlicense (public domain)
 - [ ] Automated test suite (none exists yet)
 - [ ] Quantified AI footprint figures — deliberately omitted; the build was not
       instrumented, so no measured token/energy/CO₂e/water numbers are available

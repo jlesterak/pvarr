@@ -42,7 +42,15 @@ Open <http://localhost:8999>.
 
 `start.sh` creates a `venv/`, installs `requirements.txt`, and serves on `${HOST:-0.0.0.0}:${PORT:-8999}`. Set `PVARR_NO_VENV=1` to skip virtualenv creation (this is what the container does).
 
-Requires **FFmpeg** on the host. Verify the app is up by loading the dashboard:
+### Requirements
+
+- **FFmpeg** — required. Does the actual recording.
+- **Python 3.8+** and the packages in `requirements.txt` (FastAPI, uvicorn, requests, jinja2).
+- **[hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy)** — *optional but recommended*. PVArr uses it as a dependency for fallback mode: when a direct FFmpeg connection fails because the upstream demands injected headers or has an expiring token, the recorder shells out to `hls-proxy` to bridge the stream, and to `detect-headers` to work out what those headers should be.
+
+  PVArr resolves both on `PATH` at runtime and degrades gracefully if they're absent — direct recording still works, but streams that need header injection will fail over instead of recovering. The provided `Dockerfile` installs both into the image automatically.
+
+Verify the app is up by loading the dashboard:
 
 ```bash
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8999/
@@ -69,7 +77,7 @@ Most HLS sources reject requests that don't carry the headers a browser would se
 
 ### 2. Auto-detection with `detect-headers`
 
-> **Note:** `detect-headers.sh` / `detect-headers-py.py` ship with the companion [hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy) project, not with PVArr. Run them from that checkout.
+> **Note:** `detect-headers.sh` / `detect-headers-py.py` come from [hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy) (see [Requirements](#requirements)), not from PVArr itself. Run them from that checkout, or from anywhere if they're on your `PATH`.
 
 ```bash
 ./detect-headers.sh "https://streaming-site.com/channel.php"
@@ -208,7 +216,7 @@ There is no automated test suite yet.
 
 ## License
 
-Not yet specified — add a `LICENSE` file before publishing if you intend this to be open source. Without one, default copyright applies and others have no right to use or redistribute the code.
+[The Unlicense](LICENSE) — public domain. Do whatever you want with it; no attribution required.
 
 ---
 
