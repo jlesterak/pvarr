@@ -41,13 +41,14 @@
 
 ## Closed by decision (not open work)
 - **Quantified AI footprint figures — will not add.** The build was never
-  instrumented: no token counts, inference wall-clock, or energy draw were
-  recorded while it happened, and providers do not publish per-token energy
-  for frontier models. Any gram-of-CO₂e or litre-of-water figure produced
-  now would be fabricated, which is exactly the failure mode a transparency
-  section exists to avoid. The README instead states what is unknown and why,
-  and notes that continuous 24/7 recording dominates the one-time build cost
-  regardless. Reopen only if real provider usage data becomes available.
+  instrumented, and providers do not publish per-token energy for frontier
+  models. Any gram-of-CO₂e or litre-of-water figure produced now would be
+  fabricated — exactly the failure mode a transparency section exists to
+  avoid. Reopen only if real provider usage data becomes available.
+- **Footprint section rewritten in an anarchist/luddite register** with
+  carbon-offset donation links (Cool Earth, Clean Air Task Force, Wren —
+  all three URLs verified live). The "we don't know and they won't say"
+  position is unchanged; only the voice moved.
 
 ## Genuinely still open
 - [ ] Integration tests for `app/server.py` routes (needs FastAPI `TestClient`)

@@ -238,36 +238,26 @@ bash -n start.sh scripts/publish.sh
 
 ## AI Genesis & Environmental Footprint
 
-### Origins
+This program was written by machines. Gemini drew the architecture, Claude wrote the code, a human pointed and reviewed. Stated plainly, because the industry mostly doesn't.
 
-PVArr was designed, architected, and implemented by large language models, with a human directing the work and reviewing output:
+The Luddites are misremembered as people who hated machines. They were skilled workers who broke the specific machines being used to break them. The question was never *machines or no machines* — it was *whose hands are on them, and who eats*. Same question here. These models were trained on an enormous pile of other people's work. Nobody asked, nobody paid. That's a debt, and it has no payment address.
 
-- **Google Gemini** — initial architecture, feature planning, and project structure.
-- **Anthropic Claude** — implementation, debugging, deployment assets, and documentation.
+**What it cost the planet: unknown, and not by accident.** Nobody metered this build, and the firms that could tell you what a token costs in watts and litres decline to publish it. "The cloud" is a shed full of hot metal in somebody's watershed. Treat any precise gram-of-CO₂ figure — including one that could easily have been invented right here — as marketing.
 
-The result is roughly **2,300 lines** across Python, Bash, HTML/CSS, and Docker configuration, built over a series of multi-turn sessions.
+What *is* knowable: the box you run this on draws power every hour of every year and will outweigh the one-time cost of writing it soon enough. PVArr remuxes instead of transcoding for exactly that reason. The lever is your hardware, not your guilt.
 
-### On the environmental footprint
+**Offsets are indulgences.** Buying one un-burns nothing, and the voluntary market is thick with fraud. If you want to send money anyway, send it where it does something structural:
 
-An honest accounting has to start with what is *not* known. This build was not instrumented — no token counts, wall-clock inference time, or energy draw were recorded while it happened. Providers also do not publish per-token energy figures for frontier models, and the actual cost depends on hardware generation, batching, datacenter PUE, and the carbon intensity and cooling design of whichever region served the requests. None of that is visible from the client side.
+- **[Cool Earth](https://www.coolearth.org)** — hands cash to forest communities to keep their land. No carbon accounting theatre.
+- **[Clean Air Task Force](https://www.catf.org)** — unglamorous policy work. Changes rules, not vibes.
+- **[Wren](https://www.wren.co)** — monthly subscription, the buy-me-a-coffee of climate guilt. Cheaper than the DVR subscription you just cancelled.
 
-So this section deliberately does **not** state a gram figure for CO₂e or a liter figure for water. Any such number produced after the fact would be invented, and a fabricated measurement is worse than an acknowledged unknown — particularly in a document meant to be a transparency disclosure.
+But the donate button is not the point. The point is that you now own a video recorder. No subscription, no account, no telemetry, nothing phoning home, nobody able to switch it off from a boardroom. That is one small thing clawed back out of the rental economy.
 
-What can be said with reasonable confidence about the *shape* of the cost:
-
-- A project of this size is on the order of a few hundred model requests, not millions. The inference energy is plausibly comparable to a modest household appliance running for a matter of hours — meaningfully greater than zero, and far below the footprint of the hardware this software runs on.
-- The **operational** footprint dominates the build footprint. A machine recording HLS streams continuously draws power every hour of every day, for years. Whatever the one-time generation cost was, continuous recording will exceed it quickly.
-- If you want the largest available lever on this project's actual impact, it is the recording host: right-size the disk, avoid needless transcoding (PVArr remuxes rather than re-encodes, which is deliberate), and don't leave captures running unwatched.
-
-Readers who want rigorous figures should consult primary sources on ML inference energy and datacenter water use rather than trusting an estimate reconstructed here.
-
-### Disclosure
-
-- The code was AI-generated and human-reviewed. Review it yourself before running it against anything you care about.
-- No personal data was used in generating this project.
-- No proprietary or black-box components are embedded in PVArr — the entire codebase is readable in this repository.
+Go do it again somewhere else.
 
 ---
 
-**Status:** Phase 3 complete — documentation and release preparation
+**Status:** Phase 4 complete — tested, licensed, published
 **Maintainer:** Stream Failover Studio
+**License:** [The Unlicense](LICENSE) — public domain
