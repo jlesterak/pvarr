@@ -181,6 +181,39 @@ async def get_system_status():
     }
 
 
+# Finished sessions are kept so the dashboard can show recent history, but not
+# forever: each holds a 500-line log buffer and candidate state.
+MAX_FINISHED_SESSIONS = 20
+
+
+def _prune_finished_sessions() -> None:
+    """Drop the oldest finished sessions once we exceed the retention cap.
+
+    Nothing else removes entries, so without this active_recorders grows for
+    the life of the process.
+    """
+    finished = [(rid, r) for rid, r in active_recorders.items() if not r.is_running]
+    excess = len(finished) - MAX_FINISHED_SESSIONS
+    if excess <= 0:
+        return
+    finished.sort(key=lambda kv: kv[1].stop_time or 0.0)
+    for rid, _ in finished[:excess]:
+        active_recorders.pop(rid, None)
+
+
+def _allocate_proxy_port(base: int = 8090) -> int:
+    """Lowest free proxy port among *running* sessions.
+
+    Deriving this from the total session count made the port climb for the
+    life of the process and never reuse a freed one.
+    """
+    used = {r.base_port for r in active_recorders.values() if r.is_running}
+    port = base
+    while port in used:
+        port += 2
+    return port
+
+
 @app.post("/api/recordings/start")
 async def start_recording(
     background_tasks: BackgroundTasks,
@@ -223,12 +256,17 @@ async def start_recording(
             status_code=400, detail=f"Could not prepare output directory: {exc}"
         )
 
-    port = 8090 + (len(active_recorders) * 2)
+    _prune_finished_sessions()
+    port = _allocate_proxy_port()
 
     def _on_complete(filepath):
         sz = round(Path(filepath).stat().st_size / (1024*1024), 2) if Path(filepath).exists() else 0
         notifier.notify_recording_finished(recording_id, Path(filepath).name, sz)
-        remux_recording(filepath, target_format="mp4", delete_source=True)
+        result = remux_recording(filepath, target_format="mp4", delete_source=True)
+        # Point the session at the remuxed file: the .ts it was recording to
+        # has just been deleted, so size and filename lookups would read 0.
+        if result.get("status") == "success" and result.get("output_filepath"):
+            recorder.final_filepath = Path(result["output_filepath"])
 
     def _on_failover(rec_id, next_name):
         notifier.notify_failover_triggered(rec_id, next_name)

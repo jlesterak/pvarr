@@ -186,11 +186,35 @@
   converting the routes to JSON body models would break the UI for no
   correctness gain. Added field-level validation and structured errors instead.
 
+## Phase 9: Session Lifecycle
+- [x] **Recorder now tracks the post-processed file.** `get_filesize_mb()` and
+      the status summary followed the original `.ts`, which post-processing
+      deletes, so a finished recording showed `0.0 MB` and a `.ts` filename
+      next to a perfectly good `.mp4`. `_on_complete` was discarding the remux
+      result entirely; it now records `final_filepath`. Verified end to end:
+      the dashboard reports `0.67 MB` and the `.mp4` name.
+
+- [x] **`active_recorders` was write-only — an unbounded leak.** Nothing ever
+      removed a finished session, so every recording stayed resident for the
+      life of the process, each holding a 500-line log buffer and candidate
+      state, and `/api/status` returned every session ever started. Finished
+      sessions are now pruned to the newest `MAX_FINISHED_SESSIONS` (20);
+      running sessions are never pruned.
+
+- [x] **Proxy port climbed forever.** `port = 8090 + len(active_recorders) * 2`
+      was derived from the *total* session count, so it rose monotonically and
+      never reused a freed slot — eventually running past the valid port range
+      on a long-lived server. Now allocates the lowest free port among
+      *running* sessions.
+
+### Investigated and closed — not a defect
+- **Tuner stream surviving post-processing.** Previously listed as an open bug
+  on the theory that deleting the `.ts` mid-stream would cut off an in-flight
+  client. It does not: the handler holds an open file descriptor, and POSIX
+  keeps it valid after unlink, so the client reads the recording through to
+  completion. Verified empirically. The earlier entry overstated the problem.
+
 ## Still open
-- [ ] `get_filesize_mb()` reports 0.0 once post-processing has remuxed and
-      deleted the source `.ts`, because it still points at the original path.
-      Cosmetic — the dashboard shows 0 MB for a finished recording that has a
-      perfectly good `.mp4` beside it.
-- [ ] Tuner stream is served from the recorder's output path; once
-      post-processing deletes the `.ts`, an in-flight client is cut off at the
-      end of the recording rather than transitioning to the remuxed file.
+- Nothing tracked. Next candidates if the project continues: a retention/cleanup
+  policy for old recordings on disk, and integration coverage for the
+  notification webhooks (currently only exercised via mocks).

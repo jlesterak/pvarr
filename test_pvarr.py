@@ -397,6 +397,29 @@ class TestRecorderConstruction(unittest.TestCase):
     def test_elapsed_is_zero_before_start(self):
         self.assertEqual(self._rec(["http://a/1.m3u8"]).get_elapsed_seconds(), 0.0)
 
+    def test_filesize_follows_the_post_processed_file(self):
+        # After remux the .ts is deleted; reading the old path reported 0 MB
+        # next to a perfectly good .mp4.
+        rec = self._rec(["http://a/1.m3u8"])
+        ts = Path(self.out)
+        ts.write_bytes(b"x" * 2048)
+        mp4 = ts.with_suffix(".mp4")
+        mp4.write_bytes(b"x" * (2 * 1024 * 1024))
+        ts.unlink()
+
+        self.assertEqual(rec.get_filesize_mb(), 0.0)  # .ts is gone
+        rec.final_filepath = mp4
+        self.assertAlmostEqual(rec.get_filesize_mb(), 2.0, places=1)
+
+    def test_status_summary_reports_the_post_processed_file(self):
+        rec = self._rec(["http://a/1.m3u8"])
+        mp4 = Path(self.out).with_suffix(".mp4")
+        mp4.write_bytes(b"x")
+        rec.final_filepath = mp4
+        summary = rec.get_status_summary()
+        self.assertTrue(summary["output_filename"].endswith(".mp4"))
+        self.assertEqual(summary["output_file"], str(mp4))
+
     def test_filesize_zero_when_absent(self):
         self.assertEqual(self._rec(["http://a/1.m3u8"]).get_filesize_mb(), 0.0)
 
@@ -1225,6 +1248,54 @@ class TestTunerStream(ServerTestCase):
         url = [l for l in m3u.splitlines() if l.startswith("http")][0]
         r = self.client.get(url.replace("http://testserver", ""))
         self.assertEqual(r.status_code, 200, f"tuner URL {url} is not routable")
+
+
+class TestSessionRetention(ServerTestCase):
+    """Nothing used to remove finished sessions, so the dict grew for the life
+    of the process and the proxy port climbed with it."""
+
+    def _session(self, rid, running, stop_time=0.0, base_port=8090):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = running
+        rec.stop_time = stop_time
+        rec.base_port = base_port
+        self.server.active_recorders[rid] = rec
+        return rec
+
+    def test_finished_sessions_are_capped(self):
+        for i in range(self.server.MAX_FINISHED_SESSIONS + 10):
+            self._session(f"old{i}", running=False, stop_time=float(i))
+        self.server._prune_finished_sessions()
+        self.assertEqual(len(self.server.active_recorders),
+                         self.server.MAX_FINISHED_SESSIONS)
+
+    def test_pruning_drops_the_oldest_first(self):
+        for i in range(self.server.MAX_FINISHED_SESSIONS + 3):
+            self._session(f"s{i}", running=False, stop_time=float(i))
+        self.server._prune_finished_sessions()
+        remaining = set(self.server.active_recorders)
+        self.assertNotIn("s0", remaining)
+        self.assertIn(f"s{self.server.MAX_FINISHED_SESSIONS + 2}", remaining)
+
+    def test_running_sessions_are_never_pruned(self):
+        for i in range(self.server.MAX_FINISHED_SESSIONS + 5):
+            self._session(f"done{i}", running=False, stop_time=float(i))
+        self._session("live", running=True)
+        self.server._prune_finished_sessions()
+        self.assertIn("live", self.server.active_recorders)
+
+    def test_proxy_port_reuses_freed_slots(self):
+        # Derived from the total count, this climbed forever and eventually
+        # ran past the valid port range.
+        self._session("a", running=True, base_port=8090)
+        self._session("b", running=False, base_port=8092)
+        self.assertEqual(self.server._allocate_proxy_port(), 8092)
+
+    def test_proxy_ports_do_not_collide_between_running_sessions(self):
+        self._session("a", running=True, base_port=8090)
+        self._session("b", running=True, base_port=8092)
+        self.assertEqual(self.server._allocate_proxy_port(), 8094)
 
 
 class TestShutdown(ServerTestCase):

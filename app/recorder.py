@@ -83,6 +83,9 @@ class StreamFailoverRecorder:
             if url and url.strip()
         ]
         self.output_filepath = Path(output_filepath).resolve()
+        # Set by the post-processor once the .ts has been remuxed. The original
+        # .ts is deleted at that point, so size/name lookups must follow here.
+        self.final_filepath: Optional[Path] = None
         self.base_port = base_port
         self.freeze_timeout_sec = freeze_timeout_sec
         self.log_callback = log_callback
@@ -461,9 +464,15 @@ class StreamFailoverRecorder:
         end = self.stop_time or time.time()
         return round(end - self.start_time, 1)
 
+    @property
+    def current_filepath(self) -> Path:
+        """The file that currently represents this recording on disk."""
+        return self.final_filepath or self.output_filepath
+
     def get_filesize_mb(self) -> float:
-        if self.output_filepath.exists():
-            return round(self.output_filepath.stat().st_size / (1024 * 1024), 2)
+        target = self.current_filepath
+        if target.exists():
+            return round(target.stat().st_size / (1024 * 1024), 2)
         return 0.0
 
     def get_status_summary(self) -> Dict[str, Any]:
@@ -471,8 +480,8 @@ class StreamFailoverRecorder:
             "id": self.recording_id,
             "status": self.status,
             "is_running": self.is_running,
-            "output_file": str(self.output_filepath),
-            "output_filename": self.output_filepath.name,
+            "output_file": str(self.current_filepath),
+            "output_filename": self.current_filepath.name,
             "filesize_mb": self.get_filesize_mb(),
             "bytes_written": self.bytes_written,
             "elapsed_seconds": self.get_elapsed_seconds(),
