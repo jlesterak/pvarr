@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Optional, List
 
-from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, APIRouter, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -23,7 +23,14 @@ from app.recorder import StreamFailoverRecorder
 from app.probe import probe_stream
 from app.naming import StorageManager, generate_sports_filename, probe_video_resolution
 from app.cleanup import register_signal_handlers
-from app.tuner import generate_m3u_playlist, generate_xmltv_epg
+from app.tuner import (
+    generate_m3u_playlist,
+    generate_xmltv_epg,
+    generate_discover,
+    generate_lineup,
+    generate_lineup_status,
+    generate_device_xml,
+)
 from app.notifications import NotificationManager
 from app.post_processor import remux_recording
 from app.logging_config import configure_logging
@@ -171,6 +178,68 @@ async def get_tuner_epg():
     active_sessions = [r.get_status_summary() for r in active_recorders.values()]
     xml_content = generate_xmltv_epg(active_sessions)
     return Response(content=xml_content, media_type="application/xml")
+
+# --------------------------------------------------------------------------
+# HDHomeRun tuner emulation
+#
+# Plex's Live TV setup probes a device address for these three files before it
+# will add a tuner; a 404 on any of them fails the whole flow. The router is
+# mounted twice so either `http://host:8999` or `http://host:8999/live` works
+# as the device address.
+# --------------------------------------------------------------------------
+hdhr = APIRouter(tags=["hdhomerun"])
+
+
+def _hdhr_base_url(request: Request) -> str:
+    """The address the client used, minus the file it asked for.
+
+    Derived from the request rather than the app root so the URLs PVArr
+    advertises come back to the same mount (and the same host header) the
+    media server actually reached us on.
+    """
+    return str(request.url).split("?")[0].rsplit("/", 1)[0]
+
+
+def _active_sessions() -> List[dict]:
+    return [r.get_status_summary() for r in active_recorders.values()]
+
+
+@hdhr.get("/discover.json")
+async def hdhr_discover(request: Request):
+    return JSONResponse(content=generate_discover(_hdhr_base_url(request)))
+
+
+@hdhr.get("/lineup_status.json")
+async def hdhr_lineup_status():
+    return JSONResponse(content=generate_lineup_status())
+
+
+@hdhr.get("/lineup.json")
+async def hdhr_lineup(request: Request):
+    return JSONResponse(
+        content=generate_lineup(_active_sessions(), str(request.base_url))
+    )
+
+
+@hdhr.get("/lineup.post")
+@hdhr.post("/lineup.post")
+async def hdhr_lineup_post():
+    """Channel-scan trigger. PVArr's lineup is always live, so this is a no-op
+    that must still answer 200 or Plex reports the scan as failed."""
+    return JSONResponse(content={})
+
+
+@hdhr.get("/device.xml")
+async def hdhr_device_xml(request: Request):
+    return Response(
+        content=generate_device_xml(_hdhr_base_url(request)),
+        media_type="application/xml",
+    )
+
+
+app.include_router(hdhr)
+app.include_router(hdhr, prefix="/live")
+
 
 @app.get("/api/status")
 async def get_system_status():

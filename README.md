@@ -19,7 +19,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
 - **Sports-friendly auto-naming** — derives readable filenames for broadcasts instead of opaque timestamps.
 - **Automatic post-processing** — remuxes the recorded TS into MKV/MP4 on completion. Container change only, no transcode.
-- **Virtual IPTV / M3U tuner endpoints** — serves an M3U playlist and XMLTV EPG so Plex Live TV and Emby DVR can consume active recordings as channels.
+- **Virtual tuner** — emulates a HDHomeRun for Plex Live TV and serves an M3U playlist plus XMLTV EPG for Emby/Jellyfin, so active recordings appear as channels.
 - **Discord & Telegram webhooks** — notifications on recording start, completion, and failure.
 - **Modern *arr dark UI** — a dashboard in the style of Sonarr/Radarr for starting recordings, watching failover state, tailing logs, and managing the library.
 
@@ -197,6 +197,8 @@ All configuration is environment-based; recordings are configured per-job from t
 | `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
 | `TELEGRAM_BOT_TOKEN` | unset | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | unset | Telegram destination chat |
+| `PVARR_DEVICE_ID` | derived from hostname | 8-hex-digit HDHomeRun device id Plex keys the DVR off. Set it to pin the id across hosts. |
+| `PVARR_TUNER_COUNT` | `4` | Concurrent tuners advertised to Plex |
 | `PLEX_URL` | unset | Plex server URL for library refresh |
 | `PLEX_TOKEN` | unset | Plex auth token |
 | `EMBY_URL` | unset | Emby server URL for library refresh |
@@ -227,6 +229,7 @@ and mounts `./recordings` there.
 | `GET` | `/api/library/download/{filename}` | Download a recording |
 | `GET` | `/live/playlist.m3u` · `/live/playlist.m3u8` | M3U tuner playlist |
 | `GET` | `/live/epg.xml` | XMLTV EPG |
+| `GET` | `/discover.json` · `/lineup.json` · `/lineup_status.json` · `/lineup.post` · `/device.xml` | HDHomeRun tuner emulation, also served under `/live` |
 
 Interactive docs are available at `/docs` (FastAPI).
 
@@ -236,7 +239,15 @@ Interactive docs are available at `/docs` (FastAPI).
 
 PVArr exposes active recordings as a virtual tuner.
 
-1. In Plex or Emby, add a **Live TV / DVR** source of type **M3U Tuner**.
+**Plex (HDHomeRun — recommended).** Plex discovers PVArr as a tuner device:
+
+1. **Settings → Live TV & DVR → Set up Plex DVR**, then *Don't see your HDHomeRun? Enter its network address manually*.
+2. Device address: `http://<pvarr-host>:8999` — the **base URL, with no path**. Pasting the playlist URL here fails: Plex appends `/discover.json` to whatever you type and gets a 404.
+3. When asked for a guide, choose **Have an XMLTV guide on your server?** and enter `http://<pvarr-host>:8999/live/epg.xml`.
+
+**M3U tuner (Emby, Jellyfin, Plex's M3U path).**
+
+1. Add a **Live TV / DVR** source of type **M3U Tuner**.
 2. Playlist URL: `http://<pvarr-host>:8999/live/playlist.m3u`
 3. EPG / XMLTV URL: `http://<pvarr-host>:8999/live/epg.xml`
 
@@ -285,6 +296,10 @@ app/
 **`403` from the upstream.** A required header is missing. Re-run the URL through `POST /api/probe` (or just re-paste it into Add Recording) — the message names the status the origin returned. If the probe reports *segments rejected*, the stream is session gated: copy the `Cookie` request header from DevTools into the manual header fields.
 
 **Tuner doesn't appear in Plex/Emby.** Confirm the media server can reach PVArr (`curl http://<pvarr-host>:8999/live/playlist.m3u`). The playlist is empty when nothing is recording — start a recording first.
+
+**Plex says it can't find a tuner, and the PVArr log shows `404` on `discover.json` / `lineup.json`.** The device address includes a path. Plex appends its own filenames to whatever you enter, so `.../live/playlist.m3u` is probed as `.../live/playlist.m3u/discover.json`. Enter `http://<pvarr-host>:8999` (or `http://<pvarr-host>:8999/live`) instead.
+
+**Plex tunes a channel but the guide is empty.** The XMLTV URL is separate from the device address — add `http://<pvarr-host>:8999/live/epg.xml` as the guide, then run a channel scan.
 
 **FFmpeg not found.** Install it (`apt install ffmpeg`, `brew install ffmpeg`). The container already includes it.
 

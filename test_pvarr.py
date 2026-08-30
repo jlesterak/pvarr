@@ -287,6 +287,56 @@ class TestTuner(unittest.TestCase):
         self.assertEqual(root.tag, "tv")
         self.assertEqual(len(root.findall("channel")), 2)  # running only
 
+    def test_channel_numbers_are_stable_across_calls(self):
+        # Plex remembers a channel by its number; renumbering live channels on
+        # a rescan shuffles the guide underneath it.
+        first = tuner.assign_channel_numbers(self.sessions)
+        second = tuner.assign_channel_numbers(self.sessions)
+        self.assertEqual(first, second)
+
+    def test_channel_numbers_cover_running_sessions_only(self):
+        numbers = tuner.assign_channel_numbers(self.sessions)
+        self.assertEqual(set(numbers), {"rec1", "rec3"})
+
+    def test_channel_numbers_are_released_when_a_session_stops(self):
+        # Otherwise the registry grows for the life of the process.
+        tuner.assign_channel_numbers(self.sessions)
+        numbers = tuner.assign_channel_numbers(
+            [{"id": "rec9", "output_filename": "g.ts", "is_running": True}]
+        )
+        self.assertEqual(numbers, {"rec9": tuner.FIRST_CHANNEL_NUMBER})
+
+    def test_lineup_guide_numbers_appear_in_the_epg(self):
+        # This is how Plex maps XMLTV guide data onto a HDHomeRun lineup.
+        import xml.etree.ElementTree as ET
+        lineup = tuner.generate_lineup(self.sessions, "http://host:8999")
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines()
+                         if not l.startswith("<!DOCTYPE"))
+        names = {n.text for n in ET.fromstring(body).iter("display-name")}
+        for entry in lineup:
+            self.assertIn(entry["GuideNumber"], names)
+
+    def test_lineup_excludes_stopped_sessions(self):
+        names = {e["GuideName"] for e in
+                 tuner.generate_lineup(self.sessions, "http://host:8999")}
+        self.assertEqual(names, {"game1", "game3"})
+
+    def test_discover_lineup_url_matches_the_base(self):
+        d = tuner.generate_discover("http://host:8999/live/")
+        self.assertEqual(d["LineupURL"], "http://host:8999/live/lineup.json")
+        self.assertEqual(d["BaseURL"], "http://host:8999/live")
+
+    def test_device_id_override(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_DEVICE_ID": "abc123"}):
+            self.assertEqual(tuner.device_id(), "00ABC123")
+
+    def test_tuner_count_falls_back_on_junk(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_TUNER_COUNT": "lots"}):
+            self.assertEqual(tuner.tuner_count(), 4)
+
     def test_epg_empty_is_wellformed(self):
         import xml.etree.ElementTree as ET
         xml = tuner.generate_xmltv_epg([])
@@ -1047,6 +1097,83 @@ class TestTunerRoutes(ServerTestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.headers["content-type"], "application/xml")
         self.assertIn("<tv", r.text)
+
+
+class TestHDHomeRunRoutes(ServerTestCase):
+    """Plex's Live TV setup probes a device address for these files before it
+    will add a tuner. They 404'd, so the whole add-device flow failed."""
+
+    def _add_session(self, rid="rec1", name="Game 1.ts"):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.get_status_summary.return_value = {
+            "id": rid, "output_filename": name, "is_running": True,
+            "started_at": 1756000000.0,
+        }
+        self.server.active_recorders[rid] = rec
+        return rec
+
+    def test_probe_paths_answer_at_both_mounts(self):
+        # Plex appends these to whatever address the user typed, so the root
+        # and the /live prefix both have to serve them.
+        for prefix in ("", "/live"):
+            for name in ("discover.json", "lineup_status.json", "lineup.json"):
+                with self.subTest(path=f"{prefix}/{name}"):
+                    r = self.client.get(f"{prefix}/{name}")
+                    self.assertEqual(r.status_code, 200)
+
+    def test_discover_advertises_a_reachable_lineup_url(self):
+        r = self.client.get("/live/discover.json").json()
+        self.assertTrue(r["LineupURL"].endswith("/live/lineup.json"))
+        follow = self.client.get(r["LineupURL"].replace("http://testserver", ""))
+        self.assertEqual(follow.status_code, 200)
+
+    def test_discover_device_id_is_stable(self):
+        first = self.client.get("/discover.json").json()["DeviceID"]
+        second = self.client.get("/discover.json").json()["DeviceID"]
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"^[0-9A-F]{8}$")
+
+    def test_lineup_lists_running_recordings(self):
+        self._add_session()
+        entry = self.client.get("/lineup.json").json()[0]
+        self.assertEqual(entry["GuideName"], "Game 1")
+        self.assertEqual(entry["URL"],
+                         "http://testserver/api/recordings/rec1/stream")
+
+    def test_lineup_urls_are_routable(self):
+        # The same regression as the M3U: a lineup pointing at a 404 gives
+        # Plex channels that will not tune.
+        path = Path(self.tmp) / "live.ts"
+        path.write_bytes(b"\x47data")
+        rec = self._add_session()
+        rec.output_filepath = path
+        url = self.client.get("/lineup.json").json()[0]["URL"]
+        # Fetch it as a finished recording: a running one tails the file and
+        # the request would never return.
+        rec.is_running = False
+        r = self.client.get(url.replace("http://testserver", ""))
+        self.assertEqual(r.status_code, 200, f"lineup URL {url} is not routable")
+
+    def test_empty_lineup_is_still_a_json_array(self):
+        self.assertEqual(self.client.get("/lineup.json").json(), [])
+
+    def test_lineup_status_reports_no_scan_running(self):
+        self.assertEqual(
+            self.client.get("/lineup_status.json").json()["ScanInProgress"], 0
+        )
+
+    def test_lineup_post_scan_trigger_succeeds(self):
+        for method in (self.client.get, self.client.post):
+            with self.subTest(method=method):
+                self.assertEqual(method("/lineup.post").status_code, 200)
+
+    def test_device_xml_is_wellformed(self):
+        import xml.etree.ElementTree as ET
+        r = self.client.get("/device.xml")
+        self.assertEqual(r.headers["content-type"], "application/xml")
+        ET.fromstring(r.text)
 
 
 class TestRecordingRoutes(ServerTestCase):
