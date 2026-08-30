@@ -1,0 +1,4 @@
+# Test-only dependencies. Not needed to run PVArr.
+#   pip install -r requirements-dev.txt
+-r requirements.txt
+httpx>=0.24.0          # required by fastapi.testclient.TestClient

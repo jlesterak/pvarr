@@ -123,6 +123,7 @@ All configuration is environment-based; recordings are configured per-job from t
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8999` | HTTP port |
 | `PVARR_NO_VENV` | unset | Set to `1` to skip virtualenv creation in `start.sh` (used in-container) |
+| `PVARR_ALLOWED_DIRS` | unset | Extra directories the library API may read/delete in, `:`-separated. By default only `recordings/` is reachable — set this if you record to a custom `output_dir` and want it visible in the library. |
 | `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
 | `TELEGRAM_BOT_TOKEN` | unset | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | unset | Telegram destination chat |
@@ -208,18 +209,19 @@ app/
 ### Tests
 
 ```bash
-python3 test_pvarr.py               # full suite, verbose
-python3 -m unittest discover        # quiet
+pip install -r requirements-dev.txt   # adds httpx, needed for route tests
+python3 test_pvarr.py                 # full suite, verbose
+python3 -m unittest discover          # quiet
 ```
 
-58 tests covering filename sanitisation and collision handling, storage
-operations, M3U/XMLTV generation, dependency resolution, failover candidate
-parsing, and FFmpeg command construction. Stdlib `unittest` only — no extra
-dependencies.
+109 tests covering filename sanitisation and collision handling, storage
+operations, M3U/XMLTV generation, dependency resolution, the failover state
+machine, freeze detection, FFmpeg command construction, and every HTTP route.
 
-Most tests spawn no subprocesses. Two exercise a real remux end to end by
-encoding a one-second transport stream; they skip automatically when FFmpeg
-is not installed.
+Most spawn no subprocesses — the recorder tests drive the real loop against
+scripted fakes. Two exercise a real remux by encoding a one-second transport
+stream and skip when FFmpeg is absent; the route tests skip when `httpx` is
+absent, so the core suite still runs with only `requirements.txt` installed.
 
 ### Syntax checks
 

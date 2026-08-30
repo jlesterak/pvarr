@@ -777,5 +777,262 @@ class TestFreezeDetection(unittest.TestCase):
                          "stall should still be counted against the candidate")
 
 
+# --------------------------------------------------------------------------
+# app.server  —  route integration tests
+#
+# Needs httpx (fastapi.testclient). Install with:
+#     pip install -r requirements-dev.txt
+# The whole group skips cleanly when it is absent so the core suite still runs.
+# --------------------------------------------------------------------------
+try:
+    from fastapi.testclient import TestClient
+    HAS_TESTCLIENT = True
+except Exception:
+    HAS_TESTCLIENT = False
+
+
+@unittest.skipUnless(HAS_TESTCLIENT, "httpx not installed (see requirements-dev.txt)")
+class ServerTestCase(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        from app import server
+        from app.naming import StorageManager
+
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.server = server
+        # Point the module-level storage at a scratch dir so tests never touch
+        # the developer's real recordings/.
+        self._storage_patch = patch.object(
+            server, "storage", StorageManager(self.tmp)
+        )
+        self._storage_patch.start()
+        self._recorders_patch = patch.object(server, "active_recorders", {})
+        self._recorders_patch.start()
+        self._dir_patch = patch.object(server, "RECORDINGS_DIR", Path(self.tmp))
+        self._dir_patch.start()
+        self.client = TestClient(server.app)
+
+    def tearDown(self):
+        self._storage_patch.stop()
+        self._recorders_patch.stop()
+        self._dir_patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class TestStaticRoutes(ServerTestCase):
+    def test_dashboard_renders(self):
+        r = self.client.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/html", r.headers["content-type"])
+
+    def test_favicon(self):
+        r = self.client.get("/favicon.ico")
+        self.assertIn(r.status_code, (200, 204))
+
+    def test_openapi_docs_available(self):
+        self.assertEqual(self.client.get("/openapi.json").status_code, 200)
+
+
+class TestTunerRoutes(ServerTestCase):
+    def test_m3u_both_extensions(self):
+        for path in ("/live/playlist.m3u", "/live/playlist.m3u8"):
+            with self.subTest(path=path):
+                r = self.client.get(path)
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.headers["content-type"], "application/x-mpegurl")
+                self.assertTrue(r.text.startswith("#EXTM3U"))
+
+    def test_epg_is_xml(self):
+        r = self.client.get("/live/epg.xml")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "application/xml")
+        self.assertIn("<tv", r.text)
+
+
+class TestRecordingRoutes(ServerTestCase):
+    def test_start_requires_a_url(self):
+        r = self.client.post("/api/recordings/start", data={"sport": "NFL"})
+        self.assertEqual(r.status_code, 422)  # missing required form field
+
+    def test_start_rejects_blank_url(self):
+        r = self.client.post("/api/recordings/start", data={"url_primary": "   "})
+        self.assertEqual(r.status_code, 400)
+
+    def test_stop_unknown_session_404s(self):
+        r = self.client.post("/api/recordings/nope/stop")
+        self.assertEqual(r.status_code, 404)
+
+    def test_failover_unknown_session_404s(self):
+        r = self.client.post("/api/recordings/nope/failover")
+        self.assertEqual(r.status_code, 404)
+
+    def test_logs_unknown_session_404s(self):
+        r = self.client.get("/api/recordings/nope/logs")
+        self.assertEqual(r.status_code, 404)
+
+    def test_failover_on_stopped_session_400s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = False
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/failover")
+        self.assertEqual(r.status_code, 400)
+        rec.force_failover.assert_not_called()
+
+    def test_failover_on_running_session_calls_recorder(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/failover")
+        self.assertEqual(r.status_code, 200)
+        rec.force_failover.assert_called_once()
+
+    def test_stop_calls_recorder_stop(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/stop")
+        self.assertEqual(r.status_code, 200)
+        rec.stop.assert_called_once()
+
+    def test_start_registers_session_without_spawning_ffmpeg(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {"id": "x"}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        fake.start_recording.assert_called_once()
+        self.assertEqual(len(self.server.active_recorders), 1)
+
+    def test_start_passes_all_three_candidates_in_order(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor, \
+             patch.object(self.server, "notifier", MagicMock()):
+            self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8",
+                "url_backup1": "",                       # blank middle field
+                "url_backup2": "http://c/3.m3u8",
+            })
+        candidates = ctor.call_args.kwargs["candidates"]
+        self.assertEqual(candidates, ["http://a/1.m3u8", "http://c/3.m3u8"])
+
+
+class TestLibraryRoutes(ServerTestCase):
+    def test_library_lists_recordings(self):
+        (Path(self.tmp) / "game.ts").write_bytes(b"x" * 1024)
+        r = self.client.get("/api/library")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual([i["filename"] for i in r.json()["library"]], ["game.ts"])
+
+    def test_rename(self):
+        (Path(self.tmp) / "old.ts").write_bytes(b"x")
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": "old.ts", "new_name": "new.ts"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue((Path(self.tmp) / "new.ts").exists())
+
+    def test_rename_missing_file_400s(self):
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": "ghost.ts", "new_name": "new.ts"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_delete(self):
+        (Path(self.tmp) / "game.ts").write_bytes(b"x")
+        r = self.client.request("DELETE", "/api/library/game.ts")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse((Path(self.tmp) / "game.ts").exists())
+
+    def test_delete_missing_404s(self):
+        self.assertEqual(
+            self.client.request("DELETE", "/api/library/ghost.ts").status_code, 404
+        )
+
+    def test_download_missing_404s(self):
+        self.assertEqual(
+            self.client.get("/api/library/download/ghost.ts").status_code, 404
+        )
+
+    def test_download_serves_file(self):
+        (Path(self.tmp) / "game.ts").write_bytes(b"payload")
+        r = self.client.get("/api/library/download/game.ts")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"payload")
+
+
+class TestMissingStatusRoute(ServerTestCase):
+    def test_api_status_is_registered(self):
+        # The dashboard polls /api/status on a timer to refresh active
+        # sessions. get_system_status() exists in server.py but has no route
+        # decorator, so the poll 404s and the UI never updates.
+        r = self.client.get("/api/status")
+        self.assertEqual(r.status_code, 200,
+                         "/api/status is not routed; dashboard polling is dead")
+        body = r.json()
+        for key in ("active_count", "total_sessions", "sessions"):
+            self.assertIn(key, body)
+
+
+class TestPathHandling(ServerTestCase):
+    """Directory-escape guards.
+
+    None of these endpoints are authenticated, so an unconstrained dir_path
+    turned the library API into arbitrary file read and delete for anyone who
+    could reach the port. All three of these failed before the fix.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.outside = tempfile.mkdtemp(prefix="pvarr-outside-")
+        self.secret = Path(self.outside) / "secret.txt"
+        self.secret.write_bytes(b"SENSITIVE")
+
+    def tearDown(self):
+        shutil.rmtree(self.outside, ignore_errors=True)
+        super().tearDown()
+
+    def test_download_refuses_dir_path_outside_allowlist(self):
+        r = self.client.get(
+            f"/api/library/download/secret.txt?dir_path={self.outside}"
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertNotIn(b"SENSITIVE", r.content)
+
+    def test_delete_refuses_dir_path_outside_allowlist(self):
+        r = self.client.request(
+            "DELETE", f"/api/library/secret.txt?dir_path={self.outside}"
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(self.secret.exists(), "file outside allowlist was deleted")
+
+    def test_list_refuses_dir_path_outside_allowlist(self):
+        self.assertEqual(
+            self.client.get(f"/api/library?dir_path={self.outside}").status_code, 403
+        )
+
+    def test_rename_refuses_filename_with_directory_component(self):
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": "../x.ts", "new_name": "y.ts"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_allowlist_env_var_permits_extra_dirs(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_ALLOWED_DIRS": self.outside}):
+            r = self.client.get(
+                f"/api/library/download/secret.txt?dir_path={self.outside}"
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"SENSITIVE")
+
+    def test_download_rejects_dotdot_traversal(self):
+        r = self.client.get("/api/library/download/..%2F..%2Fetc%2Fpasswd")
+        self.assertNotEqual(r.status_code, 200, "path traversal via %2F succeeded")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

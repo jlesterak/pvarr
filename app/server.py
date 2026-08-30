@@ -6,6 +6,7 @@ Provides REST API & SSE streaming endpoints for multi-stream failover recording 
 
 import asyncio
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -40,6 +41,49 @@ active_recorders: Dict[str, StreamFailoverRecorder] = {}
 # Register SIGINT / SIGTERM handlers for container & process safety
 register_signal_handlers(active_recorders)
 
+
+
+def _allowed_library_dirs():
+    """Directories the library API may touch.
+
+    RECORDINGS_DIR always, plus anything listed in PVARR_ALLOWED_DIRS
+    (os.pathsep-separated). Without this allowlist a caller could pass any
+    absolute path as ?dir_path= and read or delete arbitrary files, since
+    none of these endpoints are authenticated.
+    """
+    dirs = [RECORDINGS_DIR.resolve()]
+    for raw in os.environ.get("PVARR_ALLOWED_DIRS", "").split(os.pathsep):
+        if raw.strip():
+            try:
+                dirs.append(Path(raw.strip()).resolve())
+            except Exception:
+                pass
+    return dirs
+
+
+def _resolve_library_dir(dir_path: Optional[str]) -> Path:
+    """Resolve a caller-supplied dir_path, refusing anything outside the allowlist."""
+    if not dir_path:
+        return RECORDINGS_DIR.resolve()
+    try:
+        candidate = Path(dir_path).resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid dir_path")
+    for allowed in _allowed_library_dirs():
+        if candidate == allowed or allowed in candidate.parents:
+            return candidate
+    raise HTTPException(
+        status_code=403,
+        detail="dir_path is outside the permitted recording directories",
+    )
+
+
+def _safe_filename(filename: str) -> str:
+    """Reject any filename carrying a directory component."""
+    name = Path(filename).name
+    if not name or name in (".", "..") or name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return name
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -85,6 +129,7 @@ async def get_tuner_epg():
     xml_content = generate_xmltv_epg(active_sessions)
     return Response(content=xml_content, media_type="application/xml")
 
+@app.get("/api/status")
 async def get_system_status():
     """Return JSON summary of all active recorders."""
     sessions = [r.get_status_summary() for r in active_recorders.values()]
@@ -207,14 +252,17 @@ async def stream_logs(recording_id: str):
 @app.get("/api/library")
 async def list_library(dir_path: Optional[str] = None):
     """List completed recordings in library."""
-    items = storage.list_recordings(dir_path)
+    items = storage.list_recordings(str(_resolve_library_dir(dir_path)))
     return {"library": items}
 
 
 @app.post("/api/library/rename")
 async def rename_file(old_name: str = Form(...), new_name: str = Form(...), dir_path: Optional[str] = Form(None)):
     """Rename a recording file in library."""
-    success = storage.rename_recording(old_name, new_name, dir_path)
+    success = storage.rename_recording(
+        _safe_filename(old_name), _safe_filename(new_name),
+        str(_resolve_library_dir(dir_path)),
+    )
     if not success:
         raise HTTPException(status_code=400, detail="Rename failed. File might not exist or target name already exists.")
     return {"status": "success", "message": f"Renamed {old_name} to {new_name}"}
@@ -223,7 +271,9 @@ async def rename_file(old_name: str = Form(...), new_name: str = Form(...), dir_
 @app.delete("/api/library/{filename}")
 async def delete_file(filename: str, dir_path: Optional[str] = None):
     """Delete a recording file from library."""
-    success = storage.delete_recording(filename, dir_path)
+    success = storage.delete_recording(
+        _safe_filename(filename), str(_resolve_library_dir(dir_path))
+    )
     if not success:
         raise HTTPException(status_code=404, detail="File not found")
     return {"status": "success", "message": f"Deleted {filename}"}
@@ -232,7 +282,8 @@ async def delete_file(filename: str, dir_path: Optional[str] = None):
 @app.get("/api/library/download/{filename}")
 async def download_file(filename: str, dir_path: Optional[str] = None):
     """Download or stream recording file."""
-    target_dir = Path(dir_path).resolve() if dir_path else RECORDINGS_DIR
+    target_dir = _resolve_library_dir(dir_path)
+    filename = _safe_filename(filename)
     file_path = target_dir / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")

@@ -79,5 +79,28 @@
       `failed` despite having captured almost everything. Current behaviour is
       pinned by `TestFreezeDetection.test_mid_stream_freeze_after_data_reports_success`.
 
-## Genuinely still open
-- [ ] Integration tests for `app/server.py` routes (needs FastAPI `TestClient`)
+## Phase 6: Route Coverage & Path Containment
+- [x] **Route integration tests** — 26 tests over every endpoint via FastAPI
+      `TestClient`. Dev-only dep (`httpx`) in `requirements-dev.txt`; the group
+      skips cleanly when absent so the core suite needs nothing extra.
+
+- [x] **BUG FIX: `/api/status` was never routed (`server.py`)**
+      `get_system_status()` was defined without an `@app.get` decorator. The
+      dashboard polls `/api/status` on a timer to refresh active sessions, so
+      the poll 404'd and the UI never updated during a recording.
+
+- [x] **SECURITY FIX: unauthenticated arbitrary file read/delete (`server.py`)**
+      `?dir_path=` was passed straight through to the library endpoints with no
+      containment, so `GET /api/library/download/passwd?dir_path=/etc` served
+      the file and `DELETE` removed it. No endpoint requires auth, so this was
+      reachable by anyone who could reach port 8999. Now constrained to
+      `recordings/` plus `PVARR_ALLOWED_DIRS`; filenames carrying a directory
+      component are rejected outright.
+
+## Still open
+- [ ] **No authentication on any endpoint.** Anyone who can reach the port can
+      start, stop, and delete recordings. Fine on a trusted LAN, not fine if
+      exposed. Wants at minimum a shared-secret header or basic auth before
+      anyone puts this behind a public reverse proxy.
+- [ ] `_stream_ffmpeg_process` has no test for the partial-write path where
+      FFmpeg exits non-zero *after* writing data.
