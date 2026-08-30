@@ -56,7 +56,7 @@ On a machine doing real recording you probably want upgrades to be deliberate â€
 set `PVARR_TAG` in `.env` to pin an exact version:
 
 ```bash
-echo "PVARR_TAG=0.1.0" >> .env
+echo "PVARR_TAG=0.1.1" >> .env
 docker compose up -d
 ```
 
