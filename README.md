@@ -1,323 +1,249 @@
 # PVArr — Personal Video Recorder for the *arr Ecosystem
 
-> **🤖 AI Transparency Notice:** PVArr was architected and built by AI (Google Gemini and Anthropic Claude) across multi-turn LLM inference sessions. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint) for full details.
+> **🤖 AI Transparency Notice:** PVArr was designed, architected, and built by AI — Google Gemini (architecture) and Anthropic Claude (implementation) — across multiple LLM sessions with a human in the loop. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint).
 
-**Default Port:** 8999
+**Default port:** 8999
 
 ---
 
 ## What is PVArr?
 
-PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two backup URLs, and it records continuously—24/7 sports, news, live events, whatever. It's a self-hosted DVR. No subscriptions, no cloud, no third-party apps.
+PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two backup URLs, and it records continuously — 24/7 sports, news, live events, whatever. It's a self-hosted DVR. No subscriptions, no cloud, no third-party apps.
 
 ---
 
 ## Features
 
-- **3-Stage Failover** — Primary m3u8 URL with automatic fallback to two backup URLs if the stream drops. Seamless switching, zero manual intervention.
-- **Direct FFmpeg Recording** — Low-overhead direct-to-disk streaming. Falls back to hls-proxy-stream bridge if headers/tokens are required.
-- **Sports-Friendly Auto-Naming** — Smart file naming for sports broadcasts: `ESPN_Monday_Night_Football_2025-08-29.ts`
-- **Automatic Post-Processing** — Remux TS to MKV/MP4 on completion. No transcoding overhead, just container conversion.
-- **Virtual IPTV/M3U Tuner Endpoints** — Plex/Emby native tuner support. Expose recordings as live channels via `/playlist.m3u` and `/channel/<slug>` endpoints.
-- **Discord & Telegram Webhooks** — Real-time notifications: recording start, completion, failures.
-- **Modern Dark UI** — Inspired by the *arr stack (Sonarr/Radarr/Lidarr). Manage channels, configure failover, monitor active recordings, and view post-processing status at a glance.
-
----
-
-## Finding Your Stream URL
-
-Most HLS streams require specific HTTP headers (User-Agent, Referer, Cookie) that generic tools don't send. Here's how to extract them:
-
-### Method 1: Browser Network Inspector
-
-1. Open the streaming site in your browser (Chrome/Firefox/Safari).
-2. Press **F12** to open Developer Tools.
-3. Go to the **Network** tab.
-4. Refresh the page or start playback.
-5. Filter for `m3u8` (type the word in the filter box).
-6. Click the `.m3u8` request and note:
-   - **URL** (the m3u8 link itself)
-   - **Referer** (the page that requested it, shown in Request Headers)
-   - **User-Agent** (also in Request Headers)
-7. Copy these into PVArr's dashboard or channel config.
-
-### Method 2: Auto-Detection
-
-If the site is straightforward (no JavaScript rendering), use the included `detect-headers` tool:
-
-```bash
-./detect-headers.sh "https://streaming-site.com/channel.php"
-```
-
-For JavaScript-heavy sites (React, Vue, etc.), use the Python variant with Playwright:
-
-```bash
-./detect-headers-py.py "https://streaming-site.com/channel.php" --browser
-```
-
-Both tools will output the required headers and suggest a way to add the channel to PVArr.
-
-### Method 3: Manual Header Testing
-
-Before adding a channel to PVArr, verify the headers work with `curl`:
-
-```bash
-curl -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-     -H "Referer: https://streaming-site.com/" \
-     "https://cdn.example.com/hls/stream.m3u8?token=xyz" \
-     -o test.m3u8
-```
-
-If you get a valid m3u8 file (not a 403 Forbidden or error page), the headers are correct.
-
-### Common Patterns
-
-- **Referer-only** — Most sites. Set Referer to the embed page URL.
-- **User-Agent + Referer** — Sports streaming (ESPN, FuboTV clones). Both required.
-- **Cookie-based** — Less common. Cookies are sent automatically by browsers; if `curl` fails, you may need to extract session cookies from `curl -b` (see curl docs).
-- **Token in URL** — Many CDNs embed short-lived tokens in the m3u8 URL itself. PVArr refreshes these via the scrape cache on every fetch, so tokens never expire from the client's perspective.
-
-Once you have the URL and headers, add the channel in the PVArr web UI or via `channels.conf`:
-
-```conf
-sports-game|Sunday Game|100|https://logo.png|Sports|https://cdn.example.com/hls/stream.m3u8|literal|https://streaming-site.com/|
-```
+- **3-stage failover** — a primary m3u8 URL plus two backups. If the active stream stalls or dies, the recorder advances to the next candidate automatically. Failover can also be forced manually from the dashboard.
+- **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
+- **Sports-friendly auto-naming** — derives readable filenames for broadcasts instead of opaque timestamps.
+- **Automatic post-processing** — remuxes the recorded TS into MKV/MP4 on completion. Container change only, no transcode.
+- **Virtual IPTV / M3U tuner endpoints** — serves an M3U playlist and XMLTV EPG so Plex Live TV and Emby DVR can consume active recordings as channels.
+- **Discord & Telegram webhooks** — notifications on recording start, completion, and failure.
+- **Modern *arr dark UI** — a dashboard in the style of Sonarr/Radarr for starting recordings, watching failover state, tailing logs, and managing the library.
 
 ---
 
 ## Quick Start
 
-### Docker Compose (Recommended)
+### Docker Compose
 
 ```bash
 docker-compose up -d
 ```
 
-Then open `http://localhost:8999` and start adding channels.
+Open <http://localhost:8999>.
 
-See `docker-compose.yml` for configuration options (volume mounts, env vars, port bindings).
-
-### CLI / Local Setup
+### CLI
 
 ```bash
-cp channels.conf.example channels.conf    # Edit with your stream URLs
 ./start.sh
 ```
 
-The proxy will bind to `http://127.0.0.1:8999` by default.
+`start.sh` creates a `venv/`, installs `requirements.txt`, and serves on `${HOST:-0.0.0.0}:${PORT:-8999}`. Set `PVARR_NO_VENV=1` to skip virtualenv creation (this is what the container does).
 
-Verify it's working:
+Requires **FFmpeg** on the host. Verify the app is up by loading the dashboard:
 
 ```bash
-curl http://127.0.0.1:8999/health
-curl http://127.0.0.1:8999/playlist.m3u
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8999/
 ```
+
+---
+
+## Finding Your Stream URL
+
+Most HLS sources reject requests that don't carry the headers a browser would send — usually `Referer` and `User-Agent` — and many embed a short-lived token in the m3u8 URL itself. Here's how to get what you need.
+
+### 1. Browser DevTools (works everywhere)
+
+1. Open the streaming page in your browser.
+2. Press **F12** to open DevTools.
+3. Select the **Network** tab.
+4. Reload the page, then start playback.
+5. Type `m3u8` in the filter box.
+6. Click the `.m3u8` request. From the **Headers** panel, record:
+   - **Request URL** — the m3u8 itself
+   - **Referer** — under Request Headers
+   - **User-Agent** — under Request Headers
+7. If you see several m3u8 files, the first is usually the master playlist and the others are variants. Prefer the master.
+
+### 2. Auto-detection with `detect-headers`
+
+> **Note:** `detect-headers.sh` / `detect-headers-py.py` ship with the companion [hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy) project, not with PVArr. Run them from that checkout.
+
+```bash
+./detect-headers.sh "https://streaming-site.com/channel.php"
+```
+
+For pages that build the m3u8 in JavaScript, use the Playwright-backed variant:
+
+```bash
+./detect-headers-py.py "https://streaming-site.com/channel.php" --browser
+```
+
+### 3. Verify with `curl` before committing
+
+Confirm the URL and headers actually work:
+
+```bash
+curl -i -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+        -H "Referer: https://streaming-site.com/" \
+        "https://cdn.example.com/hls/stream.m3u8?token=xyz"
+```
+
+A `200` with a body starting `#EXTM3U` means you're good. A `403` means a header is missing or wrong; a `404` usually means the token expired — re-grab it from DevTools.
+
+### Common patterns
+
+- **Referer only** — the most common case. Set it to the embed/player page URL.
+- **Referer + User-Agent** — typical for sports streams; both are checked.
+- **Expiring token in the query string** — the URL works for minutes to hours. Configure a backup URL so failover covers the expiry, and re-scrape when both die.
+- **Cookie/session gated** — the stream needs a logged-in session. These are the least stable; expect to refresh manually.
+
+### Using it in PVArr
+
+Open the dashboard at <http://localhost:8999>, start a new recording, and paste the primary m3u8 URL plus up to two backups. PVArr tries them in order and advances on failure.
 
 ---
 
 ## Configuration
 
-### Environment Variables
+All configuration is environment-based; recordings are configured per-job from the dashboard or the API.
 
 | Variable | Default | Purpose |
-|----------|---------|---------|
-| `PVARR_PORT` | `8999` | HTTP server port |
-| `PVARR_RECORDINGS_DIR` | `./recordings` | Where to save TS files |
-| `PVARR_ARCHIVE_DIR` | `./archive` | Post-processed output (MKV/MP4) |
-| `PVARR_CACHE_TTL` | `3600` | M3U8 scrape cache (seconds) |
-| `PVARR_FAILOVER_TIMEOUT` | `30` | Switch to backup URL after N seconds of silence |
-| `PVARR_POST_PROCESS` | `mkv` | Output container: `mkv` or `mp4` |
-| `PVARR_DISCORD_WEBHOOK` | `` | Discord webhook URL for notifications |
-| `PVARR_TELEGRAM_TOKEN` | `` | Telegram bot token (set `PVARR_TELEGRAM_CHAT_ID` too) |
-| `PVARR_NO_VENV` | `` | Set to `1` in Docker/container mode to skip venv setup |
+|---|---|---|
+| `HOST` | `0.0.0.0` | Bind address |
+| `PORT` | `8999` | HTTP port |
+| `PVARR_NO_VENV` | unset | Set to `1` to skip virtualenv creation in `start.sh` (used in-container) |
+| `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
+| `TELEGRAM_BOT_TOKEN` | unset | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | unset | Telegram destination chat |
+| `PLEX_URL` | unset | Plex server URL for library refresh |
+| `PLEX_TOKEN` | unset | Plex auth token |
+| `EMBY_URL` | unset | Emby server URL for library refresh |
+| `EMBY_API_KEY` | unset | Emby API key |
 
-### channels.conf Format
+For Docker, copy these into a `.env` beside `docker-compose.yml` — it is gitignored.
 
-Pipe-delimited text file (same format as hls-proxy):
+Recordings are written to `recordings/` in the project directory. Mount that path as a volume in Docker to keep captures outside the container.
 
-```
-slug|name|channel_number|logo_url|group|primary_m3u8_url|mode|referer|backup_m3u8_url|backup_m3u8_url_2
-```
+---
 
-**Fields:**
-- `slug` — URL-safe identifier (e.g., `espn-main`)
-- `name` — Display name in the UI
-- `channel_number` — Tuner/IPTV channel slot (e.g., 100)
-- `logo_url` — Icon URL (can be blank)
-- `group` — Category (Sports, News, Entertainment, etc.)
-- `primary_m3u8_url` — Main stream URL
-- `mode` — `literal` (URL is already m3u8), `direct` (scrape page for m3u8), or `iframe` (scrape iframe embed)
-- `referer` — Required HTTP Referer header for CDN access
-- `backup_m3u8_url` — Automatic failover URL (optional)
-- `backup_m3u8_url_2` — Second backup (optional)
+## API
 
-**Example:**
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/` | Dashboard |
+| `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs) |
+| `POST` | `/api/recordings/{id}/stop` | Stop a recording |
+| `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL |
+| `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
+| `GET` | `/api/library` | List completed recordings |
+| `POST` | `/api/library/rename` | Rename a recording |
+| `DELETE` | `/api/library/{filename}` | Delete a recording |
+| `GET` | `/api/library/download/{filename}` | Download a recording |
+| `GET` | `/live/playlist.m3u` · `/live/playlist.m3u8` | M3U tuner playlist |
+| `GET` | `/live/epg.xml` | XMLTV EPG |
 
-```conf
-espn-main|ESPN Main|100|https://media.espn.com/logo.png|Sports|https://cdn.espn.com/live/game.m3u8?token=abc123|literal|https://espn.com/watch/|https://backup1.cdn.com/game.m3u8|https://backup2.cdn.com/game.m3u8
-nfl-sunday|NFL Sunday|101|https://nfl.logo|Sports|https://nfl-cdn.com/stream.m3u8?session=xyz|literal|https://nfl.com/watch|
-```
+Interactive docs are available at `/docs` (FastAPI).
 
 ---
 
 ## Plex / Emby Integration
 
-PVArr exposes virtual tuner endpoints so you can add it as a live TV source in Plex or Emby:
+PVArr exposes active recordings as a virtual tuner.
 
-1. In Plex/Emby, go to **Settings → Live TV & DVR**.
-2. Add a new **HDHomeRun** or **Generic HTTP** tuner source.
-3. Point it to: `http://<pvArr-host>:8999/playlist.m3u`
-4. PVArr will serve channels as if they were a TV tuner.
+1. In Plex or Emby, add a **Live TV / DVR** source of type **M3U Tuner**.
+2. Playlist URL: `http://<pvarr-host>:8999/live/playlist.m3u`
+3. EPG / XMLTV URL: `http://<pvarr-host>:8999/live/epg.xml`
 
-Recordings are stored in `PVARR_RECORDINGS_DIR` and post-processed to `PVARR_ARCHIVE_DIR` per your config.
-
----
-
-## Notifications
-
-### Discord Webhooks
-
-Set `PVARR_DISCORD_WEBHOOK` to your Discord webhook URL. PVArr will post:
-- Recording started
-- Recording completed
-- Post-processing done
-- Failures (stream down, disk full, etc.)
-
-### Telegram
-
-Set `PVARR_TELEGRAM_TOKEN` and `PVARR_TELEGRAM_CHAT_ID`:
-
-```bash
-export PVARR_TELEGRAM_TOKEN="123456:ABC-DEF"
-export PVARR_TELEGRAM_CHAT_ID="987654321"
-```
+Set `PLEX_URL`/`PLEX_TOKEN` or `EMBY_URL`/`EMBY_API_KEY` to have PVArr trigger a library refresh once post-processing finishes.
 
 ---
 
 ## Architecture
 
-PVArr is built on top of the **hls-proxy** toolkit (a lightweight HLS restream bridge) with a web UI and DVR scheduling layer:
+```
+app/
+├── server.py          FastAPI app — dashboard, REST API, tuner routes
+├── recorder.py        Failover engine — direct FFmpeg first, proxy bridge fallback
+├── post_processor.py  TS → MKV/MP4 remux on completion
+├── naming.py          Sports-aware output filenames
+├── tuner.py           M3U playlist + XMLTV EPG generation
+├── notifications.py   Discord / Telegram / Plex / Emby hooks
+├── check_deps.py      Startup dependency validation (FFmpeg, Python packages)
+├── cleanup.py         Graceful shutdown of child FFmpeg processes
+├── templates/         Dashboard UI
+└── static/            Favicon and assets
+```
 
-- **hls-proxy.py** — Injects required headers, rewrites m3u8 playlists, caches m3u8 URLs, auto-learns Referer headers from upstream responses.
-- **FFmpeg** — Direct TS recording engine with automatic header/token refresh via hls-proxy bridge.
-- **Post-Processing Engine** — On-completion TS→MKV/MP4 remux (no transcode).
-- **Web Dashboard** — Channel management, failover config, recording schedule, live status.
-- **Tuner Endpoints** — `/playlist.m3u` and `/channel/<slug>` for Plex/Emby native integration.
-
-Zero external dependencies for core recording. Optional Playwright for JavaScript-rendered sites (see SETUP.md).
+`recorder.py` holds the core loop: it walks the candidate URL list, prefers a direct FFmpeg connection, drops to the proxy bridge when headers are required, and advances to the next candidate on stall, failure, or a forced failover.
 
 ---
 
 ## Troubleshooting
 
-### Recording drops frequently
+**Recording drops repeatedly.** Confirm the primary URL still resolves (`curl` it, as above). Expiring tokens are the usual cause — configure backups.
 
-- Check the failover timeout (`PVARR_FAILOVER_TIMEOUT`). If streams hiccup often, increase to 60s.
-- Verify the primary URL works manually with `curl` (see "Finding Your Stream URL").
-- Monitor Referer and User-Agent headers; streaming sites change them without notice.
+**`403` from the upstream.** A required header is missing. Re-check `Referer` and `User-Agent` in DevTools; sites change them without notice.
 
-### No m3u8 is found
+**Tuner doesn't appear in Plex/Emby.** Confirm the media server can reach PVArr (`curl http://<pvarr-host>:8999/live/playlist.m3u`). The playlist is empty when nothing is recording — start a recording first.
 
-- Confirm the site is HLS (check Network tab for `.m3u8` files, not `.ts` or `.mp4` streams).
-- Referer and User-Agent might be stale. Re-run `detect-headers` to refresh.
-- Some sites require a login session. Extract the session cookie and add it to `curl -b "COOKIE_NAME=value"`.
+**FFmpeg not found.** Install it (`apt install ffmpeg`, `brew install ffmpeg`). The container already includes it.
 
-### Tuner doesn't appear in Plex/Emby
-
-- Ensure PVArr is reachable from your Plex/Emby server. Test: `curl http://<pvArr-host>:8999/health`
-- Try the generic HTTP tuner source first, not HDHomeRun.
-- Check PVArr logs for errors.
-
-### Disk fills up
-
-- Set `PVARR_RECORDINGS_DIR` to a larger partition or external drive.
-- Implement automated cleanup (e.g., `find ./recordings -mtime +30 -delete` via cron).
+**Disk fills up.** Recordings are uncompressed TS and grow quickly. Point `recordings/` at a large volume and prune on a schedule.
 
 ---
 
 ## Development
 
-### Testing
-
-Run the unit test suite:
-
 ```bash
-python3 test_proxy.py
+python3 -m py_compile app/*.py stream-recorder.py   # syntax check
+bash -n start.sh scripts/publish.sh                 # shell syntax check
 ```
 
-### Sanity checks
-
-```bash
-python3 -m py_compile hls-proxy.py detect-headers-py.py
-bash -n start.sh
-```
-
-### Docker Build
-
-```bash
-docker build -t pvarr:latest .
-docker run -d -p 8999:8999 \
-  -e PVARR_RECORDINGS_DIR=/recordings \
-  -v recordings:/recordings \
-  pvarr:latest
-```
-
-See `Dockerfile` for details.
+There is no automated test suite yet.
 
 ---
 
 ## License
 
-MIT License
+Not yet specified — add a `LICENSE` file before publishing if you intend this to be open source. Without one, default copyright applies and others have no right to use or redistribute the code.
 
 ---
 
 ## AI Genesis & Environmental Footprint
 
-### Project Origins
+### Origins
 
-PVArr was **architected and built entirely by AI** across multiple LLM inference sessions:
+PVArr was designed, architected, and implemented by large language models, with a human directing the work and reviewing output:
 
-- **Architecture & Strategy:** Google Gemini 2.0 (multi-turn design sessions, feature planning, systems thinking).
-- **Implementation:** Anthropic Claude (code generation, debugging, optimization, testing).
-- **Total Inference Sessions:** 47 multi-turn conversations, averaging 8–12 turns each (450+ individual requests and responses).
-- **Code Generated:** ~4,200 lines of Python, Bash, JavaScript, Docker, and HTML/CSS.
+- **Google Gemini** — initial architecture, feature planning, and project structure.
+- **Anthropic Claude** — implementation, debugging, deployment assets, and documentation.
 
-### Environmental Impact
+The result is roughly **2,300 lines** across Python, Bash, HTML/CSS, and Docker configuration, built over a series of multi-turn sessions.
 
-LLM inference consumes significant compute resources. Below is an estimated footprint for PVArr's development:
+### On the environmental footprint
 
-**Compute Metrics:**
-- **Total Tokens Processed:** ~12 million tokens (input + output).
-- **Average Model Capacity:** Gemini 2.0 (multi-modal) + Claude 3.5 Sonnet (reasoning).
-- **Inference Duration:** ~18 GPU-hours (distributed across Anthropic and Google clusters).
+An honest accounting has to start with what is *not* known. This build was not instrumented — no token counts, wall-clock inference time, or energy draw were recorded while it happened. Providers also do not publish per-token energy figures for frontier models, and the actual cost depends on hardware generation, batching, datacenter PUE, and the carbon intensity and cooling design of whichever region served the requests. None of that is visible from the client side.
 
-**Carbon Footprint:**
-- **Estimated CO2e:** 1.8–2.4 kg CO2 equivalent (based on a typical ML inference grid powered by ~40% renewable energy).
-- **Equivalent to:** 
-  - Driving a mid-size car ~7–10 km
-  - One transatlantic flight per 500 passengers
-  - Manufacturing ~12–15 plastic bags
-- **Water Usage:** 12–18 liters of cooling water (data center evaporative cooling).
+So this section deliberately does **not** state a gram figure for CO₂e or a liter figure for water. Any such number produced after the fact would be invented, and a fabricated measurement is worse than an acknowledged unknown — particularly in a document meant to be a transparency disclosure.
 
-### Context & Justification
+What can be said with reasonable confidence about the *shape* of the cost:
 
-This cost is a **one-time investment** in creating a tool that will:
-- Eliminate recurring cloud DVR subscriptions (~$10–20/month per user).
-- Enable offline/self-hosted recording for thousands of personal use cases.
-- Provide a foundation for the open-source community to extend and deploy.
+- A project of this size is on the order of a few hundred model requests, not millions. The inference energy is plausibly comparable to a modest household appliance running for a matter of hours — meaningfully greater than zero, and far below the footprint of the hardware this software runs on.
+- The **operational** footprint dominates the build footprint. A machine recording HLS streams continuously draws power every hour of every day, for years. Whatever the one-time generation cost was, continuous recording will exceed it quickly.
+- If you want the largest available lever on this project's actual impact, it is the recording host: right-size the disk, avoid needless transcoding (PVArr remuxes rather than re-encodes, which is deliberate), and don't leave captures running unwatched.
 
-Over 5 years of use, a single PVArr instance saves ~$600–1,200 in subscription fees and environmental impact per household from avoided cloud infrastructure, offsetting the build-time carbon cost many times over for typical deployments.
+Readers who want rigorous figures should consult primary sources on ML inference energy and datacenter water use rather than trusting an estimate reconstructed here.
 
-### Data Transparency
+### Disclosure
 
-- All inference happened in **private LLM sessions** (no data leakage to third-party training sets).
-- **No personally identifiable information** was used in prompts.
-- Prompts and conversations are **stored locally** in the user's session history.
-- The codebase is **fully open-source**; no black-box components or proprietary models are embedded in PVArr itself.
+- The code was AI-generated and human-reviewed. Review it yourself before running it against anything you care about.
+- No personal data was used in generating this project.
+- No proprietary or black-box components are embedded in PVArr — the entire codebase is readable in this repository.
 
 ---
 
-**Last Updated:** 2025-08-29  
-**Maintainer:** Stream Failover Studio  
-**Status:** Production-Ready (Phase 3 Complete)
+**Status:** Phase 3 complete — documentation and release preparation
+**Maintainer:** Stream Failover Studio

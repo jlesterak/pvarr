@@ -17,11 +17,18 @@
 - [x] **Task 6: Dockerization & Deployment Assets (`Dockerfile` & `docker-compose.yml`)**
 
 ## Phase 3: Documentation, AI Transparency & GitHub Release
-- [x] **Task 1: Production README.md & AI Environmental Impact Analysis**
-  - Feature table, architecture diagram, API reference, quick start guides (CLI + Docker)
+- [x] **Task 1: Production README.md & AI Transparency Disclosure**
+  - Feature list, architecture overview, API reference, quick start guides (CLI + Docker)
+  - "Finding Your Stream URL" guide (DevTools / `detect-headers` / `curl` verification)
   - AI transparency callout banner + dedicated `## AI Genesis & Environmental Footprint` section
-  - Carbon/water/compute footprint estimate with academic citations
+  - Env var table, endpoints, and file references verified against the actual codebase
 
 - [x] **Task 2: Git Prep & Publish Automation (`scripts/publish.sh`)**
-  - `.gitignore` verified (excludes `venv/`, `__pycache__`, test recordings, logs)
+  - `.gitignore` verified (excludes `venv/`, `__pycache__`, test recordings, logs, `.env`)
   - `scripts/publish.sh` stages, commits, and provides exact GitHub remote attach + push commands
+
+## Open Items (not blocking first push)
+- [ ] Add a `LICENSE` file — README currently states none is specified
+- [ ] Automated test suite (none exists yet)
+- [ ] Quantified AI footprint figures — deliberately omitted; the build was not
+      instrumented, so no measured token/energy/CO₂e/water numbers are available
