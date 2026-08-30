@@ -55,6 +55,13 @@ RUN chmod +x start.sh stream-recorder.py && \
 # Create required volume directories
 RUN mkdir -p /config /recordings /app/logs
 
+# Links this image to the GitHub repository that builds it. Without this the
+# package is a standalone user-owned package, and the Actions GITHUB_TOKEN has
+# no write access to it — pushes from CI are denied even though login succeeds.
+LABEL org.opencontainers.image.source="https://github.com/jlesterak/pvarr" \
+      org.opencontainers.image.description="PVArr - multi-stream HLS failover recorder" \
+      org.opencontainers.image.licenses="Unlicense"
+
 EXPOSE 8999
 
 # Environment defaults.
