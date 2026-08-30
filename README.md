@@ -264,20 +264,17 @@ The Luddites are misremembered as people who hated machines. They were skilled w
 
 **What it cost the planet: unknown, and not by accident.** Nobody metered this build, and the firms that could tell you what a token costs in watts and litres decline to publish it. "The cloud" is a shed full of hot metal in somebody's watershed. Treat any precise gram-of-CO₂ figure — including one that could easily have been invented right here — as marketing.
 
-What *is* knowable: the box you run this on draws power every hour of every year and will outweigh the one-time cost of writing it soon enough. PVArr remuxes instead of transcoding for exactly that reason. The lever is your hardware, not your guilt.
-
 **Offsets are indulgences.** Buying one un-burns nothing, and the voluntary market is thick with fraud. If you want to send money anyway, send it where it does something structural:
 
 - **[Cool Earth](https://www.coolearth.org)** — hands cash to forest communities to keep their land. No carbon accounting theatre.
-- **[Clean Air Task Force](https://www.catf.org)** — unglamorous policy work. Changes rules, not vibes.
 - **[Wren](https://www.wren.co)** — monthly subscription, the buy-me-a-coffee of climate guilt. Cheaper than the DVR subscription you just cancelled.
 
 But the donate button is not the point. The point is that you now own a video recorder. No subscription, no account, no telemetry, nothing phoning home, nobody able to switch it off from a boardroom. That is one small thing clawed back out of the rental economy.
 
-Go do it again somewhere else.
+***Go do it again somewhere else.***
 
 ---
 
-**Status:** Phase 6 complete — tested, licensed, published
+**Status:** Phase (inf) complete — tested, licensed, published
 **Maintainer:** jlester.ak
 **License:** [The Unlicense](LICENSE) — public domain
