@@ -1,0 +1,26 @@
+# Build context hygiene: without this, `COPY . .` pulls the whole git history,
+# any local virtualenv, and every recorded .ts into the image layer.
+.git/
+.github/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime data must come from mounted volumes, never baked into the image.
+recordings/
+logs/
+config/
+*.ts
+*.mkv
+*.mp4
+*.log
+.env
+
+# Dev-only
+test_pvarr.py
+requirements-dev.txt
+TODO.md
+.vscode/
+.idea/
+.DS_Store

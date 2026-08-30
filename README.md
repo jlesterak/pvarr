@@ -123,7 +123,9 @@ All configuration is environment-based; recordings are configured per-job from t
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8999` | HTTP port |
 | `PVARR_NO_VENV` | unset | Set to `1` to skip virtualenv creation in `start.sh` (used in-container) |
-| `PVARR_ALLOWED_DIRS` | unset | Extra directories the library API may read/delete in, `:`-separated. By default only `recordings/` is reachable — set this if you record to a custom `output_dir` and want it visible in the library. |
+| `PVARR_RECORDINGS_DIR` | `./recordings` | Where recordings are written. The container sets this to `/recordings` so captures land on the mounted volume rather than inside the image. |
+| `PVARR_ALLOWED_DIRS` | unset | Extra directories the library API and `output_dir` may write to, `:`-separated. By default only the recordings dir is reachable. |
+| `PVARR_LOG_LEVEL` | `INFO` | Root log level. |
 | `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
 | `TELEGRAM_BOT_TOKEN` | unset | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | unset | Telegram destination chat |
@@ -134,7 +136,9 @@ All configuration is environment-based; recordings are configured per-job from t
 
 For Docker, copy these into a `.env` beside `docker-compose.yml` — it is gitignored.
 
-Recordings are written to `recordings/` in the project directory. Mount that path as a volume in Docker to keep captures outside the container.
+Recordings are written to `PVARR_RECORDINGS_DIR` (default `recordings/` in the
+project directory). The supplied `docker-compose.yml` sets it to `/recordings`
+and mounts `./recordings` there.
 
 ---
 

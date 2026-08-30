@@ -97,6 +97,61 @@
       `recordings/` plus `PVARR_ALLOWED_DIRS`; filenames carrying a directory
       component are rejected outright.
 
+## Phase 7: Relocation & Stability Audit
+- [x] **Relocated to `~/pvarr`** — already an independent git root (own `.git`,
+      zero files tracked by the old parent, not a submodule), so the move was a
+      plain `mv`. Remote and branch preserved. No tracked file hardcoded the old
+      path; only the venv did, and it was rebuilt.
+
+### Bugs found and fixed
+- [x] **Recordings never reached the mounted volume.** `docker-compose.yml`
+      mounts `./recordings:/recordings`, but the app wrote to `/app/recordings`
+      inside the image layer. Every containerised recording was lost on
+      recreate. `PVARR_RECORDINGS_DIR` now drives the path and the image sets
+      it to `/recordings`. Verified by running the container.
+- [x] **detect-headers never worked for shell installs.** `check_deps` accepts
+      `detect-headers.sh`, but `detect_candidate_headers` ran whatever it found
+      through `sys.executable`. Upstream ships only the `.sh`, so every
+      detection failed silently and fell through to the undetected path. Now
+      dispatches on extension; the Dockerfile installs the `.sh` too.
+      Container `check_deps` now reports all four dependencies OK.
+- [x] **Notifications blocked the event loop.** `notify_recording_started` ran
+      inline in the `async` start handler — up to three HTTP calls at
+      `timeout=5`, so a slow webhook stalled the whole server for ~15s. Now a
+      `BackgroundTasks` job.
+- [x] **`output_dir` was unconstrained** — caller-supplied, `mkdir`'d and
+      written to, i.e. arbitrary directory creation and file write. Same
+      allowlist as the library endpoints.
+- [x] **FFmpeg children were not reaped.** `_recording_loop` called
+      `terminate()` with no `wait()`, accumulating zombies across failovers.
+      Single `_reap_ffmpeg()` path now used everywhere.
+- [x] **No shutdown hook.** Uvicorn drives shutdown through the ASGI lifespan
+      and installs its own signal handlers, so `docker stop` could return with
+      FFmpeg/hls-proxy children still alive. Added a lifespan shutdown that
+      stops every active recorder.
+- [x] Container ran as **root**; now a non-root `pvarr` user (verified
+      `uid=1000` at runtime).
+- [x] **No `.dockerignore`** — `COPY . .` was baking `.git/`, `venv/` and any
+      recorded `.ts` into the image.
+- [x] Three modules each called `logging.basicConfig()` at import; first import
+      won and silently reconfigured the root logger. Centralised in
+      `app/logging_config.py`. CLI also double-printed every line.
+- [x] `start.sh` passed `--reload-dir` with no `--reload` (no-op); removed.
+- [x] Unhandled exceptions returned bare 500s; added a structured handler.
+- [x] `freeze_timeout` was unbounded; now validated 1–600.
+
+### Audited and already correct — no change needed
+- Webhook timeouts: all four `requests` calls already had `timeout=5`.
+- Post-processor already verified `returncode == 0`, destination existence and
+  non-zero size before declaring success, and checked the source before delete.
+- Direct-FFmpeg-first with proxy fallback already behaved as documented.
+- No duplicate output handles: a single `with open(..., "ab")` per attempt.
+
+### Deliberately not done
+- **Pydantic request models.** The dashboard posts `application/x-www-form-urlencoded`;
+  converting the routes to JSON body models would break the UI for no
+  correctness gain. Added field-level validation and structured errors instead.
+
 ## Still open
 - [ ] **No authentication on any endpoint.** Anyone who can reach the port can
       start, stop, and delete recordings. Fine on a trusted LAN, not fine if

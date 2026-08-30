@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Graceful Process Cleanup Module - Stream Failover Studio
+Graceful Process Cleanup Module - PVArr
 Registers SIGINT and SIGTERM handlers to stop all active background ffmpeg and proxy processes cleanly.
 """
 

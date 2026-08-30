@@ -10,7 +10,6 @@ import os
 import requests
 from typing import Dict, Any, Optional
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PVArrNotifications")
 
 

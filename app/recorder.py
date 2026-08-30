@@ -19,11 +19,6 @@ from typing import List, Optional, Callable, Dict, Any
 
 from app.check_deps import find_executable
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("PVArrRecorder")
 
 
@@ -121,12 +116,15 @@ class StreamFailoverRecorder:
             return True
 
         self._log(f"Detecting headers for {candidate.name}: {candidate.url[:70]}...")
-        cmd = [
-            sys.executable,
-            self.detect_headers_path,
-            candidate.url,
-            "--json"
-        ]
+        # check_deps also accepts detect-headers.sh, and upstream currently
+        # ships only the shell version. Running that through sys.executable
+        # makes Python choke on shell syntax, so every detection silently
+        # failed and fell through to the undetected path.
+        if self.detect_headers_path.endswith(".py"):
+            cmd = [sys.executable, self.detect_headers_path]
+        else:
+            cmd = [self.detect_headers_path]
+        cmd += [candidate.url, "--json"]
         if ".m3u8" in candidate.url.split("?")[0].lower():
             cmd.append("--direct")
 
@@ -201,6 +199,28 @@ class StreamFailoverRecorder:
                     pass
             self._proxy_process = None
 
+    def _reap_ffmpeg(self):
+        """Terminate and reap the FFmpeg child.
+
+        terminate() only delivers the signal. Without a wait() the exited
+        child stays in the process table as a zombie until the Popen object
+        happens to be collected, so a long recording that fails over
+        repeatedly accumulates them.
+        """
+        proc = self._ffmpeg_process
+        if not proc:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        self._ffmpeg_process = None
+
     def start_recording(self):
         """Start recording thread."""
         if self.is_running:
@@ -230,17 +250,7 @@ class StreamFailoverRecorder:
         self.status = "completed"
         self.stop_time = time.time()
 
-        if self._ffmpeg_process:
-            try:
-                self._ffmpeg_process.terminate()
-                self._ffmpeg_process.wait(timeout=3)
-            except Exception:
-                try:
-                    self._ffmpeg_process.kill()
-                except Exception:
-                    pass
-            self._ffmpeg_process = None
-
+        self._reap_ffmpeg()
         self.stop_proxy()
 
     def _build_ffmpeg_cmd(self, stream_url: str, referer: str = "", user_agent: str = "") -> List[str]:
@@ -333,12 +343,7 @@ class StreamFailoverRecorder:
             success = self._stream_ffmpeg_process(direct_cmd, candidate)
 
             # Clean up FFmpeg process
-            if self._ffmpeg_process:
-                try:
-                    self._ffmpeg_process.terminate()
-                except Exception:
-                    pass
-                self._ffmpeg_process = None
+            self._reap_ffmpeg()
 
             # 3. Fallback Mode: If Direct Mode failed without yielding data, attempt hls-proxy-stream
             if not success and not self._stop_event.is_set() and not self._force_failover_flag:
@@ -348,12 +353,7 @@ class StreamFailoverRecorder:
                 
                 success = self._stream_ffmpeg_process(proxy_cmd, candidate)
 
-                if self._ffmpeg_process:
-                    try:
-                        self._ffmpeg_process.terminate()
-                    except Exception:
-                        pass
-                    self._ffmpeg_process = None
+                self._reap_ffmpeg()
                 self.stop_proxy()
 
             if self._stop_event.is_set():

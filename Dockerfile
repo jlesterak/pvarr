@@ -38,6 +38,11 @@ RUN if [ -f /opt/hls-restream-proxy/hls-proxy.py ]; then \
         cp /opt/hls-restream-proxy/detect-headers-py.py /usr/local/bin/detect-headers-py.py && \
         chmod +x /usr/local/bin/detect-headers-py.py && \
         ln -sf /usr/local/bin/detect-headers-py.py /usr/local/bin/detect-headers; \
+    fi && \
+    if [ ! -e /usr/local/bin/detect-headers ] && [ -f /opt/hls-restream-proxy/detect-headers.sh ]; then \
+        cp /opt/hls-restream-proxy/detect-headers.sh /usr/local/bin/detect-headers.sh && \
+        chmod +x /usr/local/bin/detect-headers.sh && \
+        ln -sf /usr/local/bin/detect-headers.sh /usr/local/bin/detect-headers; \
     fi
 
 # Copy application files
@@ -52,9 +57,24 @@ RUN mkdir -p /config /recordings /app/logs
 
 EXPOSE 8999
 
-# Environment defaults
+# Environment defaults.
+# PVARR_RECORDINGS_DIR must point at the mounted volume: the app otherwise
+# defaults to /app/recordings, which lives inside the image layer, so every
+# recording would be written to the container's writable layer and lost on
+# recreate while the mounted ./recordings stayed empty.
 ENV HOST=0.0.0.0 \
     PORT=8999 \
-    PVARR_NO_VENV=1
+    PVARR_NO_VENV=1 \
+    PVARR_RECORDINGS_DIR=/recordings \
+    PVARR_ALLOWED_DIRS=/recordings
+
+# Drop root. Everything the app writes to is chowned first; dependencies are
+# already baked in, so no install step needs elevated privileges at runtime.
+RUN useradd --create-home --shell /bin/bash pvarr && \
+    chown -R pvarr:pvarr /app /config /recordings
+USER pvarr
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8999/api/status || exit 1
 
 CMD ["./start.sh"]

@@ -340,6 +340,47 @@ class TestRecorderConstruction(unittest.TestCase):
         self.assertLessEqual(len(rec.get_status_summary()["logs"]), 30)
 
 
+class TestDetectHeadersInvocation(unittest.TestCase):
+    """The detector may be a .py or a .sh; each needs the right interpreter."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.rec = StreamFailoverRecorder(
+            "test-id", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts")
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _captured_cmd(self, detector_name):
+        from unittest.mock import patch, MagicMock
+        detector = Path(self.tmp) / detector_name
+        detector.write_text("#!/bin/sh\necho {}\n")
+        detector.chmod(0o755)
+        self.rec.detect_headers_path = str(detector)
+        result = MagicMock(returncode=0, stdout="{}")
+        with patch("app.recorder.subprocess.run", return_value=result) as run:
+            self.rec.detect_candidate_headers(self.rec.candidates[0])
+        return run.call_args[0][0]
+
+    def test_python_detector_runs_under_interpreter(self):
+        cmd = self._captured_cmd("detect-headers-py.py")
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertTrue(cmd[1].endswith(".py"))
+
+    def test_shell_detector_runs_directly(self):
+        # Upstream ships only detect-headers.sh; running it under python3
+        # made every detection fail silently.
+        cmd = self._captured_cmd("detect-headers.sh")
+        self.assertNotEqual(cmd[0], sys.executable)
+        self.assertTrue(cmd[0].endswith(".sh"))
+
+    def test_json_flag_always_passed(self):
+        for name in ("detect-headers-py.py", "detect-headers.sh"):
+            with self.subTest(detector=name):
+                self.assertIn("--json", self._captured_cmd(name))
+
+
 class TestFFmpegCommand(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
@@ -858,6 +899,31 @@ class TestRecordingRoutes(ServerTestCase):
         r = self.client.post("/api/recordings/start", data={"url_primary": "   "})
         self.assertEqual(r.status_code, 400)
 
+    def test_freeze_timeout_bounds_enforced(self):
+        for bad in (0, -5, 9999):
+            with self.subTest(freeze_timeout=bad):
+                r = self.client.post("/api/recordings/start", data={
+                    "url_primary": "http://a/1.m3u8",
+                    "freeze_timeout": bad,
+                })
+                self.assertEqual(r.status_code, 400)
+
+    def test_notifications_do_not_block_the_response(self):
+        # The notifier must be deferred to a background task; called inline it
+        # can stall the event loop for up to 15s on slow webhooks.
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        notifier = MagicMock()
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", notifier):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        # TestClient runs background tasks before returning, so it has fired --
+        # what matters is that it was scheduled, not awaited inline.
+        notifier.notify_recording_started.assert_called_once()
+
     def test_stop_unknown_session_404s(self):
         r = self.client.post("/api/recordings/nope/stop")
         self.assertEqual(r.status_code, 404)
@@ -978,6 +1044,28 @@ class TestMissingStatusRoute(ServerTestCase):
             self.assertIn(key, body)
 
 
+class TestShutdown(ServerTestCase):
+    def test_lifespan_shutdown_stops_active_recorders(self):
+        # docker stop / Ctrl-C must not orphan FFmpeg and hls-proxy children.
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        with TestClient(self.server.app) as client:
+            self.server.active_recorders["abc"] = rec
+            client.get("/live/epg.xml")
+        rec.stop.assert_called_once()
+
+    def test_shutdown_survives_a_failing_recorder(self):
+        from unittest.mock import MagicMock
+        bad = MagicMock()
+        bad.stop.side_effect = RuntimeError("already dead")
+        good = MagicMock()
+        with TestClient(self.server.app) as client:
+            self.server.active_recorders["bad"] = bad
+            self.server.active_recorders["good"] = good
+            client.get("/live/epg.xml")
+        good.stop.assert_called_once()
+
+
 class TestPathHandling(ServerTestCase):
     """Directory-escape guards.
 
@@ -995,6 +1083,30 @@ class TestPathHandling(ServerTestCase):
     def tearDown(self):
         shutil.rmtree(self.outside, ignore_errors=True)
         super().tearDown()
+
+    def test_start_refuses_output_dir_outside_allowlist(self):
+        # output_dir gets mkdir'd and written to, so an unconstrained value is
+        # arbitrary directory creation plus arbitrary file write.
+        r = self.client.post("/api/recordings/start", data={
+            "url_primary": "http://a/1.m3u8",
+            "output_dir": str(Path(self.outside) / "escaped"),
+        })
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse((Path(self.outside) / "escaped").exists(),
+                         "directory created outside the allowlist")
+
+    def test_start_accepts_output_dir_inside_allowlist(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        inside = str(Path(self.tmp) / "sub")
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8",
+                "output_dir": inside,
+            })
+        self.assertEqual(r.status_code, 200)
 
     def test_download_refuses_dir_path_outside_allowlist(self):
         r = self.client.get(

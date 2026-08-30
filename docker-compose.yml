@@ -19,6 +19,11 @@ services:
       - PLEX_TOKEN=${PLEX_TOKEN:-}
       - EMBY_URL=${EMBY_URL:-}
       - EMBY_API_KEY=${EMBY_API_KEY:-}
+      # Must match the mounted volume below, or recordings land inside the
+      # container and vanish on recreate.
+      - PVARR_RECORDINGS_DIR=/recordings
+      - PVARR_ALLOWED_DIRS=/recordings
+      - PVARR_LOG_LEVEL=${PVARR_LOG_LEVEL:-INFO}
     volumes:
       - ./config:/config
       - ./recordings:/recordings

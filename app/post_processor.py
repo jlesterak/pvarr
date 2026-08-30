@@ -13,7 +13,6 @@ from typing import Optional, Dict, Any
 
 from app.check_deps import find_executable
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PVArrPostProcessor")
 
 

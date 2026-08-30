@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sports File-Naming & Storage Module - Stream Failover Studio
+Sports File-Naming & Storage Module - PVArr
 Handles standardized sports recording filenames, ffprobe resolution probe,
 and output directory management.
 """

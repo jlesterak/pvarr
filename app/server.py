@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Web Server Backend Module - Stream Failover Studio
+Web Server Backend Module - PVArr
 Provides REST API & SSE streaming endpoints for multi-stream failover recording control.
 """
 
 import asyncio
 import json
+import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -22,15 +24,44 @@ from app.cleanup import register_signal_handlers
 from app.tuner import generate_m3u_playlist, generate_xmltv_epg
 from app.notifications import NotificationManager
 from app.post_processor import remux_recording
+from app.logging_config import configure_logging
 
-app = FastAPI(title="PVArr - Personal Video Recorder", version="1.0.0")
+configure_logging()
+logger = logging.getLogger("PVArrServer")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Stop every active recorder on shutdown.
+
+    The SIGINT/SIGTERM handlers registered below only fire when the signal
+    reaches this process's handler. Uvicorn installs its own handlers and
+    drives shutdown through the ASGI lifespan, so without this hook a
+    `docker stop` or Ctrl-C could return before FFmpeg and hls-proxy children
+    were terminated, orphaning them.
+    """
+    yield
+    for rec_id, recorder in list(active_recorders.items()):
+        try:
+            recorder.stop()
+        except Exception as exc:
+            logger.error("Error stopping recorder %s during shutdown: %s", rec_id, exc)
+
+
+app = FastAPI(
+    title="PVArr - Personal Video Recorder",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 notifier = NotificationManager()
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "app" / "templates"
-RECORDINGS_DIR = BASE_DIR / "recordings"
+# Overridable so the container can write to a mounted volume rather than a
+# path inside the image layer.
+RECORDINGS_DIR = Path(os.environ.get("PVARR_RECORDINGS_DIR") or (BASE_DIR / "recordings"))
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 storage = StorageManager(record_dir=str(RECORDINGS_DIR))
@@ -40,6 +71,16 @@ active_recorders: Dict[str, StreamFailoverRecorder] = {}
 
 # Register SIGINT / SIGTERM handlers for container & process safety
 register_signal_handlers(active_recorders)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Return a structured error instead of leaking a bare traceback."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "detail": "Internal server error"},
+    )
 
 
 
@@ -142,6 +183,7 @@ async def get_system_status():
 
 @app.post("/api/recordings/start")
 async def start_recording(
+    background_tasks: BackgroundTasks,
     sport: str = Form("Sports"),
     team_a: str = Form("TeamA"),
     team_b: str = Form("TeamB"),
@@ -157,14 +199,29 @@ async def start_recording(
     if not candidates:
         raise HTTPException(status_code=400, detail="At least one candidate stream URL is required")
 
+    if not 1 <= freeze_timeout <= 600:
+        raise HTTPException(
+            status_code=400, detail="freeze_timeout must be between 1 and 600 seconds"
+        )
+
+    # output_dir is caller-supplied and gets mkdir'd, so it needs the same
+    # containment as the library endpoints -- otherwise it is arbitrary
+    # directory creation and file write anywhere the process can reach.
+    resolved_output_dir = str(_resolve_library_dir(output_dir)) if output_dir else None
+
     recording_id = str(uuid.uuid4())[:8]
-    output_path = storage.get_output_path(
-        sport=sport,
-        team_a=team_a,
-        team_b=team_b,
-        resolution=resolution,
-        custom_dir=output_dir
-    )
+    try:
+        output_path = storage.get_output_path(
+            sport=sport,
+            team_a=team_a,
+            team_b=team_b,
+            resolution=resolution,
+            custom_dir=resolved_output_dir,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not prepare output directory: {exc}"
+        )
 
     port = 8090 + (len(active_recorders) * 2)
 
@@ -186,7 +243,12 @@ async def start_recording(
         on_failover_callback=_on_failover
     )
 
-    notifier.notify_recording_started(recording_id, output_path.name, candidates[0])
+    # Runs in the threadpool after the response is sent. Called inline this
+    # would block the event loop for up to 15s (three HTTP calls, timeout=5).
+    background_tasks.add_task(
+        notifier.notify_recording_started,
+        recording_id, output_path.name, candidates[0],
+    )
 
 
     active_recorders[recording_id] = recorder

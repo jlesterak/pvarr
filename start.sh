@@ -79,4 +79,6 @@ echo "[+] Starting Web Dashboard Server on http://${HOST}:${PORT}..."
 echo "[+] Press Ctrl+C to stop all active streams and exit gracefully."
 echo ""
 
-exec python3 -m uvicorn app.server:app --host "$HOST" --port "$PORT" --reload-dir app
+# --reload-dir without --reload is a no-op; omitted rather than shipping a
+# reloader in production.
+exec python3 -m uvicorn app.server:app --host "$HOST" --port "$PORT"

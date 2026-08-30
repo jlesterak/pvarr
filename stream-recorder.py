@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI Entry Point for Stream Failover Studio Core Recorder Engine
+CLI Entry Point for the PVArr Core Recorder Engine
 Usage:
   ./stream-recorder.py --output recordings/game.ts "http://stream1.m3u8" "http://stream2.m3u8" "http://stream3.m3u8"
 """
@@ -11,20 +11,23 @@ import time
 from pathlib import Path
 
 from app.recorder import StreamFailoverRecorder
+from app.logging_config import configure_logging
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stream Failover Studio CLI Recorder")
+    parser = argparse.ArgumentParser(description="PVArr CLI Recorder")
     parser.add_argument("urls", nargs="+", help="Up to 3 candidate stream URLs (Primary, Backup 1, Backup 2)")
     parser.add_argument("-o", "--output", default="recordings/output.ts", help="Output file path (.ts recommended)")
     parser.add_argument("--freeze-timeout", type=int, default=15, help="Stale/freeze timeout in seconds")
     parser.add_argument("--port", type=int, default=8090, help="Base proxy port")
     args = parser.parse_args()
 
+    configure_logging()
+
     candidates = args.urls[:3]
     output_path = Path(args.output).resolve()
     
-    print("=== Stream Failover Studio Engine ===")
+    print("=== PVArr Recorder Engine ===")
     print(f"Candidates ({len(candidates)}):")
     for i, c in enumerate(candidates):
         print(f"  [{i+1}] {c}")
@@ -36,7 +39,6 @@ def main():
         output_filepath=str(output_path),
         base_port=args.port,
         freeze_timeout_sec=args.freeze_timeout,
-        log_callback=lambda msg: print(msg)
     )
 
     try:
