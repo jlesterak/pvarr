@@ -520,6 +520,23 @@ class StreamFailoverRecorder:
         self._reap_ffmpeg()
         self.stop_proxy()
 
+    def wait_until_finished(self, timeout: Optional[float] = None) -> bool:
+        """Block until the recorder thread has finished its completion work.
+
+        stop() only *asks* the thread to stop. The completion block -- remux,
+        final_filepath, notification -- runs afterwards on that thread, and
+        nothing used to wait for it. Since the thread is a daemon, an
+        interpreter exit killed it mid-remux, which is why every container stop
+        left an un-remuxed .ts behind.
+
+        Returns True if the thread finished within the timeout.
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
     def _build_ffmpeg_cmd(
         self, stream_url: str, referer: str = "", user_agent: str = "", cookie: str = ""
     ) -> List[str]:

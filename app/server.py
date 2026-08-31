@@ -28,7 +28,7 @@ from app.naming import (
     media_type_for,
     probe_video_resolution,
 )
-from app.cleanup import register_signal_handlers
+from app.cleanup import register_signal_handlers, stop_all
 from app.tuner import (
     generate_m3u_playlist,
     generate_xmltv_epg,
@@ -39,6 +39,7 @@ from app.tuner import (
 )
 from app.notifications import NotificationManager
 from app.post_processor import remux_recording
+from app.cleanup import _shutdown_timeout
 from app.logging_config import configure_logging
 
 configure_logging()
@@ -56,11 +57,12 @@ async def lifespan(app: FastAPI):
     were terminated, orphaning them.
     """
     yield
-    for rec_id, recorder in list(active_recorders.items()):
-        try:
-            recorder.stop()
-        except Exception as exc:
-            logger.error("Error stopping recorder %s during shutdown: %s", rec_id, exc)
+    # Offloaded because stopping reaps FFmpeg (up to 7s each) and then waits for
+    # post-processing -- both blocking, and this still runs on the event loop.
+    try:
+        await asyncio.to_thread(stop_all, active_recorders, _shutdown_timeout())
+    except Exception as exc:
+        logger.error("Error stopping recorders during shutdown: %s", exc)
 
 
 app = FastAPI(

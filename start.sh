@@ -70,8 +70,13 @@ fi
 # 4. Run full Python dependency check (non-fatal for optional tools)
 python3 app/check_deps.py || true
 
-# 5. Ensure runtime directories exist
-mkdir -p recordings logs
+# 5. Ensure runtime directories exist.
+#
+# Non-fatal: under `set -e` a failure here killed the container at boot for any
+# uid that does not own /app. In the container these are bind mounts that the
+# entrypoint has already prepared, and `recordings` here is a decoy anyway --
+# PVARR_RECORDINGS_DIR points at /recordings.
+mkdir -p recordings logs 2>/dev/null || true
 
 # 6. Start Uvicorn Web Dashboard Server
 echo ""

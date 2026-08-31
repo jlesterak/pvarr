@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     psmisc \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -49,7 +50,7 @@ RUN if [ -f /opt/hls-restream-proxy/hls-proxy.py ]; then \
 COPY . .
 
 # Ensure executable permissions
-RUN chmod +x start.sh stream-recorder.py && \
+RUN chmod +x start.sh stream-recorder.py docker-entrypoint.sh && \
     [ -f scripts/publish.sh ] && chmod +x scripts/publish.sh || true
 
 # Create required volume directories
@@ -75,13 +76,21 @@ ENV HOST=0.0.0.0 \
     PVARR_RECORDINGS_DIR=/recordings \
     PVARR_ALLOWED_DIRS=/recordings
 
-# Drop root. Everything the app writes to is chowned first; dependencies are
-# already baked in, so no install step needs elevated privileges at runtime.
-RUN useradd --create-home --shell /bin/bash pvarr && \
+# The app user. PUID/PGID at runtime re-point it at the host's uid/gid so files
+# on the far side of a bind mount are owned by the right person.
+ENV PUID=1000 \
+    PGID=1000
+RUN useradd --create-home --shell /bin/bash --uid 1000 pvarr && \
     chown -R pvarr:pvarr /app /config /recordings
-USER pvarr
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -fsS http://localhost:8999/api/status || exit 1
 
+# Deliberately no `USER pvarr`. The entrypoint starts as root purely to fix the
+# ownership of bind-mounted volumes -- which the image-time chown above cannot
+# do, because a bind mount replaces the image's directory inode with the host's
+# -- and then execs the app under PUID:PGID via gosu. No root process survives
+# into the running container. If `user:` is set in compose the entrypoint is
+# already unprivileged, and it verifies writability and fails fast instead.
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["./start.sh"]

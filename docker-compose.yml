@@ -10,9 +10,27 @@ services:
     restart: unless-stopped
     ports:
       - "8999:8999"
+    # Docker's default is 10s, which is not enough to reap FFmpeg and let a
+    # remux finish. PVARR_SHUTDOWN_TIMEOUT (default 20s) must stay inside this.
+    stop_grace_period: 30s
+    # Unrotated container logs grow without bound; a crash loop fills the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      # PVArr follows :latest by default and Watchtower recreates containers
+      # unattended. A recreate mid-recording is exactly what you do not want at
+      # 4am. Remove this label (or pin PVARR_TAG) to opt back in.
+      - "com.centurylinklabs.watchtower.enable=false"
     environment:
       - HOST=0.0.0.0
       - PORT=8999
+      # Match your host user so files on the far side of the bind mounts are
+      # owned by you: `id -u` and `id -g`.
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}

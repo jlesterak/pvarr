@@ -39,3 +39,41 @@ jobs:
 
       - name: Run tests
         run: python test_pvarr.py
+
+  # The image is only built by the publish workflow, which runs on version tags
+  # only -- so a broken Dockerfile would not surface until a release. Build it
+  # on every push, and prove the container can actually write to a bind mount
+  # that the host owns as root, which is the failure this guards against.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pvarr:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Root-owned bind mounts must not break the app
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /tmp/pv/config /tmp/pv/recordings /tmp/pv/logs
+          sudo chown -R root:root /tmp/pv
+          docker run --rm \
+            -e PUID=1000 -e PGID=1000 \
+            -v /tmp/pv/config:/config \
+            -v /tmp/pv/recordings:/recordings \
+            -v /tmp/pv/logs:/app/logs \
+            pvarr:ci \
+            sh -c 'id -u; touch /config/x /recordings/y /app/logs/z && echo WRITES_OK'
+
+      - name: The app must not be running as root
+        run: |
+          uid=$(docker run --rm pvarr:ci id -u)
+          test "$uid" = "1000" || { echo "::error::app ran as uid $uid"; exit 1; }
