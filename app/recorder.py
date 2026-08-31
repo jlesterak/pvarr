@@ -18,6 +18,7 @@ import time
 from enum import Enum
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import List, Optional, Callable, Dict, Any, Tuple
 
 from app.check_deps import find_executable
@@ -96,6 +97,61 @@ class StreamOutcome(str, Enum):
     COMPLETED = "completed"      # FFmpeg exited 0: the stream genuinely ended
     FAILED = "failed"            # died without delivering a single byte
     INTERRUPTED = "interrupted"  # delivered data, then stalled or exited non-zero
+
+
+# Cache keyed by ffmpeg path: the answer cannot change while we run, and this
+# shells out.
+_HLS_EXT_FLAGS_CACHE: Dict[str, List[str]] = {}
+
+
+def hls_extension_flags(ffmpeg_path: Optional[str]) -> List[str]:
+    """FFmpeg options that stop the HLS demuxer refusing a segment by extension.
+
+    Anti-leech streams disguise segments as something else. The sponsor's
+    candidate 1 serves MPEG-TS from a TikTok *image* CDN, on URLs ending
+    ".image", and FFmpeg's HLS demuxer refuses any extension outside its
+    allowlist. hls-proxy mirrors the upstream extension onto its own
+    /proxy.<ext> path, so the rewritten segments get refused for the same
+    reason -- which is why the fallback could not rescue that stream either.
+
+    Which option unlocks it depends on the build, and they are not
+    interchangeable. Measured against the shipped image (Debian's ffmpeg
+    5.1.9) with a real .image segment:
+
+        no flags                        refused: not in allowed_segment_extensions
+        -allowed_extensions ALL         refused: not in allowed_segment_extensions
+        -allowed_segment_extensions ALL refused: "extension none mismatches"
+        -extension_picky 0              PASS
+
+    So `extension_picky` is the one that matters there -- and it does not exist
+    on upstream 6.1, which has only `allowed_extensions`. Passing an option a
+    build does not know is fatal, so ask the binary what it supports rather
+    than guessing from a version number.
+    """
+    key = ffmpeg_path or "ffmpeg"
+    if key in _HLS_EXT_FLAGS_CACHE:
+        return list(_HLS_EXT_FLAGS_CACHE[key])
+
+    flags: List[str] = []
+    try:
+        result = subprocess.run(
+            [key, "-hide_banner", "-h", "demuxer=hls"],
+            capture_output=True, text=True, timeout=10,
+        )
+        help_text = (result.stdout or "") + (result.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        help_text = ""
+
+    for option, value in (
+        ("allowed_extensions", "ALL"),
+        ("allowed_segment_extensions", "ALL"),
+        ("extension_picky", "0"),
+    ):
+        if f"-{option} " in help_text:
+            flags.extend([f"-{option}", value])
+
+    _HLS_EXT_FLAGS_CACHE[key] = list(flags)
+    return flags
 
 
 class _FileSink:
@@ -481,7 +537,22 @@ class StreamFailoverRecorder:
         conf_dir.mkdir(parents=True, exist_ok=True)
         conf_file = conf_dir / f"channels_{self.recording_id}.conf"
 
-        mode = "literal" if candidate.referer else "direct"
+        # hls-proxy's "literal" mode means "this URL *is* the playlist".
+        # Every other mode makes it scrape the URL as an HTML page, hunting for
+        # an iframe and then an m3u8 inside it.
+        #
+        # This used to key off the referer, which decides nothing of the sort. A
+        # stream needing no Referer -- the common case -- got mode="direct", so
+        # the proxy fetched our already-resolved playlist, looked for an
+        # <iframe> in what is actually MPEG-TS playlist text, found none, and
+        # answered "Channel not found or scrape failed". That is the 404 the
+        # fallback died on every time, on a stream that was perfectly healthy.
+        #
+        # What actually decides the mode is whether we hold a playlist or a page
+        # to scrape. The referer is written to its own field either way.
+        resolved = candidate.m3u8_url or candidate.url
+        is_playlist = ".m3u8" in urlsplit(resolved).path.lower()
+        mode = "literal" if is_playlist else "direct"
         # channels.conf is line- and pipe-delimited, so a newline in either
         # field injects an extra channel definition into hls-proxy's config.
         conf_url = safe_header_value(candidate.m3u8_url)
@@ -825,9 +896,14 @@ class StreamFailoverRecorder:
         return not thread.is_alive()
 
     def _build_ffmpeg_cmd(
-        self, stream_url: str, referer: str = "", user_agent: str = "", cookie: str = ""
+        self, stream_url: str, referer: str = "", user_agent: str = "",
+        cookie: str = "", local_proxy: bool = False
     ) -> List[str]:
-        """Build FFmpeg command line with custom HTTP headers if present."""
+        """Build FFmpeg command line with custom HTTP headers if present.
+
+        `local_proxy` marks the fallback path, where the playlist comes from our
+        own hls-proxy on 127.0.0.1 rather than from the internet.
+        """
         cmd = [
             self.ffmpeg_path or "ffmpeg",
             # FFmpeg's periodic progress line is ~124 bytes/sec on stderr. That
@@ -850,6 +926,9 @@ class StreamFailoverRecorder:
             "-reconnect_delay_max", "5",
             "-rw_timeout", "15000000",
         ]
+
+        if local_proxy:
+            cmd.extend(hls_extension_flags(self.ffmpeg_path))
 
         # Construct HTTP headers for Direct Mode. Each value is checked because
         # FFmpeg copies this block verbatim into the request; see
@@ -1075,7 +1154,7 @@ class StreamFailoverRecorder:
                     and not self._force_failover_flag):
                 self._log(f"[Direct Mode Failed] Falling back to hls-proxy-stream for {candidate.name}...", "WARN")
                 proxy_url = self.start_proxy(candidate)
-                proxy_cmd = self._build_ffmpeg_cmd(proxy_url)
+                proxy_cmd = self._build_ffmpeg_cmd(proxy_url, local_proxy=True)
                 
                 outcome = self._stream_ffmpeg_process(proxy_cmd, candidate)
 

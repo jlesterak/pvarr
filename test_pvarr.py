@@ -2190,6 +2190,164 @@ class TestDashboardSurfacesCapturedBytes(ServerTestCase):
         self.assertIn("toggleFinished", body)
 
 
+class TestProxyChannelMode(unittest.TestCase):
+    """hls-proxy must be told the URL is a playlist, not a page to scrape.
+
+    The mode was keyed off the referer, which decides nothing of the sort. A
+    stream needing no Referer got mode="direct", so the proxy fetched our
+    already-resolved playlist, hunted for an <iframe> in MPEG-TS playlist text,
+    found none, and answered "Channel not found or scrape failed". That 404 is
+    what the fallback died on every time -- on a stream that was healthy, with
+    valid tokens, whose headers had been detected correctly.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-mode-")
+        self.rec = StreamFailoverRecorder(
+            "m1", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"), min_free_gb=0)
+        # Any real file will do; Popen and the settle sleep are stubbed.
+        self.rec.hls_proxy_path = str(Path(self.tmp) / "fake-proxy.py")
+        Path(self.rec.hls_proxy_path).write_text("# stub\n")
+        self._popen = patch("app.recorder.subprocess.Popen")
+        proc = self._popen.start()
+        proc.return_value.poll.return_value = None
+        self._sleep = patch("app.recorder.time.sleep")
+        self._sleep.start()
+        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p: [])
+        self._drain.start()
+
+    def tearDown(self):
+        self._popen.stop(); self._sleep.stop(); self._drain.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _mode_for(self, m3u8_url, referer=""):
+        cand = self.rec.candidates[0]
+        cand.m3u8_url = m3u8_url
+        cand.referer = referer
+        cand.slug = "cand_0"
+        self.rec.start_proxy(cand)
+        conf = list((Path(self.tmp) / ".proxy_conf").glob("*.conf"))[0]
+        return conf.read_text().strip().split("|")[6]
+
+    def test_a_playlist_without_a_referer_is_literal(self):
+        """The exact regression: this used to write "direct" and 404."""
+        self.assertEqual(self._mode_for("https://x.example/live.m3u8"), "literal")
+
+    def test_a_playlist_with_a_referer_is_still_literal(self):
+        self.assertEqual(
+            self._mode_for("https://x.example/live.m3u8", "https://x.example/"), "literal")
+
+    def test_a_playlist_with_a_query_string_is_literal(self):
+        """Tokenised playlists are the normal case, not the exception."""
+        self.assertEqual(
+            self._mode_for("https://x.example/secure/a.m3u8?st=tok&e=123"), "literal")
+
+    def test_a_page_url_is_still_scraped(self):
+        """A URL we could not resolve is where scraping is the right answer."""
+        self.assertEqual(self._mode_for("https://x.example/watch/game"), "direct")
+
+    def test_the_referer_is_still_written_to_its_own_field(self):
+        cand = self.rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.referer = "https://x.example/"
+        cand.slug = "cand_0"
+        self.rec.start_proxy(cand)
+        conf = list((Path(self.tmp) / ".proxy_conf").glob("*.conf"))[0]
+        self.assertEqual(conf.read_text().strip().split("|")[7], "https://x.example/")
+
+
+class TestHlsExtensionFlags(unittest.TestCase):
+    """Only send options the FFmpeg on this machine actually has.
+
+    Measured in the shipped image (Debian ffmpeg 5.1.9) against a real segment
+    disguised as ".image": -allowed_extensions ALL is refused,
+    -allowed_segment_extensions ALL is refused a step later, and only
+    -extension_picky 0 lets it through. That option does not exist on upstream
+    6.1, and passing an option a build does not know is fatal -- so the build
+    is asked rather than guessed at from a version number.
+    """
+
+    def setUp(self):
+        from app import recorder
+        recorder._HLS_EXT_FLAGS_CACHE.clear()
+
+    def _flags_for(self, help_text):
+        from unittest.mock import patch, MagicMock
+        from app.recorder import hls_extension_flags
+        result = MagicMock(stdout=help_text, stderr="")
+        with patch("app.recorder.subprocess.run", return_value=result):
+            return hls_extension_flags("/usr/bin/ffmpeg-fake")
+
+    def test_debian_build_gets_extension_picky(self):
+        flags = self._flags_for(
+            "  -allowed_extensions <string> ...\n"
+            "  -allowed_segment_extensions <string> ...\n"
+            "  -extension_picky   <boolean> ...\n")
+        self.assertEqual(flags, ["-allowed_extensions", "ALL",
+                                 "-allowed_segment_extensions", "ALL",
+                                 "-extension_picky", "0"])
+
+    def test_upstream_build_gets_only_what_it_has(self):
+        """ffmpeg 6.1 has no extension_picky; sending it would be fatal."""
+        flags = self._flags_for("  -allowed_extensions <string> ...\n")
+        self.assertEqual(flags, ["-allowed_extensions", "ALL"])
+        self.assertNotIn("-extension_picky", flags)
+
+    def test_a_build_with_none_of_them_gets_nothing(self):
+        self.assertEqual(self._flags_for("  -live_start_index <int> ...\n"), [])
+
+    def test_a_broken_ffmpeg_does_not_raise(self):
+        from unittest.mock import patch
+        from app.recorder import hls_extension_flags
+        with patch("app.recorder.subprocess.run", side_effect=OSError("no such file")):
+            self.assertEqual(hls_extension_flags("/nope"), [])
+
+    def test_the_probe_is_cached(self):
+        from unittest.mock import patch, MagicMock
+        from app.recorder import hls_extension_flags
+        result = MagicMock(stdout="  -extension_picky   <boolean> ...\n", stderr="")
+        with patch("app.recorder.subprocess.run", return_value=result) as run:
+            hls_extension_flags("/usr/bin/ff")
+            hls_extension_flags("/usr/bin/ff")
+            self.assertEqual(run.call_count, 1, "shelling out once is enough")
+
+
+class TestFfmpegExtensionScope(unittest.TestCase):
+    """Relaxing the extension check is scoped to our own local proxy."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-scope-")
+        self.rec = StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(Path(self.tmp) / "o.ts"), min_free_gb=0)
+        from app import recorder
+        recorder._HLS_EXT_FLAGS_CACHE[self.rec.ffmpeg_path or "ffmpeg"] = [
+            "-extension_picky", "0"]
+
+    def tearDown(self):
+        from app import recorder
+        recorder._HLS_EXT_FLAGS_CACHE.clear()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_direct_mode_keeps_ffmpegs_strict_default(self):
+        cmd = self.rec._build_ffmpeg_cmd("https://remote.example/live.m3u8")
+        self.assertNotIn("-extension_picky", cmd)
+
+    def test_the_proxy_path_relaxes_it(self):
+        cmd = self.rec._build_ffmpeg_cmd(
+            "http://127.0.0.1:8090/channel/cand_0", local_proxy=True)
+        self.assertIn("-extension_picky", cmd)
+        self.assertEqual(cmd[cmd.index("-extension_picky") + 1], "0")
+
+    def test_the_protocol_whitelist_still_applies_on_the_proxy_path(self):
+        """The protocol list, not the extension list, is what stops file://."""
+        cmd = self.rec._build_ffmpeg_cmd("http://127.0.0.1:8090/channel/x",
+                                         local_proxy=True)
+        self.assertIn("-protocol_whitelist", cmd)
+        whitelist = cmd[cmd.index("-protocol_whitelist") + 1]
+        self.assertNotIn("file", whitelist)
+
+
 class TestFileSink(unittest.TestCase):
     """The sink must know when its file has been taken away.
 

@@ -1376,3 +1376,88 @@ Everything in it came out of the sponsor's v0.2.1 test session:
   that actually happens.
 
 357 tests green at the tag. Nothing to do on upgrade.
+
+## Candidate 1's 404s: two bugs, neither of them the stream (2026-08-31)  [COMPLETED]
+
+Sponsor asked whether the stream was down or the headers were wrong. Neither.
+The stream was healthy, both tokens were valid, and header detection was
+correct. Both failures were ours.
+
+### Was the stream down? No.
+Decoded from the failing URLs in the log: the segment token `x-expires`
+expires 2026-09-01T00:00:00Z and the playlist path token 2026-08-31T20:43:06Z
+-- 11.5 and 8.2 hours *after* the failure. The probe also succeeded
+("Probe resolved Candidate 1: media, headers none"), so the origin was serving
+a playlist. Nothing was expired and nothing was down.
+
+### Bug 1 — the proxy fallback has never worked for a stream needing no Referer
+`start_proxy` chose the hls-proxy channel mode with
+`mode = "literal" if candidate.referer else "direct"`.
+
+The referer decides nothing of the sort. In hls-proxy, **literal** means "this
+URL *is* the playlist"; every other mode makes it fetch the URL as an HTML
+page, look for an `<iframe>`, then look for an m3u8 inside that. So a stream
+needing no `Referer` -- the common case, and exactly what the probe reported
+for candidate 1 -- got `direct`, and the proxy tried to scrape MPEG-TS playlist
+text as a web page. No iframe, no m3u8, and it answered
+`404 Channel not found or scrape failed: cand_0`.
+
+That is the 404 in the log, three times over. **The entire fallback path was
+dead for any stream that does not need a Referer**, which was never noticed
+because the streams that reach fallback usually do need one.
+
+Fixed: the mode is now chosen by whether we hold a playlist (`.m3u8` in the
+path) or a page to scrape. The referer is written to its own field either way.
+
+### Bug 2 — the fallback could not have rescued this stream anyway
+Candidate 1 is anti-leech: its segments are MPEG-TS served from a TikTok
+*image* CDN on URLs ending `.image`. FFmpeg's HLS demuxer refuses them by
+extension, which is what killed Direct Mode. hls-proxy mirrors the upstream
+extension onto its own `/proxy.<ext>` path, so the rewritten segments get
+refused for the same reason.
+
+Which FFmpeg option unlocks this is **not** guessable, and they are not
+interchangeable. Measured inside the shipped image (Debian ffmpeg 5.1.9)
+against a real `.image` segment:
+
+| flags | result |
+|---|---|
+| none | refused: `not in allowed_segment_extensions` |
+| `-allowed_extensions ALL` | refused: same |
+| `-allowed_segment_extensions ALL` | refused one step later: `extension none mismatches` |
+| **`-extension_picky 0`** | **PASS, 42676 bytes** |
+
+`extension_picky` does not exist on upstream ffmpeg 6.1 (this dev box), which
+has only `allowed_extensions` -- and passing an option a build does not know is
+fatal. So `hls_extension_flags()` asks the binary what it supports and sends
+only that, cached per path.
+
+**Scoped to the fallback only.** There the playlist comes from our own proxy on
+127.0.0.1, so "any extension" means "any file this process already fetched and
+rewrote", not "anything a remote playlist cares to name". Direct Mode keeps
+FFmpeg's strict default, and `-protocol_whitelist` forbids `file://` on both
+paths regardless -- the protocol list, not the extension list, is what actually
+stops a hostile playlist reading local files. There is a test asserting that.
+
+### Verified
+The dev box could not reproduce any of this: ffmpeg 6.1 here happily accepts a
+`.image` segment and does not even have the option that matters. Everything
+above was measured **inside `ghcr.io/jlesterak/pvarr:0.2.2`** against a local
+origin serving real MPEG-TS bytes at a `.image` URL, through the real
+hls-proxy, driven by PVArr's own `start_proxy` and `_build_ffmpeg_cmd`:
+
+    ffmpeg flags probed : ['-allowed_extensions','ALL',
+                           '-allowed_segment_extensions','ALL',
+                           '-extension_picky','0']
+    channels.conf mode  : 'literal'   <-- was 'direct', the 404
+    bytes captured      : 42676       <-- was 0
+
+That is the whole reason to keep a copy of the shipped image around: reasoning
+from the dev box's FFmpeg would have produced a confident, wrong fix.
+
+370 tests (was 357).
+
+### Still open
+- [ ] Whether candidate 1 *records* for the sponsor now. This proves the
+      mechanism against a synthetic origin of the same shape; it does not prove
+      that particular provider stays up.

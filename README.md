@@ -376,6 +376,22 @@ has a name, the footage is unrecoverable, and the dashboard shows `0.00 MB`
 because it reads the size from the path. Stop the recording first — it is
 post-processed and released within a few seconds.
 
+**A stream fails in Direct Mode and the proxy fallback then returns `404
+Channel not found or scrape failed`.** Fixed in v0.2.3. PVArr was telling
+hls-proxy to *scrape* the playlist URL as if it were a web page whenever the
+stream needed no `Referer` — which is the common case — so the fallback could
+never work for those streams. If you see this on an older build, upgrade.
+
+**FFmpeg says a segment `is not in allowed_segment_extensions`.** The stream is
+anti-leech: its segments are disguised as some other file type (one real
+example serves MPEG-TS from a TikTok image CDN on URLs ending `.image`) and
+FFmpeg's HLS demuxer refuses them by extension. Direct Mode cannot record such
+a stream — that check is deliberate — so PVArr falls back to hls-proxy, which
+re-serves the segments from `127.0.0.1` with the extension check relaxed for
+that local hop only. Remote playlists still get FFmpeg's strict default, and
+`-protocol_whitelist` forbids `file://` on both paths regardless. Nothing to
+configure; the fallback is automatic.
+
 **A stopped recording shows `post processing` with an amber dot.** The capture
 has finished but the recorder is still remuxing the `.ts` into an `.mp4`, which
 for a long recording takes minutes (263 MB took about 2.5 on a NAS-backed
@@ -424,7 +440,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-357 tests covering filename sanitisation and collision handling, storage
+370 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across
