@@ -18,12 +18,39 @@ import time
 from enum import Enum
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Callable, Dict, Any
+from typing import List, Optional, Callable, Dict, Any, Tuple
 
 from app.check_deps import find_executable
 from app.probe import DEFAULT_USER_AGENT, probe_stream
 
 logger = logging.getLogger("PVArrRecorder")
+
+
+ALLOWED_URL_SCHEMES = ("http", "https")
+
+
+def safe_stream_url(value: str) -> str:
+    """Reject anything that is not a plain http(s) URL.
+
+    FFmpeg speaks far more than HTTP. Handed `file:///etc/passwd` it will
+    happily open it, `concat:` will splice two local files together, and
+    `tcp://host:port` will connect anywhere the container can reach. Every
+    candidate URL comes from an unauthenticated caller, and the captured bytes
+    are readable back through the stream and download endpoints -- so an
+    unconstrained scheme turns PVArr into a file-read and port-scan primitive
+    for anything on the LAN. Checked here as well as at the API boundary
+    because this is the last point before the URL reaches an argv list.
+    """
+    url = (value or "").strip()
+    if not url:
+        raise ValueError("Stream URL is empty.")
+    scheme = url.split(":", 1)[0].lower() if ":" in url else ""
+    if scheme not in ALLOWED_URL_SCHEMES:
+        raise ValueError(
+            f"Unsupported URL scheme {scheme or '(none)'!r}: "
+            "only http:// and https:// stream URLs are accepted."
+        )
+    return url
 
 
 def safe_header_value(value: str) -> Optional[str]:
@@ -47,6 +74,13 @@ def safe_header_value(value: str) -> Optional[str]:
 # Free-space floor below which a recording aborts rather than filling the
 # volume. Module level rather than a class attribute so callers can read it
 # without going through StreamFailoverRecorder, which tests routinely patch.
+# Each session reserves a contiguous block of proxy ports: start_proxy() binds
+# base_port + candidate_index, so a session with three candidates occupies
+# base_port .. base_port + 2. The allocator in server.py hands out base ports
+# this far apart, so one session's third candidate cannot land on the next
+# session's primary. Must stay greater than the maximum candidates per session.
+PROXY_PORT_STRIDE = 4
+
 DEFAULT_MIN_FREE_GB = 5.0
 
 
@@ -122,6 +156,8 @@ class StreamFailoverRecorder:
     READ_CHUNK_BYTES = 65536
     # Tail of FFmpeg's stderr kept for diagnostics when an attempt fails.
     STDERR_TAIL_LINES = 15
+    # Lines of recorder log kept for the dashboard. Older lines are dropped.
+    LOG_HISTORY_LIMIT = 500
     # How often free space is checked while recording. statvfs is cheap but not
     # free, and checking per chunk would mean thousands of calls a second.
     DISK_CHECK_INTERVAL_SEC = 15.0
@@ -190,6 +226,11 @@ class StreamFailoverRecorder:
         self.stop_time: Optional[float] = None
         self.bytes_written: int = 0
         self.log_history: List[str] = []
+        # Total lines ever logged, never reset. log_history is trimmed to the
+        # last LOG_HISTORY_LIMIT, so a plain index into it stops advancing once
+        # trimming begins -- which silently froze the live log view. Readers
+        # track this sequence number instead.
+        self._log_seq: int = 0
 
         self._thread: Optional[threading.Thread] = None
         self._ffmpeg_process: Optional[subprocess.Popen] = None
@@ -210,8 +251,9 @@ class StreamFailoverRecorder:
         formatted = f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] [{self.recording_id}] {message}"
         with self._lock:
             self.log_history.append(formatted)
-            if len(self.log_history) > 500:
-                self.log_history.pop(0)
+            self._log_seq += 1
+            if len(self.log_history) > self.LOG_HISTORY_LIMIT:
+                del self.log_history[:-self.LOG_HISTORY_LIMIT]
         logger.info(f"[{self.recording_id}] {message}")
         if self.log_callback:
             try:
@@ -321,7 +363,9 @@ class StreamFailoverRecorder:
         if not self.hls_proxy_path or not os.path.exists(self.hls_proxy_path):
             return candidate.m3u8_url
 
-        port = self.base_port + self.current_candidate_index
+        # Modulo keeps a session inside the block reserved for it even if it
+        # somehow carries more candidates than the stride allows.
+        port = self.base_port + (self.current_candidate_index % PROXY_PORT_STRIDE)
         conf_dir = self.output_filepath.parent / ".proxy_conf"
         conf_dir.mkdir(parents=True, exist_ok=True)
         conf_file = conf_dir / f"channels_{self.recording_id}.conf"
@@ -340,24 +384,56 @@ class StreamFailoverRecorder:
         env = os.environ.copy()
         env["HLS_PROXY_PORT"] = str(port)
         env["CHANNELS_CONF"] = str(conf_file)
+        self._proxy_conf_file = conf_file
         if candidate.referer:
             env["HLS_PROXY_REFERER"] = candidate.referer
 
         self._log(f"[Fallback Mode] Launching hls-proxy on port {port} for {candidate.name}...")
+        self._proxy_stderr_tail: "collections.deque" = collections.deque()
         try:
             self._proxy_process = subprocess.Popen(
                 [sys.executable, self.hls_proxy_path],
                 env=env,
-                stdout=subprocess.PIPE,
+                # Nothing ever read these pipes. Once the proxy had written
+                # 64KB of its own logging the pipe filled, the proxy blocked
+                # writing to it, and the fallback stream wedged with no error
+                # -- the same defect that stopped FFmpeg dead at ~7 minutes.
+                # stdout is discarded; stderr is drained to a bounded tail so a
+                # proxy that fails to bind can still say why.
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                text=True
             )
+            self._proxy_stderr_tail = self._drain_stderr(self._proxy_process)
             time.sleep(1.5)
+            if self._proxy_process.poll() is not None:
+                detail = "; ".join(self._proxy_stderr_tail) or "no output"
+                self._log(
+                    f"hls-proxy exited immediately (code "
+                    f"{self._proxy_process.returncode}): {detail}", "ERROR")
+                self._proxy_process = None
+                return candidate.m3u8_url
             candidate.used_proxy = True
             return f"http://127.0.0.1:{port}/channel/{candidate.slug}"
         except Exception as e:
             self._log(f"Failed to start hls-proxy: {e}", "ERROR")
             return candidate.m3u8_url
+
+    def _remove_proxy_conf(self):
+        """Delete this session's channels.conf.
+
+        It holds the fully tokenised stream URL and lives on the mounted
+        recordings volume. Nothing removed it, so every session that ever fell
+        back to the proxy left a readable credential behind indefinitely.
+        """
+        conf = getattr(self, "_proxy_conf_file", None)
+        if not conf:
+            return
+        try:
+            Path(conf).unlink(missing_ok=True)
+        except OSError as exc:
+            self._log(f"Could not remove proxy config: {exc}", "WARN")
+        finally:
+            self._proxy_conf_file = None
 
     def stop_proxy(self):
         """Terminate active hls-proxy subprocess."""
@@ -368,9 +444,36 @@ class StreamFailoverRecorder:
             except Exception:
                 try:
                     self._proxy_process.kill()
+                    # kill() only delivers SIGKILL. Without the wait() the
+                    # dead child stays in the process table as a zombie, and a
+                    # long session that fails over repeatedly accumulates one
+                    # per switch. Same defect _reap_ffmpeg() documents.
+                    self._proxy_process.wait(timeout=2)
                 except Exception:
                     pass
             self._proxy_process = None
+        self._remove_proxy_conf()
+
+    def logs_since(self, seq: int) -> Tuple[List[str], int]:
+        """Log lines added since sequence number `seq`, plus the new sequence.
+
+        The live log view used to track a plain index into log_history. That
+        list is trimmed to the newest LOG_HISTORY_LIMIT lines, so once a
+        recording passed that many the length stopped growing, the "is there
+        anything new" test could never be true again, and the log view sat
+        silently frozen for the rest of the session. A monotonic sequence
+        survives trimming. A reader that has fallen further behind than the
+        buffer is deep gets what is still held rather than nothing.
+        """
+        with self._lock:
+            total = self._log_seq
+            history = list(self.log_history)
+        if seq >= total:
+            return [], total
+        missed = total - seq
+        if missed >= len(history):
+            return history, total
+        return history[len(history) - missed:], total
 
     def _reap_ffmpeg(self):
         """Terminate and reap the FFmpeg child.
@@ -566,6 +669,11 @@ class StreamFailoverRecorder:
             "-hide_banner",
             "-nostats",
             "-loglevel", "error",
+            # Belt and braces with safe_stream_url(): even if a non-http URL
+            # reached here, FFmpeg is not permitted to open a local file or an
+            # arbitrary socket. 'file' is deliberately absent. crypto and data
+            # are required for AES-128 encrypted HLS, which is common.
+            "-protocol_whitelist", "http,https,tcp,tls,crypto,data",
             "-y",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -864,7 +972,11 @@ class StreamFailoverRecorder:
                     self.on_failover_callback(self.recording_id, next_name)
                 except Exception:
                     pass
-            time.sleep(delay)
+            # Interruptible: a plain sleep here held a stop for up to 60s,
+            # past the 20s shutdown budget and the 30s stop_grace_period, so
+            # Docker SIGKILLed the container mid-shutdown.
+            if self._stop_event.wait(delay):
+                break
 
         if self.status != "failed":
             # These must survive: each says the file is worth keeping but the

@@ -320,6 +320,10 @@ app/
 
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 
+**The live log pane stops updating on a long recording (versions before 0.1.5).** The recorder keeps the newest 500 log lines; the dashboard tracked its position by counting them, so once trimming started the count stopped growing and the view silently froze for the rest of the session. Fixed — position is tracked by a sequence number that survives trimming.
+
+**A stream URL is rejected with "only http:// and https:// stream URLs are accepted".** Working as intended. FFmpeg will open `file://`, `concat:` and `tcp://` just as readily as `https://`, and PVArr streams captured bytes back through the tuner and download endpoints — so an unconstrained scheme would let anything on your LAN read local files through PVArr. Paste the real playlist URL.
+
 **`PermissionError` on the first recording, or the container exits at start.**
 The `config/`, `recordings/` and `logs/` directories are bind mounts. If they do
 not exist on the host, Docker creates them as `root:root`, and PVArr does not
@@ -362,7 +366,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-258 tests covering filename sanitisation and collision handling, storage
+271 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

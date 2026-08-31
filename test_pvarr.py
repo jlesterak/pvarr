@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,7 +31,12 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
-from app.recorder import CandidateStream, StreamFailoverRecorder, StreamOutcome
+from app.recorder import (
+    CandidateStream,
+    StreamFailoverRecorder,
+    StreamOutcome,
+    safe_stream_url,
+)
 
 # The modules log at INFO on import; silence it so test output stays readable.
 logging.disable(logging.CRITICAL)
@@ -912,10 +918,108 @@ class FailoverLoopTestCase(unittest.TestCase):
         return rec
 
     def run_loop(self, rec):
-        # Patch out the inter-failover delay so tests stay fast.
+        # Zero the inter-failover delay so tests stay fast. This stubs the
+        # delay itself rather than time.sleep: the loop waits on _stop_event
+        # so that a shutdown interrupts the backoff, and patching sleep would
+        # no longer make these tests fast -- it would silently make them take
+        # the real backoff, up to 60s each.
+        rec._failover_delay = lambda wrapped: 0.0
         from unittest.mock import patch
         with patch("app.recorder.time.sleep"):
             rec._recording_loop()
+
+
+class TestLogSequence(unittest.TestCase):
+    """The live log view froze silently once a session passed 500 lines.
+
+    log_history is trimmed to its newest LOG_HISTORY_LIMIT entries, but the
+    SSE endpoint tracked a plain index into it. Once trimming began the length
+    stopped growing, "is there anything new" was never true again, and the
+    dashboard log pane sat dead for the rest of the recording with no error.
+    """
+
+    def make(self):
+        return StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts")
+
+    def test_new_lines_still_arrive_after_the_buffer_wraps(self):
+        rec = self.make()
+        for i in range(rec.LOG_HISTORY_LIMIT + 50):
+            rec._log(f"line {i}")
+        _, seq = rec.logs_since(0)
+        rec._log("after the wrap")
+        lines, _ = rec.logs_since(seq)
+        self.assertEqual([l.split("] ", 3)[-1] for l in lines], ["after the wrap"])
+
+    def test_history_is_capped(self):
+        rec = self.make()
+        for i in range(rec.LOG_HISTORY_LIMIT + 200):
+            rec._log(f"line {i}")
+        self.assertEqual(len(rec.log_history), rec.LOG_HISTORY_LIMIT)
+
+    def test_reader_further_behind_than_the_buffer_gets_what_is_left(self):
+        rec = self.make()
+        for i in range(rec.LOG_HISTORY_LIMIT * 2):
+            rec._log(f"line {i}")
+        lines, seq = rec.logs_since(0)
+        self.assertEqual(len(lines), rec.LOG_HISTORY_LIMIT)
+        self.assertEqual(seq, rec.LOG_HISTORY_LIMIT * 2)
+
+    def test_nothing_new_returns_nothing(self):
+        rec = self.make()
+        rec._log("one")
+        _, seq = rec.logs_since(0)
+        self.assertEqual(rec.logs_since(seq), ([], seq))
+
+
+class TestStreamUrlSchemes(unittest.TestCase):
+    """FFmpeg opens far more than HTTP, and PVArr streams captured bytes back."""
+
+    def test_http_and_https_are_accepted(self):
+        for url in ("http://a/1.m3u8", "https://a/1.m3u8", "  https://a/1.m3u8  "):
+            self.assertTrue(safe_stream_url(url).startswith("http"))
+
+    def test_local_file_read_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("file:///etc/passwd")
+
+    def test_concat_splicing_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("concat:/etc/passwd|/etc/shadow")
+
+    def test_raw_socket_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("tcp://169.254.169.254:80")
+
+    def test_empty_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("   ")
+
+    def test_ffmpeg_command_pins_the_protocol_whitelist(self):
+        rec = StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts")
+        cmd = rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertIn("-protocol_whitelist", cmd)
+        allowed = cmd[cmd.index("-protocol_whitelist") + 1]
+        self.assertNotIn("file", allowed.split(","))
+
+
+class TestBackoffIsInterruptible(FailoverLoopTestCase):
+    """A stop must not have to wait out the failover backoff.
+
+    The backoff climbs to 60s after a fruitless lap. It used to be a plain
+    time.sleep, so a container stop landing in one blew through the 20s
+    shutdown budget and the 30s stop_grace_period, and Docker SIGKILLed the
+    app mid-shutdown -- losing the remux the shutdown fix exists to protect.
+    """
+
+    def test_stop_during_backoff_returns_promptly(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [False, False])
+        rec._failover_delay = lambda wrapped: 30.0
+        rec._stop_event.set()
+        t0 = time.time()
+        rec._recording_loop()
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 5.0,
+                        f"stop waited out the backoff ({elapsed:.1f}s)")
 
 
 class TestFailoverHappyPath(FailoverLoopTestCase):
@@ -2122,15 +2226,37 @@ class TestSessionRetention(ServerTestCase):
 
     def test_proxy_port_reuses_freed_slots(self):
         # Derived from the total count, this climbed forever and eventually
-        # ran past the valid port range.
+        # ran past the valid port range. A stopped session's block is free.
         self._session("a", running=True, base_port=8090)
-        self._session("b", running=False, base_port=8092)
-        self.assertEqual(self.server._allocate_proxy_port(), 8092)
+        self._session("b", running=False, base_port=8094)
+        self.assertEqual(self.server._allocate_proxy_port(), 8094)
 
     def test_proxy_ports_do_not_collide_between_running_sessions(self):
         self._session("a", running=True, base_port=8090)
-        self._session("b", running=True, base_port=8092)
-        self.assertEqual(self.server._allocate_proxy_port(), 8094)
+        self._session("b", running=True, base_port=8094)
+        self.assertEqual(self.server._allocate_proxy_port(), 8098)
+
+    def test_allocator_leaves_room_for_every_candidate(self):
+        # start_proxy() binds base_port + candidate_index, so a three-candidate
+        # session occupies base .. base+2. The allocator used to step by 2, so
+        # session A failing over to its third candidate bound 8092 -- which had
+        # already been handed to session B as a base, and B's proxy then could
+        # not start. The gap must exceed the candidates a session can hold.
+        from app.server import PROXY_PORT_STRIDE
+        self._session("a", running=True, base_port=8090)
+        second = self.server._allocate_proxy_port()
+        self.assertGreaterEqual(second - 8090, 3,
+                                "next base port lands inside session a's block")
+        self.assertEqual(second, 8090 + PROXY_PORT_STRIDE)
+
+    def test_candidate_index_cannot_escape_its_reserved_block(self):
+        from app.recorder import PROXY_PORT_STRIDE, StreamFailoverRecorder
+        rec = StreamFailoverRecorder(
+            "x", ["u1", "u2", "u3"], "/tmp/x.ts", base_port=8090)
+        for index in range(6):
+            rec.current_candidate_index = index
+            port = rec.base_port + (rec.current_candidate_index % PROXY_PORT_STRIDE)
+            self.assertLess(port, 8090 + PROXY_PORT_STRIDE)
 
 
 class TestShutdown(ServerTestCase):

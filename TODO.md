@@ -682,3 +682,112 @@ presents the same keys will get a correct guide entry for free -- but
 `output_filename` will be meaningless for one, since nothing is being written.
 That is the first thing the rebroadcast design has to answer.
 
+## Agent-team review of rebroadcast mode (2026-08-31)
+
+Architect / Security / DevOps, briefed on humantodo line 3 ("an option to not
+record and just rebroadcast"). The reviews surfaced six live bugs that have
+nothing to do with rebroadcast; those were fixed first and are recorded here.
+The feature itself is NOT built -- the design decision is still with the
+sponsor.
+
+### Live bugs found and fixed
+- [x] **Proxy port blocks overlapped.** `_allocate_proxy_port` stepped by 2,
+      but `start_proxy` binds `base_port + candidate_index` and a session holds
+      up to three candidates -- so session A's third candidate bound the port
+      already handed to session B, and B's proxy failed to start. Found
+      independently by Architect and Security. Fixed: a shared
+      `PROXY_PORT_STRIDE = 4`, and the index is taken modulo the stride so a
+      session can never escape its own block.
+- [x] **The live log view froze after 500 lines.** `log_history` is trimmed,
+      but the SSE endpoint tracked a plain index into it, so once trimming
+      began `len(history) > last_sent_idx` was never true again. Silent: no
+      error, the pane just stopped. Fixed with a monotonic sequence number and
+      `logs_since()`; a reader further behind than the buffer is deep gets what
+      is still held rather than nothing.
+- [x] **hls-proxy's pipes were never drained.** Spawned with `stdout=PIPE,
+      stderr=PIPE` and nothing reading either. Exactly the defect that stopped
+      FFmpeg dead at ~7 minutes, in the module next door. stdout is now
+      discarded, stderr drained to a bounded tail, and a proxy that exits
+      immediately now says why instead of failing silently.
+- [x] **`stop_proxy` left zombies.** `kill()` with no `wait()`, one per
+      failover. `_reap_ffmpeg` documents this exact defect and does it right;
+      the proxy path was simply missed.
+- [x] **Failover backoff was not interruptible.** `time.sleep(delay)` with
+      delay up to 60s, against a 20s shutdown budget and a 30s
+      `stop_grace_period` -- a stop landing in a backoff was SIGKILLed, losing
+      the remux that the shutdown fix exists to protect. Now
+      `_stop_event.wait(delay)`.
+      Note: the test fixture had patched `time.sleep` to stay fast. That patch
+      silently stopped working, and the suite went from 1s to 120s. The fixture
+      now zeroes `_failover_delay` instead, and a test asserts a stop during a
+      30s backoff returns in under 5s.
+- [x] **No URL scheme validation, no FFmpeg protocol whitelist.** Verified by
+      Security against ffmpeg 6.1.1: `file://`, `concat:` and `tcp://` were all
+      reachable from `/api/recordings/start`, and captured bytes are readable
+      back through the stream and download endpoints. Bounded in practice --
+      ffmpeg's mpegts demuxer drops non-media content, and `file:` segments
+      under an http parent are already blocked by ffmpeg's own default
+      whitelist -- but it is a cheap fix. Now rejected at the API boundary and
+      pinned with `-protocol_whitelist http,https,tcp,tls,crypto,data`.
+- [x] **Proxy `channels.conf` held a tokenised URL and was never deleted.**
+      Written under `recordings/.proxy_conf/`, which is on the mounted volume.
+      Now removed in `stop_proxy`.
+      **Action for the sponsor:** one pre-existing file is still on disk at
+      `recordings/.proxy_conf/channels_893cc63a.conf`. It is gitignored and was
+      never committed, but it holds a real stream URL. Delete it when
+      convenient -- not doing so myself, per the escalation rule on config
+      files.
+
+### Still open, deliberately not fixed
+- [ ] **No cap on concurrent sessions or on readers per session.** Every tail
+      reader goes through `asyncio.to_thread` onto the default executor
+      (`min(32, cpu+4)` workers), so ~32 active readers starve `/api/probe` and
+      the shutdown hook. Not urgent for a single-sponsor LAN install, and the
+      right fix depends on the rebroadcast decision below.
+- [ ] **URL tokens still reach the logs.** `FFmpeg said: {detail}` puts up to
+      500 chars of a tokenised URL into `log_history`, which is served by
+      `/api/status` and the log endpoint. The cookie is redacted; the URL query
+      string is not. Worth a redaction pass on log sinks.
+- [ ] **Notifications ship the full primary URL** to Discord/Telegram.
+- [ ] **`_failover_delay` and `max_cycles=3` are recording semantics.** A
+      permanent channel should retry forever, not give up after three laps.
+- [ ] **The healthcheck cannot see a wedged session.** Both the Dockerfile and
+      compose healthchecks hit `/api/status`, which returns 200 for a session
+      whose `bytes_written` has been frozen for an hour.
+- [ ] **hls-proxy's bind address is unverified.** It is cloned at build time,
+      not vendored. If it binds 0.0.0.0 it is a second unauthenticated relay on
+      8090+. Check before rebroadcast ships.
+
+### The rebroadcast design decision -- SPONSOR INPUT NEEDED
+Architect and DevOps agree on the shape: keep `StreamFailoverRecorder` and swap
+its *sink*. The failover machinery never touches the file -- only three lines
+inside `_stream_ffmpeg_process` do -- so a sink abstraction reuses 100% of the
+cycling, backoff and freeze detection and duplicates none of it. Rejected: a
+separate recorder class (duplicates ~200 lines of the loop this project has
+spent its whole history debugging).
+
+They disagree on the buffer, and this is the real decision:
+- **Architect** wants an in-memory hub: a bounded per-subscriber queue, evict a
+  slow client rather than drop chunks from the middle of its stream (which
+  hands Plex a corrupt transport stream).
+- **DevOps** says in-memory is the wrong call on this host class and gives the
+  number: at 10 Mbps a stalled client accumulates 75 MB/min, and with no
+  `mem_limit` in `docker-compose.yml` the OOM killer takes uvicorn -- PID 1 --
+  killing every concurrent *recording* too. On a 4 GB NAS that is ~27 minutes
+  from one wedged Plex client to losing the game you were recording.
+
+Lead Engineer's call, for the sponsor to confirm: **DevOps wins on the buffer.**
+The same 75 MB as a capped ring file on disk is page cache, which the kernel
+reclaims under pressure instead of OOM-killing, and is served from RAM anyway.
+It also keeps the existing tail-the-file fan-out, which already works. Architect
+was right that a rotating file breaks a reader holding an fd across truncation
+-- so it needs a fixed-size ring written in place, not log-style rotation.
+
+Two more constraints, from Architect, that any implementation must respect:
+- Chunks are 65536 bytes, which is not a multiple of 188, so chunk boundaries
+  are not TS-packet-aligned. A late joiner must start on a 188-byte boundary or
+  it gets a partial packet before its first PAT/PMT.
+- Each failover spawns a fresh FFmpeg with its own timeline, so there is a PTS
+  discontinuity at every switch. Invisible in a DVR file; it is exactly where a
+  live client drops. Untested -- must be tried on icebox before promising 24/7.
+

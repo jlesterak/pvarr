@@ -20,7 +20,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app import __version__
-from app.recorder import DEFAULT_MIN_FREE_GB, StreamFailoverRecorder
+from app.recorder import (
+    DEFAULT_MIN_FREE_GB,
+    PROXY_PORT_STRIDE,
+    StreamFailoverRecorder,
+    safe_stream_url,
+)
 from app.probe import probe_stream
 from app.naming import (
     StorageManager,
@@ -301,7 +306,12 @@ def _allocate_proxy_port(base: int = 8090) -> int:
     used = {r.base_port for r in active_recorders.values() if r.is_running}
     port = base
     while port in used:
-        port += 2
+        # Step by the whole reserved block, not by 2. A session binds
+        # base_port + candidate_index, so with three candidates it occupies
+        # base .. base+2 -- stepping by 2 handed the next session a base that
+        # the previous one's last candidate would bind, and the second proxy
+        # then failed to start.
+        port += PROXY_PORT_STRIDE
     return port
 
 
@@ -343,6 +353,14 @@ async def start_recording(
     for candidate_url in candidates:
         if len(candidate_url) > 4096:
             raise HTTPException(status_code=400, detail="URL is too long")
+        # FFmpeg will open file://, concat: and tcp:// just as readily as
+        # https://, and the captured bytes are readable back through the
+        # stream and download endpoints. Refuse anything that is not a real
+        # stream URL here, at the boundary, rather than at the argv list.
+        try:
+            safe_stream_url(candidate_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     if not 1 <= freeze_timeout <= 600:
         raise HTTPException(
@@ -543,15 +561,17 @@ async def stream_logs(recording_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     async def log_generator():
-        last_sent_idx = 0
+        # A sequence number, not an index. log_history is trimmed to its last
+        # LOG_HISTORY_LIMIT lines, so an index into it stops advancing once
+        # trimming starts -- the "anything new?" test could then never be true
+        # again and the live log view sat frozen for the rest of the session.
+        last_seq = 0
         while True:
-            history = list(recorder.log_history)
-            if len(history) > last_sent_idx:
-                for line in history[last_sent_idx:]:
-                    yield f"data: {json.dumps({'log': line, 'summary': recorder.get_status_summary()})}\n\n"
-                last_sent_idx = len(history)
+            lines, last_seq = recorder.logs_since(last_seq)
+            for line in lines:
+                yield f"data: {json.dumps({'log': line, 'summary': recorder.get_status_summary()})}\n\n"
 
-            if not recorder.is_running and len(history) <= last_sent_idx:
+            if not recorder.is_running and not lines:
                 yield f"data: {json.dumps({'log': '[END] Session completed.', 'summary': recorder.get_status_summary()})}\n\n"
                 break
 
