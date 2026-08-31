@@ -4558,5 +4558,100 @@ class TestOriginRefusalIsNotAHeaderProblem(unittest.TestCase):
 
 
 
+class TestLooksTokenised(unittest.TestCase):
+    """Deciding whether a URL carries a per-session access token.
+
+    Only used to offer one extra sentence of advice, so a false positive is
+    cheap -- but a false positive on every ordinary URL would make the advice
+    noise, which is why the path heuristic needs randomness and not just length.
+    """
+
+    def test_a_token_in_the_query_string(self):
+        self.assertTrue(probe.looks_tokenised("https://c.example/live.m3u8?token=abc"))
+        self.assertTrue(probe.looks_tokenised("https://c.example/m.m3u8?hdnts=exp=1~hmac=aa"))
+
+    def test_a_token_baked_into_the_path(self):
+        """nginx secure_link, which is what the sponsor's provider used."""
+        self.assertTrue(probe.looks_tokenised(
+            "https://lb7.example/secure/FlvJQqsJxGnlYyFpbiOfUVLbEzjzTHyA/stream/mono.m3u8"))
+
+    def test_a_long_hex_path_segment(self):
+        self.assertTrue(probe.looks_tokenised("https://c.example/hls/10ee824a533e34e1/mono.m3u8"))
+
+    def test_an_ordinary_slug_is_not_a_token(self):
+        """Length alone would flag this -- 26 characters of plain English."""
+        self.assertFalse(probe.looks_tokenised(
+            "https://s.example/2024-nfl-week-1-highlights/master.m3u8"))
+
+    def test_ordinary_urls_are_not_tokens(self):
+        for url in ("https://c.example/hls/master.m3u8",
+                    "https://s.example/watch/game-123",
+                    "https://s.example/channel.php?id=5",
+                    "https://c.example/live/manchester-united/index.m3u8"):
+            self.assertFalse(probe.looks_tokenised(url), url)
+
+
+class TestExpiredTokenAdvice(unittest.TestCase):
+    """The likeliest real cause of "could not detect headers".
+
+    These tokens are minted for one browser session and commonly last minutes,
+    so an m3u8 copied out of DevTools is often dead by the time it is pasted --
+    and PVArr answered that by suggesting more headers. Pasting the page URL
+    instead lets the recorder re-resolve it on every connect and failover, which
+    is the thing that actually survives a three-hour recording.
+    """
+
+    def _fake_fetch(self, script):
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            for needle, status in script.items():
+                if needle in url:
+                    resp = MagicMock()
+                    resp.status_code = status
+                    resp.ok = 200 <= status < 300
+                    resp.url = url
+                    return resp, b"denied" if status >= 400 else b"<html>hi</html>"
+            raise AssertionError(f"unscripted URL: {url}")
+
+        return fetch
+
+    def test_a_rejected_token_suggests_the_page_url(self):
+        from unittest.mock import patch
+        url = "https://x.example/secure/FlvJQqsJxGnlYyFpbiOfUVLbEzjzTHyA/mono.m3u8"
+        with patch("app.probe._fetch", self._fake_fetch({"mono.m3u8": 403, "://x.example/": 200})):
+            result = probe.probe_stream(url)
+        self.assertIn("access token", result["message"])
+        self.assertIn("page URL", result["message"])
+        # And it must stop blaming headers for it.
+        self.assertNotIn("copy them from DevTools", result["message"])
+
+    def test_an_untokenised_url_keeps_the_header_advice(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 200})):
+            result = probe.probe_stream("https://x.example/hls/live.m3u8")
+        self.assertIn("DevTools", result["message"])
+        self.assertNotIn("access token", result["message"])
+
+    def test_a_wall_beats_the_token_advice(self):
+        """If the host refuses its own front page, "paste the page URL" is
+        wrong advice -- the page will be refused too."""
+        from unittest.mock import patch
+        url = "https://x.example/secure/FlvJQqsJxGnlYyFpbiOfUVLbEzjzTHyA/mono.m3u8"
+        with patch("app.probe._fetch", self._fake_fetch({"mono.m3u8": 403, "://x.example/": 403})):
+            result = probe.probe_stream(url)
+        self.assertIn("front page", result["message"])
+        self.assertNotIn("page URL", result["message"])
+
+    def test_a_404_on_a_tokenised_url_says_expired(self):
+        from unittest.mock import patch
+        url = "https://x.example/hls/10ee824a533e34e1/mono.m3u8"
+        with patch("app.probe._fetch", self._fake_fetch({"mono.m3u8": 404, "://x.example/": 200})):
+            result = probe.probe_stream(url)
+        self.assertIn("expired", result["message"])
+        self.assertIn("page URL", result["message"])
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

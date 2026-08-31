@@ -504,6 +504,39 @@ def _check_origin(
     return resp.status_code
 
 
+# Query keys and path shapes that mean "this URL carries an access token".
+# Not an exhaustive list and does not need to be: it only decides whether to
+# offer one extra sentence of advice.
+_TOKEN_QUERY_KEYS = (
+    "token", "tok", "key", "sig", "signature", "hash", "md5", "expires",
+    "expire", "exp", "auth", "hdnts", "wmsauthsign", "st", "e",
+)
+# A token in a path is long *and* looks random. Length alone is not enough:
+# "2024-nfl-week-1-highlights" is 26 characters of perfectly ordinary slug.
+# Randomness shows up as either long hex, or a mix of upper and lower case --
+# neither of which happens in a human-written path segment.
+_HEX_SEGMENT = re.compile(r"^[0-9a-f]{16,}$", re.I)
+_MIXED_CASE_SEGMENT = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])[A-Za-z0-9_\-]{16,}$")
+
+
+def looks_tokenised(url: str) -> bool:
+    """True when the URL carries what looks like a per-session access token.
+
+    Two shapes, both common: a token in the query string, and a token baked
+    into the path as a long opaque segment (nginx secure_link does this --
+    /secure/<32 chars>/...). Used only to decide whether to suggest pasting the
+    page URL instead, so a false positive costs one unnecessary sentence.
+    """
+    parts = urlsplit(url or "")
+    keys = {k.lower() for k in parse_qs(parts.query)}
+    if keys & set(_TOKEN_QUERY_KEYS):
+        return True
+    return any(
+        _HEX_SEGMENT.match(seg) or _MIXED_CASE_SEGMENT.match(seg)
+        for seg in parts.path.split("/")
+    )
+
+
 def _failure_message(
     status: Optional[int],
     url: str,
@@ -520,6 +553,21 @@ def _failure_message(
             "from DevTools will not help. Either the link has expired (these "
             "tokens are usually short-lived) or the host is blocking us. Open "
             "the URL in a browser: if it fails there too, get a fresh link."
+        )
+    # A tokenised URL that is refused, from a host that is otherwise talking to
+    # us, is far more often an expired token than a missing header. These
+    # tokens are minted for one browser session and commonly die in minutes, so
+    # a link copied out of DevTools is often already dead when it is pasted --
+    # and no header will revive it. Pasting the *page* instead lets PVArr mint
+    # its own, and re-mint it on every failover.
+    if status in (401, 403, 404) and looks_tokenised(url):
+        expired = "has probably expired" if status == 404 else "was rejected"
+        return (
+            f"The access token in this URL {expired} ({status}). These are usually "
+            "tied to one browser session and last minutes, so an m3u8 copied from "
+            "DevTools is often dead by the time it is pasted. Paste the **page URL** "
+            "you watch the stream on instead — PVArr re-resolves it every time it "
+            "connects, including on failover, so it gets a fresh token each time."
         )
     if status == 403:
         return (

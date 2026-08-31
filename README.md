@@ -118,14 +118,27 @@ When you paste a URL, PVArr:
    what the origin returned.
 
 The same probe runs again inside the recorder each time it connects to a
-candidate — including on failover an hour later — so an expired token is
-re-resolved rather than replayed.
+candidate — including on failover an hour later. **What you pasted is what gets
+re-probed**, which is why it matters which URL you give it: paste a page and
+PVArr re-resolves it and mints a fresh token every time; paste a tokenised
+m3u8 and there is nothing to re-resolve, so it can only retry the same token.
 
 ### Getting the URL to paste
 
-If the site plays the stream on a normal page, paste the page URL. If that
-comes back red, or the player builds its URL in JavaScript, take the m3u8 from
-the browser instead:
+**Paste the page URL, not the m3u8, whenever the page works.** This is the
+single most common cause of "PVArr cannot detect the headers".
+
+Most streaming sites mint the token in the m3u8 URL for one browser session,
+and it commonly expires in minutes. So an m3u8 copied out of DevTools is often
+dead before you have finished pasting it — and no header will revive it. Worse,
+it stays dead: the recorder re-probes whatever you gave it, so a tokenised URL
+gets retried rather than re-resolved. Give it the page and PVArr does the
+handshake itself, from the machine that will do the recording, every time it
+connects.
+
+If the page genuinely does not work — it comes back red, or the player builds
+its URL in JavaScript — then take the m3u8 from the browser, and expect to
+repaste it if the recording is long:
 
 1. Open the streaming page and press **F12**.
 2. Select the **Network** tab, reload, and start playback.
@@ -493,7 +506,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-425 tests covering filename sanitisation and collision handling, storage
+434 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

@@ -1802,3 +1802,62 @@ The dev box hit 100% disk (6.7 MB free) mid-session and took 302 tests down
 with it. Cause was 16.66 GB of dangling images from this session's own docker
 builds; `docker image prune` recovered it. Worth remembering that building the
 shipped image to test against is not free.
+
+## humantodo line 2, step 3: it was the wrong URL, not the wrong headers (2026-08-31)  [COMPLETED]
+
+Sponsor tested **five streams from five different providers**. All five gave
+the same "Every header combination was rejected (403)... copy them from
+DevTools", and all five 403'd under curl and in a browser too.
+
+Five independent providers do not all break the same way by coincidence. The
+common factor is not the providers -- it is what was being pasted.
+
+### The cause
+`_probe_candidate()` probes `candidate.url` -- **the URL the operator typed** --
+fresh at connect time and again on every failover. The resolved playlist is
+kept separately in `candidate.m3u8_url` and is never fed back in as input.
+
+That makes the choice of pasted URL decisive:
+
+- Paste a **page**: PVArr scrapes it and mints a token itself, from the machine
+  doing the recording, every single time it connects. Token expiry mid-capture
+  fixes itself.
+- Paste a **tokenised m3u8**: there is nothing to re-resolve. Every retry
+  replays the same token. And that token was minted for the operator's *browser
+  session*, often expiring in minutes -- so a URL copied out of DevTools is
+  frequently dead before it is pasted, and dead for good.
+
+Reproduced end to end against a local origin that mints per-session tokens with
+a short TTL: the copied m3u8 probes fine immediately, 403s seconds later, and
+the same origin's page URL keeps working indefinitely with a fresh token each
+probe.
+
+### The fix
+`looks_tokenised()` spots an access token in a URL -- either in the query
+string (token/sig/hash/expires/hdnts/...) or baked into the path as a long
+opaque segment, which is what nginx `secure_link` does and what the sponsor's
+provider used. On a 401/403/404 from a host that *is* otherwise answering, the
+message now names the real problem and says to paste the page URL instead of
+sending the operator after headers that do not exist.
+
+Precedence matters: the "host refuses its own front page" check still wins,
+because telling someone to paste the page URL of a host that refuses everything
+would be wrong advice. There is a test for that ordering.
+
+The path heuristic needs randomness, not just length -- `2024-nfl-week-1-
+highlights` is 26 characters of ordinary slug. Long hex, or a mix of upper and
+lower case, neither of which occurs in a human-written path segment.
+
+### README was overselling this too
+It said "an expired token is re-resolved rather than replayed", full stop. Only
+true when a page URL was pasted. Corrected, and "Getting the URL to paste" now
+leads with paste-the-page and explains why, rather than presenting the DevTools
+m3u8 as an equal option.
+
+434 tests (was 425).
+
+### Still open
+Whether this actually resolves the sponsor's five. It explains all the observed
+evidence, but the confirming test is theirs to run: paste the **page** URL for
+those same five streams. If a page URL still fails on a host whose root answers,
+that is a genuine header-detection gap and the trace will finally show it.
