@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 from typing import List, Optional, Callable, Dict, Any, Tuple
 
 from app.check_deps import find_executable
+from app.logging_config import redact_url_secrets
 from app.probe import DEFAULT_USER_AGENT, probe_stream
 
 logger = logging.getLogger("PVArrRecorder")
@@ -436,6 +437,12 @@ class StreamFailoverRecorder:
         self.ffmpeg_path = find_executable("ffmpeg")
 
     def _log(self, message: str, level: str = "INFO"):
+        # Redacted here, at the sink, rather than at each call site. log_history
+        # is served by /api/status and the log endpoint, so a token in a log
+        # line is a token readable by anything that can reach port 8999 -- and
+        # not every URL in these lines is ours to sanitise at the source, since
+        # FFmpeg's own error text quotes the URL it was given.
+        message = redact_url_secrets(message)
         formatted = f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] [{self.recording_id}] {message}"
         with self._lock:
             self.log_history.append(formatted)

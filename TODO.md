@@ -744,11 +744,10 @@ sponsor.
       (`min(32, cpu+4)` workers), so ~32 active readers starve `/api/probe` and
       the shutdown hook. Not urgent for a single-sponsor LAN install, and the
       right fix depends on the rebroadcast decision below.
-- [ ] **URL tokens still reach the logs.** `FFmpeg said: {detail}` puts up to
-      500 chars of a tokenised URL into `log_history`, which is served by
-      `/api/status` and the log endpoint. The cookie is redacted; the URL query
-      string is not. Worth a redaction pass on log sinks.
-- [ ] **Notifications ship the full primary URL** to Discord/Telegram.
+- [x] **URL tokens still reach the logs.** Fixed 2026-08-31 -- see the
+      redaction pass below.
+- [x] **Notifications ship the full primary URL** to Discord/Telegram. Fixed
+      2026-08-31; it was a parameter mismatch, not a formatting choice.
 - [ ] **`_failover_delay` and `max_cycles=3` are recording semantics.** A
       permanent channel should retry forever, not give up after three laps.
 - [ ] **The healthcheck cannot see a wedged session.** Both the Dockerfile and
@@ -1593,3 +1592,52 @@ channel.
 398 tests (was 373). The dashboard helper was additionally exercised in node
 across nine cases (null, undefined, sub-minute, minutes, hours, zero, negative,
 and the two status gates).
+
+
+## Credential redaction in logs and notifications (2026-08-31)  [COMPLETED]
+
+Follow-on from clearing the stale `channels.conf`: same class of leak, larger
+blast radius. `redact_url_secrets()` in `logging_config.py` strips userinfo,
+query string and fragment from any URL in a string, keeping scheme, host and
+path -- which is what identifies the candidate and is the whole diagnostic
+value of the line.
+
+### Applied at the sinks, not the call sites
+A redaction you have to remember to call is one that gets forgotten at the next
+call site added -- and these URLs are not all ours to sanitise at source, since
+a token can arrive inside FFmpeg's own error text. So it goes in
+`StreamFailoverRecorder._log()`, which every recorder log line passes through.
+
+### The notification leak was a parameter mismatch, not a formatting choice
+`notify_recording_started(session_id, filename, candidate_name)` renders its
+third argument as "Stream: {value}". `server.py` was passing `candidates[0]` --
+the raw tokenised primary URL. So **every** "recording started" message shipped
+a live stream token to Discord and Telegram, where it lands in a third party's
+message history that cannot be expired or deleted. That is a worse exposure
+than the same token in a local log, and worse than the conf file, which never
+left the box.
+
+Fixed at the call site (pass `recorder.candidates[0].name`) *and* at the sink,
+because a notification cannot be recalled.
+
+### Also found while doing it
+`trigger_media_server_refresh()` and `send_telegram()` logged raw exception
+text on failure. `requests` puts the failing URL in its exception message, and
+those URLs carry `X-Plex-Token`, `api_key` and the Telegram bot token in their
+query strings -- so a Plex refresh failing would print the Plex token to
+stdout. All four handlers now redact.
+
+### Proven, not assumed
+- revert the `_log` redaction -> `'SECRET' unexpectedly found in [...log_history]`
+- revert the call site -> `'SECRET' unexpectedly found in '<id> <file> https://cdn.example/live.m3u8?token=SECRET'`
+
+408 tests (was 398).
+
+### Deliberately NOT redacted -- sponsor call if this should change
+`candidates[].url` in `/api/status` still carries the full tokenised URL. The
+operator typed it, the dashboard shows it back to them, and the advanced header
+override fields are keyed by it, so redacting it would break the UI and hide
+the operator's own input from them. It is an API contract decision rather than
+a bug fix, so it is recorded here rather than made quietly. Note that PVArr has
+no authentication at all, so port 8999 is trusted-LAN-only either way -- which
+is the real reason this one is not urgent.

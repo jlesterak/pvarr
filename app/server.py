@@ -769,9 +769,15 @@ async def start_recording(
 
     # Runs in the threadpool after the response is sent. Called inline this
     # would block the event loop for up to 15s (three HTTP calls, timeout=5).
+    # The recorder's own name for the candidate, NOT candidates[0]. This
+    # argument is called candidate_name and is rendered as "Stream: {value}",
+    # but it was being handed the raw primary URL -- so every "recording
+    # started" message shipped a fully tokenised stream URL to Discord and
+    # Telegram, where it lands in a third party's message history that cannot
+    # be expired or deleted.
     background_tasks.add_task(
         notifier.notify_recording_started,
-        recording_id, output_path.name, candidates[0],
+        recording_id, output_path.name, recorder.candidates[0].name,
     )
 
     return JSONResponse({

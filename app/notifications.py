@@ -10,6 +10,8 @@ import os
 import requests
 from typing import Dict, Any, Optional
 
+from app.logging_config import redact_url_secrets
+
 logger = logging.getLogger("PVArrNotifications")
 
 
@@ -39,7 +41,7 @@ class NotificationManager:
         try:
             requests.post(self.discord_webhook_url, json=payload, timeout=5)
         except Exception as e:
-            logger.error(f"Failed to send Discord webhook: {e}")
+            logger.error("Failed to send Discord webhook: %s", redact_url_secrets(str(e)))
 
     def send_telegram(self, message: str):
         """Send Telegram message notification."""
@@ -55,9 +57,14 @@ class NotificationManager:
         try:
             requests.post(url, json=payload, timeout=5)
         except Exception as e:
-            logger.error(f"Failed to send Telegram notification: {e}")
+            logger.error("Failed to send Telegram notification: %s", redact_url_secrets(str(e)))
 
     def notify_recording_started(self, session_id: str, filename: str, candidate_name: str):
+        # Belt and braces. The call site is fixed to pass a candidate *name*,
+        # but a notification leaves the network for good -- there is no taking
+        # it back out of a Discord channel -- so the sink refuses to carry a
+        # token even if a future caller hands it a URL again.
+        candidate_name = redact_url_secrets(candidate_name)
         msg = f"🎥 <b>Recording Started</b>\nSession: <code>{session_id}</code>\nFile: <code>{filename}</code>\nActive Stream: {candidate_name}"
         self.send_discord("Recording Started 🎥", f"**Session:** `{session_id}`\n**File:** `{filename}`\n**Stream:** {candidate_name}", color=3066993)
         self.send_telegram(msg)
@@ -82,7 +89,7 @@ class NotificationManager:
                 requests.get(url, timeout=5)
                 logger.info("Plex library refresh triggered successfully.")
             except Exception as e:
-                logger.error(f"Plex refresh failed: {e}")
+                logger.error("Plex refresh failed: %s", redact_url_secrets(str(e)))
 
         # Emby / Jellyfin refresh
         if self.emby_url and self.emby_api_key:
@@ -91,4 +98,4 @@ class NotificationManager:
                 requests.post(url, timeout=5)
                 logger.info("Emby/Jellyfin library refresh triggered successfully.")
             except Exception as e:
-                logger.error(f"Emby refresh failed: {e}")
+                logger.error("Emby refresh failed: %s", redact_url_secrets(str(e)))

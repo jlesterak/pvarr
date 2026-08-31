@@ -31,7 +31,8 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
-from app import ringbuffer, sessions
+from app import notifications, ringbuffer, sessions
+from app.logging_config import redact_url_secrets
 from app.recorder import (
     DEFAULT_MAX_HOURS,
     CandidateStream,
@@ -4221,6 +4222,114 @@ class TestDeadlineSurvivesRestart(unittest.TestCase):
                 end_time=time.time() + 3600)
             self.assertEqual(
                 sessions.resume_decision(record, gap_limit=99999), "resume")
+
+
+
+class TestUrlSecretRedaction(unittest.TestCase):
+    """Query strings are where stream access tokens live."""
+
+    def test_the_query_string_goes(self):
+        out = redact_url_secrets(
+            "FFmpeg said: https://cdn.example/live/seg.ts?token=SECRET&x-expires=1 failed")
+        self.assertNotIn("SECRET", out)
+        self.assertNotIn("x-expires", out)
+        # The useful half survives: which host and path is what identifies the
+        # candidate, and is the entire diagnostic value of the line.
+        self.assertIn("https://cdn.example/live/seg.ts", out)
+        self.assertIn("failed", out)
+
+    def test_userinfo_credentials_go(self):
+        out = redact_url_secrets("Probe https://user:hunter2@cdn.example/a.m3u8")
+        self.assertNotIn("hunter2", out)
+        self.assertNotIn("user", out)
+
+    def test_a_clean_url_is_left_alone(self):
+        text = "Connecting to https://cdn.example/a/b.m3u8 now"
+        self.assertEqual(redact_url_secrets(text), text)
+
+    def test_several_urls_in_one_line(self):
+        out = redact_url_secrets("https://a.example/1?z=1 and https://b.example/2?y=2")
+        self.assertNotIn("z=1", out)
+        self.assertNotIn("y=2", out)
+
+    def test_a_truncated_url_is_still_redacted(self):
+        """Log lines cut URLs at 70 chars, which can land mid-token."""
+        out = redact_url_secrets("[Direct Mode] Connecting to https://cdn.example/x.m3u8?tok=abcd")
+        self.assertNotIn("abcd", out)
+
+    def test_non_string_input_does_not_raise(self):
+        self.assertEqual(redact_url_secrets(None), None)
+        self.assertIn("cdn.example", redact_url_secrets(Path("https://cdn.example/a?k=v")))
+
+
+class TestRecorderLogsCarryNoTokens(unittest.TestCase):
+    """log_history is served by /api/status and the log endpoint, so a token
+    in a log line is readable by anything that can reach port 8999."""
+
+    def make(self):
+        tmp = tempfile.mkdtemp(prefix="pvarr-redact-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return StreamFailoverRecorder(
+            "r1", ["https://cdn.example/live.m3u8?token=SECRET"],
+            str(Path(tmp) / "out.ts"), min_free_gb=0)
+
+    def test_a_token_never_reaches_the_log_history(self):
+        rec = self.make()
+        rec._log("FFmpeg said: https://cdn.example/seg.ts?token=SECRET&sig=DEADBEEF broke")
+        joined = "\n".join(rec.log_history)
+        self.assertNotIn("SECRET", joined)
+        self.assertNotIn("DEADBEEF", joined)
+        self.assertIn("cdn.example/seg.ts", joined)
+
+    def test_the_log_lines_in_the_status_summary_are_redacted(self):
+        """Scoped to the logs deliberately.
+
+        `candidates[].url` in the same payload still carries the full
+        tokenised URL, and that is not an oversight: the operator typed it,
+        the dashboard shows it back to them, and the advanced header fields
+        are keyed by it. Changing that is an API contract decision, recorded
+        in TODO.md rather than made quietly here.
+        """
+        rec = self.make()
+        rec._log("connecting https://cdn.example/live.m3u8?token=SECRET")
+        summary = rec.get_status_summary()
+        self.assertNotIn("SECRET", json.dumps(summary["logs"]))
+
+
+class TestNotificationsShipNoTokens(ServerTestCase):
+    """A notification leaves the network for good.
+
+    There is no taking a message back out of a Discord channel, and no
+    expiring it -- so this is a worse leak than the same token in a local log.
+    """
+
+    def test_the_started_notification_is_given_a_name_not_a_url(self):
+        """The regression: notify_recording_started declares a candidate_name
+        and was handed candidates[0], the raw tokenised primary URL."""
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock()]
+        fake.candidates[0].name = "Candidate 1"
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake):
+            with patch.object(self.server.notifier, "notify_recording_started") as note:
+                r = self.client.post("/api/recordings/start", data={
+                    "url_primary": "https://cdn.example/live.m3u8?token=SECRET",
+                })
+        self.assertEqual(r.status_code, 200)
+        shipped = " ".join(str(a) for a in note.call_args.args)
+        self.assertNotIn("SECRET", shipped)
+        self.assertIn("Candidate 1", shipped)
+
+    def test_the_sink_redacts_a_url_handed_to_it_anyway(self):
+        from unittest.mock import patch
+        manager = notifications.NotificationManager()
+        with patch.object(manager, "send_discord") as discord, \
+             patch.object(manager, "send_telegram") as telegram:
+            manager.notify_recording_started(
+                "s1", "game.ts", "https://cdn.example/live.m3u8?token=SECRET")
+        self.assertNotIn("SECRET", " ".join(str(a) for a in discord.call_args.args))
+        self.assertNotIn("SECRET", " ".join(str(a) for a in telegram.call_args.args))
 
 
 

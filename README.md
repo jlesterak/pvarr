@@ -436,6 +436,8 @@ the attempt fails or PVArr is stopped. The folder itself stays behind, empty,
 and is safe to leave alone. A `channels_*.conf` file sitting in it while
 nothing is recording is a bug — please report it.
 
+**Stream URLs in the logs and notifications.** PVArr strips the query string — where stream access tokens live — from every URL before it reaches the event log, the container's stdout, or a Discord/Telegram message. You will see `https://cdn.example/live.m3u8?<redacted>`; the host and path stay, because that is what tells you which candidate is talking. The candidate URLs shown on the dashboard and returned by `/api/status` are **not** redacted: you typed them, and the advanced header fields are keyed by them. PVArr has no authentication, so treat port 8999 as trusted-LAN-only regardless.
+
 **A recording says `finished on schedule`.** It reached the end of its window (or the `PVARR_MAX_HOURS` backstop) while still capturing, and stopped cleanly — the file is complete and was remuxed and announced as normal. If instead it says `completed partial`, the window closed while every candidate was down, so the file stops where the stream did.
 
 **A recording ended after 6 hours and you did not ask it to.** That is `PVARR_MAX_HOURS`, the backstop for captures with no duration set. Give the recording a duration, raise the variable, or set it to `0` to remove the cap. Live rebroadcast channels are never subject to it.
@@ -454,12 +456,13 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-398 tests covering filename sanitisation and collision handling, storage
+408 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across
 containers, FFmpeg command construction, proxy credential cleanup, recording
-windows and the duration backstop, and every HTTP route.
+windows and the duration backstop, log and notification redaction, and
+every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the
