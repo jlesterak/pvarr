@@ -38,3 +38,7 @@ channels.conf
 .idea/
 .DS_Store
 *.swp
+
+# Local-only working files (not part of the published project)
+CLAUDE.md
+humantodo.md
