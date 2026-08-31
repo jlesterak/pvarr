@@ -612,7 +612,14 @@
           try {
             await fetch(`/api/recordings/${id}/stop`, { method: 'POST' });
             this.refreshStatus();
-            setTimeout(() => this.fetchLibrary(), 1500);
+            // Post-processing runs after the stop returns, and a remux of a
+            // long recording takes far longer than a second or two. A single
+            // refresh here listed the .ts that the remux was about to delete,
+            // so the next click on it 404'd. Keep checking back.
+            [1500, 5000, 15000, 30000].forEach(ms => setTimeout(() => {
+              this.fetchLibrary();
+              this.refreshStatus();
+            }, ms));
           } catch (e) {
             alert('Stop error: ' + e);
           }

@@ -130,11 +130,22 @@ class TestStorageManager(unittest.TestCase):
         third = self.mgr.get_output_path("NFL", "A", "B")
         self.assertNotIn(third, (first, second))
 
-    def test_list_recordings_only_returns_ts(self):
+    def test_list_recordings_covers_every_container(self):
+        # This used to glob "*.ts" only, which hid every FINISHED recording:
+        # post-processing remuxes to .mp4 and deletes the .ts, so the library
+        # emptied itself the moment a capture succeeded.
         (Path(self.tmp) / "a.ts").write_bytes(b"x" * 2048)
         (Path(self.tmp) / "b.mkv").write_bytes(b"x" * 2048)
-        (Path(self.tmp) / "c.txt").write_text("not a recording")
+        (Path(self.tmp) / "c.mp4").write_bytes(b"x" * 2048)
+        (Path(self.tmp) / "d.txt").write_text("not a recording")
 
+        names = sorted(r["filename"] for r in self.mgr.list_recordings())
+        self.assertEqual(names, ["a.ts", "b.mkv", "c.mp4"])
+
+    def test_list_recordings_ignores_directories(self):
+        # .proxy_conf and similar live alongside the recordings.
+        (Path(self.tmp) / "a.ts").write_bytes(b"x")
+        (Path(self.tmp) / "weird.mp4").mkdir()
         names = [r["filename"] for r in self.mgr.list_recordings()]
         self.assertEqual(names, ["a.ts"])
 
@@ -148,10 +159,33 @@ class TestStorageManager(unittest.TestCase):
     def test_list_recordings_missing_dir_is_empty(self):
         self.assertEqual(self.mgr.list_recordings("/nonexistent/pvarr/path"), [])
 
-    def test_rename_appends_ts_extension(self):
+    def test_rename_inherits_the_existing_extension(self):
         (Path(self.tmp) / "old.ts").write_bytes(b"x")
         self.assertTrue(self.mgr.rename_recording("old.ts", "new"))
         self.assertTrue((Path(self.tmp) / "new.ts").exists())
+
+    def test_rename_inherits_mp4_not_ts(self):
+        # ".ts" used to be forced onto every rename, so renaming a finished
+        # recording gave it a name that lied about its contents.
+        (Path(self.tmp) / "old.mp4").write_bytes(b"x")
+        self.assertTrue(self.mgr.rename_recording("old.mp4", "highlights"))
+        self.assertTrue((Path(self.tmp) / "highlights.mp4").exists())
+        self.assertFalse((Path(self.tmp) / "highlights.ts").exists())
+
+    def test_rename_keeps_an_explicit_mp4_extension(self):
+        (Path(self.tmp) / "old.mp4").write_bytes(b"x")
+        self.assertTrue(self.mgr.rename_recording("old.mp4", "highlights.mp4"))
+        self.assertTrue((Path(self.tmp) / "highlights.mp4").exists())
+        self.assertFalse((Path(self.tmp) / "highlights.mp4.ts").exists(),
+                         "rename produced a double extension")
+
+    def test_renamed_file_is_still_listed(self):
+        # The rename bug also made the file vanish from the library, since the
+        # result was neither a real .ts nor a listed container.
+        (Path(self.tmp) / "old.mp4").write_bytes(b"x")
+        self.mgr.rename_recording("old.mp4", "highlights")
+        names = [r["filename"] for r in self.mgr.list_recordings()]
+        self.assertEqual(names, ["highlights.mp4"])
 
     def test_rename_refuses_to_clobber(self):
         (Path(self.tmp) / "old.ts").write_bytes(b"old")
@@ -167,6 +201,19 @@ class TestStorageManager(unittest.TestCase):
         (Path(self.tmp) / "a.ts").write_bytes(b"x")
         self.assertTrue(self.mgr.delete_recording("a.ts"))
         self.assertFalse((Path(self.tmp) / "a.ts").exists())
+
+    def test_delete_a_remuxed_recording(self):
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x")
+        self.assertTrue(self.mgr.delete_recording("game.mp4"))
+        self.assertFalse((Path(self.tmp) / "game.mp4").exists())
+
+    def test_media_type_by_extension(self):
+        from app.naming import media_type_for
+        self.assertEqual(media_type_for("a.ts"), "video/mp2t")
+        self.assertEqual(media_type_for("a.mp4"), "video/mp4")
+        self.assertEqual(media_type_for("a.MP4"), "video/mp4")
+        self.assertEqual(media_type_for("a.mkv"), "video/x-matroska")
+        self.assertEqual(media_type_for("a.weird"), "application/octet-stream")
 
     def test_delete_missing_returns_false(self):
         self.assertFalse(self.mgr.delete_recording("ghost.ts"))
@@ -1692,6 +1739,26 @@ class TestLibraryRoutes(ServerTestCase):
         r = self.client.post("/api/library/rename",
                              data={"old_name": "ghost.ts", "new_name": "new.ts"})
         self.assertEqual(r.status_code, 400)
+
+    def test_delete_remuxed_recording(self):
+        # The reported symptom: deleting a finished recording errored, because
+        # the library only ever showed (and the UI only ever offered) .ts.
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x")
+        r = self.client.request("DELETE", "/api/library/game.mp4")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse((Path(self.tmp) / "game.mp4").exists())
+
+    def test_library_lists_remuxed_recordings(self):
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x")
+        r = self.client.get("/api/library")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual([i["filename"] for i in r.json()["library"]], ["game.mp4"])
+
+    def test_download_uses_the_right_content_type(self):
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x" * 16)
+        r = self.client.get("/api/library/download/game.mp4")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "video/mp4")
 
     def test_delete(self):
         (Path(self.tmp) / "game.ts").write_bytes(b"x")

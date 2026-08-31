@@ -21,7 +21,12 @@ from fastapi.templating import Jinja2Templates
 from app import __version__
 from app.recorder import StreamFailoverRecorder
 from app.probe import probe_stream
-from app.naming import StorageManager, generate_sports_filename, probe_video_resolution
+from app.naming import (
+    StorageManager,
+    generate_sports_filename,
+    media_type_for,
+    probe_video_resolution,
+)
 from app.cleanup import register_signal_handlers
 from app.tuner import (
     generate_m3u_playlist,
@@ -630,4 +635,8 @@ async def download_file(filename: str, dir_path: Optional[str] = None):
     file_path = target_dir / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path=file_path, filename=filename, media_type="video/MP2T")
+    # Was hardcoded to MPEG-TS, so a remuxed .mp4 downloaded with a Content-Type
+    # that contradicted its contents.
+    return FileResponse(
+        path=file_path, filename=filename, media_type=media_type_for(filename)
+    )

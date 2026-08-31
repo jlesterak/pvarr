@@ -369,6 +369,42 @@ additional disk writes. `select()` on pipes is POSIX; PVArr is Linux/Docker.
   19.34 MB, no stalls, stderr thread exits cleanly on stop.
 - 211 tests pass (was 195 at the start of Phase 11).
 
+## Phase 15: Library Knew Only About `.ts`
+
+Reported by the sponsor as "delete media errors -- seems it's looking for .ts
+not .mp4". The delete failure was the visible edge of a larger problem.
+
+- [x] **BUG FIX: finished recordings were invisible in the library
+      (`naming.py`).** `list_recordings()` was `glob("*.ts")`. Post-processing
+      remuxes to `.mp4` and deletes the `.ts`, so a recording disappeared from
+      the library at the exact moment it succeeded -- the library could only
+      ever show captures that were still running or had failed to remux.
+      Now lists `.ts`, `.mp4` and `.mkv`, and ignores directories.
+
+- [x] **BUG FIX: the reported delete error.** Stopping a recording refreshed the
+      library after 1.5s -- before a real remux finishes -- so the list showed
+      the `.ts` that was about to be deleted. Clicking delete on that stale
+      entry `404`'d. The dashboard now re-checks at 1.5s, 5s, 15s and 30s while
+      post-processing runs, and the listing shows the remuxed file once it
+      lands.
+
+- [x] **BUG FIX: rename forced `.ts` onto everything (`naming.py`).**
+      `if not new_filename.endswith(".ts"): new_filename += ".ts"` turned
+      `highlights.mp4` into `highlights.mp4.ts` -- a name that lies about the
+      contents, and one Plex would mis-handle. A new name now inherits the
+      file's existing container when it has no recognised extension of its own.
+
+- [x] **BUG FIX: downloads always claimed MPEG-TS (`server.py`).** The
+      `media_type` was hardcoded `video/MP2T`, so a remuxed `.mp4` downloaded
+      with a Content-Type contradicting its contents. Now derived from the
+      extension via `naming.media_type_for()`.
+
+### Verified end to end
+Real 2s TS, real FFmpeg remux: library went from `[]` after remux (pre-fix) to
+`['NFL_Bears_vs_Packers.mp4']`; download returned `video/mp4`; rename to
+`Highlights` produced `Highlights.mp4` rather than `Highlights.mp4.ts`; delete
+returned 200 where it previously 404'd. 234 tests, up from 225.
+
 ## Phase 14: Cycling Failover & Manual Stream Selection
 
 - [x] **BUG FIX: the candidate list was a one-way walk (`recorder.py`).**

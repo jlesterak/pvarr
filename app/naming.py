@@ -14,6 +14,23 @@ from typing import Dict, Any, List, Optional
 
 from app.check_deps import find_executable
 
+# Every container a recording can exist in. Capture writes .ts; the
+# post-processor remuxes to .mp4 (or .mkv) and deletes the .ts, so a library
+# that only knew about .ts could not see a single finished recording.
+RECORDING_EXTENSIONS = (".ts", ".mp4", ".mkv")
+
+# Served as the Content-Type when a recording is downloaded.
+MEDIA_TYPES = {
+    ".ts": "video/mp2t",
+    ".mp4": "video/mp4",
+    ".mkv": "video/x-matroska",
+}
+
+
+def media_type_for(filename: str) -> str:
+    """Content-Type for a recording, by extension."""
+    return MEDIA_TYPES.get(Path(filename).suffix.lower(), "application/octet-stream")
+
 
 def sanitize_token(text: str, fallback: str = "Unknown") -> str:
     """Clean string token for safe filename usage."""
@@ -120,8 +137,16 @@ class StorageManager:
         if not dir_path.exists():
             return []
 
+        # Was glob("*.ts"), which hid every finished recording: post-processing
+        # remuxes to .mp4 and deletes the .ts, so the library went empty the
+        # moment a capture succeeded, and a delete clicked against a stale .ts
+        # entry 404'd on a file that no longer existed.
+        files = [
+            f for f in dir_path.iterdir()
+            if f.is_file() and f.suffix.lower() in RECORDING_EXTENSIONS
+        ]
         results = []
-        for file in sorted(dir_path.glob("*.ts"), key=os.path.getmtime, reverse=True):
+        for file in sorted(files, key=os.path.getmtime, reverse=True):
             stat = file.stat()
             results.append({
                 "filename": file.name,
@@ -135,8 +160,11 @@ class StorageManager:
     def rename_recording(self, old_filename: str, new_filename: str, target_dir: Optional[str] = None) -> bool:
         dir_path = Path(target_dir).resolve() if target_dir else self.record_dir
         old_path = dir_path / old_filename
-        if not new_filename.endswith(".ts"):
-            new_filename += ".ts"
+        # Keep the container the file is actually in. This used to force ".ts"
+        # onto every rename, so renaming a finished recording produced
+        # "highlights.mp4.ts" -- a name that lies about the contents.
+        if Path(new_filename).suffix.lower() not in RECORDING_EXTENSIONS:
+            new_filename += old_path.suffix
         new_path = dir_path / new_filename
 
         if old_path.exists() and not new_path.exists():

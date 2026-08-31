@@ -226,9 +226,9 @@ and mounts `./recordings` there.
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
-| `POST` | `/api/library/rename` | Rename a recording |
+| `POST` | `/api/library/rename` | Rename a recording. A new name with no extension inherits the file's existing one, so a remuxed `.mp4` stays an `.mp4`. |
 | `DELETE` | `/api/library/{filename}` | Delete a recording |
-| `GET` | `/api/library/download/{filename}` | Download a recording |
+| `GET` | `/api/library/download/{filename}` | Download a recording. `Content-Type` follows the container (`.ts`, `.mp4`, `.mkv`). |
 | `GET` | `/live/playlist.m3u` · `/live/playlist.m3u8` | M3U tuner playlist |
 | `GET` | `/live/epg.xml` | XMLTV EPG |
 | `GET` | `/discover.json` · `/lineup.json` · `/lineup_status.json` · `/lineup.post` · `/device.xml` | HDHomeRun tuner emulation, also served under `/live` |
@@ -297,6 +297,8 @@ app/
 
 **A recording ended early when all sources blipped at once (versions before 0.1.3).** The candidate list was a one-way walk: once it ran off the end the recording stopped, with no route back to candidate 1 even after it recovered. The list now wraps. Fixed.
 
+**Finished recordings missing from the library, and deleting one errors (versions before 0.1.3).** The library only listed `.ts` files. Post-processing remuxes to `.mp4` and deletes the `.ts`, so a recording vanished from the library the moment it succeeded — and a delete clicked against the stale `.ts` entry `404`'d on a file that no longer existed. Renaming was affected too: `.ts` was forced onto every rename, turning `highlights.mp4` into `highlights.mp4.ts`. The library now covers `.ts`, `.mp4` and `.mkv`, renames keep the container the file is actually in, and downloads carry the right `Content-Type`. Fixed.
+
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 
 **`403` from the upstream.** A required header is missing. Re-run the URL through `POST /api/probe` (or just re-paste it into Add Recording) — the message names the status the origin returned. If the probe reports *segments rejected*, the stream is session gated: copy the `Cookie` request header from DevTools into the manual header fields.
@@ -329,10 +331,11 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-225 tests covering filename sanitisation and collision handling, storage
+234 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
-stream-completion ordering, FFmpeg command construction, and every HTTP route.
+stream-completion ordering, library listing across containers, FFmpeg command
+construction, and every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the
