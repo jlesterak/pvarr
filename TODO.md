@@ -1099,3 +1099,42 @@ Provider survey, done 2026-08-31:
 - **API-Sports and similar** — commercial, per-request quotas.
 - **Sportradar / Stats Perform** — enterprise pricing. Not for a self-hosted
   tool.
+
+## Version badge lied about the running build (2026-08-31)  [COMPLETED]
+
+**Symptom.** The sponsor pulled v0.2.0 onto icebox and the dashboard header
+still read `v1.0.0`. Indistinguishable from "the pull did not take" — the worst
+possible ambiguity at the exact moment you are trying to confirm which build
+you are testing.
+
+**Cause.** `app/templates/index.html:89` carried the literal string `v1.0.0`,
+hardcoded from the first commit and never wired to `__version__`. It has
+therefore been wrong for every release in the 0.1.x series; nobody noticed
+because it was wrong in a stable way. `scripts/publish.sh` bumps
+`app/__init__.py` and CI checks the tag against it, but neither can reach a
+number baked into markup.
+
+**Fix.** `__version__` is registered as a Jinja global
+(`templates.env.globals["pvarr_version"]`) rather than threaded through the one
+route's context dict — a global cannot be forgotten by a route added later,
+which is how this class of bug returns. The template renders
+`v{{ pvarr_version }}`.
+
+`/api/status` now also reports `version`, so "what is icebox actually running?"
+is answerable with `curl` without trusting a number rendered in a page. That is
+the check the sponsor actually needed and did not have.
+
+**Proven.** Reintroduced the hardcoded literal and confirmed the new guard
+fails with the offending file and line named, then restored it. Three tests
+fail with the bug present, all pass without it.
+
+Seven tests added (330 total, was 323):
+- the badge renders the real `__version__`
+- the page does not contain a stale `v1.0.0`
+- **no template anywhere hardcodes a `vX.Y.Z` literal** — the regression guard;
+  this is the one that would have caught the original bug
+- `/api/status` and `/openapi.json` both report `__version__`
+- `__version__` is semver, and the assignment line still matches the regex
+  that `scripts/publish.sh` and the CI tag guard both sed. If that line is ever
+  reformatted the release script silently fails to bump and CI's tag-vs-code
+  check reads an empty string.

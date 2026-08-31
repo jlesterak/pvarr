@@ -237,7 +237,7 @@ and mounts `./recordings` there.
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
 | `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
-| `GET` | `/api/status` | Every session, its candidates and recent logs. Polled by the dashboard. Candidate cookies are **not** included — see below. |
+| `GET` | `/api/status` | The running version, every session, its candidates and recent logs. Polled by the dashboard. Candidate cookies are **not** included — see below. |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
@@ -381,7 +381,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-323 tests covering filename sanitisation and collision handling, storage
+330 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

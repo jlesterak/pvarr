@@ -2077,6 +2077,81 @@ class TestStaticRoutes(ServerTestCase):
         self.assertEqual(self.client.get("/openapi.json").status_code, 200)
 
 
+class TestVersionReporting(ServerTestCase):
+    """The version a user can see must be the version they are running.
+
+    The dashboard badge was the literal "v1.0.0" from the first commit and was
+    never wired to __version__, so it disagreed with every shipped release of
+    the 0.1.x series. The sponsor hit this on icebox: the page said 1.0.0 while
+    the container was 0.2.0, which is indistinguishable from "the pull did not
+    take" -- exactly the wrong thing to be unsure about when testing a build.
+    """
+
+    def test_dashboard_badge_shows_the_real_version(self):
+        from app import __version__
+        body = self.client.get("/").text
+        self.assertIn(f"v{__version__}", body)
+
+    def test_dashboard_does_not_show_a_stale_hardcoded_version(self):
+        from app import __version__
+        body = self.client.get("/").text
+        if __version__ != "1.0.0":
+            self.assertNotIn("v1.0.0", body)
+
+    def test_no_template_hardcodes_a_version_literal(self):
+        """The guard that would have caught the original bug.
+
+        A version baked into markup cannot be bumped by the release script, so
+        it silently rots. Templates must render pvarr_version instead.
+        """
+        import re
+        from app import server
+
+        pattern = re.compile(r"v\d+\.\d+\.\d+")
+        offenders = []
+        for path in Path(server.TEMPLATES_DIR).rglob("*.html"):
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if pattern.search(line):
+                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        self.assertEqual(
+            offenders, [],
+            "Hardcoded version literal in a template; use "
+            "{{ pvarr_version }} so the release bump reaches the UI:\n"
+            + "\n".join(offenders),
+        )
+
+    def test_status_endpoint_reports_the_version(self):
+        from app import __version__
+        data = self.client.get("/api/status").json()
+        self.assertEqual(data["version"], __version__)
+
+    def test_openapi_reports_the_version(self):
+        from app import __version__
+        data = self.client.get("/openapi.json").json()
+        self.assertEqual(data["info"]["version"], __version__)
+
+
+class TestVersionConsistency(unittest.TestCase):
+    """__version__ is the single source of truth the release flow bumps."""
+
+    def test_version_is_semver(self):
+        import re
+        from app import __version__
+        self.assertRegex(__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_version_file_is_what_the_publish_script_parses(self):
+        """scripts/publish.sh and the CI tag guard both sed this exact line.
+
+        If the assignment is ever reformatted, the release script silently
+        fails to bump and CI's tag-vs-code check reads an empty string.
+        """
+        import re
+        from app import __version__
+        text = Path("app/__init__.py").read_text()
+        found = re.findall(r'^__version__ = "(.*)"$', text, re.MULTILINE)
+        self.assertEqual(found, [__version__])
+
+
 class TestTunerRoutes(ServerTestCase):
     def test_m3u_both_extensions(self):
         for path in ("/live/playlist.m3u", "/live/playlist.m3u8"):

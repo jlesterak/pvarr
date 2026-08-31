@@ -115,6 +115,11 @@ def _min_free_gb() -> float:
         return DEFAULT_MIN_FREE_GB
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+# Exposed to every template as a Jinja global rather than passed through
+# each route's context: the dashboard badge was hardcoded to "v1.0.0" and
+# silently disagreed with the shipped version for the whole 0.1.x series.
+# A global cannot be forgotten by a route added later.
+templates.env.globals["pvarr_version"] = __version__
 storage = StorageManager(record_dir=str(RECORDINGS_DIR))
 
 # Active recorder sessions: recording_id -> StreamFailoverRecorder
@@ -288,6 +293,9 @@ async def get_system_status():
     """Return JSON summary of all active recorders."""
     sessions = [r.get_status_summary() for r in active_recorders.values()]
     return {
+        # So "what is icebox actually running?" is answerable with curl,
+        # without trusting a number rendered in the UI.
+        "version": __version__,
         "active_count": len([r for r in active_recorders.values() if r.is_running]),
         "total_sessions": len(sessions),
         "sessions": sessions
