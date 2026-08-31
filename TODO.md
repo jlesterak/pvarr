@@ -617,7 +617,7 @@ one before it.
       immediately cannot loop against `restart: unless-stopped`. Token expiry is
       already handled: the recorder re-probes each candidate at connect time.
 
-- [PENDING] **4. Recording windows and duration caps.** A recording may carry an
+- [COMPLETED] **4. Recording windows and duration caps.** A recording may carry an
       end time or a maximum duration; at the deadline it stops cleanly and
       post-processes normally. This is what makes resume *exact* -- `now < end`
       means reconnect, `now >= end` means finalise -- reducing the gap heuristic
@@ -1527,3 +1527,69 @@ test script (`e2e_proxy_mode.py`) while reproducing the candidate 1 404s.
 Scrubbed. Session-local temp dir, token expiring the same night, but it should
 not have been written down. Repo and scratchpad both verified clean for that
 host.
+
+
+## Phase 13 item 4: Recording windows & duration caps (2026-08-31)  [COMPLETED]
+
+A recording may now carry a length. At the deadline it stops cleanly and
+post-processes exactly as an operator stop does. Both sponsor decisions from
+the Phase 13 spec are implemented as agreed.
+
+### What was built
+- `duration_minutes` (what a curl or cron caller wants) or `end_time` (an
+  absolute epoch, what the dashboard sends) on `POST /api/recordings/start`.
+  **Stop After (min)** on the new-recording form; blank means "until the
+  stream ends".
+- `PVARR_MAX_HOURS`, default **6**, for recordings given no length. A capture
+  pointed at a 24/7 channel never ends by itself -- the stream does not stop,
+  so no failover ever fires and it runs until the disk guard trips. That is a
+  safety net doing a scheduler's job.
+- Checked on the write path *and* at the top of each failover lap. Write path
+  alone would never fire on a healthy stream's deadline... in fact the reverse:
+  a healthy stream never leaves the write loop, and a lap-only check would sit
+  through up to 60s of backoff, or miss the deadline entirely if every
+  candidate happened to be down as the window closed.
+- `ends_at` and `seconds_remaining` in the status summary; the card shows
+  "42m left" under Elapsed, titled with the absolute local time.
+
+### Stored absolute, never as a duration
+A duration restarts its clock on every resume, so a recording that crashed
+twice would run well past the end that was asked for -- and each restart would
+be handed a fresh six hours by the backstop, which is the exact thing the
+backstop exists to prevent. `end_time` is persisted as an absolute epoch and
+the backstop is measured from the *original* `start_time`. `resume_decision()`
+now finalises rather than resuming a session whose window closed while the
+container was down: an exact answer where the mtime gap was a guess.
+
+### Sponsor decision: retry until the window closes
+`max_cycles` is a guess at "these sources are dead"; an explicit end time is a
+statement that the event runs until then, and a stream down at kick-off is
+often back minutes later. So the give-up cap is lifted while a window is open.
+
+Deliberately keyed off an **explicit** window and not the backstop: with no
+duration given, the 6h figure is a default the operator may not know about, and
+retrying for six hours against three dead URLs is not what anyone means by a
+safety net. There is a test for that distinction.
+
+### The status has to stay honest
+First cut called every deadline stop `completed_window`. Wrong, and the test
+caught it: if the stream died twenty minutes into a two-hour window and never
+came back, "finished on schedule" hides a truncated file behind a reassuring
+word -- the same failure as reporting "completed" while a remux was still
+running. Now:
+- capturing when the deadline arrived -> `completed_window` ("finished on
+  schedule")
+- window closed after several dead laps, bytes on disk -> `completed_partial`
+- window closed having captured nothing -> `failed`
+
+### Rebroadcast is exempt from the backstop
+Found while writing this, not after. A live channel is meant to sit there --
+the sponsor starts one and expects it in Plex tomorrow -- and it writes into a
+fixed-size ring, so none of the reasoning behind the backstop applies. Without
+the exemption this change would have silently killed every channel at the six
+hour mark. An explicit `end_time` is still honoured, for a deliberately finite
+channel.
+
+398 tests (was 373). The dashboard helper was additionally exercised in node
+across nine cases (null, undefined, sub-minute, minutes, hours, zero, negative,
+and the two status gates).

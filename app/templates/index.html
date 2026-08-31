@@ -180,6 +180,13 @@
               <div>
                 <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Elapsed Time</span>
                 <span class="text-sm font-bold font-mono text-slate-200" x-text="formatSeconds(session.elapsed_seconds)"></span>
+                <!-- Only rendered when a deadline exists, so an open-ended
+                     recording says nothing rather than saying "no limit" in
+                     every card forever. -->
+                <span x-show="endsIn(session)"
+                      class="text-[11px] block text-slate-500 font-mono"
+                      :title="'Stops at ' + endsAtLocal(session)"
+                      x-text="endsIn(session)"></span>
               </div>
               <div>
                 <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">On Disk</span>
@@ -371,6 +378,20 @@
             <label class="block text-xs font-medium text-slate-400 mb-1">Freeze Timeout (sec)</label>
             <input type="number" x-model="form.freeze_timeout" value="15" min="5" max="60" class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white">
           </div>
+          <!-- Blank is the common case: the global backstop applies and the
+               recording stops when the stream does. A number here is for an
+               event with a known length. -->
+          <div x-show="!form.rebroadcast">
+            <label class="block text-xs font-medium text-slate-400 mb-1">Stop After (min)</label>
+            <input type="number" x-model="form.duration_minutes" min="0" max="1440"
+                   placeholder="blank = until the stream ends"
+                   class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white">
+            <p class="text-[11px] text-slate-500 mt-1">
+              Keeps trying every candidate until this time is up, then stops
+              cleanly and remuxes. <span class="text-slate-400">0</span> also
+              lifts the safety cap.
+            </p>
+          </div>
         </div>
 
         <!-- Rebroadcast: capture and serve to Plex without keeping anything.
@@ -471,6 +492,7 @@
           team_b: 'RedSox',
           resolution: '1080p',
           freeze_timeout: 15,
+          duration_minutes: '',
           rebroadcast: false,
           channel_name: '',
           url_primary: '',
@@ -516,7 +538,11 @@
         },
 
         prettyStatus(status) {
-          return (status || '').replace(/_/g, ' ');
+          // "completed window" is what the underscore rule produces, and it
+          // reads like something went wrong. It did not -- the recording ran
+          // to the end that was asked for.
+          const named = { completed_window: 'finished on schedule' };
+          return named[status] || (status || '').replace(/_/g, ' ');
         },
 
         toMB(bytes) {
@@ -548,6 +574,25 @@
         // The recorder has received data but the file on disk is not growing.
         // That combination is what a recording being deleted underneath looks
         // like, and it was invisible until both numbers were on screen.
+        // A window is a fact about the session, so it is shown while the
+        // recording is live and stays useful afterwards ("ended on schedule").
+        endsIn(s) {
+          if (s.seconds_remaining === null || s.seconds_remaining === undefined) return '';
+          if (!['recording', 'failing_over'].includes(s.status)) return '';
+          const left = s.seconds_remaining;
+          if (left <= 0) return 'stopping';
+          if (left < 90) return Math.round(left) + 's left';
+          if (left < 5400) return Math.round(left / 60) + 'm left';
+          return (left / 3600).toFixed(1) + 'h left';
+        },
+
+        endsAtLocal(s) {
+          if (!s.ends_at) return '';
+          // Rendered from an absolute timestamp in the viewer's own locale, so
+          // the container's TZ (unset, therefore UTC) never has to be right.
+          return new Date(s.ends_at * 1000).toLocaleString();
+        },
+
         sizeDisagrees(s) {
           // Only while actually capturing. During post_processing the remux
           // has already deleted the .ts, so on-disk is legitimately 0 against
@@ -683,6 +728,9 @@
             this.advanced[slot.key] = false;
             this.overrides[slot.key] = { referer: '', user_agent: '', cookie: '' };
           });
+          // A duration belongs to the event just recorded, not to the next
+          // one. Leaving it set would silently cap an unrelated recording.
+          this.form.duration_minutes = '';
         },
 
         async submitRecording() {
@@ -693,7 +741,16 @@
           }
 
           const formData = new FormData();
-          Object.keys(this.form).forEach(k => formData.append(k, this.form[k]));
+          Object.keys(this.form).forEach(k => {
+            const v = this.form[k];
+            // Blank numeric options are omitted, not sent as "": FastAPI parses
+            // Optional[float] from the raw form value and answers 422 on an
+            // empty string, which would reject the whole start. Only the
+            // numeric fields are filtered -- the text fields have server-side
+            // defaults that a deliberately cleared box should not resurrect.
+            if (k === 'duration_minutes' && (v === '' || v === null || v === undefined)) return;
+            formData.append(k, v);
+          });
           const headers = this.buildStreamHeaders();
           if (Object.keys(headers).length) {
             formData.append('stream_headers', JSON.stringify(headers));

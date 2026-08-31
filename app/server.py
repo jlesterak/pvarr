@@ -23,6 +23,7 @@ from fastapi.templating import Jinja2Templates
 from app import __version__
 from app.recorder import (
     DEFAULT_MIN_FREE_GB,
+    DEFAULT_MAX_HOURS,
     PROXY_PORT_STRIDE,
     StreamFailoverRecorder,
     safe_stream_url,
@@ -113,6 +114,23 @@ def _min_free_gb() -> float:
     except ValueError:
         logger.warning("Ignoring invalid PVARR_MIN_FREE_GB=%r", raw)
         return DEFAULT_MIN_FREE_GB
+
+
+def _max_hours() -> float:
+    """Global cap on how long any one recording may run. 0 disables it.
+
+    A per-recording duration overrides this, so the backstop only ever ends a
+    capture nobody gave an end to.
+    """
+    raw = os.environ.get("PVARR_MAX_HOURS")
+    if raw is None:
+        return DEFAULT_MAX_HOURS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid PVARR_MAX_HOURS=%r", raw)
+        return DEFAULT_MAX_HOURS
+
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 # Exposed to every template as a Jinja global rather than passed through
@@ -514,6 +532,8 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         min_free_gb=record.get("min_free_gb", DEFAULT_MIN_FREE_GB),
         ring=ring,
         channel_name=record.get("channel_name") or None,
+        end_time=record.get("end_time"),
+        max_hours=record.get("max_hours", _max_hours()),
     )
     if record.get("started_at"):
         recorder.start_time = record["started_at"]
@@ -598,6 +618,8 @@ async def start_recording(
     stream_headers: Optional[str] = Form(None),
     rebroadcast: bool = Form(False),
     channel_name: Optional[str] = Form(None),
+    duration_minutes: Optional[float] = Form(None),
+    end_time: Optional[float] = Form(None),
 ):
     """Create and start a new failover recording session.
 
@@ -628,6 +650,34 @@ async def start_recording(
         raise HTTPException(
             status_code=400, detail="freeze_timeout must be between 1 and 600 seconds"
         )
+
+    # How long to record. Two spellings because they suit different callers:
+    # `duration_minutes` is what a person typing curl or a cron line wants,
+    # `end_time` is an absolute epoch and is what the dashboard sends, so the
+    # container's timezone never has to agree with the operator's. An absolute
+    # end wins if both are given.
+    resolved_end: Optional[float] = None
+    if end_time is not None:
+        if end_time <= time.time():
+            raise HTTPException(
+                status_code=400, detail="end_time is in the past"
+            )
+        resolved_end = float(end_time)
+    elif duration_minutes is not None:
+        # 0 is meaningful: "no cap, ignore the backstop too".
+        if duration_minutes < 0 or duration_minutes > 24 * 60:
+            raise HTTPException(
+                status_code=400,
+                detail="duration_minutes must be between 0 and 1440 (24 hours)",
+            )
+        if duration_minutes > 0:
+            resolved_end = time.time() + (duration_minutes * 60.0)
+
+    # An explicit duration overrides the global backstop -- including an
+    # explicit 0, which is how an operator says "this one runs until the stream
+    # ends, and I know what I am asking for".
+    session_max_hours = None if duration_minutes is not None or end_time is not None \
+        else _max_hours()
 
     # output_dir is caller-supplied and gets mkdir'd, so it needs the same
     # containment as the library endpoints -- otherwise it is arbitrary
@@ -712,6 +762,8 @@ async def start_recording(
         rebroadcast=rebroadcast,
         channel_name=(channel_name or "").strip()
         or _default_channel_name(sport, team_a, team_b),
+        end_time=resolved_end,
+        max_hours=session_max_hours,
     )
     recorder = _launch_session(record, port)
 

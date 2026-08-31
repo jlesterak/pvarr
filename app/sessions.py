@@ -197,6 +197,8 @@ def build_record(
     resume_attempts: int = 0,
     rebroadcast: bool = False,
     channel_name: str = "",
+    end_time: Optional[float] = None,
+    max_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The shape written to disk. Everything needed to rebuild the recorder.
 
@@ -217,6 +219,11 @@ def build_record(
         "resume_attempts": int(resume_attempts),
         "rebroadcast": bool(rebroadcast),
         "channel_name": str(channel_name or ""),
+        # Absolute epoch, not a duration. A duration would restart its clock on
+        # every resume, so a recording that crashed twice would run well past
+        # the end the operator asked for.
+        "end_time": float(end_time) if end_time else None,
+        "max_hours": None if max_hours is None else float(max_hours),
     }
 
 
@@ -262,6 +269,14 @@ def resume_decision(
         return "discard"
 
     if int(record.get("resume_attempts", 0)) >= attempt_limit:
+        return "finalise"
+
+    # An exact answer, where the gap heuristic below is a guess. If the window
+    # has closed while we were down, the recording is simply over: reconnecting
+    # would capture footage past the end that was asked for, and would then
+    # have to stop almost immediately anyway.
+    end_time = record.get("end_time")
+    if end_time and now >= float(end_time):
         return "finalise"
 
     if (now - stat.st_mtime) > gap_limit:

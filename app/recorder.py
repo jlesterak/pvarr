@@ -84,6 +84,16 @@ PROXY_PORT_STRIDE = 4
 
 DEFAULT_MIN_FREE_GB = 5.0
 
+# Global backstop on how long any one recording may run, in hours. A capture
+# pointed at a 24/7 channel never ends on its own: the stream does not stop, so
+# nothing in the failover logic ever fires and the file grows until the disk
+# guard trips. That is a safety net doing a scheduler's job.
+#
+# 6 rather than 4: 4 truncates NFL overtime and extra-innings baseball, which
+# are the most likely things to be recording unattended. A per-recording
+# duration overrides this; 0 disables it entirely.
+DEFAULT_MAX_HOURS = 6.0
+
 
 class StreamOutcome(str, Enum):
     """Why a single FFmpeg attempt ended.
@@ -331,6 +341,8 @@ class StreamFailoverRecorder:
         auto_probe: bool = True,
         max_cycles: int = 3,
         min_free_gb: Optional[float] = None,
+        end_time: Optional[float] = None,
+        max_hours: Optional[float] = None,
     ):
         self.recording_id = recording_id
         # Per-URL header overrides from the dashboard's "advanced" fields, keyed
@@ -379,6 +391,15 @@ class StreamFailoverRecorder:
         self.min_free_bytes = int(
             (DEFAULT_MIN_FREE_GB if min_free_gb is None else float(min_free_gb))
             * 1024 ** 3
+        )
+        # An absolute epoch deadline, or None to run until the stream ends.
+        # Absolute rather than a duration so it survives a restart unchanged:
+        # a resumed recording must finish when it was always going to finish,
+        # not start its clock again. The same reasoning applies to the backstop
+        # below, which is measured from the original start_time.
+        self.end_time: Optional[float] = float(end_time) if end_time else None
+        self.max_hours: Optional[float] = (
+            None if max_hours is None else max(0.0, float(max_hours))
         )
         self._last_disk_check: float = 0.0
         self._last_output_check: float = 0.0
@@ -823,6 +844,102 @@ class StreamFailoverRecorder:
         self._stop_event.set()
         return False
 
+    def deadline(self) -> Optional[float]:
+        """When this recording must stop, as an absolute epoch time.
+
+        An explicit end time wins outright. Otherwise the global backstop
+        applies, measured from `start_time` -- the *original* one, carried
+        across a resume in the session record. Measuring it from "now" would
+        hand every restart a fresh 6 hours, so a crash-looping recording could
+        run indefinitely, which is the exact thing the backstop exists to stop.
+
+        None means no deadline: an explicit 0 duration, or the backstop
+        disabled with PVARR_MAX_HOURS=0.
+        """
+        if self.end_time:
+            return self.end_time
+        # The backstop is a *recording* limit. A rebroadcast channel is meant to
+        # sit there indefinitely -- the sponsor starts one and expects it to
+        # still be in Plex tomorrow -- and it writes into a fixed-size ring, so
+        # none of the reasoning behind the backstop (an unbounded file eating
+        # the volume) applies to it. Applying it anyway would silently kill
+        # every live channel at the 6 hour mark. An explicit end time is still
+        # honoured: that is someone deliberately asking for a finite channel.
+        if self.is_rebroadcast:
+            return None
+        if not self.max_hours or not self.start_time:
+            return None
+        return self.start_time + (self.max_hours * 3600.0)
+
+    def seconds_remaining(self) -> Optional[float]:
+        """Time left before the deadline, or None if there is not one."""
+        deadline = self.deadline()
+        if deadline is None:
+            return None
+        return deadline - time.time()
+
+    def _within_window(self) -> bool:
+        """True while a deadline exists and has not yet passed.
+
+        A recording with no deadline is deliberately *not* "within a window" --
+        it has no window, so the retry-forever rule below must not apply to it.
+        """
+        remaining = self.seconds_remaining()
+        return remaining is not None and remaining > 0
+
+    def _deadline_ok(self, capturing: bool = False) -> bool:
+        """False once the recording has run to its scheduled end.
+
+        Checked on the write path beside the disk and output guards, and again
+        at the top of each failover lap so a deadline reached during a backoff
+        is not sat through. Ends the recording the same way an operator stop
+        does: it post-processes and is announced normally.
+
+        `capturing` says whether bytes were flowing when the deadline arrived,
+        and it decides what the recording is *called*. Reaching the end of the
+        window mid-capture is a complete recording. Reaching it after the
+        stream died twenty minutes in and never came back is a truncated one,
+        and calling that "finished on schedule" would hide a short file behind
+        a reassuring word -- the same failure as reporting "completed" while a
+        remux was still running.
+        """
+        remaining = self.seconds_remaining()
+        if remaining is None or remaining > 0:
+            return True
+
+        if capturing or self.cycles_without_data == 0:
+            self._log(
+                f"Reached the scheduled end of this recording "
+                f"({self._deadline_reason()}). Stopping cleanly and "
+                "post-processing what was captured.",
+            )
+            self.status = "completed_window"
+        elif self.bytes_written > 0:
+            self._log(
+                f"Reached the scheduled end of this recording "
+                f"({self._deadline_reason()}), but no candidate has delivered "
+                f"data for {self.cycles_without_data} full attempts. Keeping "
+                f"the {self.bytes_written} bytes already recorded.", "WARN",
+            )
+            self.status = "completed_partial"
+        else:
+            self._log(
+                f"Reached the scheduled end of this recording "
+                f"({self._deadline_reason()}) without capturing anything.",
+                "ERROR",
+            )
+            self.status = "failed"
+        self._stop_event.set()
+        return False
+
+    def _deadline_reason(self) -> str:
+        """Which limit is doing the stopping -- worth saying, since one is a
+        deliberate choice and the other is a default the operator may not know
+        about."""
+        if self.end_time:
+            return "requested end time"
+        return f"PVARR_MAX_HOURS backstop, {self.max_hours:g}h"
+
     def _failover_delay(self, wrapped: bool) -> float:
         """Pause before the next attempt.
 
@@ -1033,6 +1150,12 @@ class StreamFailoverRecorder:
                         break
                     if not self._output_ok(out_f):
                         break
+                    # Checked here rather than only between candidates: a
+                    # healthy stream never leaves this loop, so a deadline
+                    # tested only on failover would never fire on exactly the
+                    # long unattended capture the backstop is for.
+                    if not self._deadline_ok(capturing=True):
+                        break
                     continue
 
                 ret_code = self._ffmpeg_process.poll()
@@ -1129,6 +1252,12 @@ class StreamFailoverRecorder:
         every one of them was healthy again. The index now wraps.
         """
         while not self._stop_event.is_set():
+            # A deadline can pass while the loop is in a failover backoff,
+            # which is up to 60s of not writing anything -- so the write-path
+            # check alone would overshoot, or miss it entirely if every
+            # candidate is down at the moment the window closes.
+            if not self._deadline_ok():
+                break
             candidate = self.candidates[self.current_candidate_index]
             bytes_before = self.bytes_written
             # Clear any lingering "failing_over" from the previous iteration so
@@ -1209,7 +1338,27 @@ class StreamFailoverRecorder:
 
             if wrapped:
                 self.cycles_without_data += 1
-                if self.cycles_without_data >= self.max_cycles:
+                # Sponsor decision: a recording with a window keeps trying
+                # until that window closes. max_cycles is a guess at "these
+                # sources are dead"; an explicit end time is a statement that
+                # the event runs until then, and a stream that is down at
+                # kick-off is often back minutes later. The backoff from
+                # Phase 14 already keeps a dead set of origins from being
+                # hammered, and _deadline_ok() above is what finally ends it.
+                #
+                # Deliberately keyed off the *window*, not the backstop: with
+                # no explicit end time this is a plain 6h default the operator
+                # may not know about, and retrying for six hours against three
+                # dead URLs is not what anyone meant by it.
+                if self.end_time and self._within_window():
+                    remaining = self.seconds_remaining() or 0
+                    self._log(
+                        f"No data from any candidate in "
+                        f"{self.cycles_without_data} full attempts, but the "
+                        f"recording window is open for another "
+                        f"{remaining / 60:.0f} min -- still trying.", "WARN",
+                    )
+                elif self.cycles_without_data >= self.max_cycles:
                     # Giving up after capturing real footage is not the same as
                     # never recording anything. Keeping these distinct is what
                     # lets post-processing still run on a long recording whose
@@ -1265,7 +1414,7 @@ class StreamFailoverRecorder:
             # what told the resume logic there was nothing to come back to.
             if self.status not in (
                 "completed_partial", "aborted_no_space", "aborted_output_lost",
-                "interrupted",
+                "interrupted", "completed_window",
             ):
                 self.status = "completed"
             if self.on_completion_callback:
@@ -1334,6 +1483,14 @@ class StreamFailoverRecorder:
             ),
             "min_free_disk_gb": round(self.min_free_bytes / 1024 ** 3, 2),
             "max_cycles": self.max_cycles,
+            # Absolute, so the dashboard renders it in the viewer's local time
+            # and the container's TZ never enters into it. None means the
+            # recording runs until the stream ends.
+            "ends_at": self.deadline(),
+            "seconds_remaining": (
+                round(remaining, 1)
+                if (remaining := self.seconds_remaining()) is not None else None
+            ),
             "total_candidates": len(self.candidates),
             "candidates": [c.to_dict() for c in self.candidates],
             "logs": self.log_history[-30:]

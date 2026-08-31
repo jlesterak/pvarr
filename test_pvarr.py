@@ -33,6 +33,7 @@ from app.naming import (
 from app.post_processor import remux_recording
 from app import ringbuffer, sessions
 from app.recorder import (
+    DEFAULT_MAX_HOURS,
     CandidateStream,
     StreamFailoverRecorder,
     StreamOutcome,
@@ -3812,6 +3813,55 @@ class TestProbeRoute(ServerTestCase):
             {"https://cdn.example/x.m3u8": {"referer": "https://site/"}},
         )
 
+    def _start(self, **extra):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        data = {"url_primary": "https://cdn.example/x.m3u8"}
+        data.update(extra)
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            r = self.client.post("/api/recordings/start", data=data)
+        return r, ctor
+
+    def test_duration_minutes_becomes_an_absolute_end_time(self):
+        r, ctor = self._start(duration_minutes=90)
+        self.assertEqual(r.status_code, 200)
+        end = ctor.call_args.kwargs["end_time"]
+        self.assertAlmostEqual(end - time.time(), 90 * 60, delta=5)
+        # An explicit duration overrides the global backstop.
+        self.assertIsNone(ctor.call_args.kwargs["max_hours"])
+
+    def test_no_duration_falls_back_to_the_backstop(self):
+        r, ctor = self._start()
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(ctor.call_args.kwargs["end_time"])
+        self.assertEqual(ctor.call_args.kwargs["max_hours"], DEFAULT_MAX_HOURS)
+
+    def test_duration_zero_means_no_cap_at_all(self):
+        """Including the backstop -- that is what asking for 0 means."""
+        r, ctor = self._start(duration_minutes=0)
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(ctor.call_args.kwargs["end_time"])
+        self.assertIsNone(ctor.call_args.kwargs["max_hours"])
+
+    def test_an_absolute_end_time_is_passed_through(self):
+        end = time.time() + 1800
+        r, ctor = self._start(end_time=end)
+        self.assertEqual(r.status_code, 200)
+        self.assertAlmostEqual(ctor.call_args.kwargs["end_time"], end, places=2)
+
+    def test_an_end_time_in_the_past_is_refused(self):
+        r, _ = self._start(end_time=time.time() - 60)
+        self.assertEqual(r.status_code, 400)
+
+    def test_an_absurd_duration_is_refused(self):
+        r, _ = self._start(duration_minutes=60 * 48)
+        self.assertEqual(r.status_code, 400)
+
+    def test_a_negative_duration_is_refused(self):
+        r, _ = self._start(duration_minutes=-5)
+        self.assertEqual(r.status_code, 400)
+
     def test_malformed_stream_headers_ignored(self):
         # A bad hint must not cost the user their recording.
         from unittest.mock import patch, MagicMock
@@ -3933,6 +3983,244 @@ class TestProxyConfNeverOutlivesTheSession(unittest.TestCase):
         self.assertEqual(len(self._confs()), 1)
         rec.stop_proxy()
         self.assertEqual(self._confs(), [])
+
+
+
+class TestRecordingDeadline(unittest.TestCase):
+    """A recording may carry an end time; at the deadline it stops cleanly.
+
+    Absolute, never a duration. A duration restarts its clock on every resume,
+    so a recording that crashed twice would run well past the end that was
+    asked for -- and the global backstop would hand each restart a fresh six
+    hours, which is exactly what it exists to prevent.
+    """
+
+    def make(self, **kw):
+        tmp = tempfile.mkdtemp(prefix="pvarr-deadline-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return StreamFailoverRecorder(
+            "d1", ["http://a/1.m3u8"], str(Path(tmp) / "out.ts"),
+            min_free_gb=0, **kw)
+
+    def test_no_window_and_no_backstop_means_no_deadline(self):
+        rec = self.make()
+        rec.start_time = time.time()
+        self.assertIsNone(rec.deadline())
+        self.assertIsNone(rec.seconds_remaining())
+
+    def test_an_explicit_end_time_wins_over_the_backstop(self):
+        soon = time.time() + 600
+        rec = self.make(end_time=soon, max_hours=6)
+        rec.start_time = time.time()
+        self.assertEqual(rec.deadline(), soon)
+
+    def test_the_backstop_is_measured_from_the_original_start(self):
+        """The resume case. Six hours from *then*, not six more from now."""
+        started = time.time() - (5 * 3600)
+        rec = self.make(max_hours=6)
+        rec.start_time = started
+        self.assertAlmostEqual(rec.deadline(), started + 6 * 3600, places=3)
+        # One hour left, not six.
+        self.assertLess(rec.seconds_remaining(), 3601)
+        self.assertGreater(rec.seconds_remaining(), 3599)
+
+    def test_a_zero_backstop_disables_it(self):
+        rec = self.make(max_hours=0)
+        rec.start_time = time.time()
+        self.assertIsNone(rec.deadline())
+
+    def test_a_rebroadcast_is_not_capped_by_the_backstop(self):
+        """A live channel is meant to sit there. Capping it would kill every
+        channel at the six hour mark, silently."""
+        tmp = Path(tempfile.mkdtemp(prefix="pvarr-deadline-rb-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ring = ringbuffer.RingBuffer(
+            tmp / "chan.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        self.addCleanup(ring.close)
+        rec = StreamFailoverRecorder(
+            "d2", ["http://a/1.m3u8"], str(tmp / "out.ts"),
+            min_free_gb=0, ring=ring, max_hours=6)
+        rec.start_time = time.time() - (10 * 3600)
+        self.assertIsNone(rec.deadline())
+
+    def test_a_rebroadcast_still_honours_an_explicit_end_time(self):
+        tmp = Path(tempfile.mkdtemp(prefix="pvarr-deadline-rb2-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ring = ringbuffer.RingBuffer(
+            tmp / "chan2.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        self.addCleanup(ring.close)
+        soon = time.time() + 300
+        rec = StreamFailoverRecorder(
+            "d3", ["http://a/1.m3u8"], str(tmp / "out.ts"),
+            min_free_gb=0, ring=ring, end_time=soon, max_hours=6)
+        rec.start_time = time.time()
+        self.assertEqual(rec.deadline(), soon)
+
+    def test_passing_the_deadline_stops_the_recording(self):
+        rec = self.make(end_time=time.time() - 1)
+        rec.start_time = time.time() - 60
+        self.assertFalse(rec._deadline_ok())
+        self.assertEqual(rec.status, "completed_window")
+        self.assertTrue(rec._stop_event.is_set())
+
+    def test_before_the_deadline_nothing_happens(self):
+        rec = self.make(end_time=time.time() + 3600)
+        rec.start_time = time.time()
+        self.assertTrue(rec._deadline_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_the_status_survives_post_processing(self):
+        """completed_window must not be flattened to "completed" -- the whole
+        point is being able to tell a scheduled finish from a stream ending."""
+        rec = self.make(end_time=time.time() - 1)
+        rec.start_time = time.time() - 60
+        rec.is_running = True
+        rec.on_completion_callback = lambda path: None
+        rec._recording_loop()
+        self.assertEqual(rec.status, "completed_window")
+
+    def test_the_summary_carries_the_deadline(self):
+        soon = time.time() + 1800
+        rec = self.make(end_time=soon)
+        rec.start_time = time.time()
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["ends_at"], soon)
+        self.assertGreater(summary["seconds_remaining"], 1700)
+
+    def test_the_summary_says_none_when_open_ended(self):
+        rec = self.make()
+        rec.start_time = time.time()
+        summary = rec.get_status_summary()
+        self.assertIsNone(summary["ends_at"])
+        self.assertIsNone(summary["seconds_remaining"])
+
+
+class TestWindowKeepsRetrying(unittest.TestCase):
+    """Sponsor decision: while a window is open, keep trying every candidate.
+
+    max_cycles is a guess at "these sources are dead". An explicit end time is
+    a statement that the event runs until then, and a stream that is down at
+    kick-off is often back a few minutes later.
+    """
+
+    def make(self, **kw):
+        tmp = tempfile.mkdtemp(prefix="pvarr-window-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        rec = StreamFailoverRecorder(
+            "w1", ["http://a/1.m3u8", "http://b/2.m3u8"],
+            str(Path(tmp) / "out.ts"), min_free_gb=0, max_cycles=2, **kw)
+        rec.detect_candidate_headers = lambda c: setattr(c, "m3u8_url", c.url) or True
+        rec._failover_delay = lambda wrapped: 0.0
+        return rec
+
+    def test_without_a_window_it_gives_up_after_max_cycles(self):
+        """The existing behaviour, asserted so the change below is visibly a
+        change and not an accident."""
+        rec = self.make()
+        rec.start_time = time.time()
+        rec._stream_ffmpeg_process = lambda cmd, cand: StreamOutcome.FAILED
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+        self.assertEqual(rec.status, "failed")
+
+    def test_with_an_open_window_it_keeps_trying_past_max_cycles(self):
+        rec = self.make(end_time=time.time() + 3600)
+        rec.start_time = time.time()
+        attempts = []
+
+        def fail_then_close_the_window(cmd, cand):
+            attempts.append(cand.name)
+            # Well past max_cycles=2 (two candidates, so 4 attempts a lap).
+            if len(attempts) >= 12:
+                rec.end_time = time.time() - 1   # window closes
+            return StreamOutcome.FAILED
+
+        rec._stream_ffmpeg_process = fail_then_close_the_window
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+
+        self.assertGreaterEqual(len(attempts), 12,
+                                "gave up while the window was still open")
+        # And once the window closed having captured nothing, it reports
+        # "failed" rather than "finished on schedule". Deliberate: the window
+        # lifts the give-up cap, it does not turn a recording that captured
+        # zero bytes into a success. completed_window is for a capture that
+        # was actually running when its deadline arrived.
+        self.assertEqual(rec.status, "failed")
+        self.assertEqual(rec.bytes_written, 0)
+
+    def test_footage_captured_before_the_window_closed_is_kept(self):
+        """The realistic failure: it recorded, then every source died."""
+        rec = self.make(end_time=time.time() + 3600)
+        rec.start_time = time.time()
+        attempts = []
+
+        def record_then_die(cmd, cand):
+            attempts.append(cand.name)
+            if len(attempts) == 1:
+                rec.bytes_written = 5_000_000
+                return StreamOutcome.INTERRUPTED
+            if len(attempts) >= 10:
+                rec.end_time = time.time() - 1
+            return StreamOutcome.FAILED
+
+        rec._stream_ffmpeg_process = record_then_die
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+        self.assertEqual(rec.status, "completed_partial")
+
+    def test_the_backstop_alone_does_not_grant_infinite_retries(self):
+        """Deliberately keyed off an explicit window, not the 6h default.
+
+        Retrying for six hours against three dead URLs is not what anyone
+        means by a safety backstop.
+        """
+        rec = self.make(max_hours=6)
+        rec.start_time = time.time()
+        rec._stream_ffmpeg_process = lambda cmd, cand: StreamOutcome.FAILED
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+        self.assertEqual(rec.status, "failed")
+
+
+class TestDeadlineSurvivesRestart(unittest.TestCase):
+    """The window is what makes resume exact, rather than a gap heuristic."""
+
+    def test_build_record_carries_the_window(self):
+        end = time.time() + 900
+        record = sessions.build_record(
+            recording_id="r1", candidates=["http://a/1.m3u8"],
+            output_filepath="/tmp/x.ts", started_at=time.time(),
+            end_time=end, max_hours=6)
+        self.assertEqual(record["end_time"], end)
+        self.assertEqual(record["max_hours"], 6)
+
+    def test_a_closed_window_finalises_instead_of_resuming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.ts"
+            path.write_bytes(b"x" * 4096)
+            record = sessions.build_record(
+                recording_id="r2", candidates=["http://a/1.m3u8"],
+                output_filepath=str(path), started_at=time.time() - 7200,
+                end_time=time.time() - 60)
+            # Fresh mtime, so the gap heuristic alone would say "resume".
+            self.assertEqual(
+                sessions.resume_decision(record, gap_limit=99999), "finalise")
+
+    def test_an_open_window_still_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.ts"
+            path.write_bytes(b"x" * 4096)
+            record = sessions.build_record(
+                recording_id="r3", candidates=["http://a/1.m3u8"],
+                output_filepath=str(path), started_at=time.time() - 600,
+                end_time=time.time() + 3600)
+            self.assertEqual(
+                sessions.resume_decision(record, gap_limit=99999), "resume")
 
 
 

@@ -23,6 +23,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 - **A guide that says what is actually happening** — in Plex's channel guide, each programme is titled with the recording's name, sub-titled with the stream currently feeding it (`Primary`, `Backup 1`), and described with the file being written and how many backups are still in reserve. Press Info mid-game to see which feed you are on.
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
 - **3-stage cycling failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder moves to the next candidate automatically, and **wraps back round to the first** rather than giving up at the end of the list. The usual failure is an expiring token, which fixes itself in minutes, so a blip that touches all three sources no longer ends a recording that still has hours to run. It gives up only after three complete laps with no data — and any data at all resets that budget.
+- **Recording windows** — give a recording a length and it stops cleanly at the deadline and post-processes normally, so a two-hour event does not leave a capture running all night. While the window is open PVArr keeps retrying every candidate rather than giving up after three fruitless laps: a stream that is down at kick-off is often back minutes later. Recordings with no length set are held to `PVARR_MAX_HOURS` (default 6). Set it from **Stop After (min)** on the new-recording form, or `duration_minutes` on the API.
 - **Disk-space guard** — every active recording watches free space on its volume and aborts cleanly before filling it, keeping what was captured and post-processing it normally. Recordings are uncompressed TS on what is usually the same filesystem as everything else, so an unattended capture that runs out of room does not just lose itself, it takes the host with it. Floor set by `PVARR_MIN_FREE_GB` (default 5 GB); a start request is refused up front with `507` if the volume is already below it.
 - **Manual stream control** — force a failover, or click any candidate in the dashboard to switch straight to it. That is the only route *back* to the primary once it recovers, since automatic failover only ever moves forwards.
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
@@ -209,6 +210,7 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |
 | `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files; keep it below the compose `stop_grace_period` (30s) or Docker will `SIGKILL` first. |
 | `PVARR_MIN_FREE_GB` | `5` | Free space, in GB, below which an active recording aborts and a new one is refused. `0` disables the guard entirely — only sensible if the recordings volume is separate from the system disk. |
+| `PVARR_MAX_HOURS` | `6` | Longest any one recording may run without an explicit duration, in hours. A capture pointed at a 24/7 channel never ends on its own — the stream does not stop, so nothing in the failover logic ever fires. 6 rather than 4 so NFL overtime and extra-innings baseball are not truncated. A per-recording duration overrides it; `0` disables it. Rebroadcast channels are never capped by it. |
 | `PVARR_BUFFER_MB` | `71` | Size of a rebroadcast channel's buffer, per channel. Roughly 60 seconds at 10 Mbps — deep enough for a client to join late or stall briefly without a gap. It is a file, not memory, so the kernel reclaims it under pressure. |
 | `PVARR_BUFFER_DIR` | `<recordings>/.buffers` | Where rebroadcast buffers live. Each takes a steady ~1 MB/s of writes, so point it at an SSD if your library is on a spinning disk. Buffers are deleted when the channel stops. |
 | `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
@@ -235,7 +237,7 @@ and mounts `./recordings` there.
 |---|---|---|
 | `GET` | `/` | Dashboard |
 | `POST` | `/api/probe` | Resolve a URL to a playlist and detect the headers it needs |
-| `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs). Returns `507` if the target volume is already below `PVARR_MIN_FREE_GB`. Pass `rebroadcast=true` to serve the stream as a live channel without saving it; `channel_name` names it in the guide (defaults to the team names). |
+| `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs). Returns `507` if the target volume is already below `PVARR_MIN_FREE_GB`. Pass `rebroadcast=true` to serve the stream as a live channel without saving it; `channel_name` names it in the guide (defaults to the team names). `duration_minutes` stops it cleanly after that long (`0` = no cap, and no backstop either); `end_time` does the same as an absolute Unix timestamp and wins if both are given. Both return `400` if the value is in the past or over 24 hours. |
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
 | `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
@@ -434,6 +436,10 @@ the attempt fails or PVArr is stopped. The folder itself stays behind, empty,
 and is safe to leave alone. A `channels_*.conf` file sitting in it while
 nothing is recording is a bug — please report it.
 
+**A recording says `finished on schedule`.** It reached the end of its window (or the `PVARR_MAX_HOURS` backstop) while still capturing, and stopped cleanly — the file is complete and was remuxed and announced as normal. If instead it says `completed partial`, the window closed while every candidate was down, so the file stops where the stream did.
+
+**A recording ended after 6 hours and you did not ask it to.** That is `PVARR_MAX_HOURS`, the backstop for captures with no duration set. Give the recording a duration, raise the variable, or set it to `0` to remove the cap. Live rebroadcast channels are never subject to it.
+
 **A recording stopped with `aborted_no_space`.** The volume fell below the free-space floor. PVArr deliberately does *not* fail over here: the problem is local, so another stream would not help. Free some space, or lower `PVARR_MIN_FREE_GB` if the floor is too conservative for your setup.
 
 ---
@@ -448,12 +454,12 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-373 tests covering filename sanitisation and collision handling, storage
+398 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across
-containers, FFmpeg command construction, proxy credential cleanup, and every
-HTTP route.
+containers, FFmpeg command construction, proxy credential cleanup, recording
+windows and the duration backstop, and every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the
