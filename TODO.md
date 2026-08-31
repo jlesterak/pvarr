@@ -452,6 +452,75 @@ restoring. Returning to an earlier candidate is a manual action instead.
 - 225 tests (was 211). Three existing tests were rewritten rather than patched,
   because this change deliberately inverts their premise.
 
+## Agent-team review of Phase 13 (2026-08-30)
+
+Architect / Security / DevOps reviews of the persistence design, run before any
+of it was written. Every claim below was re-verified independently.
+
+### Blocking, and NOT caused by this work -- these are live bugs today
+- [ ] **A fresh install cannot record at all.** `config/`, `recordings/` and
+      `logs/` are untracked in git, so a clean clone has none of them. Compose
+      bind-mounts all three, dockerd creates the missing host directories as
+      **root:root**, and the container runs as uid 1000 -- so `naming.py`'s
+      `record_dir.mkdir()` raises PermissionError on the first recording. The
+      image-time `chown` cannot help: a bind mount grafts the host inode over
+      the image's, and permission checks run against the host. Reproduced
+      against the published image. This is why `config/` is root-owned here.
+- [ ] **Remux and notification are skipped on every container stop.**
+      `cleanup.py` registers a SIGTERM handler at import (`server.py` module
+      scope), which overwrites uvicorn's and calls `sys.exit(0)`. The recorder
+      thread is a daemon and `stop()` never joins it, so the completion block --
+      remux, `final_filepath`, notify -- dies mid-flight. The lifespan shutdown
+      hook therefore never runs either. **Demonstrated:** recorded 147 KB, sent
+      SIGTERM, `.ts` left un-remuxed with no notification.
+- [ ] **`/api/status` serves live session cookies** in plaintext to anything on
+      the LAN. `CandidateStream.to_dict()` includes `cookie`. Verified with a
+      real request. Consistent with "unauthenticated by design", but it means a
+      cookie is not a secret PVArr keeps -- decide whether to redact.
+- [x] **`config/` was not gitignored.** Once state lands there, `git add -A`
+      would commit live cookies to a public repo. Fixed immediately.
+- [x] **CRLF injection into FFmpeg `-headers` and into hls-proxy's
+      channels.conf.** Values were concatenated unchecked; `probe.py` accepts a
+      `referer=` from a third-party m3u8 query string and percent-decodes it, so
+      a hostile page can supply a real CRLF. Persistence would have made a
+      poisoned header permanent and replayed it every boot. Fixed: rejected
+      (not stripped) at both sinks.
+- [x] **No URL length cap on `/api/recordings/start`**, though `/api/probe` has
+      one. Fixed.
+
+### Design conclusions that changed the plan
+- **Persistence belongs in a new `app/sessions.py`**, not in the recorder and
+  not in `server.py`. The recorder stays a pure engine and gains one more
+  injected callback alongside the existing log/completion/failover ones.
+- **The gap must be measured from the `.ts` mtime, not the last transition.**
+  Under transitions-only writing, a healthy three-hour recording's last
+  transition is at t=0, so a naive gap check would finalise exactly the long
+  recordings the feature exists to save.
+- **`stop()` conflates "operator stopped" with "process going away"** and
+  unconditionally sets `completed`. Persisting that means nothing ever resumes.
+  It has to be split before resume can work at all.
+- **Nothing may be written at shutdown**, because shutdown does not reliably
+  run (see above). Whatever is on disk at an arbitrary instant must suffice.
+- **Do not persist probe-derived headers or the resolved m3u8** except as
+  diagnostics -- tokens expire, and storing them invites a future "skip the
+  probe on resume" optimisation that reconnects with a dead token.
+- **Re-validate `output_filepath` against the allowlist on read-back.** The
+  likeliest trigger is not an attacker but allowlist drift: a stale file naming
+  a directory the sponsor has since removed from `PVARR_ALLOWED_DIRS`.
+- Rejected: one combined `sessions.json`; reusing `get_status_summary()` as the
+  on-disk format; any "last seen alive" heartbeat field.
+
+### Operational
+- **Watchtower on this host recreates PVArr unattended at 04:00 daily** --
+  `MONITOR_ONLY=false`, `CLEANUP=true`, no label filter, 10s grace. That is the
+  exact scenario resume is for, happening on a schedule, mid-recording. Pin
+  `PVARR_TAG` or add `com.centurylinklabs.watchtower.enable=false`.
+- Container logs are unrotated; a resume crash-loop would fill the disk.
+- `./logs:/app/logs` is a dead mount -- logging goes to stdout only.
+- Cost of the write pattern: ~1-2 KB per transition, under 30 MB even for a
+  pathological six-hour flapping session. Three to four orders of magnitude
+  below the video it describes. Negligible, conditional on no timer writes.
+
 ## Phase 13: Session Durability & Bounded Recordings  (ACCEPTED, not started)
 
 Agreed with the sponsor 2026-08-30. Build in this order -- each step needs the

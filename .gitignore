@@ -33,6 +33,10 @@ recordings/
 channels.conf
 .env
 
+# Runtime state. Once session state is persisted here it holds live cookies and
+# tokenised stream URLs -- treat as a credentials directory, never commit it.
+config/
+
 # IDE / System
 .vscode/
 .idea/

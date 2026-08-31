@@ -25,6 +25,25 @@ from app.probe import DEFAULT_USER_AGENT, probe_stream
 
 logger = logging.getLogger("PVArrRecorder")
 
+
+def safe_header_value(value: str) -> Optional[str]:
+    """Return the value, or None if it cannot be put in a header safely.
+
+    FFmpeg pastes -headers straight into its outgoing HTTP request, so a CR or
+    LF in a Referer/User-Agent/Cookie injects extra headers. These values are
+    not all operator-typed: probe.py accepts a `referer=` taken from the query
+    string of a third-party m3u8 URL and percent-decodes it, so a hostile page
+    can supply one containing a real CRLF.
+
+    Rejected rather than stripped -- a silently mangled cookie produces a
+    confusing 403 much later, where a refusal names the problem at once.
+    """
+    if value is None:
+        return None
+    if any(ch in value for ch in ("\r", "\n", "\x00")):
+        return None
+    return value
+
 # Free-space floor below which a recording aborts rather than filling the
 # volume. Module level rather than a class attribute so callers can read it
 # without going through StreamFailoverRecorder, which tests routinely patch.
@@ -294,8 +313,15 @@ class StreamFailoverRecorder:
         conf_file = conf_dir / f"channels_{self.recording_id}.conf"
 
         mode = "literal" if candidate.referer else "direct"
+        # channels.conf is line- and pipe-delimited, so a newline in either
+        # field injects an extra channel definition into hls-proxy's config.
+        conf_url = safe_header_value(candidate.m3u8_url)
+        conf_referer = safe_header_value(candidate.referer) or ""
+        if conf_url is None:
+            self._log("Refusing to start the proxy: the URL contains a line break.", "ERROR")
+            return candidate.m3u8_url
         with open(conf_file, "w", encoding="utf-8") as f:
-            f.write(f"{candidate.slug}|{candidate.name}|1||Sports|{candidate.m3u8_url}|{mode}|{candidate.referer}|\n")
+            f.write(f"{candidate.slug}|{candidate.name}|1||Sports|{conf_url}|{mode}|{conf_referer}|\n")
 
         env = os.environ.copy()
         env["HLS_PROXY_PORT"] = str(port)
@@ -516,14 +542,22 @@ class StreamFailoverRecorder:
             "-rw_timeout", "15000000",
         ]
 
-        # Construct HTTP headers for Direct Mode
+        # Construct HTTP headers for Direct Mode. Each value is checked because
+        # FFmpeg copies this block verbatim into the request; see
+        # safe_header_value().
         headers_str = ""
-        if user_agent:
-            headers_str += f"User-Agent: {user_agent}\r\n"
-        if referer:
-            headers_str += f"Referer: {referer}\r\n"
-        if cookie:
-            headers_str += f"Cookie: {cookie}\r\n"
+        for name, raw in (("User-Agent", user_agent), ("Referer", referer),
+                          ("Cookie", cookie)):
+            if not raw:
+                continue
+            checked = safe_header_value(raw)
+            if checked is None:
+                self._log(
+                    f"Dropping {name}: it contains a line break or NUL, which "
+                    "would inject additional HTTP headers.", "ERROR",
+                )
+                continue
+            headers_str += f"{name}: {checked}\r\n"
 
         if headers_str:
             cmd.extend(["-headers", headers_str])

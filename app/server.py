@@ -336,6 +336,12 @@ async def start_recording(
     if not candidates:
         raise HTTPException(status_code=400, detail="At least one candidate stream URL is required")
 
+    # /api/probe already caps this; start did not, so an arbitrarily large URL
+    # could be held in memory and (once sessions are persisted) written to disk.
+    for candidate_url in candidates:
+        if len(candidate_url) > 4096:
+            raise HTTPException(status_code=400, detail="URL is too long")
+
     if not 1 <= freeze_timeout <= 600:
         raise HTTPException(
             status_code=400, detail="freeze_timeout must be between 1 and 600 seconds"
