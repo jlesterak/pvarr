@@ -1217,18 +1217,22 @@ raises nothing and the path does not exist.
 guard that a broken sink can never take a recording down.
 
 ### Still open from the same logs
-- [ ] **hls-proxy 404s on `cand_0`.** `http://127.0.0.1:8090/channel/cand_0:
+- [x] **hls-proxy 404s on `cand_0`.** `http://127.0.0.1:8090/channel/cand_0:
       Server returned 404 Not Found` at 12:14:42, 12:21:00 and 12:30:17.
-      Fallback mode has never once worked for candidate 1 in these logs. This
-      is the next thing to look at — it is why candidate 1 fails at all.
-- [ ] **Anti-leech decoy segments.** Candidate 1's playlist lists segments
+      Fallback mode has never once worked for candidate 1 in these logs.
+      Resolved in "Candidate 1's 404s" below (v0.2.3): the channel mode was
+      keyed off the referer, so the proxy scraped a playlist as an HTML page.
+- [x] **Anti-leech decoy segments.** Candidate 1's playlist lists segments
       disguised as TikTok CDN image URLs
       (`...tplv-tiktokx-origin.image ... is not in allowed_segment_extensions`).
-      FFmpeg refuses them by extension. Fixable with `-allowed_extensions ALL`,
-      but that loosens a safety check and deserves a deliberate decision rather
-      than a reflex.
-- [ ] The dashboard still never shows `bytes_written`. Had it been beside
+      FFmpeg refuses them by extension. Resolved in v0.2.3 -- and note the
+      guess recorded here was **wrong**: `-allowed_extensions ALL` does nothing
+      on the shipped build. Measurement inside the image found
+      `-extension_picky 0`, and the flags are now probed per binary.
+- [x] The dashboard still never shows `bytes_written`. Had it been beside
       `filesize_mb`, the disagreement would have been visible immediately.
+      Shipped in v0.2.2 as *Captured*, with *On Disk* going amber on a
+      disagreement.
 
 ## Release v0.2.1 (2026-08-31)  [COMPLETED]
 
