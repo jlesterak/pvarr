@@ -438,21 +438,56 @@ async def trigger_failover(recording_id: str):
     if not recorder.is_running:
         raise HTTPException(status_code=400, detail="Recording session is not currently running")
 
-    # Without this the request advanced past the last candidate, which ends the
-    # recording -- a single-URL session was killed by the button and still got
-    # a "success" back.
+    # A single-URL session has nowhere to go: honouring the request would end
+    # the recording rather than switch it, and the caller still got a "success".
+    # Sessions with several candidates always have a next one now, because the
+    # list cycles round to the first.
     if not recorder.has_next_candidate:
         raise HTTPException(
             status_code=400,
             detail=(
-                "No backup stream to fail over to: this session is already on "
-                f"its last candidate ({len(recorder.candidates)} configured). "
-                "Add a backup URL when starting the recording."
+                "No backup stream to fail over to: this session was started "
+                "with a single URL. Add a backup URL when starting the "
+                "recording."
             ),
         )
 
     recorder.force_failover()
     return {"status": "success", "message": f"Forced failover triggered for {recording_id}"}
+
+
+@app.post("/api/recordings/{recording_id}/switch")
+async def switch_candidate(recording_id: str, candidate: int = Form(...)):
+    """Move a running recording to a specific candidate, 1-based.
+
+    Failover only ever moves to the *next* stream, so there was no way back to
+    the primary once it recovered -- which is the common case, since the usual
+    failure is a token that expires and is reissued minutes later.
+    """
+    recorder = active_recorders.get(recording_id)
+    if not recorder:
+        raise HTTPException(status_code=404, detail="Recording session not found")
+
+    if not recorder.is_running:
+        raise HTTPException(status_code=400, detail="Recording session is not currently running")
+
+    total = len(recorder.candidates)
+    if not 1 <= candidate <= total:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Candidate must be between 1 and {total} for this session",
+        )
+
+    if not recorder.switch_to_candidate(candidate - 1):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Already recording candidate {candidate}",
+        )
+
+    return {
+        "status": "success",
+        "message": f"Switching {recording_id} to candidate {candidate}",
+    }
 
 
 @app.get("/api/recordings/{recording_id}/logs")

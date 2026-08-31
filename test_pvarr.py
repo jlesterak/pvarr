@@ -681,6 +681,8 @@ class FailoverLoopTestCase(unittest.TestCase):
         fallback. Entries may be callables taking (recorder, candidate).
         """
         rec = StreamFailoverRecorder("test-id", urls, self.out, **kwargs)
+        # Cycling means an unscripted run keeps going; the default budget of 3
+        # laps is what makes these tests terminate.
         script = list(outcomes)
         rec.attempts = []
         rec.proxy_starts = []
@@ -766,13 +768,53 @@ class TestFailoverAdvance(FailoverLoopTestCase):
         self.run_loop(rec)
         self.assertEqual(seen, [("test-id", "Candidate 2")])
 
-    def test_three_stage_exhaustion_marks_failed(self):
+    def test_exhaustion_takes_max_cycles_laps_not_one_pass(self):
+        # The list cycles now, so one bad pass is no longer the end: a token
+        # blip that touches all three sources must not kill a recording that
+        # still has hours to run. Giving up takes max_cycles fruitless laps.
         rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
-                        [False] * 6)
+                        [], max_cycles=3)
         self.run_loop(rec)
         self.assertEqual(rec.status, "failed")
-        self.assertEqual(rec.current_candidate_index, 3)
-        self.assertEqual(rec.attempts.count("Candidate 3"), 2)
+        self.assertEqual(rec.cycles_without_data, 3)
+        # Three laps x three candidates x (direct + proxy).
+        self.assertEqual(rec.attempts.count("Candidate 1"), 6)
+        self.assertEqual(rec.attempts.count("Candidate 3"), 6)
+
+    def test_one_bad_lap_does_not_end_the_recording(self):
+        # Everything fails once, then candidate 1 comes back on the second lap.
+        script = [False] * 6 + [True]
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        script, max_cycles=3)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed",
+                         "a single failed lap ended the recording")
+        self.assertEqual(rec.current_candidate_index, 0,
+                         "did not cycle back round to candidate 1")
+
+    def test_data_resets_the_fruitless_lap_budget(self):
+        # A long capture that fails over occasionally must never exhaust its
+        # budget: any bytes at all put the counter back to zero.
+        def deliver(rec, candidate):
+            rec.bytes_written += 4096
+            return StreamOutcome.INTERRUPTED
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [False, False, deliver, deliver, deliver, deliver, True],
+                        max_cycles=2)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed")
+        self.assertEqual(rec.cycles_without_data, 0)
+
+    def test_backoff_grows_between_fruitless_laps(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertEqual(rec._failover_delay(wrapped=False), 1.0)
+        rec.cycles_without_data = 1
+        self.assertEqual(rec._failover_delay(wrapped=True), 5.0)
+        rec.cycles_without_data = 2
+        self.assertEqual(rec._failover_delay(wrapped=True), 10.0)
+        rec.cycles_without_data = 99
+        self.assertEqual(rec._failover_delay(wrapped=True), 60.0)
 
     def test_completion_callback_not_fired_when_all_fail(self):
         seen = []
@@ -921,7 +963,10 @@ class TestForceFailover(FailoverLoopTestCase):
         self.assertEqual(rec.status, "completed",
                          "a refused failover ended the recording anyway")
 
-    def test_force_failover_refused_on_the_last_of_several_candidates(self):
+    def test_force_failover_from_the_last_candidate_wraps(self):
+        # Was refused when the walk was one-way, because advancing past the end
+        # ended the recording. Now the list cycles, so the last candidate has
+        # somewhere to go: back to the first.
         calls = []
 
         def die(rec, candidate):
@@ -931,19 +976,76 @@ class TestForceFailover(FailoverLoopTestCase):
             calls.append(rec.force_failover())
             return True
 
-        # Candidate 1 fails direct, then fails via the proxy, so the loop
-        # advances to candidate 2 -- the last one.
+        # Candidate 1 fails direct, then via the proxy, so we land on the last.
         rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
-                        [die, die, try_force])
+                        [die, die, try_force, True])
         self.run_loop(rec)
-        self.assertEqual(calls, [False])
-        self.assertEqual(rec.current_candidate_index, 1)
+        self.assertEqual(calls, [True], "force-failover refused despite cycling")
+        self.assertEqual(rec.current_candidate_index, 0)
 
-    def test_has_next_candidate_tracks_position(self):
+    def test_has_next_candidate_holds_at_the_end_of_the_list(self):
+        # Cycling means the last candidate still has a next one -- the first.
         rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
         self.assertTrue(rec.has_next_candidate)
         rec.current_candidate_index = 1
+        self.assertTrue(rec.has_next_candidate)
+
+    def test_switch_jumps_straight_to_a_chosen_candidate(self):
+        def jump(rec, candidate):
+            rec.switch_to_candidate(2)      # 0-based -> Candidate 3
+            return False
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        [jump, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts, ["Candidate 1", "Candidate 3"],
+                         "switch did not skip straight to the chosen candidate")
+        self.assertEqual(rec.current_candidate_index, 2)
+
+    def test_switch_back_to_the_primary(self):
+        # The story this whole change exists for: the primary's token expires,
+        # the recorder moves to a backup, the primary recovers, and there was
+        # previously no route back to it.
+        def to_first(rec, candidate):
+            rec.switch_to_candidate(0)
+            return False
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        [False, False, to_first, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts,
+                         ["Candidate 1", "Candidate 1", "Candidate 2", "Candidate 1"])
+        self.assertEqual(rec.current_candidate_index, 0)
+        self.assertEqual(rec.status, "completed")
+
+    def test_switch_skips_the_proxy_retry_on_the_stream_being_left(self):
+        def jump(rec, candidate):
+            rec.switch_to_candidate(1)
+            return False
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [jump, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, [],
+                         "spent time on the proxy for a stream the operator left")
+
+    def test_switch_rejects_an_index_out_of_range(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertFalse(rec.switch_to_candidate(-1))
+        self.assertFalse(rec.switch_to_candidate(2))
+        self.assertFalse(rec._force_failover_flag,
+                         "a rejected switch must not latch the failover flag")
+
+    def test_switch_to_the_current_candidate_is_a_no_op(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertFalse(rec.switch_to_candidate(0))
+        self.assertFalse(rec._force_failover_flag)
+
+    def test_single_candidate_still_has_nowhere_to_go(self):
+        # The protection that matters stays: forcing a failover on a one-URL
+        # session would end the recording, so it is still refused.
+        rec = self.make(["http://a/1.m3u8"], [])
         self.assertFalse(rec.has_next_candidate)
+        self.assertFalse(rec.force_failover())
 
     def test_force_failover_marks_status_immediately(self):
         # The loop only reaches its own "failing_over" assignment once the
@@ -1389,6 +1491,53 @@ class TestRecordingRoutes(ServerTestCase):
         r = self.client.post("/api/recordings/abc/failover")
         self.assertEqual(r.status_code, 200)
         rec.force_failover.assert_called_once()
+
+    def test_switch_unknown_session_404s(self):
+        r = self.client.post("/api/recordings/nope/switch", data={"candidate": 1})
+        self.assertEqual(r.status_code, 404)
+
+    def test_switch_on_stopped_session_400s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = False
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/switch", data={"candidate": 1})
+        self.assertEqual(r.status_code, 400)
+        rec.switch_to_candidate.assert_not_called()
+
+    def test_switch_rejects_out_of_range_candidate(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = True
+        rec.candidates = ["a", "b"]
+        self.server.active_recorders["abc"] = rec
+        for bad in (0, -1, 3):
+            with self.subTest(candidate=bad):
+                r = self.client.post("/api/recordings/abc/switch",
+                                     data={"candidate": bad})
+                self.assertEqual(r.status_code, 400)
+        rec.switch_to_candidate.assert_not_called()
+
+    def test_switch_passes_zero_based_index_to_the_recorder(self):
+        # The API is 1-based because that is what the dashboard shows; the
+        # recorder indexes from 0. Getting this wrong switches to the wrong
+        # stream, which is silent and hard to spot.
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = True
+        rec.candidates = ["a", "b", "c"]
+        rec.switch_to_candidate.return_value = True
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/switch", data={"candidate": 3})
+        self.assertEqual(r.status_code, 200)
+        rec.switch_to_candidate.assert_called_once_with(2)
+
+    def test_switch_to_the_current_candidate_400s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = True
+        rec.candidates = ["a", "b"]
+        rec.switch_to_candidate.return_value = False
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/switch", data={"candidate": 1})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("already", r.json()["detail"].lower())
 
     def test_failover_refused_when_no_backup_configured(self):
         # A single-URL session has nothing to fail over to. Honouring the

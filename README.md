@@ -15,7 +15,8 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 ## Features
 
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
-- **3-stage failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder advances to the next candidate automatically. Failover can also be forced manually from the dashboard; the button is disabled when a session has no backup left, since there would be nothing to switch to.
+- **3-stage cycling failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder moves to the next candidate automatically, and **wraps back round to the first** rather than giving up at the end of the list. The usual failure is an expiring token, which fixes itself in minutes, so a blip that touches all three sources no longer ends a recording that still has hours to run. It gives up only after three complete laps with no data — and any data at all resets that budget.
+- **Manual stream control** — force a failover, or click any candidate in the dashboard to switch straight to it. That is the only route *back* to the primary once it recovers, since automatic failover only ever moves forwards.
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
 - **Sports-friendly auto-naming** — derives readable filenames for broadcasts instead of opaque timestamps.
 - **Automatic post-processing** — remuxes the recorded TS into MKV/MP4 on completion. Container change only, no transcode. The Plex/Emby library scan is triggered *after* the remux, so the media server indexes the finished MP4 rather than the TS that is about to be deleted.
@@ -220,7 +221,8 @@ and mounts `./recordings` there.
 | `POST` | `/api/probe` | Resolve a URL to a playlist and detect the headers it needs |
 | `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs) |
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
-| `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL. Returns `400` if the session is not running, or if it is already on its last candidate — advancing past the end would end the recording, not fail it over. |
+| `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
+| `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
@@ -291,7 +293,11 @@ app/
 
 ## Troubleshooting
 
-**Recording drops repeatedly.** Confirm the primary URL still resolves by pasting it back into Add Recording. Expiring tokens are the usual cause — configure backups from a different source.
+**Recording drops repeatedly.** Confirm the primary URL still resolves by pasting it back into Add Recording. Expiring tokens are the usual cause — configure backups from a different source. The recorder cycles through all candidates repeatedly and only gives up after three complete laps with no data, so brief outages across every source are survivable.
+
+**A recording ended early when all sources blipped at once (versions before 0.1.3).** The candidate list was a one-way walk: once it ran off the end the recording stopped, with no route back to candidate 1 even after it recovered. The list now wraps. Fixed.
+
+**I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 
 **`403` from the upstream.** A required header is missing. Re-run the URL through `POST /api/probe` (or just re-paste it into Add Recording) — the message names the status the origin returned. If the probe reports *segments rejected*, the stream is session gated: copy the `Cookie` request header from DevTools into the manual header fields.
 
@@ -323,10 +329,10 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-211 tests covering filename sanitisation and collision handling, storage
+225 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
-machine, freeze detection, stream-completion ordering, FFmpeg command
-construction, and every HTTP route.
+machine, cycling failover and manual candidate switching, freeze detection,
+stream-completion ordering, FFmpeg command construction, and every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the

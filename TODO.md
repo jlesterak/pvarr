@@ -369,6 +369,53 @@ additional disk writes. `select()` on pipes is POSIX; PVArr is Linux/Docker.
   19.34 MB, no stalls, stderr thread exits cleanly on stop.
 - 211 tests pass (was 195 at the start of Phase 11).
 
+## Phase 14: Cycling Failover & Manual Stream Selection
+
+- [x] **BUG FIX: the candidate list was a one-way walk (`recorder.py`).**
+      `current_candidate_index` was only ever `+= 1`; nothing reset or
+      decremented it, and the loop exited once it passed the end. So there was
+      no route back to candidate 1 after it recovered, and a blip that touched
+      all three sources ended the recording outright -- even twenty minutes
+      into a three-hour capture with every source healthy again a minute later.
+      An expiring token, which is the most common failure here and resolves
+      itself in minutes, was enough to trigger it. The index now wraps.
+      Automatic and forced failover always shared this path, so both were
+      affected identically.
+
+- [x] **Bounded cycling.** Gives up after `max_cycles` (default 3) complete laps
+      that produced no data. Any bytes at all reset the counter, so a long
+      capture that fails over occasionally can never exhaust its budget. Backoff
+      between fruitless laps escalates 5s / 10s / 20s, capped at 60s, so a set
+      of genuinely dead origins is not hammered in a tight loop; within a lap
+      the original 1s pause is unchanged.
+
+- [x] **Manual switch to a specific candidate.** `POST /api/recordings/{id}/switch`
+      (`candidate=1..3`, 1-based) and clickable candidate badges in the
+      dashboard. Automatic failover deliberately only moves forwards -- see the
+      decision below -- so this is the only way back to the primary.
+
+- [x] **`has_next_candidate` re-derived.** It meant "not yet at the end of the
+      list", which was only right while the walk was one-way. It now means
+      "more than one candidate", since the last one cycles round to the first.
+      The refusal shipped in 0.1.2 therefore narrows to genuinely single-URL
+      sessions -- where forcing a failover would still end the recording -- and
+      that protection is unchanged.
+
+### Decision: no automatic return to the primary
+Considered and rejected: periodically health-checking candidate 1 and switching
+back to it while a backup is working fine. It means abandoning a *working*
+stream for one that might work, and every switch puts a discontinuity in the
+file. For a DVR that trades real footage for possible quality. The
+primary/backup order is about what to try first, not a ranking to keep
+restoring. Returning to an earlier candidate is a manual action instead.
+
+### Verified
+- Real subprocesses, three candidates, candidate 1 dead for the whole of lap 1:
+  the recorder went 1 -> 2 -> 3 -> "Cycling back to Candidate 1 (lap 1 of 3)"
+  and recorded. Pre-fix this path ended the recording.
+- 225 tests (was 211). Three existing tests were rewritten rather than patched,
+  because this change deliberately inverts their premise.
+
 ## Phase 13: Session Durability & Bounded Recordings  (ACCEPTED, not started)
 
 Agreed with the sponsor 2026-08-30. Build in this order -- each step needs the
@@ -411,9 +458,9 @@ one before it.
       means reconnect, `now >= end` means finalise -- reducing the gap heuristic
       above to a fallback for recordings with no window.
       - **Sponsor decision:** when a window is set and every candidate fails
-        before it closes, keep retrying until the window ends (with backoff, so
-        a dead origin is not hammered). With no window, exhausting the
-        candidates ends the recording, as today.
+        before it closes, keep retrying until the window ends. The cycling and
+        backoff this needs landed in Phase 14; what remains is lifting the
+        `max_cycles` cap while a window is still open.
       - **Sponsor decision:** global backstop `PVARR_MAX_HOURS`, default **6**.
         4 was proposed and revised to 6 on the observation that 4h truncates NFL
         overtime and extra-innings baseball -- the most likely things being

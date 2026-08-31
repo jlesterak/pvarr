@@ -96,7 +96,8 @@ class StreamFailoverRecorder:
         on_completion_callback: Optional[Callable[[str], None]] = None,
         on_failover_callback: Optional[Callable[[str, str], None]] = None,
         header_overrides: Optional[Dict[str, Dict[str, str]]] = None,
-        auto_probe: bool = True
+        auto_probe: bool = True,
+        max_cycles: int = 3,
     ):
         self.recording_id = recording_id
         # Per-URL header overrides from the dashboard's "advanced" fields, keyed
@@ -126,6 +127,12 @@ class StreamFailoverRecorder:
         self.on_failover_callback = on_failover_callback
 
         self.current_candidate_index: int = 0
+        # How many complete laps of the candidate list may pass without a
+        # single byte arriving before the recording is given up on. Reset the
+        # moment any candidate delivers data, so a long capture that fails over
+        # occasionally never exhausts its budget.
+        self.max_cycles = max(1, int(max_cycles))
+        self.cycles_without_data: int = 0
         self.is_running: bool = False
         self.status: str = "initialized"  # initialized, recording, failing_over, completed, failed
         self.start_time: Optional[float] = None
@@ -137,6 +144,9 @@ class StreamFailoverRecorder:
         self._ffmpeg_process: Optional[subprocess.Popen] = None
         self._proxy_process: Optional[subprocess.Popen] = None
         self._force_failover_flag: bool = False
+        # Set by switch_to_candidate() to redirect the next hop to a specific
+        # candidate rather than simply the next one.
+        self._manual_target_index: Optional[int] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -339,8 +349,57 @@ class StreamFailoverRecorder:
 
     @property
     def has_next_candidate(self) -> bool:
-        """Is there a backup candidate left to fail over to?"""
-        return self.current_candidate_index + 1 < len(self.candidates)
+        """Is there another candidate a failover could move to?
+
+        Now that the list cycles, this is simply "more than one candidate":
+        from the last one, the next is the first. It used to mean "not yet at
+        the end of the list", which was right only while the walk was one-way.
+        A single-URL session still has nowhere to go, and forcing a failover
+        there would end the recording rather than switch it.
+        """
+        return len(self.candidates) > 1
+
+    def switch_to_candidate(self, index: int) -> bool:
+        """Manually move to a specific candidate, by 0-based index.
+
+        Force-failover only ever means *next*. With the index moving in one
+        direction there was no route back to the primary once it recovered,
+        which is the common case: a token expires, the recorder moves to a
+        backup, and the original is healthy again minutes later.
+        """
+        if not 0 <= index < len(self.candidates):
+            self._log(f"Switch refused: no candidate {index + 1}.", "WARN")
+            return False
+        if index == self.current_candidate_index:
+            self._log(
+                f"Switch refused: already on {self.candidates[index].name}.", "WARN"
+            )
+            return False
+
+        self._log(f"Manual switch to {self.candidates[index].name} requested.", "WARN")
+        self._manual_target_index = index
+        # Reuse the force-failover abort path: it stops the current attempt
+        # without letting the proxy fallback run on the stream being left.
+        self._force_failover_flag = True
+        if self.is_running:
+            self.status = "failing_over"
+        if self._ffmpeg_process:
+            try:
+                self._ffmpeg_process.terminate()
+            except Exception:
+                pass
+        return True
+
+    def _failover_delay(self, wrapped: bool) -> float:
+        """Pause before the next attempt.
+
+        Within a lap this is the original short breath. After a whole lap that
+        produced nothing, back off so a set of genuinely dead origins is not
+        hammered in a tight loop: 5s, 10s, 20s, capped at 60s.
+        """
+        if not wrapped:
+            return 1.0
+        return min(5.0 * (2 ** max(0, self.cycles_without_data - 1)), 60.0)
 
     def force_failover(self) -> bool:
         """Manual trigger to force switch to the next stream candidate.
@@ -557,9 +616,18 @@ class StreamFailoverRecorder:
         return tail
 
     def _recording_loop(self):
-        """Main recording & failover loop."""
-        while not self._stop_event.is_set() and self.current_candidate_index < len(self.candidates):
+        """Main recording & failover loop.
+
+        The candidate index used to only ever increment, so the list was a
+        one-way walk: run off the end and the recording stopped, with no route
+        back to candidate 1 even after it recovered. The most common failure
+        here is an expiring token, which fixes itself in minutes -- so a blip
+        that touched all three sources could end a three-hour capture while
+        every one of them was healthy again. The index now wraps.
+        """
+        while not self._stop_event.is_set():
             candidate = self.candidates[self.current_candidate_index]
+            bytes_before = self.bytes_written
             # Clear any lingering "failing_over" from the previous iteration so
             # the dashboard shows the candidate we are actually recording.
             self.status = "recording"
@@ -598,46 +666,82 @@ class StreamFailoverRecorder:
             if self._stop_event.is_set():
                 break
 
+            # Any data at all means the sources are not collectively dead, so
+            # the "fruitless laps" budget starts over. Without this reset, a
+            # long capture that fails over now and then would eventually spend
+            # its budget and stop despite recording perfectly well.
+            if self.bytes_written > bytes_before:
+                self.cycles_without_data = 0
+
             # Consume the force-failover request: it applies to the candidate we
             # are leaving, not the one we are about to try. Leaving it latched
             # makes every remaining candidate abort on entry, turning a single
             # button press into a dead recording.
             forced = self._force_failover_flag
             self._force_failover_flag = False
+            manual_target = self._manual_target_index
+            self._manual_target_index = None
 
-            # Anything short of a clean completion means try the next candidate.
-            # INTERRUPTED lands here now; it used to be read as success, which
-            # ended the recording at the point of the stall.
-            if forced or outcome is not StreamOutcome.COMPLETED:
-                self.current_candidate_index += 1
-                if self.current_candidate_index < len(self.candidates):
-                    next_name = self.candidates[self.current_candidate_index].name
-                    self.status = "failing_over"
-                    self._log(f"Failing over to Candidate {self.current_candidate_index+1} ({next_name})...", "WARN")
-                    if self.on_failover_callback:
-                        try:
-                            self.on_failover_callback(self.recording_id, next_name)
-                        except Exception:
-                            pass
-                    time.sleep(1)
-                else:
-                    # Exhausting the list after capturing real footage is not
-                    # the same as never recording anything. Keeping these
-                    # distinct is what lets post-processing still run on a
-                    # long recording whose stream died near the end.
+            # A clean finish ends the recording -- unless the operator asked to
+            # move, in which case honour that instead.
+            if (outcome is StreamOutcome.COMPLETED
+                    and not forced and manual_target is None):
+                break
+
+            # Where next? An explicit request wins; otherwise step forward and
+            # wrap around the end of the list.
+            if manual_target is not None:
+                next_index, wrapped = manual_target, False
+            else:
+                next_index = (self.current_candidate_index + 1) % len(self.candidates)
+                # A single-candidate session wraps onto itself, which is what
+                # gives it retries at all rather than one attempt and out.
+                wrapped = next_index <= self.current_candidate_index
+
+            if wrapped:
+                self.cycles_without_data += 1
+                if self.cycles_without_data >= self.max_cycles:
+                    # Giving up after capturing real footage is not the same as
+                    # never recording anything. Keeping these distinct is what
+                    # lets post-processing still run on a long recording whose
+                    # stream died near the end.
+                    laps = self.cycles_without_data
                     if self.bytes_written > 0:
                         self._log(
-                            "All stream candidates exhausted; keeping "
-                            f"{self.bytes_written} bytes already recorded.", "WARN"
+                            f"No data from any candidate in {laps} full attempts; "
+                            f"keeping {self.bytes_written} bytes already recorded.",
+                            "WARN",
                         )
                         self.status = "completed_partial"
                     else:
-                        self._log("All stream candidates exhausted!", "ERROR")
+                        self._log(
+                            f"No data from any candidate in {laps} full attempts.",
+                            "ERROR",
+                        )
                         self.status = "failed"
                     break
+
+            self.current_candidate_index = next_index
+            next_name = self.candidates[next_index].name
+            self.status = "failing_over"
+            delay = self._failover_delay(wrapped)
+            if wrapped:
+                self._log(
+                    f"Cycling back to Candidate {next_index + 1} ({next_name}) "
+                    f"after {delay:.0f}s (lap {self.cycles_without_data} of "
+                    f"{self.max_cycles})...", "WARN",
+                )
             else:
-                # Stream completed naturally
-                break
+                self._log(
+                    f"Failing over to Candidate {next_index + 1} ({next_name})...",
+                    "WARN",
+                )
+            if self.on_failover_callback:
+                try:
+                    self.on_failover_callback(self.recording_id, next_name)
+                except Exception:
+                    pass
+            time.sleep(delay)
 
         if self.status != "failed":
             # completed_partial must survive: it tells the caller the file is
@@ -685,6 +789,8 @@ class StreamFailoverRecorder:
             # Clamped: the index runs one past the end when the candidate list
             # is exhausted, which the dashboard rendered as "Stream 2 of 1".
             "current_candidate": min(self.current_candidate_index + 1, len(self.candidates)),
+            "cycles_without_data": self.cycles_without_data,
+            "max_cycles": self.max_cycles,
             "total_candidates": len(self.candidates),
             "candidates": [c.to_dict() for c in self.candidates],
             "logs": self.log_history[-30:]

@@ -182,12 +182,23 @@
             <!-- Candidate Stream Slots Badges -->
             <div class="flex items-center space-x-3 overflow-x-auto pb-1">
               <template x-for="(cand, idx) in session.candidates" :key="idx">
-                <div class="px-3 py-1.5 rounded-lg text-xs flex items-center space-x-2 border shrink-0"
-                     :title="cand.detect_note ? cand.detect_note + (cand.referer ? ' Referer: ' + cand.referer : '') : ''"
+                <!-- Clickable: this is the only route back to an earlier
+                     candidate, since failover only ever moves forwards. -->
+                <button type="button"
+                     @click="switchCandidate(session.id, idx + 1)"
+                     :disabled="!session.is_running || (idx + 1) === session.current_candidate"
+                     class="px-3 py-1.5 rounded-lg text-xs flex items-center space-x-2 border shrink-0 transition enabled:hover:border-arr-blue/60 enabled:cursor-pointer disabled:cursor-default"
+                     :title="(idx + 1) === session.current_candidate
+                               ? 'Currently recording this stream'
+                               : (session.is_running ? 'Switch to ' + cand.name : '')
+                             + (cand.detect_note ? ' — ' + cand.detect_note : '')
+                             + (cand.referer ? ' Referer: ' + cand.referer : '')"
                      :class="(idx + 1) === session.current_candidate ? 'bg-arr-blue/20 text-arr-accent border-arr-blue/40 font-semibold' : 'bg-slate-900/60 text-slate-400 border-slate-800'">
                   <span class="w-2 h-2 rounded-full" :class="(idx + 1) === session.current_candidate ? 'bg-emerald-400 animate-ping' : 'bg-slate-600'"></span>
                   <span x-text="cand.name + ': ' + (cand.url.length > 40 ? cand.url.slice(0, 40) + '...' : cand.url)"></span>
-                </div>
+                  <span x-show="cand.fail_count > 0" class="text-amber-500/80"
+                        x-text="'⚠ ' + cand.fail_count"></span>
+                </button>
               </template>
             </div>
 
@@ -574,6 +585,25 @@
             [500, 1500, 3000].forEach(ms => setTimeout(() => this.refreshStatus(), ms));
           } catch (e) {
             alert('Failover error: ' + e);
+          }
+        },
+
+        async switchCandidate(id, candidate) {
+          try {
+            const body = new URLSearchParams({ candidate: candidate });
+            const res = await fetch(`/api/recordings/${id}/switch`, { method: 'POST', body });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              alert('Switch refused: ' + (err.detail || ('HTTP ' + res.status)));
+              return;
+            }
+            // Same reason as triggerFailover: the recorder thread reacts a
+            // moment after the POST returns, so one immediate refresh would
+            // still paint the candidate we just left.
+            this.refreshStatus();
+            [500, 1500, 3000].forEach(ms => setTimeout(() => this.refreshStatus(), ms));
+          } catch (e) {
+            alert('Switch error: ' + e);
           }
         },
 
