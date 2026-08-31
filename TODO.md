@@ -1353,3 +1353,26 @@ on the dev box, and one was never proven at all.
       a failover *while a client is watching it*. That remains the first thing
       to look at if Plex ever drops a channel mid-game. Recordings are
       unaffected and measured — only the live viewer path is open.
+
+## Release v0.2.2 (2026-08-31)  [COMPLETED]
+
+Patch. Sponsor-approved. No change to how recording works — this is the
+dashboard telling the truth, plus a README pass.
+
+Everything in it came out of the sponsor's v0.2.1 test session:
+- **`post_processing` status.** A stopped recording no longer reports
+  "completed" beside a pulsing green dot while the remux is still running and
+  no `.mp4` exists in the library yet.
+- **Finished sessions collapse** to a one-line row that expands to its event
+  log, instead of sitting at the top of the page looking active. Collapsed
+  rather than removed: the log history is the evidence, and it is what
+  diagnosed the delete-while-recording bug.
+- **`bytes_written` is on screen** as *Captured*, beside *On Disk*. On Disk
+  turns amber when the two diverge — the signature of writing into a deleted
+  file, which was invisible before despite the API carrying both numbers all
+  along.
+- **README intro pass** (humantodo lines 5-8): the duplicated port line is
+  gone, and the pronunciation note now defends against the mispronunciation
+  that actually happens.
+
+357 tests green at the tag. Nothing to do on upgrade.
