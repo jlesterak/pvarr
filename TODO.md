@@ -369,6 +369,65 @@ additional disk writes. `select()` on pipes is POSIX; PVArr is Linux/Docker.
   19.34 MB, no stalls, stderr thread exits cleanly on stop.
 - 211 tests pass (was 195 at the start of Phase 11).
 
+## Phase 13: Session Durability & Bounded Recordings  (ACCEPTED, not started)
+
+Agreed with the sponsor 2026-08-30. Build in this order -- each step needs the
+one before it.
+
+- [PENDING] **1. Disk-space guard (`recorder.py`).** Mandated by the project
+      directives and never implemented; the unused `import shutil` in
+      `recorder.py` is where it was meant to go. Without it, pointing PVArr at a
+      24/7 channel fills the disk until the host breaks -- and the recordings
+      volume is usually the same filesystem as everything else. Every active
+      recorder checks free space and aborts cleanly below a configured floor.
+      Smallest of these items and the only one that prevents damage, so it goes
+      first.
+
+- [PENDING] **2. Session state persisted to `/config`.** All session state lives
+      in the in-memory `active_recorders` dict, so a `docker restart` or
+      `docker compose up -d` destroys every in-flight recording: the FFmpeg
+      child dies, the `.ts` survives on the volume but is orphaned -- no remux,
+      no notification, no library entry, and the Plex channel vanishes.
+      One small JSON per session (URLs, detected headers, output path, timings,
+      active candidate), written **on state transitions only** -- not on a timer
+      -- so ongoing disk writes stay near zero. Progress is recovered by
+      `stat()`ing the `.ts` at resume, not by persisting counters.
+
+      *Note:* `./config:/config` is already mounted and the Dockerfile creates
+      it, but **nothing writes there yet**, and the host `config/` is owned by
+      root while the container runs as uid 1000 -- so the first write will fail
+      with permission denied until it is chowned. Fix and document with this.
+
+- [PENDING] **3. Resume on restart/recreate.** On boot, read the session files
+      and reconnect, appending to the same `.ts` (which is how failover already
+      works). Bounded by a maximum gap -- past it, finalise instead of
+      reconnecting -- and by a resume-attempt counter, so a recording that dies
+      immediately cannot loop against `restart: unless-stopped`. Token expiry is
+      already handled: the recorder re-probes each candidate at connect time.
+
+- [PENDING] **4. Recording windows and duration caps.** A recording may carry an
+      end time or a maximum duration; at the deadline it stops cleanly and
+      post-processes normally. This is what makes resume *exact* -- `now < end`
+      means reconnect, `now >= end` means finalise -- reducing the gap heuristic
+      above to a fallback for recordings with no window.
+      - **Sponsor decision:** when a window is set and every candidate fails
+        before it closes, keep retrying until the window ends (with backoff, so
+        a dead origin is not hammered). With no window, exhausting the
+        candidates ends the recording, as today.
+      - **Sponsor decision:** global backstop `PVARR_MAX_HOURS`, default **4**.
+        Flagged at decision time that 4h truncates NFL overtime and extra-innings
+        baseball -- the most likely things being recorded. Sponsor to confirm 4
+        vs 6, or a notify-instead-of-stop behaviour.
+      - Timezone: the dashboard sends absolute timestamps and renders them back
+        in local time, so the container's TZ (UTC, unset in compose) never
+        matters. This holds only for one-shot windows.
+
+### Declined
+- **Deferred start / scheduled recordings ("start at 1400").** Sponsor declined
+  2026-08-30. It needs a pending-job store, a scheduler, and pending-job UI, and
+  `cron` + `curl` against the existing API covers it at zero cost. Recurring
+  schedules would additionally need real timezone and DST handling.
+
 ## Still open
 
 ### Longer-term candidates
