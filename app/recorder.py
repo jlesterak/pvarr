@@ -98,6 +98,63 @@ class StreamOutcome(str, Enum):
     INTERRUPTED = "interrupted"  # delivered data, then stalled or exited non-zero
 
 
+class _FileSink:
+    """The recording sink: an append handle that knows whether it still exists.
+
+    A plain `open(path, "ab")` handle keeps working perfectly after the file
+    it points at is deleted -- writes succeed, the offset advances, and nothing
+    raises. The bytes go to an inode with no name and are freed when the handle
+    closes. NFS makes this visible as a `.nfsXXXX` silly-rename; on a local
+    filesystem it is completely invisible.
+
+    That is not hypothetical: a recording was lost to it. The library delete
+    endpoint unlinked a file that was being recorded to, and the capture loop
+    wrote four minutes of video into the hole without noticing, while the
+    dashboard showed 0 MB because it stats the path rather than the handle.
+    So the sink carries the check with it.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._fh = open(self.path, "ab")
+
+    def write(self, data: bytes) -> int:
+        return self._fh.write(data)
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def is_intact(self) -> bool:
+        """True while our handle still refers to whatever is at our path.
+
+        Inode comparison, not `st_nlink == 0`. A silly-rename is a *rename*,
+        so the link count stays 1 and a link-count test passes happily on
+        exactly the case this exists to catch.
+        """
+        try:
+            return os.fstat(self._fh.fileno()).st_ino == os.stat(self.path).st_ino
+        except OSError:
+            return False  # the path is gone entirely
+
+    def reopen(self) -> None:
+        """Point at the path again, creating it if it has been removed."""
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+        self._fh = open(self.path, "ab")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+        return False
+
+
 class _RingSink:
     """Adapts a RingBuffer to the file-like write/flush the capture loop uses.
 
@@ -115,6 +172,14 @@ class _RingSink:
     def flush(self) -> None:
         # The ring is positional writes to an already-sized file; there is no
         # userspace buffer to push.
+        pass
+
+    def is_intact(self) -> bool:
+        # The ring owns a fixed file it created and never unlinks mid-capture;
+        # there is no path for anyone else to delete out from under it.
+        return True
+
+    def reopen(self) -> None:
         pass
 
     def __enter__(self):
@@ -188,6 +253,12 @@ class StreamFailoverRecorder:
     # free, and checking per chunk would mean thousands of calls a second.
     DISK_CHECK_INTERVAL_SEC = 15.0
 
+    # How often to confirm our open handle still refers to output_filepath,
+    # and how many times to recreate it before giving up. Same cadence as the
+    # disk guard: two stats every 15s is nothing next to the write path.
+    OUTPUT_CHECK_INTERVAL_SEC = 15.0
+    MAX_OUTPUT_REOPENS = 3
+
     def __init__(
         self,
         recording_id: str,
@@ -254,6 +325,8 @@ class StreamFailoverRecorder:
             * 1024 ** 3
         )
         self._last_disk_check: float = 0.0
+        self._last_output_check: float = 0.0
+        self._output_reopens: int = 0
         self.is_running: bool = False
         self.status: str = "initialized"  # initialized, recording, failing_over, completed, failed
         self.start_time: Optional[float] = None
@@ -596,6 +669,55 @@ class StreamFailoverRecorder:
         except OSError:
             return None
 
+    def _output_ok(self, sink) -> bool:
+        """Rate-limited check that our bytes are still landing at the path.
+
+        An append handle keeps working after its file is deleted: writes
+        succeed, nothing raises, and the data goes to an unnamed inode that is
+        freed when the handle closes. Neither the freeze detector nor the size
+        readout can see this -- the freeze detector watches successful writes,
+        which these are, and the size readout stats the path, which reports 0.
+        A recording was lost to exactly that combination.
+
+        Returns False when the recording should stop.
+        """
+        now = time.time()
+        if now - self._last_output_check < self.OUTPUT_CHECK_INTERVAL_SEC:
+            return True
+        self._last_output_check = now
+
+        try:
+            if sink.is_intact():
+                return True
+        except Exception:
+            return True  # never let a diagnostic take a recording down
+
+        self._output_reopens += 1
+        if self._output_reopens > self.MAX_OUTPUT_REOPENS:
+            self._log(
+                f"Output file {self.output_filepath.name} has been removed "
+                f"{self._output_reopens} times. Something outside PVArr keeps "
+                "deleting it; stopping rather than writing into a hole.",
+                "ERROR",
+            )
+            self.status = "aborted_output_lost"
+            return False
+
+        self._log(
+            f"Output file {self.output_filepath.name} vanished from under an "
+            f"open handle after {self.bytes_written} bytes -- deleted by "
+            "something outside this recording. Recreating it and continuing; "
+            "footage written since it was removed is not recoverable.",
+            "ERROR",
+        )
+        try:
+            sink.reopen()
+        except OSError as exc:
+            self._log(f"Could not recreate {self.output_filepath}: {exc}", "ERROR")
+            self.status = "aborted_output_lost"
+            return False
+        return True
+
     def _disk_space_ok(self) -> bool:
         """Rate-limited free-space check. False means stop recording.
 
@@ -825,6 +947,8 @@ class StreamFailoverRecorder:
                     # being consumed. Rate-limited internally.
                     if not self._disk_space_ok():
                         break
+                    if not self._output_ok(out_f):
+                        break
                     continue
 
                 ret_code = self._ffmpeg_process.poll()
@@ -877,7 +1001,7 @@ class StreamFailoverRecorder:
         """
         if self.ring is not None:
             return _RingSink(self.ring)
-        return open(self.output_filepath, "ab")
+        return _FileSink(self.output_filepath)
 
     def _drain_stderr(self, proc: subprocess.Popen) -> "collections.deque":
         """Continuously drain FFmpeg's stderr, keeping only the tail.
@@ -1049,7 +1173,10 @@ class StreamFailoverRecorder:
             # "interrupted" joins these: the container is going away with the
             # recording still wanted, and overwriting it with "completed" is
             # what told the resume logic there was nothing to come back to.
-            if self.status not in ("completed_partial", "aborted_no_space", "interrupted"):
+            if self.status not in (
+                "completed_partial", "aborted_no_space", "aborted_output_lost",
+                "interrupted",
+            ):
                 self.status = "completed"
             if self.on_completion_callback:
                 try:

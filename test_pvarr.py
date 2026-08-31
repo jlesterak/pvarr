@@ -2077,6 +2077,220 @@ class TestStaticRoutes(ServerTestCase):
         self.assertEqual(self.client.get("/openapi.json").status_code, 200)
 
 
+class TestFileSink(unittest.TestCase):
+    """The sink must know when its file has been taken away.
+
+    Reproduces the live incident: a DELETE against the library removed the .ts
+    of a running recording, PVArr answered 200 OK, and the capture loop wrote
+    four minutes of hockey into an unnamed inode. NFS showed it as a
+    .nfsXXXXXXXX file; on a local filesystem there is nothing to see at all.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-sink-")
+        self.path = Path(self.tmp) / "game.ts"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_intact_while_the_file_is_there(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"data")
+            sink.flush()
+            self.assertTrue(sink.is_intact())
+
+    def test_not_intact_after_the_file_is_deleted(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"data")
+            sink.flush()
+            self.path.unlink()
+            self.assertFalse(sink.is_intact())
+
+    def test_not_intact_when_the_path_is_a_different_file(self):
+        """The silly-rename case, and why st_nlink is the wrong test.
+
+        NFS answers a delete-with-open-handle by *renaming* the file, so its
+        link count stays 1. A link-count check passes happily here; only an
+        inode comparison catches it.
+        """
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"data")
+            sink.flush()
+            os.rename(self.path, Path(self.tmp) / ".nfs00000000deadbeef")
+            self.path.write_bytes(b"a different file entirely")
+            self.assertEqual(os.fstat(sink._fh.fileno()).st_nlink, 1)
+            self.assertFalse(sink.is_intact())
+
+    def test_writes_still_succeed_into_a_deleted_file(self):
+        """The property that makes this bug silent. Documented, not desired."""
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.path.unlink()
+            sink.write(b"goes nowhere")   # no exception, no error
+            sink.flush()
+            self.assertFalse(self.path.exists())
+
+    def test_reopen_recreates_the_file(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"first")
+            sink.flush()
+            self.path.unlink()
+            sink.reopen()
+            sink.write(b"second")
+            sink.flush()
+            self.assertTrue(sink.is_intact())
+            self.assertEqual(self.path.read_bytes(), b"second")
+
+
+class TestOutputVanishGuard(unittest.TestCase):
+    """_output_ok: recreate the file, and give up if it keeps disappearing."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-vanish-")
+        self.path = Path(self.tmp) / "game.ts"
+        self.rec = StreamFailoverRecorder(
+            recording_id="v1",
+            candidates=["http://a/1.m3u8"],
+            output_filepath=str(self.path),
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_intact_file_passes(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.assertTrue(self.rec._output_ok(sink))
+            self.assertEqual(self.rec._output_reopens, 0)
+
+    def test_deleted_file_is_recreated_and_recording_continues(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.path.unlink()
+            self.assertTrue(self.rec._output_ok(sink))
+            self.assertTrue(self.path.exists())
+            self.assertEqual(self.rec._output_reopens, 1)
+        joined = " ".join(self.rec.log_history)
+        self.assertIn("vanished", joined)
+
+    def test_repeated_deletion_aborts_rather_than_looping(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            for _ in range(self.rec.MAX_OUTPUT_REOPENS):
+                self.rec._last_output_check = 0.0
+                self.path.unlink()
+                self.assertTrue(self.rec._output_ok(sink))
+            self.rec._last_output_check = 0.0
+            self.path.unlink()
+            self.assertFalse(self.rec._output_ok(sink))
+        self.assertEqual(self.rec.status, "aborted_output_lost")
+
+    def test_check_is_rate_limited(self):
+        """Two stats every 15s, not two stats per chunk."""
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.rec._output_ok(sink)
+            self.path.unlink()
+            # Inside the interval, so the deletion is not noticed yet.
+            self.assertTrue(self.rec._output_ok(sink))
+            self.assertEqual(self.rec._output_reopens, 0)
+
+    def test_a_broken_sink_never_kills_a_recording(self):
+        class Exploding:
+            def is_intact(self):
+                raise RuntimeError("stat blew up")
+        self.assertTrue(self.rec._output_ok(Exploding()))
+
+    def test_rebroadcast_ring_is_always_intact(self):
+        from app.recorder import _RingSink
+        from app import ringbuffer
+        ring = ringbuffer.RingBuffer(Path(self.tmp) / "buf.bin", capacity=188 * 100)
+        try:
+            sink = _RingSink(ring)
+            self.assertTrue(sink.is_intact())
+            self.assertTrue(self.rec._output_ok(sink))
+        finally:
+            ring.close()
+
+
+class TestLibraryRefusesLiveFiles(ServerTestCase):
+    """A DELETE that returned 200 OK cost a live recording. Never again."""
+
+    def _live_recorder(self, path, rebroadcast=False):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.is_rebroadcast = rebroadcast
+        rec.output_filepath = Path(path)
+        rec.current_filepath = Path(path)
+        rec.final_filepath = None
+        return rec
+
+    def test_delete_of_a_recording_in_progress_is_refused(self):
+        target = Path(self.tmp) / "live.ts"
+        target.write_bytes(b"footage")
+        self.server.active_recorders["r1"] = self._live_recorder(target)
+
+        r = self.client.delete("/api/library/live.ts")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("r1", r.json()["detail"])
+        self.assertTrue(target.exists(), "the file must survive the refusal")
+
+    def test_rename_of_a_recording_in_progress_is_refused(self):
+        target = Path(self.tmp) / "live.ts"
+        target.write_bytes(b"footage")
+        self.server.active_recorders["r1"] = self._live_recorder(target)
+
+        r = self.client.post("/api/library/rename", data={
+            "old_name": "live.ts", "new_name": "renamed.ts",
+        })
+        self.assertEqual(r.status_code, 409)
+        self.assertTrue(target.exists())
+
+    def test_an_idle_file_is_still_deletable(self):
+        """The guard must not turn the library read-only."""
+        target = Path(self.tmp) / "old.ts"
+        target.write_bytes(b"done")
+        self.server.active_recorders["r1"] = self._live_recorder(
+            Path(self.tmp) / "live.ts"
+        )
+        r = self.client.delete("/api/library/old.ts")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(target.exists())
+
+    def test_a_stopped_recorders_file_is_deletable(self):
+        target = Path(self.tmp) / "finished.ts"
+        target.write_bytes(b"done")
+        rec = self._live_recorder(target)
+        rec.is_running = False
+        self.server.active_recorders["r1"] = rec
+        self.assertEqual(self.client.delete("/api/library/finished.ts").status_code, 200)
+
+    def test_the_remuxed_final_path_is_protected_too(self):
+        """A session switches to the .mp4 at completion; both must be safe."""
+        ts = Path(self.tmp) / "live.ts"
+        mp4 = Path(self.tmp) / "live.mp4"
+        mp4.write_bytes(b"remuxed")
+        rec = self._live_recorder(ts)
+        rec.final_filepath = mp4
+        rec.current_filepath = mp4
+        self.server.active_recorders["r1"] = rec
+        self.assertEqual(self.client.delete("/api/library/live.mp4").status_code, 409)
+
+    def test_a_rebroadcast_channel_blocks_nothing(self):
+        """A channel keeps no file, so it has no library entry to protect."""
+        target = Path(self.tmp) / "unrelated.ts"
+        target.write_bytes(b"data")
+        self.server.active_recorders["r1"] = self._live_recorder(
+            target, rebroadcast=True
+        )
+        self.assertEqual(self.client.delete("/api/library/unrelated.ts").status_code, 200)
+
+
 class TestVersionReporting(ServerTestCase):
     """The version a user can see must be the version they are running.
 

@@ -241,8 +241,8 @@ and mounts `./recordings` there.
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
-| `POST` | `/api/library/rename` | Rename a recording. A new name with no extension inherits the file's existing one, so a remuxed `.mp4` stays an `.mp4`. |
-| `DELETE` | `/api/library/{filename}` | Delete a recording |
+| `POST` | `/api/library/rename` | Rename a recording. A new name with no extension inherits the file's existing one, so a remuxed `.mp4` stays an `.mp4`. Returns `409` if a recording is currently writing to that file. |
+| `DELETE` | `/api/library/{filename}` | Delete a recording. Returns `409` if a recording is currently writing to that file — stop the recording first. |
 | `GET` | `/api/library/download/{filename}` | Download a recording. `Content-Type` follows the container (`.ts`, `.mp4`, `.mkv`). |
 | `GET` | `/live/playlist.m3u` · `/live/playlist.m3u8` | M3U tuner playlist |
 | `GET` | `/live/epg.xml` | XMLTV EPG. Each programme names the file being written and the stream currently feeding it. |
@@ -367,6 +367,27 @@ with the exact `chown` command to run. Set `PUID`/`PGID` rather than `user:`.
 
 **Disk fills up.** Recordings are uncompressed TS and grow quickly — roughly 2.25 GB per hour at 5 Mbps. PVArr now aborts a recording when free space falls below `PVARR_MIN_FREE_GB` (default 5 GB) rather than filling the volume, keeping and post-processing whatever was captured; the session reports `aborted_no_space`. Still point `recordings/` at a large volume and prune on a schedule — the guard protects the host, it does not make room.
 
+**Deleting or renaming a recording that is still running is refused (`409`).**
+Removing the file underneath a live recording does not fail and does not stop
+the recording: on Linux the writes keep succeeding into a file that no longer
+has a name, the footage is unrecoverable, and the dashboard shows `0.00 MB`
+because it reads the size from the path. Stop the recording first — it is
+post-processed and released within a few seconds.
+
+**A recording stopped with `aborted_output_lost`.** Something outside PVArr
+deleted the output file repeatedly while the recording was running — a cleanup
+script, another *arr tool, or a file manager on the share. PVArr recreates the
+file and carries on the first three times, logging each one; beyond that it
+stops rather than write into a hole. Whatever was captured between the deletion
+and the recreation is gone.
+
+**Recordings on an NFS share, and `.nfsXXXXXXXX` files.** If something deletes
+a file PVArr has open, NFS renames it to `.nfsXXXXXXXX` instead of removing it,
+and it disappears for real when PVArr closes the handle. A `.nfs…` file in the
+recordings directory means exactly that happened. PVArr now detects this within
+15 seconds and recreates the recording file, but the footage written into the
+orphan is not recoverable.
+
 **A recording stopped with `aborted_no_space`.** The volume fell below the free-space floor. PVArr deliberately does *not* fail over here: the problem is local, so another stream would not help. Free some space, or lower `PVARR_MIN_FREE_GB` if the floor is too conservative for your setup.
 
 ---
@@ -381,7 +402,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-330 tests covering filename sanitisation and collision handling, storage
+347 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

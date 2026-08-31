@@ -1138,3 +1138,94 @@ Seven tests added (330 total, was 323):
   that `scripts/publish.sh` and the CI tag guard both sed. If that line is ever
   reformatted the release script silently fails to bump and CI's tag-vs-code
   check reads an empty string.
+
+## Deleting a live recording silently destroyed it (2026-08-31)  [COMPLETED]
+
+Found by the sponsor on icebox during v0.2.0 testing. The most damaging bug
+found in this project so far: it destroys footage and reports success.
+
+**Symptom.** Candidate 1 failed, candidate 2 connected and ran for four
+minutes, elapsed time climbed, but recorded size stayed at 0 MB and no file
+appeared in the library. `ls` of the recordings directory showed only
+`.nfs000000000e3b01ab00000001`. A manual force-failover to candidate 3 made a
+proper `.ts` appear and data start filling.
+
+**Root cause, confirmed in the container log:**
+
+    "DELETE /api/library/2026-08-31_MLB_Yankees_vs_RedSox_1080p.ts" 200 OK
+
+issued mid-recording against the running session's own output file. The library
+delete endpoint unlinked it without ever asking whether a recorder was writing
+to it, and answered 200.
+
+**Why it was silent.** An append handle keeps working perfectly after its file
+is deleted — writes succeed, the offset advances, nothing raises. The bytes go
+to an inode with no name and are freed when the handle closes. The directory is
+NFS-exported from a QNAP, so it showed as a silly-rename (`.nfsXXXX`); on a
+local filesystem there would have been nothing to see at all.
+
+Three separate mechanisms all failed to notice, each for a defensible reason:
+- **Freeze detection** watches `last_write_time`, updated on every *successful*
+  write. The writes were succeeding. The stream looked perfectly healthy.
+- **`get_filesize_mb()`** stats the path, not the handle. Path gone -> 0.0.
+- **The dashboard** renders only `filesize_mb`, never `bytes_written`, so the
+  two never visibly disagreed.
+
+**Why candidate 3 "fixed" it.** Every attempt reopens with `open(path, "ab")`,
+which recreates a missing file. The manual failover made a fresh, correctly
+named file. That behaviour is diagnostic of nothing else.
+
+### Fix, in two halves
+
+**1. PVArr refuses (`server.py`).** `_active_output_paths()` maps every live
+recorder's `output_filepath`, `current_filepath` and `final_filepath` to its
+session id; `_refuse_if_recording()` raises **409** from both the delete and
+the rename endpoint. Rename is included because renaming out from under a
+handle strands the recording writing to a path nothing will look at. A
+rebroadcast channel blocks nothing — it keeps no file.
+
+**2. PVArr notices anyway (`recorder.py`).** Half 1 cannot help when something
+*outside* PVArr removes the file, which on a QNAP export is a real scenario —
+File Station, SMB, a cleanup cron, another *arr tool. The new `_FileSink`
+carries `is_intact()`, comparing the inode of the open handle against the inode
+at the path, rate-limited to every 15s alongside the disk guard.
+
+**`st_nlink == 0` is the wrong test and there is a test asserting so.** A
+silly-rename is a *rename*, so the link count stays 1 and a link-count check
+passes happily on exactly the case this exists to catch. Only the inode
+comparison works.
+
+On detection: log loudly, recreate the file, continue. After
+`MAX_OUTPUT_REOPENS` (3) it stops with status `aborted_output_lost` rather than
+looping forever against something that keeps deleting the file. `_RingSink`
+answers `is_intact() -> True` so the capture loop never branches on sink type.
+
+### Proven
+Unit tests plus a real-recorder end-to-end run (`e2e_delete_live.py`): deleted
+the `.ts` from under a live capture, and the recording recovered —
+
+    file recreated      : True
+    bytes on disk after : 1212416      (not a phantom)
+    reopen count        : 1
+    still recording     : True
+    logged loudly       : True
+
+The same script demonstrates the old behaviour for contrast: write-after-unlink
+raises nothing and the path does not exist.
+
+17 tests added (347 total, was 330), including the silly-rename case and a
+guard that a broken sink can never take a recording down.
+
+### Still open from the same logs
+- [ ] **hls-proxy 404s on `cand_0`.** `http://127.0.0.1:8090/channel/cand_0:
+      Server returned 404 Not Found` at 12:14:42, 12:21:00 and 12:30:17.
+      Fallback mode has never once worked for candidate 1 in these logs. This
+      is the next thing to look at — it is why candidate 1 fails at all.
+- [ ] **Anti-leech decoy segments.** Candidate 1's playlist lists segments
+      disguised as TikTok CDN image URLs
+      (`...tplv-tiktokx-origin.image ... is not in allowed_segment_extensions`).
+      FFmpeg refuses them by extension. Fixable with `-allowed_extensions ALL`,
+      but that loosens a safety check and deserves a deliberate decision rather
+      than a reflex.
+- [ ] The dashboard still never shows `bytes_written`. Had it been beside
+      `filesize_mb`, the disagreement would have been visible immediately.

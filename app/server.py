@@ -175,6 +175,61 @@ def _resolve_library_dir(dir_path: Optional[str]) -> Path:
     )
 
 
+def _active_output_paths() -> Dict[Path, str]:
+    """Files a live recorder is currently writing to, mapped to session id.
+
+    Both the .ts being captured and the remuxed final path, because a session
+    switches between them at completion and either one being removed underneath
+    is the same accident.
+    """
+    paths: Dict[Path, str] = {}
+    for rid, rec in list(active_recorders.items()):
+        try:
+            if not rec.is_running or rec.is_rebroadcast:
+                continue
+        except Exception:
+            continue
+        # Per attribute, so one unreadable path does not hide the others. A
+        # recorder in a strange state must never break the library; the worst
+        # case is that we fail to protect it, which is what we did before.
+        for attr in ("output_filepath", "current_filepath", "final_filepath"):
+            try:
+                value = getattr(rec, attr, None)
+                if value:
+                    paths[Path(value).resolve()] = rid
+            except Exception:
+                continue
+    return paths
+
+
+def _refuse_if_recording(path: Path, verb: str) -> None:
+    """Block a library operation on a file that is being recorded to.
+
+    Deleting the file underneath an open append handle does not fail and does
+    not stop the recording: the writes keep succeeding into an inode with no
+    name, the footage is unrecoverable, and the dashboard shows 0 MB because it
+    stats the path. On NFS the orphan is visible as a .nfsXXXX file; on a local
+    filesystem it is invisible.
+
+    This is not theoretical -- a live recording was lost to a DELETE that
+    returned 200 OK while the session kept running.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return
+    owner = _active_output_paths().get(resolved)
+    if owner:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot {verb} {resolved.name}: recording {owner} is writing "
+                "to it right now. Stop the recording first -- it will be "
+                "post-processed and released."
+            ),
+        )
+
+
 def _safe_filename(filename: str) -> str:
     """Reject any filename carrying a directory component."""
     name = Path(filename).name
@@ -909,9 +964,11 @@ async def list_library(dir_path: Optional[str] = None):
 @app.post("/api/library/rename")
 async def rename_file(old_name: str = Form(...), new_name: str = Form(...), dir_path: Optional[str] = Form(None)):
     """Rename a recording file in library."""
+    src = _safe_filename(old_name)
+    target_dir = _resolve_library_dir(dir_path)
+    _refuse_if_recording(target_dir / src, "rename")
     success = storage.rename_recording(
-        _safe_filename(old_name), _safe_filename(new_name),
-        str(_resolve_library_dir(dir_path)),
+        src, _safe_filename(new_name), str(target_dir),
     )
     if not success:
         raise HTTPException(status_code=400, detail="Rename failed. File might not exist or target name already exists.")
@@ -921,9 +978,10 @@ async def rename_file(old_name: str = Form(...), new_name: str = Form(...), dir_
 @app.delete("/api/library/{filename}")
 async def delete_file(filename: str, dir_path: Optional[str] = None):
     """Delete a recording file from library."""
-    success = storage.delete_recording(
-        _safe_filename(filename), str(_resolve_library_dir(dir_path))
-    )
+    name = _safe_filename(filename)
+    target_dir = _resolve_library_dir(dir_path)
+    _refuse_if_recording(target_dir / name, "delete")
+    success = storage.delete_recording(name, str(target_dir))
     if not success:
         raise HTTPException(status_code=404, detail="File not found")
     return {"status": "success", "message": f"Deleted {filename}"}
