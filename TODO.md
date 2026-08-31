@@ -1321,3 +1321,35 @@ humantodo lines 5-8, folded in ahead of the next release. Doc-only.
   **peevee ARRRR, matey**. Thank y'arrrrr.
 
 Not shipped on its own; rides with the next release.
+
+## v0.2.1 validated on icebox (2026-08-31)
+
+Sponsor ran the full plan against real streams on the QNAP-backed NFS volume.
+All four passed. Recording it here because two of these were only ever proven
+on the dev box, and one was never proven at all.
+
+1. **Delete guard.** Deleting or renaming a file a live recording is writing to
+   is refused; the file survives; unrelated library files still delete. The
+   guard did not turn the library read-only.
+
+2. **External delete, on real NFS.** ***The important one.*** Deleting the `.ts`
+   from the QNAP side — outside PVArr, where the 409 cannot help — is detected,
+   the file is recreated, and the recording continues. This was verified locally
+   against ext4 only; NFS silly-rename semantics on a real export were exactly
+   where the inode check could have been wrong, and they are not. The reasoning
+   behind rejecting `st_nlink == 0` in favour of the inode comparison now has
+   field evidence, not just a unit test.
+
+3. **Rebroadcast.** First clean end-to-end run against real streams — both
+   previous attempts were eaten by the delete bug before they got anywhere.
+   Channel serves, guide says it is not being recorded, nothing kept on disk.
+
+4. **Guide naming.** Plex Info shows the recording name and the feeding
+   candidate.
+
+### Still not proven
+- [ ] **PTS discontinuity across a failover, seen by a live rebroadcast
+      viewer.** The channel itself works; what has still never been observed is
+      a failover *while a client is watching it*. That remains the first thing
+      to look at if Plex ever drops a channel mid-game. Recordings are
+      unaffected and measured — only the live viewer path is open.
