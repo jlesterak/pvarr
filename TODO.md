@@ -457,14 +457,37 @@ restoring. Returning to an earlier candidate is a manual action instead.
 Agreed with the sponsor 2026-08-30. Build in this order -- each step needs the
 one before it.
 
-- [PENDING] **1. Disk-space guard (`recorder.py`).** Mandated by the project
+- [COMPLETED] **1. Disk-space guard (`recorder.py`, `server.py`).** Mandated by the project
       directives and never implemented; the unused `import shutil` in
       `recorder.py` is where it was meant to go. Without it, pointing PVArr at a
       24/7 channel fills the disk until the host breaks -- and the recordings
       volume is usually the same filesystem as everything else. Every active
       recorder checks free space and aborts cleanly below a configured floor.
-      Smallest of these items and the only one that prevents damage, so it goes
+      Smallest of these items and the only one that prevents damage, so it went
       first.
+
+      Checked on the write path, rate-limited to one `statvfs` every 15s.
+      A breach ends the recording rather than failing over -- the problem is
+      local, so another candidate cannot help -- and the footage captured so
+      far is kept and post-processed exactly as an operator stop would be.
+      Status `aborted_no_space` survives the completion block so the reason is
+      not hidden behind "completed". `PVARR_MIN_FREE_GB` (default 5) sets the
+      floor; `0` disables it. `POST /api/recordings/start` refuses with `507`
+      when the volume is already below the floor, rather than starting a
+      capture the guard would abort seconds later.
+
+      **Found on the first run:** the dev box was at 100% -- 152 MB free of
+      225 GB -- so the guard fired immediately and took several unrelated tests
+      down with it. Two real defects came out of that: the test suite depended
+      on the host's free space (fixed -- fixtures disable the guard, and the
+      guard's own tests stub `free_bytes`), and `server._min_free_gb()` read
+      its default off `StreamFailoverRecorder`, which tests routinely replace
+      with a `MagicMock` (fixed -- `DEFAULT_MIN_FREE_GB` is now a module-level
+      constant imported by name).
+
+      Verified live: real recorder, real subprocess, real writes, with only the
+      free-space reading stubbed. Dropped the volume below the floor mid-capture
+      -- stopped in 3.5s, kept 3.81 MB, did not fail over, logged the reason.
 
 - [PENDING] **2. Session state persisted to `/config`.** All session state lives
       in the in-memory `active_recorders` dict, so a `docker restart` or

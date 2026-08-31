@@ -16,6 +16,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
 - **3-stage cycling failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder moves to the next candidate automatically, and **wraps back round to the first** rather than giving up at the end of the list. The usual failure is an expiring token, which fixes itself in minutes, so a blip that touches all three sources no longer ends a recording that still has hours to run. It gives up only after three complete laps with no data — and any data at all resets that budget.
+- **Disk-space guard** — every active recording watches free space on its volume and aborts cleanly before filling it, keeping what was captured and post-processing it normally. Recordings are uncompressed TS on what is usually the same filesystem as everything else, so an unattended capture that runs out of room does not just lose itself, it takes the host with it. Floor set by `PVARR_MIN_FREE_GB` (default 5 GB); a start request is refused up front with `507` if the volume is already below it.
 - **Manual stream control** — force a failover, or click any candidate in the dashboard to switch straight to it. That is the only route *back* to the primary once it recovers, since automatic failover only ever moves forwards.
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
 - **Sports-friendly auto-naming** — derives readable filenames for broadcasts instead of opaque timestamps.
@@ -195,6 +196,7 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PVARR_RECORDINGS_DIR` | `./recordings` | Where recordings are written. The container sets this to `/recordings` so captures land on the mounted volume rather than inside the image. |
 | `PVARR_ALLOWED_DIRS` | unset | Extra directories the library API and `output_dir` may write to, `:`-separated. By default only the recordings dir is reachable. |
 | `PVARR_LOG_LEVEL` | `INFO` | Root log level. |
+| `PVARR_MIN_FREE_GB` | `5` | Free space, in GB, below which an active recording aborts and a new one is refused. `0` disables the guard entirely — only sensible if the recordings volume is separate from the system disk. |
 | `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
 | `TELEGRAM_BOT_TOKEN` | unset | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | unset | Telegram destination chat |
@@ -219,7 +221,7 @@ and mounts `./recordings` there.
 |---|---|---|
 | `GET` | `/` | Dashboard |
 | `POST` | `/api/probe` | Resolve a URL to a playlist and detect the headers it needs |
-| `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs) |
+| `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs). Returns `507` if the target volume is already below `PVARR_MIN_FREE_GB`. |
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
 | `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
@@ -317,7 +319,9 @@ app/
 
 **FFmpeg not found.** Install it (`apt install ffmpeg`, `brew install ffmpeg`). The container already includes it.
 
-**Disk fills up.** Recordings are uncompressed TS and grow quickly. Point `recordings/` at a large volume and prune on a schedule.
+**Disk fills up.** Recordings are uncompressed TS and grow quickly — roughly 2.25 GB per hour at 5 Mbps. PVArr now aborts a recording when free space falls below `PVARR_MIN_FREE_GB` (default 5 GB) rather than filling the volume, keeping and post-processing whatever was captured; the session reports `aborted_no_space`. Still point `recordings/` at a large volume and prune on a schedule — the guard protects the host, it does not make room.
+
+**A recording stopped with `aborted_no_space`.** The volume fell below the free-space floor. PVArr deliberately does *not* fail over here: the problem is local, so another stream would not help. Free some space, or lower `PVARR_MIN_FREE_GB` if the floor is too conservative for your setup.
 
 ---
 
@@ -331,11 +335,11 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-234 tests covering filename sanitisation and collision handling, storage
+246 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
-stream-completion ordering, library listing across containers, FFmpeg command
-construction, and every HTTP route.
+stream-completion ordering, the disk-space guard, library listing across
+containers, FFmpeg command construction, and every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the

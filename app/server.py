@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app import __version__
-from app.recorder import StreamFailoverRecorder
+from app.recorder import DEFAULT_MIN_FREE_GB, StreamFailoverRecorder
 from app.probe import probe_stream
 from app.naming import (
     StorageManager,
@@ -76,6 +77,18 @@ TEMPLATES_DIR = BASE_DIR / "app" / "templates"
 # Overridable so the container can write to a mounted volume rather than a
 # path inside the image layer.
 RECORDINGS_DIR = Path(os.environ.get("PVARR_RECORDINGS_DIR") or (BASE_DIR / "recordings"))
+
+
+def _min_free_gb() -> float:
+    """Free-space floor below which recordings abort. 0 disables the guard."""
+    raw = os.environ.get("PVARR_MIN_FREE_GB")
+    if raw is None:
+        return DEFAULT_MIN_FREE_GB
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid PVARR_MIN_FREE_GB=%r", raw)
+        return DEFAULT_MIN_FREE_GB
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 storage = StorageManager(record_dir=str(RECORDINGS_DIR))
@@ -366,6 +379,24 @@ async def start_recording(
         except (ValueError, TypeError):
             logger.warning("Ignoring malformed stream_headers payload")
 
+    # Fail fast rather than starting a capture that the disk guard will abort
+    # moments later -- and rather than being the thing that fills the volume.
+    min_free_gb = _min_free_gb()
+    if min_free_gb > 0:
+        try:
+            free_gb = shutil.disk_usage(output_path.parent).free / 1024 ** 3
+        except OSError:
+            free_gb = None
+        if free_gb is not None and free_gb < min_free_gb:
+            raise HTTPException(
+                status_code=507,
+                detail=(
+                    f"Only {free_gb:.2f} GB free on {output_path.parent}, below "
+                    f"the {min_free_gb:.2f} GB floor (PVARR_MIN_FREE_GB). "
+                    "Free some space or lower the floor."
+                ),
+            )
+
     _prune_finished_sessions()
     port = _allocate_proxy_port()
 
@@ -401,7 +432,8 @@ async def start_recording(
         freeze_timeout_sec=freeze_timeout,
         on_completion_callback=_on_complete,
         on_failover_callback=_on_failover,
-        header_overrides=header_overrides
+        header_overrides=header_overrides,
+        min_free_gb=min_free_gb,
     )
 
     # Runs in the threadpool after the response is sent. Called inline this

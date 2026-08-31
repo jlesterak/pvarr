@@ -705,6 +705,81 @@ class TestPostProcessor(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# recorder disk guard
+#
+# Free space is stubbed throughout: a test that reads the real filesystem
+# passes or fails according to how full the developer's disk is, which is not
+# a property of the code under test.
+# --------------------------------------------------------------------------
+class TestDiskGuard(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-disk-")
+        self.out = str(Path(self.tmp) / "out.ts")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, free_gb, min_free_gb=5.0):
+        rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out,
+                                     min_free_gb=min_free_gb)
+        rec.free_bytes = lambda: None if free_gb is None else int(free_gb * 1024 ** 3)
+        return rec
+
+    def test_ample_space_is_fine(self):
+        rec = self.make(free_gb=100)
+        self.assertTrue(rec._disk_space_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_below_the_floor_aborts(self):
+        rec = self.make(free_gb=1)
+        self.assertFalse(rec._disk_space_ok())
+        self.assertTrue(rec._stop_event.is_set())
+        self.assertEqual(rec.status, "aborted_no_space")
+
+    def test_exactly_at_the_floor_is_allowed(self):
+        rec = self.make(free_gb=5.0, min_free_gb=5.0)
+        self.assertTrue(rec._disk_space_ok())
+
+    def test_zero_floor_disables_the_guard(self):
+        rec = self.make(free_gb=0.001, min_free_gb=0)
+        self.assertTrue(rec._disk_space_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_unreadable_volume_does_not_kill_a_recording(self):
+        # If free space cannot be determined, that is not a reason to throw
+        # away a capture in progress.
+        rec = self.make(free_gb=None)
+        self.assertTrue(rec._disk_space_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_check_is_rate_limited(self):
+        calls = []
+        rec = self.make(free_gb=100)
+        rec.free_bytes = lambda: calls.append(1) or 100 * 1024 ** 3
+        for _ in range(50):
+            rec._disk_space_ok()
+        self.assertEqual(len(calls), 1,
+                         "statvfs called per write instead of on an interval")
+
+    def test_abort_status_survives_the_completion_block(self):
+        # "aborted_no_space" must not be overwritten with "completed", which
+        # would hide why the recording is short.
+        rec = self.make(free_gb=1)
+        rec._disk_space_ok()                     # sets the status and stop_event
+        # stop_event is set, so the loop falls straight through to the
+        # completion block -- which is the code that must not clobber it.
+        rec._recording_loop()
+        self.assertEqual(rec.status, "aborted_no_space")
+        self.assertFalse(rec.is_running)
+
+    def test_status_summary_reports_headroom(self):
+        rec = self.make(free_gb=42, min_free_gb=5)
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["free_disk_gb"], 42.0)
+        self.assertEqual(summary["min_free_disk_gb"], 5.0)
+
+
+# --------------------------------------------------------------------------
 # recorder._recording_loop  —  failover state machine
 #
 # These drive the real loop with the subprocess boundary replaced by a script.
@@ -727,6 +802,10 @@ class FailoverLoopTestCase(unittest.TestCase):
         single candidate can consume two entries: direct mode, then the proxy
         fallback. Entries may be callables taking (recorder, candidate).
         """
+        # Disable the disk guard unless a test is specifically about it.
+        # Left live, these tests pass or fail according to how full the
+        # developer's disk happens to be, which is not a property of the code.
+        kwargs.setdefault("min_free_gb", 0)
         rec = StreamFailoverRecorder("test-id", urls, self.out, **kwargs)
         # Cycling means an unscripted run keeps going; the default budget of 3
         # laps is what makes these tests terminate.
@@ -1212,6 +1291,7 @@ class TestFreezeDetection(unittest.TestCase):
         rec = StreamFailoverRecorder(
             "test-id", ["http://a/1.m3u8"], self.out,
             freeze_timeout_sec=freeze_timeout,
+            min_free_gb=0,   # not what these tests are about; see make() above
         )
         # Shrink the select() wait so tests do not sit through the real 0.5s.
         rec.READ_POLL_SEC = 0.01
@@ -1245,7 +1325,8 @@ class TestFreezeDetection(unittest.TestCase):
 
     def test_stop_event_returns_without_writing(self):
         from unittest.mock import patch
-        rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out)
+        rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out,
+                                     min_free_gb=0)
         rec._stop_event.set()
         proc = _FakeProc([b"x" * 100])
         try:
@@ -1358,12 +1439,18 @@ class ServerTestCase(unittest.TestCase):
         self._recorders_patch.start()
         self._dir_patch = patch.object(server, "RECORDINGS_DIR", Path(self.tmp))
         self._dir_patch.start()
+        # Disable the free-space floor by default. Left live, every start test
+        # passes or fails according to how full the developer's disk is; tests
+        # that are about the guard set it explicitly.
+        self._disk_patch = patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "0"})
+        self._disk_patch.start()
         self.client = TestClient(server.app)
 
     def tearDown(self):
         self._storage_patch.stop()
         self._recorders_patch.stop()
         self._dir_patch.stop()
+        self._disk_patch.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
@@ -1538,6 +1625,49 @@ class TestRecordingRoutes(ServerTestCase):
         r = self.client.post("/api/recordings/abc/failover")
         self.assertEqual(r.status_code, 200)
         rec.force_failover.assert_called_once()
+
+    def test_start_refuses_when_the_volume_is_nearly_full(self):
+        # Fail fast rather than starting a capture the guard aborts moments
+        # later -- and rather than being the thing that fills the volume.
+        from unittest.mock import patch
+        import collections
+        usage = collections.namedtuple("usage", "total used free")
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "5"}), \
+             patch.object(self.server.shutil, "disk_usage",
+                          return_value=usage(100, 99, int(0.5 * 1024 ** 3))):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 507)
+        self.assertIn("PVARR_MIN_FREE_GB", r.json()["detail"])
+        self.assertEqual(self.server.active_recorders, {},
+                         "a refused start still registered a session")
+
+    def test_start_allowed_when_space_is_ample(self):
+        from unittest.mock import patch, MagicMock
+        import collections
+        usage = collections.namedtuple("usage", "total used free")
+        fake = MagicMock(); fake.get_status_summary.return_value = {}
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "5"}), \
+             patch.object(self.server.shutil, "disk_usage",
+                          return_value=usage(100, 1, int(50 * 1024 ** 3))), \
+             patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_invalid_min_free_gb_falls_back_to_the_default(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "not-a-number"}):
+            self.assertEqual(self.server._min_free_gb(),
+                             self.server.DEFAULT_MIN_FREE_GB)
+
+    def test_min_free_gb_is_read_from_the_environment(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "12.5"}):
+            self.assertEqual(self.server._min_free_gb(), 12.5)
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "-4"}):
+            self.assertEqual(self.server._min_free_gb(), 0.0)
 
     def test_switch_unknown_session_404s(self):
         r = self.client.post("/api/recordings/nope/switch", data={"candidate": 1})

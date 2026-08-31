@@ -25,6 +25,11 @@ from app.probe import DEFAULT_USER_AGENT, probe_stream
 
 logger = logging.getLogger("PVArrRecorder")
 
+# Free-space floor below which a recording aborts rather than filling the
+# volume. Module level rather than a class attribute so callers can read it
+# without going through StreamFailoverRecorder, which tests routinely patch.
+DEFAULT_MIN_FREE_GB = 5.0
+
 
 class StreamOutcome(str, Enum):
     """Why a single FFmpeg attempt ended.
@@ -84,6 +89,9 @@ class StreamFailoverRecorder:
     READ_CHUNK_BYTES = 65536
     # Tail of FFmpeg's stderr kept for diagnostics when an attempt fails.
     STDERR_TAIL_LINES = 15
+    # How often free space is checked while recording. statvfs is cheap but not
+    # free, and checking per chunk would mean thousands of calls a second.
+    DISK_CHECK_INTERVAL_SEC = 15.0
 
     def __init__(
         self,
@@ -98,6 +106,7 @@ class StreamFailoverRecorder:
         header_overrides: Optional[Dict[str, Dict[str, str]]] = None,
         auto_probe: bool = True,
         max_cycles: int = 3,
+        min_free_gb: Optional[float] = None,
     ):
         self.recording_id = recording_id
         # Per-URL header overrides from the dashboard's "advanced" fields, keyed
@@ -133,6 +142,15 @@ class StreamFailoverRecorder:
         # occasionally never exhausts its budget.
         self.max_cycles = max(1, int(max_cycles))
         self.cycles_without_data: int = 0
+        # Recordings are uncompressed TS and grow without bound. The recordings
+        # volume is usually the same filesystem as everything else, so an
+        # unattended 24/7 capture does not just lose itself -- it takes the host
+        # down with it. Abort while there is still room to operate.
+        self.min_free_bytes = int(
+            (DEFAULT_MIN_FREE_GB if min_free_gb is None else float(min_free_gb))
+            * 1024 ** 3
+        )
+        self._last_disk_check: float = 0.0
         self.is_running: bool = False
         self.status: str = "initialized"  # initialized, recording, failing_over, completed, failed
         self.start_time: Optional[float] = None
@@ -390,6 +408,42 @@ class StreamFailoverRecorder:
                 pass
         return True
 
+    def free_bytes(self) -> Optional[int]:
+        """Free space on the volume the recording is being written to."""
+        try:
+            return shutil.disk_usage(self.output_filepath.parent).free
+        except OSError:
+            return None
+
+    def _disk_space_ok(self) -> bool:
+        """Rate-limited free-space check. False means stop recording.
+
+        A failover cannot help here -- the problem is local -- so a breach ends
+        the recording rather than moving to the next candidate. What has been
+        captured is kept and post-processed, exactly as an operator stop would.
+        """
+        if self.min_free_bytes <= 0:
+            return True
+        now = time.time()
+        if now - self._last_disk_check < self.DISK_CHECK_INTERVAL_SEC:
+            return True
+        self._last_disk_check = now
+
+        free = self.free_bytes()
+        if free is None or free >= self.min_free_bytes:
+            return True
+
+        self._log(
+            f"Only {free / 1024 ** 3:.2f} GB free on "
+            f"{self.output_filepath.parent} -- below the "
+            f"{self.min_free_bytes / 1024 ** 3:.2f} GB floor. Aborting to keep "
+            "the host usable; the footage recorded so far is kept.",
+            "ERROR",
+        )
+        self.status = "aborted_no_space"
+        self._stop_event.set()
+        return False
+
     def _failover_delay(self, wrapped: bool) -> float:
         """Pause before the next attempt.
 
@@ -546,6 +600,10 @@ class StreamFailoverRecorder:
                     self.bytes_written += len_chunk
                     written_for_this_session += len_chunk
                     last_write_time = time.time()
+                    # Checked on the write path, where the space is actually
+                    # being consumed. Rate-limited internally.
+                    if not self._disk_space_ok():
+                        break
                     continue
 
                 ret_code = self._ffmpeg_process.poll()
@@ -744,9 +802,10 @@ class StreamFailoverRecorder:
             time.sleep(delay)
 
         if self.status != "failed":
-            # completed_partial must survive: it tells the caller the file is
-            # worth keeping but the stream did not run to its natural end.
-            if self.status != "completed_partial":
+            # These must survive: each says the file is worth keeping but the
+            # stream did not run to its natural end. Overwriting them with
+            # "completed" would hide why the recording is short.
+            if self.status not in ("completed_partial", "aborted_no_space"):
                 self.status = "completed"
             if self.on_completion_callback:
                 try:
@@ -790,6 +849,10 @@ class StreamFailoverRecorder:
             # is exhausted, which the dashboard rendered as "Stream 2 of 1".
             "current_candidate": min(self.current_candidate_index + 1, len(self.candidates)),
             "cycles_without_data": self.cycles_without_data,
+            "free_disk_gb": (
+                round(free / 1024 ** 3, 2) if (free := self.free_bytes()) is not None else None
+            ),
+            "min_free_disk_gb": round(self.min_free_bytes / 1024 ** 3, 2),
             "max_cycles": self.max_cycles,
             "total_candidates": len(self.candidates),
             "candidates": [c.to_dict() for c in self.candidates],
