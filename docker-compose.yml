@@ -41,6 +41,8 @@ services:
       # Must match the mounted volume below, or recordings land inside the
       # container and vanish on recreate.
       - PVARR_RECORDINGS_DIR=/recordings
+      # Session state lives here so an in-flight recording survives a restart.
+      - PVARR_CONFIG_DIR=/config
       - PVARR_ALLOWED_DIRS=/recordings
       - PVARR_LOG_LEVEL=${PVARR_LOG_LEVEL:-INFO}
     volumes:

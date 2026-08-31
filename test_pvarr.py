@@ -31,6 +31,7 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
+from app import sessions
 from app.recorder import (
     CandidateStream,
     StreamFailoverRecorder,
@@ -927,6 +928,180 @@ class FailoverLoopTestCase(unittest.TestCase):
         from unittest.mock import patch
         with patch("app.recorder.time.sleep"):
             rec._recording_loop()
+
+
+class TestSessionStore(unittest.TestCase):
+    """One JSON per live session, so a restart does not lose the recording."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-store-"))
+        self.store = sessions.SessionStore(self.tmp / "sessions")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def record(self, **over):
+        r = sessions.build_record(
+            recording_id="rec1",
+            candidates=["http://a/1.m3u8", "http://b/2.m3u8"],
+            output_filepath=str(self.tmp / "game.ts"),
+            started_at=1756600000.0,
+            header_overrides={"http://a/1.m3u8": {"cookie": "SESSIONID=secret"}},
+        )
+        r.update(over)
+        return r
+
+    def test_roundtrip(self):
+        self.store.save(self.record())
+        loaded = self.store.load_all()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["id"], "rec1")
+        self.assertEqual(loaded[0]["candidates"][1], "http://b/2.m3u8")
+
+    def test_cookie_survives_because_a_resume_needs_it(self):
+        # A session-gated stream cannot be reattached without its cookie.
+        self.store.save(self.record())
+        loaded = self.store.load_all()[0]
+        self.assertEqual(
+            loaded["header_overrides"]["http://a/1.m3u8"]["cookie"],
+            "SESSIONID=secret")
+
+    def test_state_files_are_not_world_readable(self):
+        # They hold stream URLs and a live session cookie.
+        self.store.save(self.record())
+        path = next((self.tmp / "sessions").glob("*.json"))
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((self.tmp / "sessions").stat().st_mode & 0o777), "0o700")
+
+    def test_no_progress_counters_are_persisted(self):
+        # They disagree with reality the moment the process dies, which is
+        # exactly when they get read. Progress comes from stat() at resume.
+        r = self.record()
+        for key in ("bytes_written", "elapsed_seconds", "filesize_mb", "status"):
+            self.assertNotIn(key, r)
+
+    def test_save_leaves_no_temp_files_behind(self):
+        self.store.save(self.record())
+        leftovers = list((self.tmp / "sessions").glob(".tmp-*"))
+        self.assertEqual(leftovers, [])
+
+    def test_remove(self):
+        self.store.save(self.record())
+        self.store.remove("rec1")
+        self.assertEqual(self.store.load_all(), [])
+
+    def test_unknown_schema_is_ignored_not_guessed_at(self):
+        self.store.save(self.record())
+        path = next((self.tmp / "sessions").glob("*.json"))
+        data = json.loads(path.read_text())
+        data["schema"] = sessions.SCHEMA_VERSION + 99
+        path.write_text(json.dumps(data))
+        self.assertEqual(self.store.load_all(), [])
+
+    def test_corrupt_file_does_not_take_out_the_others(self):
+        self.store.save(self.record())
+        self.store.save(self.record(id="rec2"))
+        (self.tmp / "sessions" / "broken.json").write_text("{not json")
+        self.assertEqual(len(self.store.load_all()), 2)
+
+    def test_unwritable_directory_disables_rather_than_raises(self):
+        # The dev box has a root-owned config/; a running recording must not
+        # die because its state file cannot be written.
+        store = sessions.SessionStore(Path("/proc/nonexistent/sessions"))
+        self.assertFalse(store.enabled)
+        self.assertFalse(store.save(self.record()))
+        self.assertEqual(store.load_all(), [])
+        self.assertFalse(store.remove("rec1"))
+
+
+class TestResumeDecision(unittest.TestCase):
+    """What to do with a session found on disk at boot."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-resume-"))
+        self.ts = self.tmp / "game.ts"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def record(self, **over):
+        r = sessions.build_record(
+            recording_id="rec1", candidates=["http://a/1.m3u8"],
+            output_filepath=str(self.ts), started_at=1000.0)
+        r.update(over)
+        return r
+
+    def write(self, size=1024, age=0.0):
+        self.ts.write_bytes(b"x" * size)
+        if age:
+            past = time.time() - age
+            os.utime(self.ts, (past, past))
+
+    def test_missing_file_is_discarded(self):
+        self.assertEqual(sessions.resume_decision(self.record()), "discard")
+
+    def test_empty_file_is_discarded(self):
+        self.write(size=0)
+        self.assertEqual(sessions.resume_decision(self.record()), "discard")
+
+    def test_recently_written_file_resumes(self):
+        self.write(age=5)
+        self.assertEqual(sessions.resume_decision(self.record()), "resume")
+
+    def test_long_dead_file_is_finalised_not_resumed(self):
+        self.write(age=3600)
+        self.assertEqual(sessions.resume_decision(self.record()), "finalise")
+
+    def test_gap_is_measured_from_the_file_not_the_last_transition(self):
+        # The trap: state is written on transitions only, so a healthy
+        # three-hour recording's last transition is at t=0. Measuring the gap
+        # from that would finalise exactly the recordings worth saving.
+        self.write(age=5)
+        old = self.record(started_at=time.time() - 10800)
+        self.assertEqual(sessions.resume_decision(old), "resume")
+
+    def test_repeated_failures_stop_the_restart_loop(self):
+        self.write(age=5)
+        r = self.record(resume_attempts=sessions.DEFAULT_MAX_RESUME_ATTEMPTS)
+        self.assertEqual(sessions.resume_decision(r), "finalise")
+
+    def test_limits_are_configurable(self):
+        self.write(age=100)
+        self.assertEqual(
+            sessions.resume_decision(self.record(), gap_limit=50), "finalise")
+        self.assertEqual(
+            sessions.resume_decision(self.record(), gap_limit=500), "resume")
+
+
+class TestStopReason(unittest.TestCase):
+    """Operator stop and process-going-away are not the same event.
+
+    stop() used to set status='completed' unconditionally. Persisting that
+    meant a restart read 'completed' and nothing ever resumed.
+    """
+
+    def make(self):
+        rec = StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts")
+        rec._reap_ffmpeg = lambda: None
+        rec.stop_proxy = lambda: None
+        return rec
+
+    def test_operator_stop_completes(self):
+        rec = self.make()
+        rec.stop()
+        self.assertEqual(rec.status, "completed")
+        self.assertEqual(rec.stop_reason, "operator")
+
+    def test_shutdown_stop_is_interrupted_not_completed(self):
+        rec = self.make()
+        rec.stop(reason="shutdown")
+        self.assertEqual(rec.status, "interrupted")
+
+    def test_completion_block_does_not_overwrite_interrupted(self):
+        rec = self.make()
+        rec.stop(reason="shutdown")
+        rec._recording_loop()
+        self.assertEqual(rec.status, "interrupted")
 
 
 class TestLogSequence(unittest.TestCase):

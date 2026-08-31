@@ -43,7 +43,10 @@ def stop_all(active_recorders_ref: dict, timeout: float) -> bool:
     for rec_id, recorder in recorders:
         try:
             logger.info("Stopping active recorder session: %s", rec_id)
-            recorder.stop()
+            # "shutdown", not the default "operator": the recording is not
+            # finished, the process is going away. That distinction is what
+            # lets a restart resume it instead of writing it off as completed.
+            recorder.stop(reason="shutdown")
         except Exception as exc:
             logger.error("Error stopping recorder %s: %s", rec_id, exc)
 

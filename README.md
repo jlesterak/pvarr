@@ -16,6 +16,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 
 ## Features
 
+- **Recordings survive a restart** — session state is written to `/config` on state changes only, so a `docker restart`, a Watchtower update or a host reboot no longer orphans an in-flight recording. On boot PVArr reattaches and keeps appending to the same file. A recording whose file has gone cold is finalised — remuxed and announced — rather than reconnected.
 - **A guide that says what is actually happening** — in Plex's channel guide, each programme is titled with the recording's name, sub-titled with the stream currently feeding it (`Primary`, `Backup 1`), and described with the file being written and how many backups are still in reserve. Press Info mid-game to see which feed you are on.
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
 - **3-stage cycling failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder moves to the next candidate automatically, and **wraps back round to the first** rather than giving up at the end of the list. The usual failure is an expiring token, which fixes itself in minutes, so a blip that touches all three sources no longer ends a recording that still has hours to run. It gives up only after three complete laps with no data — and any data at all resets that budget.
@@ -199,6 +200,9 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PVARR_RECORDINGS_DIR` | `./recordings` | Where recordings are written. The container sets this to `/recordings` so captures land on the mounted volume rather than inside the image. |
 | `PVARR_ALLOWED_DIRS` | unset | Extra directories the library API and `output_dir` may write to, `:`-separated. By default only the recordings dir is reachable. |
 | `PVARR_LOG_LEVEL` | `INFO` | Root log level. |
+| `PVARR_CONFIG_DIR` | `./config` | Where session state is written so a restart can resume an in-flight recording. The container sets this to `/config`. |
+| `PVARR_MAX_RESUME_GAP` | `300` | Seconds a recording's file may sit untouched before a restart finalises it instead of reconnecting. Measured from the file's last write, not from when the recording started. |
+| `PVARR_MAX_RESUME_ATTEMPTS` | `3` | How many times a session may be resumed before it is finalised instead. Stops a reproducibly broken recording from restart-looping forever. |
 | `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |
 | `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files; keep it below the compose `stop_grace_period` (30s) or Docker will `SIGKILL` first. |
 | `PVARR_MIN_FREE_GB` | `5` | Free space, in GB, below which an active recording aborts and a new one is refused. `0` disables the guard entirely — only sensible if the recordings volume is separate from the system disk. |
@@ -320,6 +324,10 @@ app/
 
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 
+**The log says "Session persistence disabled: cannot use .../sessions".** The `config/` directory is not writable by the user PVArr runs as, so recordings will not survive a restart — everything else works normally. In Docker the entrypoint fixes this automatically; if you see it there, you have probably pinned `user:` in your compose file (use `PUID`/`PGID` instead). Running outside Docker, `sudo chown -R $(id -u):$(id -g) ./config`.
+
+**A recording came back as a shorter file after a restart.** It was resumed and appended to, which is expected — but if the container was down longer than `PVARR_MAX_RESUME_GAP` (default 5 minutes) PVArr finalises the recording instead of reconnecting, on the grounds that the event has moved on without it. Raise that value if your restarts are routinely slower.
+
 **The live log pane stops updating on a long recording (versions before 0.1.5).** The recorder keeps the newest 500 log lines; the dashboard tracked its position by counting them, so once trimming started the count stopped growing and the view silently froze for the rest of the session. Fixed — position is tracked by a sequence number that survives trimming.
 
 **A stream URL is rejected with "only http:// and https:// stream URLs are accepted".** Working as intended. FFmpeg will open `file://`, `concat:` and `tcp://` just as readily as `https://`, and PVArr streams captured bytes back through the tuner and download endpoints — so an unconstrained scheme would let anything on your LAN read local files through PVArr. Paste the real playlist URL.
@@ -366,7 +374,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-271 tests covering filename sanitisation and collision handling, storage
+290 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

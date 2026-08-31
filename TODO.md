@@ -595,7 +595,7 @@ one before it.
       free-space reading stubbed. Dropped the volume below the floor mid-capture
       -- stopped in 3.5s, kept 3.81 MB, did not fail over, logged the reason.
 
-- [PENDING] **2. Session state persisted to `/config`.** All session state lives
+- [COMPLETED] **2. Session state persisted to `/config`.** All session state lives
       in the in-memory `active_recorders` dict, so a `docker restart` or
       `docker compose up -d` destroys every in-flight recording: the FFmpeg
       child dies, the `.ts` survives on the volume but is orphaned -- no remux,
@@ -610,7 +610,7 @@ one before it.
       root while the container runs as uid 1000 -- so the first write will fail
       with permission denied until it is chowned. Fix and document with this.
 
-- [PENDING] **3. Resume on restart/recreate.** On boot, read the session files
+- [COMPLETED] **3. Resume on restart/recreate.** On boot, read the session files
       and reconnect, appending to the same `.ts` (which is how failover already
       works). Bounded by a maximum gap -- past it, finalise instead of
       reconnecting -- and by a resume-attempt counter, so a recording that dies
@@ -799,7 +799,7 @@ Two more constraints, from Architect, that any implementation must respect:
 - **PVArr does not promise 24/7 recording.** So the PTS discontinuity at each
   failover is low priority *as a live-streaming concern*. It stays open only
   to the extent that it affects the recorded file -- see below.
-- [ ] **Check whether the failover discontinuity affects the finished file.**
+- [x] **Checked: the failover discontinuity does NOT affect the finished file.**
       Each failover spawns a fresh FFmpeg with its own timeline and appends to
       the same .ts. The live-client drop is now explicitly out of scope, but
       the same discontinuity sits in the middle of every multi-candidate
@@ -807,4 +807,88 @@ Two more constraints, from Architect, that any implementation must respect:
       scrubbing in Plex, or the reported duration. That is an existing-recording
       concern, not a rebroadcast one, so it is worth an hour to establish
       empirically. Test locally, do not speculate.
+
+#### Measured, 2026-08-31 (two 10s clips, separate FFmpeg runs, concatenated
+#### as .ts then remuxed exactly as post_processor does)
+- The raw `.ts` reports **10.02s for 20s of content**. ffprobe reads the
+  container timeline, and the second FFmpeg restarts at zero, so everything
+  after the failover is invisible to a duration probe.
+- The remuxed `.mp4` reports **20.03s**, and seeking to 15s -- inside the
+  second half -- works. FFmpeg re-times the discontinuity on the way through.
+- `_on_complete` always remuxes to mp4 and deletes the source, so **the file a
+  user actually keeps is correct**. The sponsor's call to deprioritise stands.
+- Residual, low: if the remux ever *fails*, the kept `.ts` underreports its
+  duration and Plex will show the wrong length. Worth a guard eventually --
+  not worth work now.
+
+## Phase 13 items 2 & 3 -- session persistence and resume (2026-08-31)
+
+Built after the sponsor confirmed persistence lands before rebroadcast.
+
+New module `app/sessions.py`. The recorder was NOT touched beyond a stop
+reason: it stays a pure capture engine, and `server.py` owns the store and
+calls it at transitions. Persistence that reaches into the capture loop is
+persistence that stalls the capture loop.
+
+- One JSON per session under `<config>/sessions/`, written **on state
+  transitions only** -- start, failover, finish. A clean three-hour recording
+  writes twice. Ongoing disk writes are zero.
+- **No progress counters are persisted.** Bytes and elapsed time are recovered
+  by `stat()`ing the `.ts` at resume. A counter in a file disagrees with reality
+  the moment the process dies, which is exactly when it is read.
+- Written 0600 in a 0700 directory. The files hold stream URLs and the session
+  `Cookie` -- a resume against a gated stream cannot work without them.
+- Atomic write via `mkstemp` + `os.replace`. The likeliest moment to be
+  interrupted is a shutdown, which is exactly when this file is being written.
+- Store failure never propagates. On an unwritable directory it disables
+  itself, warns once, and every call becomes a no-op -- a running recording
+  must not die because its state file cannot be written.
+
+### `stop()` now takes a reason, and this was the crux
+It previously set `status = "completed"` unconditionally. Persisting that meant
+a restart read "completed" and nothing ever resumed. An **operator** stop
+finishes the recording: remux, notify, forget the session. A **shutdown** stop
+means the process is going away with the recording still wanted: keep the
+`.ts`, keep the record, decide at boot.
+
+That reverses part of the v0.1.4 fix on purpose. v0.1.4 made a container stop
+remux before exiting; remuxing now would delete the file the resume needs. The
+remux still runs on shutdown **if persistence is unavailable**, since then there
+is nothing to resume from -- better a finished file than an orphaned one.
+
+### Three fates at boot, decided by `resume_decision()`
+Kept a pure function so the policy is testable without a filesystem, a recorder
+or a server.
+- **resume** -- file exists, has content, was written recently, attempt budget
+  intact. Reattach and keep appending.
+- **finalise** -- footage worth keeping but too cold to reconnect (past
+  `PVARR_MAX_RESUME_GAP`, default 300s) or `PVARR_MAX_RESUME_ATTEMPTS`
+  exhausted. Remux and notify. A session that dies, resumes and dies again is
+  reproducibly broken, not unlucky.
+- **discard** -- nothing on disk to keep.
+
+**The gap is measured from the `.ts` mtime, not the last transition.** Under
+transitions-only writing a healthy three-hour recording's last transition is at
+t=0, so a gap measured from that would finalise exactly the long recordings the
+feature exists to save. There is a test for this specific trap.
+
+### Verified end to end
+Real recorder, real subprocess, real bytes. Captured 327,680 bytes; ran
+`stop_all()` exactly as `docker stop` does; confirmed **no remux ran** and the
+state file survived; cleared all in-process state; called `resume_sessions()`.
+The **same file** grew to 655,360 bytes. One file on disk, not two.
+
+290 tests (was 271).
+
+### Found while building
+`config/` on the dev box is root-owned, so the store disabled itself on first
+run -- the exact failure the Phase 13 note predicted. It degraded correctly
+rather than taking the app down. In the container the entrypoint already chowns
+`/config`, so this only bites outside Docker; both cases are now in the README
+troubleshooting section. `PVARR_CONFIG_DIR=/config` is now set in the Dockerfile
+and compose file.
+
+### Not done, deliberately
+Item 4 (recording windows, `PVARR_MAX_HOURS=6`) is still pending. Rebroadcast is
+now unblocked.
 

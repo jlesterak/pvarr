@@ -8,11 +8,12 @@ import asyncio
 import json
 import logging
 import os
+import time
 import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 
 from fastapi import FastAPI, APIRouter, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response
@@ -45,6 +46,7 @@ from app.tuner import (
 from app.notifications import NotificationManager
 from app.post_processor import remux_recording
 from app.cleanup import _shutdown_timeout
+from app.sessions import SessionStore, build_record, resume_decision
 from app.logging_config import configure_logging
 
 configure_logging()
@@ -61,6 +63,19 @@ async def lifespan(app: FastAPI):
     `docker stop` or Ctrl-C could return before FFmpeg and hls-proxy children
     were terminated, orphaning them.
     """
+    # Reattach to anything that was recording when this process last died.
+    # Offloaded: it stats files and may run a remux, and this is the event loop.
+    try:
+        counts = await asyncio.to_thread(resume_sessions)
+        if any(counts.values()):
+            logger.info(
+                "Session recovery: %s resumed, %s finalised, %s discarded.",
+                counts["resumed"], counts["finalised"], counts["discarded"],
+            )
+    except Exception as exc:
+        # A broken session file must never stop the server from booting.
+        logger.error("Session recovery failed: %s", exc)
+
     yield
     # Offloaded because stopping reaps FFmpeg (up to 7s each) and then waits for
     # post-processing -- both blocking, and this still runs on the event loop.
@@ -77,6 +92,7 @@ app = FastAPI(
 )
 
 notifier = NotificationManager()
+session_store = SessionStore()
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -329,6 +345,141 @@ async def probe_url(url: str = Form(...), referer: Optional[str] = Form(None)):
     return JSONResponse(content=result)
 
 
+def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder:
+    """Build a recorder from a session record, persist it, and start it.
+
+    Shared by a fresh start and by a resume at boot, so the two cannot drift
+    apart -- a resumed recording must behave identically to a new one, and the
+    surest way to guarantee that is for there to be one code path.
+    """
+    recording_id = record["id"]
+    output_filepath = record["output_filepath"]
+
+    def _on_complete(filepath):
+        """Post-process first, announce second.
+
+        The notification triggers a Plex/Emby library scan. Firing it before
+        the remux meant the scan ran while only the .ts existed and the .mp4
+        did not, so Plex indexed a file the remux was about to delete and never
+        saw the finished recording until its next scheduled scan. The webhook
+        text also quoted the .ts name and its pre-remux size. Remuxing first
+        costs nothing extra -- this already runs on the recorder thread, not
+        the event loop.
+
+        A shutdown is the exception. The recording is not finished -- the
+        container is going away and we intend to resume -- so remuxing here
+        would delete the .ts that the resume needs to append to. The session
+        record is left in place and the decision is made at boot instead. If
+        persistence is unavailable there is nothing to resume from, so the
+        remux still runs: better a finished file than an orphaned one.
+        """
+        if recorder.stop_reason == "shutdown" and session_store.enabled:
+            logger.info(
+                "Session %s interrupted by shutdown; keeping %s for resume.",
+                recording_id, Path(filepath).name,
+            )
+            return
+
+        result = remux_recording(filepath, target_format="mp4", delete_source=True)
+        # Point the session at the remuxed file: the .ts it was recording to
+        # has just been deleted, so size and filename lookups would read 0.
+        if result.get("status") == "success" and result.get("output_filepath"):
+            recorder.final_filepath = Path(result["output_filepath"])
+
+        final_path = recorder.final_filepath or Path(filepath)
+        sz = round(final_path.stat().st_size / (1024*1024), 2) if final_path.exists() else 0
+        notifier.notify_recording_finished(recording_id, final_path.name, sz)
+        # Genuinely finished: stop tracking it, so a later restart does not
+        # try to resume a recording that has already been remuxed and shipped.
+        session_store.remove(recording_id)
+
+    def _on_failover(rec_id, next_name):
+        notifier.notify_failover_triggered(rec_id, next_name)
+        # A state transition, and one of the few things worth re-persisting:
+        # a resume should reattach to the candidate that was actually working,
+        # not start again from the primary that had already failed.
+        record["current_candidate_index"] = recorder.current_candidate_index
+        session_store.save(record)
+
+    recorder = StreamFailoverRecorder(
+        recording_id=recording_id,
+        candidates=record["candidates"],
+        output_filepath=output_filepath,
+        base_port=port,
+        freeze_timeout_sec=record.get("freeze_timeout_sec", 60),
+        on_completion_callback=_on_complete,
+        on_failover_callback=_on_failover,
+        header_overrides=record.get("header_overrides") or {},
+        min_free_gb=record.get("min_free_gb", DEFAULT_MIN_FREE_GB),
+    )
+    if record.get("started_at"):
+        recorder.start_time = record["started_at"]
+
+    session_store.save(record)
+    active_recorders[recording_id] = recorder
+    recorder.start_recording()
+    return recorder
+
+
+def _finalise_orphan(record: Dict[str, Any]) -> None:
+    """Post-process a recording we are not going to reconnect to.
+
+    The footage is real and worth keeping; only the live capture is over. This
+    is the same work _on_complete does, minus the recorder, because there is
+    no longer a process to attach one to.
+    """
+    recording_id = record["id"]
+    filepath = record["output_filepath"]
+    try:
+        result = remux_recording(filepath, target_format="mp4", delete_source=True)
+        final = Path(result.get("output_filepath") or filepath)
+        size = round(final.stat().st_size / (1024 * 1024), 2) if final.exists() else 0
+        notifier.notify_recording_finished(recording_id, final.name, size)
+        logger.info("Finalised orphaned recording %s as %s", recording_id, final.name)
+    except Exception as exc:
+        logger.error("Could not finalise orphaned recording %s: %s", recording_id, exc)
+    finally:
+        session_store.remove(recording_id)
+
+
+def resume_sessions() -> Dict[str, int]:
+    """Reattach to recordings that were in flight when the process died.
+
+    Runs once at startup. Every record gets one of three fates, decided by
+    resume_decision(): reconnect and keep appending to the same .ts, finalise
+    it as it stands, or discard it because there is nothing on disk. Failures
+    are contained per-session -- one bad record must not stop the others, and
+    must never stop the server booting.
+    """
+    counts = {"resumed": 0, "finalised": 0, "discarded": 0}
+    for record in session_store.load_all():
+        recording_id = record.get("id", "?")
+        try:
+            decision = resume_decision(record)
+            if decision == "discard":
+                logger.info("Discarding session %s: no footage on disk.", recording_id)
+                session_store.remove(recording_id)
+                counts["discarded"] += 1
+                continue
+            if decision == "finalise":
+                logger.info("Finalising session %s rather than resuming.", recording_id)
+                _finalise_orphan(record)
+                counts["finalised"] += 1
+                continue
+
+            record["resume_attempts"] = int(record.get("resume_attempts", 0)) + 1
+            _launch_session(record, _allocate_proxy_port())
+            logger.info(
+                "Resumed session %s, appending to %s (attempt %s).",
+                recording_id, Path(record["output_filepath"]).name,
+                record["resume_attempts"],
+            )
+            counts["resumed"] += 1
+        except Exception as exc:
+            logger.error("Could not resume session %s: %s", recording_id, exc)
+    return counts
+
+
 @app.post("/api/recordings/start")
 async def start_recording(
     background_tasks: BackgroundTasks,
@@ -426,41 +577,16 @@ async def start_recording(
     _prune_finished_sessions()
     port = _allocate_proxy_port()
 
-    def _on_complete(filepath):
-        """Post-process first, announce second.
-
-        The notification triggers a Plex/Emby library scan. Firing it before
-        the remux meant the scan ran while only the .ts existed and the .mp4
-        did not, so Plex indexed a file the remux was about to delete and never
-        saw the finished recording until its next scheduled scan. The webhook
-        text also quoted the .ts name and its pre-remux size. Remuxing first
-        costs nothing extra -- this already runs on the recorder thread, not
-        the event loop.
-        """
-        result = remux_recording(filepath, target_format="mp4", delete_source=True)
-        # Point the session at the remuxed file: the .ts it was recording to
-        # has just been deleted, so size and filename lookups would read 0.
-        if result.get("status") == "success" and result.get("output_filepath"):
-            recorder.final_filepath = Path(result["output_filepath"])
-
-        final_path = recorder.final_filepath or Path(filepath)
-        sz = round(final_path.stat().st_size / (1024*1024), 2) if final_path.exists() else 0
-        notifier.notify_recording_finished(recording_id, final_path.name, sz)
-
-    def _on_failover(rec_id, next_name):
-        notifier.notify_failover_triggered(rec_id, next_name)
-
-    recorder = StreamFailoverRecorder(
+    record = build_record(
         recording_id=recording_id,
         candidates=candidates,
         output_filepath=str(output_path),
-        base_port=port,
-        freeze_timeout_sec=freeze_timeout,
-        on_completion_callback=_on_complete,
-        on_failover_callback=_on_failover,
+        started_at=time.time(),
         header_overrides=header_overrides,
+        freeze_timeout_sec=freeze_timeout,
         min_free_gb=min_free_gb,
     )
+    recorder = _launch_session(record, port)
 
     # Runs in the threadpool after the response is sent. Called inline this
     # would block the event loop for up to 15s (three HTTP calls, timeout=5).
@@ -468,10 +594,6 @@ async def start_recording(
         notifier.notify_recording_started,
         recording_id, output_path.name, candidates[0],
     )
-
-
-    active_recorders[recording_id] = recorder
-    recorder.start_recording()
 
     return JSONResponse({
         "status": "success",
@@ -487,7 +609,10 @@ async def stop_recording(recording_id: str):
     if not recorder:
         raise HTTPException(status_code=404, detail="Recording session not found")
 
-    recorder.stop()
+    # An operator stop genuinely finishes the recording, so _on_complete
+    # remuxes and the session record is removed there. Contrast stop_all(),
+    # which passes reason="shutdown" precisely so this does not happen.
+    recorder.stop(reason="operator")
     return {"status": "success", "message": f"Stopped session {recording_id}"}
 
 

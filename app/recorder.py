@@ -231,6 +231,10 @@ class StreamFailoverRecorder:
         # trimming begins -- which silently froze the live log view. Readers
         # track this sequence number instead.
         self._log_seq: int = 0
+        # Why the recorder stopped: "operator" (a person clicked stop) or
+        # "shutdown" (the container is going away). Drives whether the session
+        # is forgotten or kept for resume.
+        self.stop_reason: str = "operator"
 
         self._thread: Optional[threading.Thread] = None
         self._ffmpeg_process: Optional[subprocess.Popen] = None
@@ -626,12 +630,22 @@ class StreamFailoverRecorder:
                 pass
         return True
 
-    def stop(self):
-        """Gracefully stop recording."""
-        self._log("Stopping PVArr recorder gracefully...")
+    def stop(self, reason: str = "operator"):
+        """Gracefully stop recording.
+
+        `reason` matters, and conflating the two cases is why a restart used to
+        lose a recording. An **operator** stop means the recording is finished:
+        mark it completed and let the session state be forgotten. A
+        **shutdown** stop means the process is going away with the recording
+        still wanted -- the status must not claim "completed", or the persisted
+        state says there is nothing to come back to and the resume never
+        happens.
+        """
+        self.stop_reason = reason
+        self._log(f"Stopping PVArr recorder gracefully ({reason})...")
         self._stop_event.set()
         self.is_running = False
-        self.status = "completed"
+        self.status = "completed" if reason == "operator" else "interrupted"
         self.stop_time = time.time()
 
         self._reap_ffmpeg()
@@ -982,7 +996,10 @@ class StreamFailoverRecorder:
             # These must survive: each says the file is worth keeping but the
             # stream did not run to its natural end. Overwriting them with
             # "completed" would hide why the recording is short.
-            if self.status not in ("completed_partial", "aborted_no_space"):
+            # "interrupted" joins these: the container is going away with the
+            # recording still wanted, and overwriting it with "completed" is
+            # what told the resume logic there was nothing to come back to.
+            if self.status not in ("completed_partial", "aborted_no_space", "interrupted"):
                 self.status = "completed"
             if self.on_completion_callback:
                 try:

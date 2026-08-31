@@ -74,6 +74,7 @@ ENV HOST=0.0.0.0 \
     PORT=8999 \
     PVARR_NO_VENV=1 \
     PVARR_RECORDINGS_DIR=/recordings \
+    PVARR_CONFIG_DIR=/config \
     PVARR_ALLOWED_DIRS=/recordings
 
 # The app user. PUID/PGID at runtime re-point it at the host's uid/gid so files
