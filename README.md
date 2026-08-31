@@ -426,6 +426,14 @@ recordings directory means exactly that happened. PVArr now detects this within
 15 seconds and recreates the recording file, but the footage written into the
 orphan is not recoverable.
 
+**A `.proxy_conf` folder in your recordings directory.** When a candidate
+falls back to the bundled proxy, PVArr writes that proxy a small config file
+there. It contains the stream URL *with its access token*, so treat it as a
+credential: it is deleted as soon as the fallback attempt ends, including when
+the attempt fails or PVArr is stopped. The folder itself stays behind, empty,
+and is safe to leave alone. A `channels_*.conf` file sitting in it while
+nothing is recording is a bug — please report it.
+
 **A recording stopped with `aborted_no_space`.** The volume fell below the free-space floor. PVArr deliberately does *not* fail over here: the problem is local, so another stream would not help. Free some space, or lower `PVARR_MIN_FREE_GB` if the floor is too conservative for your setup.
 
 ---
@@ -440,11 +448,12 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-370 tests covering filename sanitisation and collision handling, storage
+373 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across
-containers, FFmpeg command construction, and every HTTP route.
+containers, FFmpeg command construction, proxy credential cleanup, and every
+HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the

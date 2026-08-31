@@ -1486,3 +1486,40 @@ machine runs it, and *then* the `v*` tag makes CI build and push the same tags
 again. Same Dockerfile, so the same image — but only the CI build runs the test
 suite first, and only CI is reproducible. Worth switching the script to
 `--skip-docker` by default and letting the tag be the single publisher.
+
+## The proxy's channels.conf could outlive its session (2026-08-31)  [COMPLETED]
+
+Found while clearing the sponsor's stale `channels_893cc63a.conf`. That file
+was already gone -- `_remove_proxy_conf()` had cleaned it up -- but the sweep
+showed the cleanup was reachable only on the straight-line path.
+
+`channels.conf` holds the **fully tokenised stream URL** and is written to the
+mounted recordings volume, where anything with read access to that share can
+see it. Two ways it survived:
+
+1. **The fallback block was not in a `try/finally`.** Anything raising between
+   `start_proxy()` and the teardown -- the capture call, the ffmpeg command
+   build -- skipped `stop_proxy()`, leaving both the credential on disk *and*
+   an orphaned hls-proxy still holding its port.
+2. **`self._proxy_conf_file = conf_file` was set several lines after the
+   write.** `_remove_proxy_conf()` can only delete what it has been told
+   about, so a failure in between orphaned the file with no reference left to
+   it -- unreachable by any later cleanup.
+
+Fixed both: the bookkeeping now happens immediately before the write, and the
+fallback block tears down in a `finally`.
+
+### Proven, not assumed
+Each guard was checked by reverting its fix and confirming the matching test
+goes red:
+- revert the `finally` -> `tokenised channels.conf outlived the session`
+- revert the ordering -> `orphaned conf: nothing held a reference to it`
+
+373 tests (was 370).
+
+### Also cleaned up
+A real tokenised TikTok CDN URL had been hardcoded at line 16 of a scratchpad
+test script (`e2e_proxy_mode.py`) while reproducing the candidate 1 404s.
+Scrubbed. Session-local temp dir, token expiring the same night, but it should
+not have been written down. Repo and scratchpad both verified clean for that
+host.

@@ -3838,5 +3838,103 @@ class TestProbeRoute(ServerTestCase):
         self.assertEqual(ctor.call_args.kwargs["header_overrides"], {})
 
 
+class TestProxyConfNeverOutlivesTheSession(unittest.TestCase):
+    """channels.conf holds the fully tokenised stream URL.
+
+    It is written to the mounted recordings volume, where the sponsor -- and
+    anything else with read access to that share -- can see it. The teardown
+    that deletes it ran on the straight-line path only, so any exception during
+    a fallback attempt left the credential behind, together with an orphaned
+    proxy still holding its port. This is the guard for both.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-conf-")
+        self.rec = StreamFailoverRecorder(
+            "c1", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"), min_free_gb=0)
+        self.rec.hls_proxy_path = str(Path(self.tmp) / "fake-proxy.py")
+        Path(self.rec.hls_proxy_path).write_text("# stub\n")
+        self._popen = patch("app.recorder.subprocess.Popen")
+        proc = self._popen.start()
+        proc.return_value.poll.return_value = None
+        self._sleep = patch("app.recorder.time.sleep")
+        self._sleep.start()
+        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p: [])
+        self._drain.start()
+        # Patching Popen also breaks subprocess.run, which this probe uses to
+        # ask the ffmpeg binary what it supports. Not what is under test here.
+        self._flags = patch("app.recorder.hls_extension_flags", return_value=[])
+        self._flags.start()
+
+    def tearDown(self):
+        self._popen.stop(); self._sleep.stop(); self._drain.stop(); self._flags.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _confs(self):
+        return list((Path(self.tmp) / ".proxy_conf").glob("*.conf"))
+
+    def test_a_raising_fallback_still_deletes_the_conf(self):
+        """The regression: an exception mid-fallback used to strand the file."""
+        rec = self.rec
+
+        def fake_detect(candidate):
+            candidate.m3u8_url = candidate.url
+            return True
+
+        calls = []
+
+        def fake_stream(cmd, candidate):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return StreamOutcome.FAILED      # direct mode fails -> fall back
+            raise RuntimeError("capture blew up mid-fallback")
+
+        rec.detect_candidate_headers = fake_detect
+        rec._stream_ffmpeg_process = fake_stream
+        rec._failover_delay = lambda wrapped: 0.0
+
+        with self.assertRaises(RuntimeError):
+            rec._recording_loop()
+
+        # The proxy did start, so there was really something to clean up.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self._confs(), [], "tokenised channels.conf outlived the session")
+        self.assertIsNone(rec._proxy_process, "hls-proxy left running, still holding its port")
+
+    def test_the_conf_is_removable_even_if_start_proxy_dies_after_writing_it(self):
+        """_remove_proxy_conf can only delete what it was told about.
+
+        The bookkeeping used to happen several lines after the write, so a
+        failure in between orphaned the file with no reference left to it.
+        """
+        from unittest.mock import patch
+        rec = self.rec
+        cand = rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.slug = "cand_0"
+
+        # Fail immediately after the write, before the old assignment point.
+        with patch("app.recorder.os.environ.copy", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                rec.start_proxy(cand)
+
+        self.assertEqual(len(self._confs()), 1, "precondition: the file was written")
+        rec.stop_proxy()
+        self.assertEqual(self._confs(), [], "orphaned conf: nothing held a reference to it")
+
+    def test_a_clean_fallback_removes_it_too(self):
+        """The ordinary path must keep working -- this is not only about crashes."""
+        rec = self.rec
+        cand = rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.slug = "cand_0"
+        rec.start_proxy(cand)
+        self.assertEqual(len(self._confs()), 1)
+        rec.stop_proxy()
+        self.assertEqual(self._confs(), [])
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

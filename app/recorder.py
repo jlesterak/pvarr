@@ -560,13 +560,18 @@ class StreamFailoverRecorder:
         if conf_url is None:
             self._log("Refusing to start the proxy: the URL contains a line break.", "ERROR")
             return candidate.m3u8_url
+        # Registered *before* the write, not after. This file holds the fully
+        # tokenised stream URL, and _remove_proxy_conf() can only delete what it
+        # has been told about -- so anything raising between the write and the
+        # bookkeeping used to strand a readable credential on the recordings
+        # volume with nothing left holding a reference to it.
+        self._proxy_conf_file = conf_file
         with open(conf_file, "w", encoding="utf-8") as f:
             f.write(f"{candidate.slug}|{candidate.name}|1||Sports|{conf_url}|{mode}|{conf_referer}|\n")
 
         env = os.environ.copy()
         env["HLS_PROXY_PORT"] = str(port)
         env["CHANNELS_CONF"] = str(conf_file)
-        self._proxy_conf_file = conf_file
         if candidate.referer:
             env["HLS_PROXY_REFERER"] = candidate.referer
 
@@ -1153,13 +1158,19 @@ class StreamFailoverRecorder:
                     and not self._stop_event.is_set()
                     and not self._force_failover_flag):
                 self._log(f"[Direct Mode Failed] Falling back to hls-proxy-stream for {candidate.name}...", "WARN")
-                proxy_url = self.start_proxy(candidate)
-                proxy_cmd = self._build_ffmpeg_cmd(proxy_url, local_proxy=True)
-                
-                outcome = self._stream_ffmpeg_process(proxy_cmd, candidate)
+                # try/finally, because the teardown is not merely tidiness: it
+                # kills the proxy child and deletes the channels.conf holding
+                # the tokenised URL. On the straight-line version, anything
+                # raising in here left both behind -- an orphaned proxy holding
+                # its port, and a readable credential on the recordings volume.
+                try:
+                    proxy_url = self.start_proxy(candidate)
+                    proxy_cmd = self._build_ffmpeg_cmd(proxy_url, local_proxy=True)
 
-                self._reap_ffmpeg()
-                self.stop_proxy()
+                    outcome = self._stream_ffmpeg_process(proxy_cmd, candidate)
+                finally:
+                    self._reap_ffmpeg()
+                    self.stop_proxy()
 
             if self._stop_event.is_set():
                 break
