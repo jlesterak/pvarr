@@ -1229,3 +1229,22 @@ guard that a broken sink can never take a recording down.
       than a reflex.
 - [ ] The dashboard still never shows `bytes_written`. Had it been beside
       `filesize_mb`, the disagreement would have been visible immediately.
+
+## Release v0.2.1 (2026-08-31)  [COMPLETED]
+
+Patch. Sponsor-approved. One bug, but the most damaging one found so far:
+deleting a recording from the library while it was still running destroyed the
+footage and returned 200 OK.
+
+Anyone on v0.2.0 has a delete button that eats live recordings, which is why
+this did not wait for other changes to accumulate.
+
+- Delete and rename now return `409` for a file a live recorder owns.
+- The capture loop detects its output file vanishing (inode comparison against
+  the path, every 15s), recreates it, and continues; three strikes stops with
+  `aborted_output_lost`.
+- The dashboard version badge shows the real `__version__` instead of the
+  hardcoded `v1.0.0` it had carried since the first commit, and `/api/status`
+  reports the running version so it can be confirmed with `curl`.
+
+347 tests green at the tag. Nothing to do on upgrade.
