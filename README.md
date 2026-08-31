@@ -374,6 +374,26 @@ has a name, the footage is unrecoverable, and the dashboard shows `0.00 MB`
 because it reads the size from the path. Stop the recording first — it is
 post-processed and released within a few seconds.
 
+**A stopped recording shows `post processing` with an amber dot.** The capture
+has finished but the recorder is still remuxing the `.ts` into an `.mp4`, which
+for a long recording takes minutes (263 MB took about 2.5 on a NAS-backed
+volume). The file does not appear in the library until that finishes. The
+session moves to `completed` and greys out on its own; there is nothing to do
+but wait, and stopping or failing over is correctly disabled meanwhile.
+
+**The dashboard shows two sizes.** *On Disk* is the size of the file, *Captured*
+is what the recorder has received from the stream. They should track each
+other. If Captured climbs while On Disk sits at 0, the size turns amber: bytes
+are arriving but not landing in the file, which is what a recording being
+deleted underneath looks like. PVArr now detects and recovers from that on its
+own, but the two numbers are the fastest way to see it.
+
+**Finished sessions collapse rather than disappear.** A stopped recording moves
+to a one-line row under *Recently Finished*; click it to expand its event log.
+The logs are kept deliberately — they are the most useful thing in the app in
+the minutes after a recording ends. The 20 most recent finished sessions are
+retained, then the oldest are dropped.
+
 **A recording stopped with `aborted_output_lost`.** Something outside PVArr
 deleted the output file repeatedly while the recording was running — a cleanup
 script, another *arr tool, or a file manager on the share. PVArr recreates the
@@ -402,7 +422,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-347 tests covering filename sanitisation and collision handling, storage
+357 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

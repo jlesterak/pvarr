@@ -2077,6 +2077,119 @@ class TestStaticRoutes(ServerTestCase):
         self.assertEqual(self.client.get("/openapi.json").status_code, 200)
 
 
+class TestPostProcessingStatus(FailoverLoopTestCase):
+    """"Completed" must not be shown while the remux is still running.
+
+    The sponsor stopped a recording and saw status "completed" beside a green
+    pulsing dot for two and a half minutes. Both were half right: the capture
+    had finished, but the recorder thread was still remuxing 263 MB and no
+    .mp4 existed in the library yet.
+    """
+
+    def test_status_is_post_processing_during_the_callback(self):
+        seen = {}
+
+        def on_complete(path):
+            seen["status"] = rec.status
+            seen["is_running"] = rec.is_running
+
+        rec = self.make(["http://a/1.m3u8"], [True], on_completion_callback=on_complete)
+        # run_loop drives _recording_loop directly, so mirror the one thing
+        # start_recording() sets that the loop itself does not.
+        rec.is_running = True
+        self.run_loop(rec)
+
+        self.assertEqual(seen["status"], "post_processing")
+        self.assertTrue(seen["is_running"],
+                        "the thread is still working, so the dot stays lit")
+
+    def test_final_status_is_restored_afterwards(self):
+        rec = self.make(["http://a/1.m3u8"], [True],
+                        on_completion_callback=lambda p: None)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed")
+        self.assertFalse(rec.is_running)
+
+    def test_a_failing_callback_still_restores_the_status(self):
+        """Post-processing blowing up must not strand the session."""
+        def boom(path):
+            raise RuntimeError("remux exploded")
+
+        rec = self.make(["http://a/1.m3u8"], [True], on_completion_callback=boom)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed")
+        self.assertFalse(rec.is_running)
+
+    def test_an_aborted_status_survives_post_processing(self):
+        """aborted_no_space must not come back as "completed"."""
+        seen = {}
+
+        def on_complete(path):
+            seen["during"] = rec.status
+
+        def abort(recorder, candidate):
+            recorder.status = "aborted_no_space"
+            return StreamOutcome.COMPLETED
+
+        rec = self.make(["http://a/1.m3u8"], [abort], on_completion_callback=on_complete)
+        self.run_loop(rec)
+        self.assertEqual(seen["during"], "post_processing")
+        self.assertEqual(rec.status, "aborted_no_space")
+
+
+class TestDashboardSurfacesCapturedBytes(ServerTestCase):
+    """bytes_written must be on screen, not just in the API.
+
+    It was in /api/status the whole time and the dashboard rendered only
+    filesize_mb, so when the two disagreed -- a recording writing into a
+    deleted file -- there was nothing on screen to show it. Four minutes of
+    footage were lost to a discrepancy the page already had the data to show.
+    """
+
+    def test_status_summary_still_carries_both_numbers(self):
+        rec = StreamFailoverRecorder("s1", ["http://a/1.m3u8"],
+                                     str(Path(self.tmp) / "a.ts"))
+        rec.bytes_written = 4096
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["bytes_written"], 4096)
+        self.assertIn("filesize_mb", summary)
+
+    def test_dashboard_renders_the_captured_counter(self):
+        body = self.client.get("/").text
+        self.assertIn("bytes_written", body)
+        self.assertIn("Captured", body)
+
+    def test_dashboard_separates_live_from_finished(self):
+        body = self.client.get("/").text
+        self.assertIn("liveSessions", body)
+        self.assertIn("finishedSessions", body)
+        self.assertIn("Recently Finished", body)
+
+    def test_the_live_dot_is_not_driven_by_session_count(self):
+        """It used to pulse green whenever any session existed, finished ones
+        included, which is why a stopped recording kept blinking."""
+        body = self.client.get("/").text
+        self.assertNotIn("activeSessions.length > 0 ? 'bg-emerald-400", body)
+
+    def test_divergence_warning_is_scoped_to_active_capture(self):
+        """It must not fire during post_processing.
+
+        The remux deletes the .ts, so on-disk is legitimately 0 against a large
+        captured count. Warning there would cry wolf on every successful
+        recording and train the operator to ignore the one case that matters.
+        Asserted against the template because the suite cannot run the page's
+        JavaScript; the logic itself was exercised directly in node.
+        """
+        body = self.client.get("/").text
+        self.assertIn("s.status !== 'recording'", body)
+
+    def test_finished_sessions_keep_their_logs(self):
+        """Collapsed, not discarded -- the log history is the evidence."""
+        body = self.client.get("/").text
+        self.assertIn("expandedFinished", body)
+        self.assertIn("toggleFinished", body)
+
+
 class TestFileSink(unittest.TestCase):
     """The sink must know when its file has been taken away.
 

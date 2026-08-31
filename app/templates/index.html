@@ -93,8 +93,8 @@
       <!-- Header Action Buttons -->
       <div class="flex items-center space-x-4">
         <div class="px-3 py-1 rounded-md text-xs font-medium flex items-center space-x-2 bg-slate-800 border border-slate-700">
-          <span class="w-2 h-2 rounded-full" :class="activeSessions.length > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
-          <span x-text="activeSessions.length > 0 ? activeSessions.length + ' Active Stream(s)' : 'System Idle'"></span>
+          <span class="w-2 h-2 rounded-full" :class="liveSessions.length > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
+          <span x-text="liveSessions.length > 0 ? liveSessions.length + ' Active Stream(s)' : 'System Idle'"></span>
         </div>
 
         <button @click="openNewModal = true" class="bg-arr-blue hover:bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-blue/20 transition flex items-center space-x-2">
@@ -109,7 +109,7 @@
   <div class="bg-slate-900/80 border-b border-slate-800 px-6 py-2">
     <div class="max-w-7xl mx-auto flex space-x-6 text-sm font-medium text-slate-400">
       <button @click="activeTab = 'active'" :class="activeTab === 'active' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
-        Live Recorders (<span x-text="activeSessions.length"></span>)
+        Live Recorders (<span x-text="liveSessions.length"></span>)
       </button>
       <button @click="activeTab = 'library'" :class="activeTab === 'library' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Media Library (<span x-text="libraryFiles.length"></span>)
@@ -134,7 +134,7 @@
       </template>
 
       <div class="grid grid-cols-1 gap-6">
-        <template x-for="session in activeSessions" :key="session.id">
+        <template x-for="session in liveSessions" :key="session.id">
           <div class="arr-card rounded-xl p-6 space-y-5 border border-slate-700/60 shadow-lg">
             
             <div class="flex items-start justify-between flex-wrap gap-4 border-b border-slate-700/60 pb-4">
@@ -165,12 +165,12 @@
             </div>
 
             <!-- Stats Bar -->
-            <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 bg-slate-900/80 p-3.5 rounded-lg border border-slate-800">
+            <div class="grid grid-cols-2 sm:grid-cols-5 gap-4 bg-slate-900/80 p-3.5 rounded-lg border border-slate-800">
               <div>
                 <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Status</span>
-                <span class="text-sm font-bold capitalize flex items-center space-x-1.5" :class="session.is_running ? 'text-emerald-400' : 'text-slate-400'">
-                  <span class="w-2 h-2 rounded-full" :class="session.is_running ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
-                  <span x-text="session.status"></span>
+                <span class="text-sm font-bold capitalize flex items-center space-x-1.5" :class="statusTextClass(session)">
+                  <span class="w-2 h-2 rounded-full" :class="statusDotClass(session)"></span>
+                  <span x-text="prettyStatus(session.status)"></span>
                 </span>
               </div>
               <div>
@@ -182,8 +182,22 @@
                 <span class="text-sm font-bold font-mono text-slate-200" x-text="formatSeconds(session.elapsed_seconds)"></span>
               </div>
               <div>
-                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Recorded Size</span>
-                <span class="text-sm font-bold font-mono text-cyan-400" x-text="session.filesize_mb + ' MB'"></span>
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">On Disk</span>
+                <span class="text-sm font-bold font-mono" :class="sizeDisagrees(session) ? 'text-amber-400' : 'text-cyan-400'"
+                      :title="sizeDisagrees(session)
+                                ? 'Data is arriving but the file on disk is not growing. Something may have removed it.'
+                                : 'Size of the file on disk'"
+                      x-text="session.filesize_mb + ' MB'"></span>
+              </div>
+              <!-- Captured is the recorder's own counter. It and On Disk must
+                   agree; when they do not, bytes are going somewhere the file
+                   is not, which is exactly how a deleted-out-from-under
+                   recording looked while it silently lost four minutes. -->
+              <div>
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Captured</span>
+                <span class="text-sm font-bold font-mono text-slate-200"
+                      title="Bytes the recorder has received from the stream"
+                      x-text="toMB(session.bytes_written) + ' MB'"></span>
               </div>
             </div>
 
@@ -223,6 +237,48 @@
           </div>
         </template>
       </div>
+
+      <!-- Recently finished ------------------------------------------------
+           Collapsed rather than removed. A finished session still holds its
+           log history, and that history is the most useful thing in the app
+           in the minutes right after a recording ends -- it is what diagnosed
+           the delete-while-recording bug. Throwing it away to tidy the page
+           would have thrown away the evidence. -->
+      <template x-if="finishedSessions.length > 0">
+        <div class="space-y-2 pt-2">
+          <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">
+            Recently Finished (<span x-text="finishedSessions.length"></span>)
+          </span>
+          <div class="space-y-2">
+            <template x-for="session in finishedSessions" :key="session.id">
+              <div class="arr-card rounded-lg border border-slate-800/80 overflow-hidden">
+                <button type="button" @click="toggleFinished(session.id)"
+                        class="w-full flex items-center gap-3 px-4 py-2.5 text-left hover:bg-slate-800/40 transition">
+                  <span class="w-2 h-2 rounded-full shrink-0" :class="statusDotClass(session)"></span>
+                  <span class="text-sm text-slate-300 truncate flex-1 min-w-0"
+                        x-text="session.is_rebroadcast ? session.channel_name : session.output_filename"></span>
+                  <span class="text-xs font-mono text-slate-500 shrink-0 hidden sm:inline"
+                        x-text="formatSeconds(session.elapsed_seconds)"></span>
+                  <span class="text-xs font-mono text-cyan-400/70 shrink-0"
+                        x-show="!session.is_rebroadcast" x-text="session.filesize_mb + ' MB'"></span>
+                  <span class="text-xs capitalize shrink-0" :class="statusTextClass(session)"
+                        x-text="prettyStatus(session.status)"></span>
+                  <span class="text-slate-500 shrink-0 text-[10px]"
+                        x-text="expandedFinished[session.id] ? '\u25B2' : '\u25BC'"></span>
+                </button>
+                <div x-show="expandedFinished[session.id]" x-cloak class="px-4 pb-3 space-y-2 border-t border-slate-800/80 pt-3">
+                  <p class="text-xs text-slate-500 font-mono truncate" x-text="session.output_file"></p>
+                  <div class="bg-black/90 rounded-lg p-3 font-mono text-xs text-slate-300 h-36 overflow-y-auto border border-slate-800 space-y-1">
+                    <template x-for="log in session.logs" :key="log">
+                      <p class="leading-relaxed hover:bg-slate-900/50 px-1 rounded" x-text="log"></p>
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
     </div>
 
     <!-- TAB 2: Media Library -->
@@ -406,6 +462,7 @@
         activeTab: 'active',
         openNewModal: false,
         activeSessions: [],
+        expandedFinished: {},
         libraryFiles: [],
         sseConnections: {},
         form: {
@@ -441,6 +498,63 @@
           this.refreshStatus();
           this.fetchLibrary();
           setInterval(() => { this.refreshStatus(); }, 3000);
+        },
+
+        // A session is "live" while its thread is still working -- which
+        // includes post-processing, not just capture. Splitting on is_running
+        // keeps a finished recording from sitting at the top of the page
+        // pretending to be active.
+        get liveSessions() {
+          return this.activeSessions.filter(s => s.is_running);
+        },
+        get finishedSessions() {
+          return this.activeSessions.filter(s => !s.is_running);
+        },
+
+        toggleFinished(id) {
+          this.expandedFinished[id] = !this.expandedFinished[id];
+        },
+
+        prettyStatus(status) {
+          return (status || '').replace(/_/g, ' ');
+        },
+
+        toMB(bytes) {
+          return ((bytes || 0) / 1048576).toFixed(2);
+        },
+
+        // Amber, not green: the thread is still busy but nothing is being
+        // captured any more, and the file is not in the library yet.
+        statusDotClass(s) {
+          if (!s.is_running) {
+            if (['failed', 'aborted_no_space', 'aborted_output_lost'].includes(s.status)) return 'bg-rose-500';
+            if (['completed_partial', 'interrupted'].includes(s.status)) return 'bg-amber-500';
+            return 'bg-slate-500';
+          }
+          return s.status === 'post_processing'
+            ? 'bg-amber-400 animate-pulse'
+            : 'bg-emerald-400 animate-pulse';
+        },
+
+        statusTextClass(s) {
+          if (!s.is_running) {
+            if (['failed', 'aborted_no_space', 'aborted_output_lost'].includes(s.status)) return 'text-rose-400';
+            if (['completed_partial', 'interrupted'].includes(s.status)) return 'text-amber-400';
+            return 'text-slate-400';
+          }
+          return s.status === 'post_processing' ? 'text-amber-400' : 'text-emerald-400';
+        },
+
+        // The recorder has received data but the file on disk is not growing.
+        // That combination is what a recording being deleted underneath looks
+        // like, and it was invisible until both numbers were on screen.
+        sizeDisagrees(s) {
+          // Only while actually capturing. During post_processing the remux
+          // has already deleted the .ts, so on-disk is legitimately 0 against
+          // a large captured count -- warning there would cry wolf on every
+          // single successful recording.
+          if (s.is_rebroadcast || s.status !== 'recording') return false;
+          return (s.bytes_written || 0) > 1048576 && (s.filesize_mb || 0) === 0;
         },
 
         formatSeconds(sec) {

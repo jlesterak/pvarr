@@ -1179,10 +1179,21 @@ class StreamFailoverRecorder:
             ):
                 self.status = "completed"
             if self.on_completion_callback:
+                # Remuxing a long recording is minutes of work on this thread
+                # (263 MB took 2.5 of them on the test server), and until it
+                # finishes there is no .mp4 in the library. Reporting
+                # "completed" through that window told the operator the job was
+                # done while the file did not yet exist anywhere they could see
+                # -- and left the status dot pulsing green next to the word
+                # "completed", which is the contradiction that surfaced this.
+                final_status = self.status
+                self.status = "post_processing"
                 try:
                     self.on_completion_callback(str(self.output_filepath))
                 except Exception:
                     pass
+                finally:
+                    self.status = final_status
 
         self.is_running = False
         self.stop_time = time.time()

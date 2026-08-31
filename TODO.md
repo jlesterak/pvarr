@@ -1248,3 +1248,60 @@ this did not wait for other changes to accumulate.
   reports the running version so it can be confirmed with `curl`.
 
 347 tests green at the tag. Nothing to do on upgrade.
+
+## Dashboard honesty pass (2026-08-31)  [COMPLETED]
+
+Two things the sponsor hit while testing v0.2.1 on icebox, plus the
+`bytes_written` item that had been sitting in "Still open" since the
+delete-while-recording bug.
+
+### 1. "Completed" was shown while the remux was still running
+**Symptom.** Stopped a recording; status read `completed` but the dot kept
+pulsing green.
+
+**Cause.** `stop()` sets `status = "completed"` immediately, but
+`on_completion_callback` -- the remux -- then runs on the recorder thread and
+`is_running` is not cleared until it returns. The log shows the window: stop at
+12:39:18, `Remux successful` at 12:41:47. Two and a half minutes of
+`completed` + green pulse, with no `.mp4` in the library the whole time.
+
+Both halves were half right, which is why it looked merely cosmetic: the
+capture *had* finished, and the thread *was* still working. Greying the dot
+would have been the wrong fix -- it would have claimed done while the remux ran.
+
+**Fix.** A real `post_processing` status for the duration of the callback, with
+the resolved final status restored in a `finally`. An `aborted_no_space` or
+`aborted_output_lost` session still comes out the far side with its own status
+intact, and a callback that raises no longer strands the session.
+
+### 2. Finished sessions cluttered the dashboard
+Collapsed, not removed. A finished session still holds its log history, and
+that history is the most useful thing in the app right after a recording ends
+-- it is what diagnosed the delete bug. Removing finished sessions to tidy the
+page would have thrown away the evidence.
+
+Live sessions (including post-processing) render in full; finished ones become
+a one-line row under *Recently Finished* that expands to its event log. The
+header dot now keys off live sessions rather than "any session exists", which
+is the specific reason a stopped recording kept blinking.
+
+### 3. `bytes_written` is on screen
+It was in `/api/status` all along and the page rendered only `filesize_mb`, so
+when the two disagreed there was nothing visible to show it. Four minutes of
+footage were lost to a discrepancy the dashboard already had the data to
+display.
+
+*On Disk* and *Captured* now sit side by side, and On Disk turns amber when
+Captured is climbing while the file is not -- the signature of writing into a
+deleted file. Scoped to `status === 'recording'` only: during post-processing
+the remux has already removed the `.ts`, so on-disk is legitimately 0 and
+warning there would cry wolf on every successful recording.
+
+### Verified
+357 tests (was 347). The Alpine helpers cannot be exercised by the Python
+suite, so the state machine was run directly in node against five sessions
+(recording, post-processing, completed, aborted, and one writing into a hole)
+and each produced the right dot, colour and warning. That run is what caught
+the post-processing false positive. `node --check` on the extracted inline
+script guards against a syntax error taking the whole page blank -- something
+no Python test would notice.
