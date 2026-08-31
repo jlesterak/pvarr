@@ -198,6 +198,8 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PVARR_RECORDINGS_DIR` | `./recordings` | Where recordings are written. The container sets this to `/recordings` so captures land on the mounted volume rather than inside the image. |
 | `PVARR_ALLOWED_DIRS` | unset | Extra directories the library API and `output_dir` may write to, `:`-separated. By default only the recordings dir is reachable. |
 | `PVARR_LOG_LEVEL` | `INFO` | Root log level. |
+| `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |
+| `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files; keep it below the compose `stop_grace_period` (30s) or Docker will `SIGKILL` first. |
 | `PVARR_MIN_FREE_GB` | `5` | Free space, in GB, below which an active recording aborts and a new one is refused. `0` disables the guard entirely — only sensible if the recordings volume is separate from the system disk. |
 | `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
 | `TELEGRAM_BOT_TOKEN` | unset | Telegram bot token |
@@ -227,6 +229,7 @@ and mounts `./recordings` there.
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
 | `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
+| `GET` | `/api/status` | Every session, its candidates and recent logs. Polled by the dashboard. Candidate cookies are **not** included — see below. |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
@@ -238,6 +241,17 @@ and mounts `./recordings` there.
 | `GET` | `/discover.json` · `/lineup.json` · `/lineup_status.json` · `/lineup.post` · `/device.xml` | HDHomeRun tuner emulation, also served under `/live` |
 
 Interactive docs are available at `/docs` (FastAPI).
+
+**The API is unauthenticated by design.** It assumes it is on a trusted LAN
+behind your firewall. Anything that can reach port 8999 can start, stop and
+delete recordings, so do not port-forward it — put it behind a reverse proxy
+with auth if it needs to leave the network.
+
+Because of that, `/api/status` reports only *whether* a candidate carries a
+session `Cookie` (`has_cookie: true`), never the value. A cookie for a
+subscription stream is a live credential for your paid account, and it used to
+be readable by anything on the network. The header you typed is still returned
+to *you* by `POST /api/probe`, which is a direct answer to your own request.
 
 ---
 
@@ -305,6 +319,14 @@ app/
 
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 
+**`PermissionError` on the first recording, or the container exits at start.**
+The `config/`, `recordings/` and `logs/` directories are bind mounts. If they do
+not exist on the host, Docker creates them as `root:root`, and PVArr does not
+run as root. The entrypoint fixes this automatically on startup — you will see
+`[entrypoint] Fixing ownership of ...` in the logs. If you have pinned a `user:`
+in your compose file, the entrypoint cannot fix anything and will instead exit
+with the exact `chown` command to run. Set `PUID`/`PGID` rather than `user:`.
+
 **`403` from the upstream.** A required header is missing. Re-run the URL through `POST /api/probe` (or just re-paste it into Add Recording) — the message names the status the origin returned. If the probe reports *segments rejected*, the stream is session gated: copy the `Cookie` request header from DevTools into the manual header fields.
 
 **Tuner doesn't appear in Plex/Emby.** Confirm the media server can reach PVArr (`curl http://<pvarr-host>:8999/live/playlist.m3u`). The playlist is empty when nothing is recording — start a recording first.
@@ -337,7 +359,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-246 tests covering filename sanitisation and collision handling, storage
+250 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

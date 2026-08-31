@@ -81,14 +81,25 @@ class CandidateStream:
         self.fail_count: int = 0
         self.last_error: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
+        """Serialise this candidate.
+
+        The cookie is a live session credential -- often the only thing
+        standing between a stranger and the sponsor's paid account -- and
+        PVArr's API is unauthenticated by design, on the assumption that it
+        sits on a trusted LAN. Those two facts together meant anything that
+        could reach port 8999 could read the cookie back out of
+        `/api/status`. So it is withheld by default and only the fact of its
+        existence is reported; callers that genuinely need the value (writing
+        session state to disk, rebuilding an FFmpeg command) opt in.
+        """
+        data = {
             "url": self.url,
             "name": self.name,
             "m3u8_url": self.m3u8_url,
             "referer": self.referer,
             "user_agent": self.user_agent,
-            "cookie": self.cookie,
+            "has_cookie": bool(self.cookie),
             "detected": self.detected,
             "detect_source": self.detect_source,
             "detect_note": self.detect_note,
@@ -96,6 +107,9 @@ class CandidateStream:
             "fail_count": self.fail_count,
             "last_error": self.last_error,
         }
+        if include_secrets:
+            data["cookie"] = self.cookie
+        return data
 
 
 class StreamFailoverRecorder:

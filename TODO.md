@@ -457,8 +457,11 @@ restoring. Returning to an earlier candidate is a manual action instead.
 Architect / Security / DevOps reviews of the persistence design, run before any
 of it was written. Every claim below was re-verified independently.
 
-### Blocking, and NOT caused by this work -- these are live bugs today
-- [ ] **A fresh install cannot record at all.** `config/`, `recordings/` and
+### Blocking, and NOT caused by this work -- all fixed, 2026-08-31
+These were live bugs found while reviewing the persistence design, not defects
+introduced by it. All six are closed and verified; the notes are kept because
+each one explains a constraint the next change has to respect.
+- [x] **A fresh install cannot record at all.** `config/`, `recordings/` and
       `logs/` are untracked in git, so a clean clone has none of them. Compose
       bind-mounts all three, dockerd creates the missing host directories as
       **root:root**, and the container runs as uid 1000 -- so `naming.py`'s
@@ -466,17 +469,51 @@ of it was written. Every claim below was re-verified independently.
       image-time `chown` cannot help: a bind mount grafts the host inode over
       the image's, and permission checks run against the host. Reproduced
       against the published image. This is why `config/` is root-owned here.
-- [ ] **Remux and notification are skipped on every container stop.**
+      **Fixed** in `docker-entrypoint.sh`: the container now starts as root,
+      aligns the `pvarr` user to `PUID`/`PGID`, chowns the three mount roots
+      non-recursively (a recursive walk of a multi-TB library on every boot is
+      not acceptable), then `exec gosu`s to the unprivileged user. No root
+      process survives into the app. If it is already non-root it cannot fix
+      anything, so it checks writability and exits 1 with the exact `chown`
+      command instead of dying mid-recording.
+      **Verified** against a locally built image with all three mounts
+      deliberately `root:root`: entrypoint reported "Fixing ownership", the app
+      ran as uid 1000, wrote to all three, and the files landed as `1000:1000`
+      on the host. Repeated with `PUID=1500` -- `usermod` path taken, files
+      landed `1500:1500`. CI now builds the image and asserts both on every
+      push.
+- [x] **Remux and notification are skipped on every container stop.**
       `cleanup.py` registers a SIGTERM handler at import (`server.py` module
       scope), which overwrites uvicorn's and calls `sys.exit(0)`. The recorder
       thread is a daemon and `stop()` never joins it, so the completion block --
       remux, `final_filepath`, notify -- dies mid-flight. The lifespan shutdown
       hook therefore never runs either. **Demonstrated:** recorded 147 KB, sent
       SIGTERM, `.ts` left un-remuxed with no notification.
-- [ ] **`/api/status` serves live session cookies** in plaintext to anything on
-      the LAN. `CandidateStream.to_dict()` includes `cookie`. Verified with a
-      real request. Consistent with "unauthenticated by design", but it means a
-      cookie is not a secret PVArr keeps -- decide whether to redact.
+      **Fixed** in `app/cleanup.py`, rewritten: the handler no longer calls
+      `sys.exit(0)`. It stops every recorder first (so remuxes run
+      concurrently), then waits on them against one shared deadline via the new
+      `StreamFailoverRecorder.wait_until_finished()`, then chains to whatever
+      handler it displaced -- uvicorn's -- so the normal shutdown still happens.
+      `PVARR_SHUTDOWN_TIMEOUT` (default 20s) bounds the wait; compose sets
+      `stop_grace_period: 30s` so Docker does not SIGKILL first.
+      **Verified** by re-running the script that demonstrated the bug: it went
+      from `REMUX RAN: no` to `REMUX RAN: yes` with the marker file present.
+- [x] **`/api/status` served live session cookies** in plaintext to anything on
+      the LAN. `CandidateStream.to_dict()` included `cookie`. Verified with a
+      real request. Consistent with "unauthenticated by design", but it meant a
+      cookie was not a secret PVArr kept.
+      **Decided: redact.** "Unauthenticated by design" is a statement about
+      *PVArr's* data -- your recordings, your session list. It is not a licence
+      to hand out a credential for the sponsor's paid subscription to anything
+      that can open a socket. The two are not the same risk and should not
+      share a policy.
+      **Fixed:** `to_dict()` now reports `has_cookie: bool` and takes
+      `include_secrets=False`; the value is returned only to callers that opt
+      in -- the FFmpeg command builder, and session persistence when it lands.
+      The dashboard never read the field (it fills its cookie box from the
+      caller's own `/api/probe` response), so nothing in the UI changed.
+      Four regression tests assert the token cannot appear anywhere in a
+      serialised status payload.
 - [x] **`config/` was not gitignored.** Once state lands there, `git add -A`
       would commit live cookies to a public repo. Fixed immediately.
 - [x] **CRLF injection into FFmpeg `-headers` and into hls-proxy's

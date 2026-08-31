@@ -12,6 +12,7 @@ Run:
 """
 
 import io
+import json
 import logging
 import os
 import shutil
@@ -1924,6 +1925,41 @@ class TestMissingStatusRoute(ServerTestCase):
         body = r.json()
         for key in ("active_count", "total_sessions", "sessions"):
             self.assertIn(key, body)
+
+
+class TestCookieRedaction(unittest.TestCase):
+    """A live session cookie must not be readable back out of the API.
+
+    PVArr is unauthenticated by design, so every field in /api/status is
+    effectively public to the LAN. The cookie is the sponsor's paid account.
+    """
+
+    def make(self):
+        from app.recorder import CandidateStream
+        c = CandidateStream("https://example.com/s.m3u8", "Primary")
+        c.cookie = "SESSIONID=super-secret-token"
+        return c
+
+    def test_to_dict_withholds_the_cookie_by_default(self):
+        data = self.make().to_dict()
+        self.assertNotIn("cookie", data)
+        self.assertNotIn("super-secret-token", json.dumps(data))
+
+    def test_to_dict_reports_that_a_cookie_exists(self):
+        # The UI still needs to show that auth is attached, just not what it is.
+        self.assertTrue(self.make().to_dict()["has_cookie"])
+        from app.recorder import CandidateStream
+        self.assertFalse(CandidateStream("https://example.com/s.m3u8").to_dict()["has_cookie"])
+
+    def test_opt_in_still_returns_the_value(self):
+        # Persistence and FFmpeg command building need the real thing.
+        self.assertEqual(self.make().to_dict(include_secrets=True)["cookie"],
+                         "SESSIONID=super-secret-token")
+
+    def test_status_payload_carries_no_cookie(self):
+        rec = StreamFailoverRecorder("s1", ["https://example.com/s.m3u8"], "/tmp/x.ts")
+        rec.candidates[0].cookie = "SESSIONID=super-secret-token"
+        self.assertNotIn("super-secret-token", json.dumps(rec.get_status_summary()))
 
 
 class TestTunerStream(ServerTestCase):
