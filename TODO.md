@@ -971,3 +971,30 @@ streaming endpoint is broken.
       (`min(32, cpu+4)` workers).
 - [ ] The healthcheck still cannot see a wedged channel.
 
+
+## Release v0.2.0 (2026-08-31)  [COMPLETED]
+
+First minor bump of the series. Sponsor-approved. The version level is
+deliberate: 0.1.x had been a recorder that could only record, and rebroadcast
+changes what PVArr *is* rather than adding to what it already did. Backward
+compatible in every respect -- existing recordings behave identically, and the
+two new settings (`PVARR_BUFFER_MB`, `PVARR_BUFFER_DIR`) have working defaults,
+so an upgrade needs no action from a user.
+
+Carries two capabilities the sponsor did not have at v0.1.3:
+- **Recordings survive a restart** (Phase 13 items 2 & 3) -- a `docker restart`,
+  a Watchtower update or a host reboot no longer orphans an in-flight `.ts`.
+- **Rebroadcast without recording** (Phase 16b) -- a live channel for
+  Plex/Emby/Jellyfin that keeps nothing on disk.
+
+Plus the guide naming work (Phase 16) and the six bugs from the agent-team
+review of Phase 13.
+
+323 tests green at the tag.
+
+### Upgrade note
+`PVARR_CONFIG_DIR=/config` must be a mount the container user can write, or
+session persistence disables itself and says so once in the log. It degrades
+cleanly -- recordings still run, they just do not survive a restart. This bit
+the dev box: `config/` was root-owned and the store correctly disabled itself.
+See PUID/PGID in the README.
