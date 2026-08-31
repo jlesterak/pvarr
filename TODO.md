@@ -1305,3 +1305,19 @@ and each produced the right dot, colour and warning. That run is what caught
 the post-processing false positive. `node --check` on the extracted inline
 script guards against a syntax error taking the whole page blank -- something
 no Python test would notice.
+
+## README intro pass (2026-08-31)  [COMPLETED]
+
+humantodo lines 5-8, folded in ahead of the next release. Doc-only.
+
+- **Dropped "Default port: 8999" from the intro.** It was duplication: the port
+  is already in Quick Start and in the `PORT` row of the configuration table.
+  The Quick Start line now says outright that 8999 is the *default* and points
+  at `PORT`, so nothing is lost by removing it from the top.
+- **Strengthened the pronunciation note.** The sponsor's actual worry was not
+  people spelling out *pee-vee-ay-arr-arr* — it was the flat *pee-vee-ar*, said
+  like the letter. The Arr must be growled, pirate-style. The note now names
+  that as the real offence and closes in the sponsor's own words: it is always
+  **peevee ARRRR, matey**. Thank y'arrrrr.
+
+Not shipped on its own; rides with the next release.

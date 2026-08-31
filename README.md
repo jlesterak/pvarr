@@ -2,9 +2,11 @@
 
 > **🤖 AI Transparency Notice:** PVArr was designed, architected, and built by AI across multiple LLM sessions with a human in the loop. Google Gemini drew the initial architecture; Anthropic Claude has been the primary architect and maintainer since, and does the ongoing design, implementation, testing, and review. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint).
 
-**Pronounced *pee-vee-ARR*** — the "Arr" like a pirate. Not *pee-vee-ay-arr-arr*. This is not negotiable.
+**Pronounced *peevee-ARRRR*** — and the *Arr* is the pirate, matey. Not *pee-vee-ay-arr-arr*, spelling it out. And **not** *pee-vee-ar*, like you are reciting the alphabet — that one is the real crime. It must be **growled**. The closer it lands to the plain letter, the less anyone has any idea what you are talking about.
 
-**Default port:** 8999
+Aloud or in your own head, it is always **peevee ARRRR, matey**.
+
+This is not negotiable. Thank y'arrrrr.
 
 ---
 
@@ -42,7 +44,7 @@ Pulls the published image from GHCR:
 docker compose up -d
 ```
 
-Open <http://localhost:8999>.
+Open <http://localhost:8999>. PVArr serves on port **8999** by default; change it with `PORT` — see [Configuration](#configuration).
 
 To build from source instead of pulling, layer the build override:
 
