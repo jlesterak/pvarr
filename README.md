@@ -16,6 +16,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 
 ## Features
 
+- **A guide that says what is actually happening** — in Plex's channel guide, each programme is titled with the recording's name, sub-titled with the stream currently feeding it (`Primary`, `Backup 1`), and described with the file being written and how many backups are still in reserve. Press Info mid-game to see which feed you are on.
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
 - **3-stage cycling failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder moves to the next candidate automatically, and **wraps back round to the first** rather than giving up at the end of the list. The usual failure is an expiring token, which fixes itself in minutes, so a blip that touches all three sources no longer ends a recording that still has hours to run. It gives up only after three complete laps with no data — and any data at all resets that budget.
 - **Disk-space guard** — every active recording watches free space on its volume and aborts cleanly before filling it, keeping what was captured and post-processing it normally. Recordings are uncompressed TS on what is usually the same filesystem as everything else, so an unattended capture that runs out of room does not just lose itself, it takes the host with it. Floor set by `PVARR_MIN_FREE_GB` (default 5 GB); a start request is refused up front with `507` if the volume is already below it.
@@ -237,7 +238,7 @@ and mounts `./recordings` there.
 | `DELETE` | `/api/library/{filename}` | Delete a recording |
 | `GET` | `/api/library/download/{filename}` | Download a recording. `Content-Type` follows the container (`.ts`, `.mp4`, `.mkv`). |
 | `GET` | `/live/playlist.m3u` · `/live/playlist.m3u8` | M3U tuner playlist |
-| `GET` | `/live/epg.xml` | XMLTV EPG |
+| `GET` | `/live/epg.xml` | XMLTV EPG. Each programme names the file being written and the stream currently feeding it. |
 | `GET` | `/discover.json` · `/lineup.json` · `/lineup_status.json` · `/lineup.post` · `/device.xml` | HDHomeRun tuner emulation, also served under `/live` |
 
 Interactive docs are available at `/docs` (FastAPI).
@@ -361,7 +362,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-250 tests covering filename sanitisation and collision handling, storage
+258 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

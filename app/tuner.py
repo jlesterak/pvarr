@@ -18,6 +18,8 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 from xml.sax.saxutils import escape, quoteattr
 
+from app.naming import RECORDING_EXTENSIONS
+
 # Plex will not display a channel that has no programme in the guide, and a
 # live recording has no known end time. Advertise a generous window.
 PROGRAMME_WINDOW_HOURS = 6
@@ -29,9 +31,64 @@ def _xmltv_time(dt: datetime) -> str:
 
 
 def _channel_title(session: Dict[str, Any], index: int) -> str:
-    """Human-readable channel name, without the .ts extension."""
+    """Human-readable channel name: the recording's filename, no extension.
+
+    Any recognised container is stripped, not just `.ts`. Post-processing
+    remuxes to `.mp4` and `current_filepath` follows the result, so a session
+    that finished remuxing while still advertised would otherwise have shown up
+    in the guide as "Bears vs Packers.mp4".
+    """
     name = session.get("output_filename") or f"Channel {index}"
-    return name[:-3] if name.endswith(".ts") else name
+    stem, ext = os.path.splitext(name)
+    return stem if ext.lower() in RECORDING_EXTENSIONS else name
+
+
+def _source_name(session: Dict[str, Any]) -> str:
+    """Which of the candidate URLs is currently being captured.
+
+    Named rather than numbered where possible: the sponsor picks backups by
+    hand for a specific event, so "Backup 1" means something to them that
+    "stream 2" does not.
+    """
+    candidates = session.get("candidates") or []
+    index = session.get("current_candidate")
+    if isinstance(index, int) and 1 <= index <= len(candidates):
+        candidate = candidates[index - 1]
+        if isinstance(candidate, dict) and candidate.get("name"):
+            return str(candidate["name"])
+    if isinstance(index, int):
+        return f"Stream {index}"
+    return "Unknown source"
+
+
+def _programme_description(session: Dict[str, Any], index: int) -> str:
+    """What the guide shows when you press Info on the channel.
+
+    Deliberately built from facts that do not change while the recording runs
+    -- filename, source, start time. Plex caches guide data and only refetches
+    the XMLTV on its own schedule, so putting a live counter here (elapsed
+    minutes, megabytes written) would display a number that is wrong within
+    seconds of being fetched, which is worse than not showing it.
+    """
+    parts = []
+    filename = session.get("output_filename")
+    if filename:
+        parts.append(f"Recording to {filename}")
+
+    source = _source_name(session)
+    total = session.get("total_candidates")
+    if isinstance(total, int) and total > 1:
+        index_now = session.get("current_candidate")
+        parts.append(f"Source: {source} ({index_now} of {total}, failover armed)")
+    else:
+        parts.append(f"Source: {source}")
+
+    started = session.get("started_at")
+    if started:
+        local = datetime.fromtimestamp(started, tz=timezone.utc).astimezone()
+        parts.append(f"Started {local.strftime('%a %d %b, %H:%M')}")
+
+    return " — ".join(parts) if parts else f"PVArr live recording {index}"
 
 
 def generate_m3u_playlist(active_sessions: List[Dict[str, Any]], host_url: str) -> str:
@@ -93,8 +150,12 @@ def generate_xmltv_epg(active_sessions: List[Dict[str, Any]]) -> str:
             f" channel={quoteattr(session_id)}>"
         )
         lines.append(f"    <title lang=\"en\">{escape(title)}</title>")
+        # Plex renders sub-title under the programme name, which is the right
+        # place for "which feed am I actually watching" -- the one thing the
+        # old guide could not tell you.
+        lines.append(f"    <sub-title lang=\"en\">{escape(_source_name(session))}</sub-title>")
         lines.append(
-            f"    <desc lang=\"en\">{escape('PVArr live recording ' + session_id)}</desc>"
+            f"    <desc lang=\"en\">{escape(_programme_description(session, idx))}</desc>"
         )
         lines.append("  </programme>")
 

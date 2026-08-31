@@ -647,3 +647,38 @@ one before it.
 - Integration coverage for the notification webhooks (currently mocks only).
 - A headless-browser probe path so JavaScript-built m3u8 URLs work without the
   external `detect-headers`.
+
+---
+
+## Phase 16 — The guide says what is happening (2026-08-31)
+
+humantodo line 2: "update the media guide for Plex so that it shows the name of
+the file/stream as well."
+
+- [x] **Programme descriptions were useless.** Every entry read `PVArr live
+      recording <uuid>`. The uuid is not something the sponsor can act on, and
+      the one question you actually have mid-event -- *which feed am I watching
+      right now?* -- had no answer anywhere in Plex.
+      Now: `<title>` is the recording name, `<sub-title>` is the live source
+      (`Primary`, `Backup 1`), `<desc>` carries the filename being written, the
+      failover position (`2 of 3, failover armed`) and the start time.
+- [x] **Channel titles only stripped `.ts`.** `current_filepath` follows the
+      remux, so a session whose post-processing had finished was advertised as
+      `Bears vs Packers.mp4`. Now strips any container in
+      `RECORDING_EXTENSIONS`.
+
+### Decision: no live counters in the guide
+Considered and rejected: putting elapsed time and megabytes-written into the
+programme description. Plex caches XMLTV and refetches on its own schedule, so
+a counter baked in there is wrong within seconds of being fetched. A number
+that is visibly stale reads as a bug. The description carries only facts that
+hold for the life of the recording; live figures stay on the dashboard, which
+polls. A test asserts no counter leaks back in.
+
+### Notes for the rebroadcast work (line 3)
+`_channel_title`, `_source_name` and `_programme_description` all take a plain
+session dict and never touch a recorder object. A rebroadcast-only channel that
+presents the same keys will get a correct guide entry for free -- but
+`output_filename` will be meaningless for one, since nothing is being written.
+That is the first thing the rebroadcast design has to answer.
+

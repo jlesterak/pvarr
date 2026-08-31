@@ -223,6 +223,74 @@ class TestStorageManager(unittest.TestCase):
 # --------------------------------------------------------------------------
 # tuner
 # --------------------------------------------------------------------------
+class TestGuideNaming(unittest.TestCase):
+    """The guide has to say what is being recorded and where it is coming from.
+
+    Before this, every programme's description was "PVArr live recording
+    <uuid>", which told the sponsor nothing they could not already see.
+    """
+
+    def session(self, **over):
+        s = {
+            "id": "rec1",
+            "is_running": True,
+            "output_filename": "Bears vs Packers.ts",
+            "started_at": 1756600000.0,
+            "current_candidate": 2,
+            "total_candidates": 3,
+            "candidates": [{"name": "Primary"}, {"name": "Backup 1"},
+                           {"name": "Backup 2"}],
+        }
+        s.update(over)
+        return s
+
+    def test_remuxed_container_is_stripped_from_the_title(self):
+        # current_filepath follows the remux, so a finished session would have
+        # been advertised as "Bears vs Packers.mp4".
+        out = tuner.generate_m3u_playlist(
+            [self.session(output_filename="Bears vs Packers.mp4")], "http://h:8999")
+        self.assertIn("Bears vs Packers", out)
+        self.assertNotIn(".mp4", out)
+
+    def test_guide_names_the_stream_in_use(self):
+        xml = tuner.generate_xmltv_epg([self.session()])
+        self.assertIn("<sub-title lang=\"en\">Backup 1</sub-title>", xml)
+
+    def test_guide_description_carries_the_filename(self):
+        xml = tuner.generate_xmltv_epg([self.session()])
+        self.assertIn("Recording to Bears vs Packers.ts", xml)
+
+    def test_guide_description_reports_failover_position(self):
+        xml = tuner.generate_xmltv_epg([self.session()])
+        self.assertIn("Backup 1 (2 of 3, failover armed)", xml)
+
+    def test_single_url_session_does_not_claim_failover(self):
+        xml = tuner.generate_xmltv_epg([self.session(
+            current_candidate=1, total_candidates=1,
+            candidates=[{"name": "Primary"}])])
+        self.assertIn("Source: Primary", xml)
+        self.assertNotIn("failover armed", xml)
+
+    def test_unnamed_candidate_falls_back_to_its_number(self):
+        xml = tuner.generate_xmltv_epg([self.session(candidates=[{}, {}, {}])])
+        self.assertIn("Stream 2", xml)
+
+    def test_missing_candidate_data_does_not_break_the_guide(self):
+        # An older session dict, or one captured mid-teardown.
+        xml = tuner.generate_xmltv_epg([{
+            "id": "rec1", "is_running": True, "output_filename": "x.ts"}])
+        self.assertIn("<programme", xml)
+        self.assertIn("</tv>", xml)
+
+    def test_description_holds_no_live_counters(self):
+        # Plex caches the XMLTV. A byte count or elapsed time baked in here is
+        # stale seconds after it is fetched, which reads as a bug to the user.
+        xml = tuner.generate_xmltv_epg([self.session(
+            filesize_mb=1234.5, elapsed_seconds=4321.0)])
+        self.assertNotIn("1234", xml)
+        self.assertNotIn("4321", xml)
+
+
 class TestTuner(unittest.TestCase):
     def setUp(self):
         self.sessions = [
