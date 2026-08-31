@@ -4374,17 +4374,16 @@ class TestProbeTrace(unittest.TestCase):
 
     def test_every_header_attempt_is_recorded_with_its_status(self):
         from unittest.mock import patch
-        script = {"gated.m3u8": (403, b"denied")}
+        script = {"gated.m3u8": (403, b"denied"), "://x.example/": (200, b"<html>hi</html>")}
         with patch("app.probe._fetch", self._fake_fetch(script)):
             result = probe.probe_stream("https://x.example/gated.m3u8", check_segment=False)
         self.assertFalse(result["ok"])
-        self.assertTrue(result["attempts"], "no trace recorded")
-        for attempt in result["attempts"]:
-            self.assertEqual(attempt["stage"], "playlist")
+        playlist = [a for a in result["attempts"] if a["stage"] == "playlist"]
+        for attempt in playlist:
             self.assertEqual(attempt["status"], 403)
         # More than one, because the point is showing *which* combinations were
         # tried -- a bare request and then each guessed referer.
-        self.assertGreaterEqual(len(result["attempts"]), 2)
+        self.assertGreaterEqual(len(playlist), 2)
 
     def test_a_disguised_segment_extension_is_named(self):
         """The candidate 1 case: everything succeeds, and it still will not
@@ -4433,7 +4432,8 @@ class TestProbeTrace(unittest.TestCase):
 
     def test_a_2xx_that_is_not_a_playlist_is_called_out(self):
         from unittest.mock import patch
-        script = {"live.m3u8": (200, b"<html>are you a robot</html>")}
+        script = {"live.m3u8": (200, b"<html>are you a robot</html>"),
+                  "://x.example/": (200, b"<html>hi</html>")}
         with patch("app.probe._fetch", self._fake_fetch(script)):
             result = probe.probe_stream("https://x.example/live.m3u8", check_segment=False)
         self.assertFalse(result["ok"])
@@ -4444,10 +4444,10 @@ class TestProbeTrace(unittest.TestCase):
         """A 403 body is obviously not a playlist. Saying so reads like a
         second, unrelated problem."""
         from unittest.mock import patch
-        script = {"live.m3u8": (403, b"denied")}
+        script = {"live.m3u8": (403, b"denied"), "://x.example/": (200, b"<html>hi</html>")}
         with patch("app.probe._fetch", self._fake_fetch(script)):
             result = probe.probe_stream("https://x.example/live.m3u8", check_segment=False)
-        notes = [a.get("note", "") for a in result["attempts"]]
+        notes = [a.get("note", "") for a in result["attempts"] if a["stage"] == "playlist"]
         self.assertFalse(any("not a playlist" in n for n in notes), notes)
 
     def test_the_trace_reaches_the_api(self):
@@ -4461,6 +4461,100 @@ class TestProbeTrace(unittest.TestCase):
             r = client.post("/api/probe", data={"url": "https://cdn.example/x.m3u8"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["attempts"][0]["status"], 403)
+
+
+
+class TestOriginRefusalIsNotAHeaderProblem(unittest.TestCase):
+    """Distinguish "needs a header we cannot guess" from "not talking to us".
+
+    A real case: the sponsor's stream 403'd from the dev box, from icebox, and
+    in a browser on their own network -- and PVArr answered all three by
+    telling them to copy headers out of DevTools. The link was simply dead. The
+    host was refusing its own front page too, which is the signal that no
+    header was ever going to help.
+    """
+
+    def _fake_fetch(self, script):
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            for needle, status in script.items():
+                if needle in url:
+                    resp = MagicMock()
+                    resp.status_code = status
+                    resp.ok = 200 <= status < 300
+                    resp.url = url
+                    return resp, b"denied" if status >= 400 else b"<html>hi</html>"
+            raise AssertionError(f"unscripted URL: {url}")
+
+        return fetch
+
+    def test_a_host_refusing_its_own_root_is_named_as_such(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 403})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertFalse(result["ok"])
+        self.assertIn("including its own front page", result["message"])
+        self.assertIn("will not help", result["message"])
+        # And it must NOT send the operator to DevTools on a dead link.
+        self.assertNotIn("copy them from DevTools", result["message"])
+
+    def test_a_host_that_answers_still_points_at_devtools(self):
+        """The genuinely header-gated case must keep its old advice."""
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 200})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertFalse(result["ok"])
+        self.assertIn("DevTools", result["message"])
+        self.assertIn("gating this stream specifically", result["message"])
+
+    def test_the_origin_check_is_in_the_trace(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 403})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        origins = [a for a in result["attempts"] if a["stage"] == "origin"]
+        self.assertEqual(len(origins), 1)
+        self.assertEqual(origins[0]["status"], 403)
+
+    def test_a_mismatched_status_is_not_treated_as_a_wall(self):
+        """404 on the playlist and 403 on the root are two different facts."""
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 404, "://x.example/": 403})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertNotIn("front page", result["message"])
+        self.assertIn("404", result["message"])
+
+    def test_an_unreachable_origin_does_not_break_the_message(self):
+        from unittest.mock import patch
+        import requests as _requests
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            from unittest.mock import MagicMock
+            if url.rstrip("/").endswith("x.example"):
+                raise _requests.RequestException("no route")
+            resp = MagicMock(status_code=403, ok=False, url=url)
+            return resp, b"denied"
+
+        with patch("app.probe._fetch", fetch):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertIn("403", result["message"])
+        origins = [a for a in result["attempts"] if a["stage"] == "origin"]
+        self.assertIn("error", origins[0])
+
+    def test_a_successful_probe_costs_no_extra_request(self):
+        """The origin check runs only on total failure."""
+        from unittest.mock import patch, MagicMock
+        seen = []
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            seen.append(url)
+            resp = MagicMock(status_code=200, ok=True, url=url)
+            return resp, b"#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n"
+
+        with patch("app.probe._fetch", fetch):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertFalse([a for a in result["attempts"] if a["stage"] == "origin"])
 
 
 

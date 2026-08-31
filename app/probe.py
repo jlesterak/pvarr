@@ -368,7 +368,9 @@ def probe_stream(
             result["message"] = _describe(result)
             return result
 
-    result["message"] = _failure_message(last_status, playlists[0] if playlists else target)
+    failed_url = playlists[0] if playlists else target
+    origin_status = _check_origin(session, failed_url, ua, timeout, result["attempts"])
+    result["message"] = _failure_message(last_status, failed_url, origin_status)
     return result
 
 
@@ -464,11 +466,66 @@ def _describe(result: Dict[str, Any]) -> str:
     return ", ".join(parts) + "."
 
 
-def _failure_message(status: Optional[int], url: str) -> str:
+def _check_origin(
+    session: requests.Session,
+    url: str,
+    user_agent: str,
+    timeout: int,
+    attempts: List[Dict[str, Any]],
+) -> Optional[int]:
+    """Ask the origin for its own front page, after everything else failed.
+
+    This is what separates "the stream needs a header we could not guess" from
+    "this host is not talking to us at all". A host that refuses its own root
+    with the same status it gave the playlist is not gating on a Referer -- it
+    is refusing the client, and no header will change that.
+
+    Worth the extra request because the alternative is what PVArr used to do:
+    answer every 403 by sending the operator to DevTools to hunt for headers,
+    including on a link that was simply dead. Runs only on total failure, so a
+    probe that succeeds costs nothing extra.
+    """
+    origin = _origin(url)
+    if not origin or "://" not in origin:
+        return None
+    root = origin + "/"
+    try:
+        resp, _ = _fetch(session, root, {"User-Agent": user_agent}, timeout, max_bytes=2048)
+    except requests.RequestException as exc:
+        attempts.append({
+            "stage": "origin", "url": root, "error": str(exc),
+            "note": "the origin's own front page",
+        })
+        return None
+    attempts.append({
+        "stage": "origin", "url": root, "status": resp.status_code,
+        "note": "the origin's own front page",
+    })
+    return resp.status_code
+
+
+def _failure_message(
+    status: Optional[int],
+    url: str,
+    origin_status: Optional[int] = None,
+) -> str:
+    # The origin refusing its own root the same way it refused the playlist is
+    # decisive: the host is turning this client away before it ever looks at
+    # the path, so headers are not the problem and DevTools will not help.
+    if (status is not None and origin_status is not None
+            and origin_status == status and status in (401, 403, 429)):
+        return (
+            f"This host refused every request, including its own front page "
+            f"({status}) — so this is not a missing header, and copying one "
+            "from DevTools will not help. Either the link has expired (these "
+            "tokens are usually short-lived) or the host is blocking us. Open "
+            "the URL in a browser: if it fails there too, get a fresh link."
+        )
     if status == 403:
         return (
-            "Every header combination was rejected (403). The stream likely needs a "
-            "cookie or a referer PVArr cannot guess — copy them from DevTools."
+            "Every header combination was rejected (403), but the host does answer "
+            "other requests — so it is gating this stream specifically. It likely "
+            "needs a cookie or a referer PVArr cannot guess — copy them from DevTools."
         )
     if status == 404:
         return "Playlist not found (404). If the URL carries a token, it has probably expired."

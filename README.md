@@ -167,6 +167,12 @@ disguising its media, which fails for a reason no status code shows.
 report. URLs in the trace have their query strings stripped, so it carries no
 access token and is safe to share.
 
+The last row is often the most useful one. When every attempt fails, PVArr also
+asks the origin for its **own front page**. If that is refused with the same
+status, the host is turning us away before it ever looks at the URL — the link
+has expired, or the host is blocking us — and no header will fix it. PVArr says
+so rather than sending you to DevTools after a header that does not exist.
+
 Two cases genuinely need this:
 
 - **Cookie/session gated.** The stream needs a logged-in session. Copy the
@@ -178,9 +184,17 @@ Two cases genuinely need this:
 For pages that only assemble their m3u8 after running JavaScript, PVArr will
 also shell out to `detect-headers` from
 [hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy) when it is
-installed (see [Requirements](#requirements)); it drives a real browser and can
-see what a plain fetch cannot. It runs only after the built-in probe comes up
-empty, and is optional.
+installed (see [Requirements](#requirements)). It runs only after the built-in
+probe comes up empty, and is optional.
+
+**It is not a browser.** The container ships upstream's shell version, which is
+`curl` following the iframe chain and trying more header combinations than the
+built-in probe does. That covers a page whose m3u8 is reachable by following
+redirects and iframes; it does **not** help against a host that rejects
+non-browser clients outright, because it looks exactly as non-browser as
+everything else here. Upstream also has a Playwright version that does drive a
+real browser — it is not in the image (Chromium is ~300 MB and a real RAM cost),
+so if you need it, install it on the host and mount it in.
 
 ### Checking a URL from the shell
 
@@ -479,7 +493,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-419 tests covering filename sanitisation and collision handling, storage
+425 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

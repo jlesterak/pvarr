@@ -1734,3 +1734,71 @@ The fix depends entirely on what they show: a referer heuristic, a
 cookie-capture step, or -- if the m3u8 is built in JavaScript -- no amount of
 probing helps and the right answer is a better message pointing at DevTools and
 the optional `detect-headers` browser path.
+
+## humantodo line 2, step 2: "needs a header" vs "not talking to us" (2026-08-31)  [COMPLETED]
+
+The sponsor supplied a failing URL (`lb7.strmd.st`, a tokenised HLS link) and
+asked whether the JavaScript limitation explained it. It did not, and chasing
+it produced a better answer than the feature we set out to build.
+
+### The evidence
+Tried from the dev box, every referer (none, the CDN origin, strmd.st,
+streamed.su/.st, embedme.top, embedstreams.top, google.com) and several
+user-agents (Chrome, curl, VLC), in both requests and curl. **Identical
+139-byte nginx 403 every time.** Then the decisive test:
+
+    https://lb7.strmd.st/            -> 403   (the site's own front page)
+    https://lb7.strmd.st/hello-there -> 403
+    bogus token + real path          -> 403
+    real token + bogus path          -> 403
+
+The host refuses the request before it ever looks at the path, so the token was
+never evaluated and no header was ever going to matter. All five sibling hosts
+(lb1/2/5/7/9, one /24 at 92.63.196.x) behave the same; the apex does not
+respond at all.
+
+Sponsor then confirmed 403 from icebox **and** 403 in a real browser on their
+own network. Three independent clients, three different TLS stacks, one of them
+an actual browser. The link is simply dead.
+
+### What PVArr got wrong
+It answered all of that with "The stream likely needs a cookie or a referer
+PVArr cannot guess -- copy them from DevTools." That sent the sponsor hunting
+in DevTools for a header that does not exist, on a link that was not going to
+work for anybody.
+
+### The fix
+On **total** failure only, the probe now asks the origin for its own front
+page and records it in the trace as stage `origin`. If the root is refused with
+the same status as the playlist (401/403/429), the message says the host is
+refusing us outright, that this is not a missing header, and that the link has
+probably expired -- instead of pointing at DevTools. When the root *does*
+answer, the old advice stands and is now stated with more confidence, because
+we have evidence the host is gating this stream specifically.
+
+Costs one extra request, and only on a probe that already failed. A successful
+probe is unchanged; there is a test asserting that.
+
+### Also corrected: the README was wrong about detect-headers
+Checked inside the shipped image: `detect-headers` is a symlink to upstream's
+**shell** version -- 11 curl calls, zero browser references, no Playwright
+module and no Chromium in the image. The README claimed it "drives a real
+browser and can see what a plain fetch cannot". True of upstream's Python
+variant, false of what we ship, and it is exactly the claim that made the
+JavaScript theory sound plausible. README now says what is actually in the
+container and what it can and cannot do.
+
+425 tests (was 419). Verified against two local origins (root answers / root
+refuses) and against the sponsor's real URL, which now produces the correct
+message.
+
+### Still open for line 2
+This URL turned out to be a dead link, so it taught us nothing about header
+detection itself. Still need traces from a stream that *is* reachable and still
+fails to detect -- that is the case the original humantodo line is about.
+
+### Housekeeping
+The dev box hit 100% disk (6.7 MB free) mid-session and took 302 tests down
+with it. Cause was 16.66 GB of dangling images from this session's own docker
+builds; `docker image prune` recovered it. Worth remembering that building the
+shipped image to test against is not free.
