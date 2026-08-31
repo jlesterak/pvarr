@@ -365,13 +365,25 @@ async def start_recording(
     port = _allocate_proxy_port()
 
     def _on_complete(filepath):
-        sz = round(Path(filepath).stat().st_size / (1024*1024), 2) if Path(filepath).exists() else 0
-        notifier.notify_recording_finished(recording_id, Path(filepath).name, sz)
+        """Post-process first, announce second.
+
+        The notification triggers a Plex/Emby library scan. Firing it before
+        the remux meant the scan ran while only the .ts existed and the .mp4
+        did not, so Plex indexed a file the remux was about to delete and never
+        saw the finished recording until its next scheduled scan. The webhook
+        text also quoted the .ts name and its pre-remux size. Remuxing first
+        costs nothing extra -- this already runs on the recorder thread, not
+        the event loop.
+        """
         result = remux_recording(filepath, target_format="mp4", delete_source=True)
         # Point the session at the remuxed file: the .ts it was recording to
         # has just been deleted, so size and filename lookups would read 0.
         if result.get("status") == "success" and result.get("output_filepath"):
             recorder.final_filepath = Path(result["output_filepath"])
+
+        final_path = recorder.final_filepath or Path(filepath)
+        sz = round(final_path.stat().st_size / (1024*1024), 2) if final_path.exists() else 0
+        notifier.notify_recording_finished(recording_id, final_path.name, sz)
 
     def _on_failover(rec_id, next_name):
         notifier.notify_failover_triggered(rec_id, next_name)
@@ -425,6 +437,19 @@ async def trigger_failover(recording_id: str):
 
     if not recorder.is_running:
         raise HTTPException(status_code=400, detail="Recording session is not currently running")
+
+    # Without this the request advanced past the last candidate, which ends the
+    # recording -- a single-URL session was killed by the button and still got
+    # a "success" back.
+    if not recorder.has_next_candidate:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No backup stream to fail over to: this session is already on "
+                f"its last candidate ({len(recorder.candidates)} configured). "
+                "Add a backup URL when starting the recording."
+            ),
+        )
 
     recorder.force_failover()
     return {"status": "success", "message": f"Forced failover triggered for {recording_id}"}

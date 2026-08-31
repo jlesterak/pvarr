@@ -15,10 +15,10 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 ## Features
 
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
-- **3-stage failover** — a primary m3u8 URL plus two backups. If the active stream stalls or dies, the recorder advances to the next candidate automatically. Failover can also be forced manually from the dashboard.
+- **3-stage failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder advances to the next candidate automatically. Failover can also be forced manually from the dashboard; the button is disabled when a session has no backup left, since there would be nothing to switch to.
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
 - **Sports-friendly auto-naming** — derives readable filenames for broadcasts instead of opaque timestamps.
-- **Automatic post-processing** — remuxes the recorded TS into MKV/MP4 on completion. Container change only, no transcode.
+- **Automatic post-processing** — remuxes the recorded TS into MKV/MP4 on completion. Container change only, no transcode. The Plex/Emby library scan is triggered *after* the remux, so the media server indexes the finished MP4 rather than the TS that is about to be deleted.
 - **Virtual tuner** — emulates a HDHomeRun for Plex Live TV and serves an M3U playlist plus XMLTV EPG for Emby/Jellyfin, so active recordings appear as channels.
 - **Discord & Telegram webhooks** — notifications on recording start, completion, and failure.
 - **Modern *arr dark UI** — a dashboard in the style of Sonarr/Radarr for starting recordings, watching failover state, tailing logs, and managing the library.
@@ -220,7 +220,7 @@ and mounts `./recordings` there.
 | `POST` | `/api/probe` | Resolve a URL to a playlist and detect the headers it needs |
 | `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs) |
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
-| `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL |
+| `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL. Returns `400` if the session is not running, or if it is already on its last candidate — advancing past the end would end the recording, not fail it over. |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
@@ -301,6 +301,12 @@ app/
 
 **Plex tunes a channel but the guide is empty.** The XMLTV URL is separate from the device address — add `http://<pvarr-host>:8999/live/epg.xml` as the guide, then run a channel scan.
 
+**Force Failover is greyed out, or returns "No backup stream to fail over to".** That session was started with a single URL. Failover moves to the *next* candidate, so with nothing to move to the request is refused rather than honoured — honouring it would end the recording. Add a backup URL when starting the recording.
+
+**Recordings stopped dead after roughly ten minutes (versions before 0.1.2).** FFmpeg's progress output filled its error pipe, which PVArr never drained; FFmpeg then blocked writing to it and stopped producing video, and the stall was not detected. Fixed — the pipe is drained continuously and the progress spam is switched off at the source. Upgrade if you are seeing this.
+
+**A dead stream was not failed over (versions before 0.1.2).** Freeze detection could not fire while the recorder was waiting on a full read buffer, so a source that went quiet without dropping the connection hung instead of failing over. Fixed.
+
 **FFmpeg not found.** Install it (`apt install ffmpeg`, `brew install ffmpeg`). The container already includes it.
 
 **Disk fills up.** Recordings are uncompressed TS and grow quickly. Point `recordings/` at a large volume and prune on a schedule.
@@ -317,14 +323,17 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-178 tests covering filename sanitisation and collision handling, storage
+211 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
-machine, freeze detection, FFmpeg command construction, and every HTTP route.
+machine, freeze detection, stream-completion ordering, FFmpeg command
+construction, and every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
-scripted fakes. Two exercise a real remux by encoding a one-second transport
-stream and skip when FFmpeg is absent; the route tests skip when `httpx` is
-absent, so the core suite still runs with only `requirements.txt` installed.
+scripted fakes. The capture-loop tests run over a real OS pipe, because the
+reader selects on a file descriptor and a fake `read()` would not exercise it.
+Two tests do a real remux by encoding a one-second transport stream and skip
+when FFmpeg is absent; the route tests skip when `httpx` is absent, so the core
+suite still runs with only `requirements.txt` installed.
 
 ### Syntax checks
 
@@ -355,18 +364,31 @@ Pushing requires a token with `write:packages`:
 echo $YOUR_TOKEN | docker login ghcr.io -u YOUR_USERNAME --password-stdin
 ```
 
-CI publishes too, on a split tag policy that keeps it from fighting the script
-over an immutable tag:
+**CI builds an image for version tags only.** Ordinary commits to `main` do not
+produce an image, so day-to-day work can be committed and pushed freely without
+changing what `docker compose pull` gives anyone:
 
 | Trigger | Tags published |
 | --- | --- |
-| `tests` passes on `main` | `:latest`, `:sha-<short>` |
-| version tag pushed (`v1.0.1`) | `:latest`, `:sha-<short>`, `:1.0.1` |
-| `scripts/publish.sh` | `:latest`, `:<version>` |
+| `git push origin main` | *none* — commits never build an image |
+| version tag pushed (`v1.0.1`) | `:1.0.1`, `:latest`, `:sha-<short>` |
+| manual `workflow_dispatch` | `:sha-<short>` only — deliberately does not move `:latest` |
+| `scripts/publish.sh` (builds locally) | `:<version>`, `:latest` |
 
-Only moving tags are written on every green `main` build. A version tag push
-must match `__version__`, or the workflow fails rather than publishing a
-mislabelled image.
+`:latest` therefore always means *the newest tagged release*, never the newest
+commit. Pin `:<version>` in production.
+
+A version tag must match `__version__` in `app/__init__.py` or the workflow
+fails rather than publishing a mislabelled image, and the full test suite runs
+inside the publish workflow before anything is built.
+
+Cutting a release:
+
+```bash
+scripts/publish.sh --bump patch --skip-docker   # set __version__, commit
+git push origin main
+git tag v1.0.1 && git push origin v1.0.1        # this is what builds the image
+```
 
 ---
 

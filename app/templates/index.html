@@ -147,7 +147,7 @@
               </div>
 
               <div class="flex items-center space-x-3">
-                <button @click="triggerFailover(session.id)" :disabled="!session.is_running" class="bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition disabled:opacity-50">
+                <button @click="triggerFailover(session.id)" :disabled="!session.is_running || session.current_candidate >= session.total_candidates" :title="session.current_candidate >= session.total_candidates ? 'No backup stream configured for this session' : 'Switch to the next candidate stream'" class="bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition disabled:opacity-50">
                   Force Failover
                 </button>
                 <button @click="stopSession(session.id)" :disabled="!session.is_running" class="bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition disabled:opacity-50">
@@ -560,8 +560,18 @@
         async triggerFailover(id) {
           if (!confirm('Force failover to next candidate stream?')) return;
           try {
-            await fetch(`/api/recordings/${id}/failover`, { method: 'POST' });
+            const res = await fetch(`/api/recordings/${id}/failover`, { method: 'POST' });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              alert('Failover refused: ' + (err.detail || ('HTTP ' + res.status)));
+              return;
+            }
+            // The recorder thread reacts a moment after the POST returns, so a
+            // single immediate refresh still paints the old candidate and the
+            // button looks dead. Re-poll over the next few seconds instead of
+            // waiting for the 3s timer to come round.
             this.refreshStatus();
+            [500, 1500, 3000].forEach(ms => setTimeout(() => this.refreshStatus(), ms));
           } catch (e) {
             alert('Failover error: ' + e);
           }

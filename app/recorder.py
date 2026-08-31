@@ -5,9 +5,11 @@ Implements Direct-First FFmpeg connection with automatic fallback to hls-proxy-s
 dynamic HTTP header injection, freeze detection, and continuous segment appending.
 """
 
+import collections
 import json
 import logging
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -73,6 +75,16 @@ class CandidateStream:
 
 
 class StreamFailoverRecorder:
+    # How long one select() wait on the FFmpeg pipe may last. This is the
+    # resolution at which a stall, a stop, or a force-failover is noticed, not
+    # a poll of the stream itself: when bytes are flowing select returns at
+    # once and the wait never happens.
+    READ_POLL_SEC = 0.5
+    # Read whatever has arrived, up to this much. Never wait for a full buffer.
+    READ_CHUNK_BYTES = 65536
+    # Tail of FFmpeg's stderr kept for diagnostics when an attempt fails.
+    STDERR_TAIL_LINES = 15
+
     def __init__(
         self,
         recording_id: str,
@@ -325,15 +337,38 @@ class StreamFailoverRecorder:
         self._thread = threading.Thread(target=self._recording_loop, daemon=True)
         self._thread.start()
 
-    def force_failover(self):
-        """Manual trigger to force switch to next stream candidate."""
+    @property
+    def has_next_candidate(self) -> bool:
+        """Is there a backup candidate left to fail over to?"""
+        return self.current_candidate_index + 1 < len(self.candidates)
+
+    def force_failover(self) -> bool:
+        """Manual trigger to force switch to the next stream candidate.
+
+        Refused when no backup remains. Advancing past the last candidate ends
+        the recording -- with a single URL the button silently killed a live
+        capture and the API still answered "success", which is the opposite of
+        what "fail over to the backup" promises.
+        """
+        if not self.has_next_candidate:
+            self._log("Force-failover refused: no backup candidate remains.", "WARN")
+            return False
+
         self._log("Manual force-failover requested!", "WARN")
         self._force_failover_flag = True
+        # Reflect the request in the status right away. The loop sets
+        # "failing_over" itself, but only after the current attempt unwinds,
+        # and holds it for about a second -- invisible to a 3s dashboard poll,
+        # so the operator saw nothing happen. Guarded on is_running so a
+        # session finishing at this instant cannot latch the status.
+        if self.is_running:
+            self.status = "failing_over"
         if self._ffmpeg_process:
             try:
                 self._ffmpeg_process.terminate()
             except Exception:
                 pass
+        return True
 
     def stop(self):
         """Gracefully stop recording."""
@@ -352,6 +387,15 @@ class StreamFailoverRecorder:
         """Build FFmpeg command line with custom HTTP headers if present."""
         cmd = [
             self.ffmpeg_path or "ffmpeg",
+            # FFmpeg's periodic progress line is ~124 bytes/sec on stderr. That
+            # pipe is 64KB and only drained on failure, so at the default log
+            # level it filled in well under ten minutes, at which point FFmpeg
+            # blocked writing to it and stopped producing video entirely --
+            # every recording longer than that wedged. Errors still come
+            # through; only the stats spam is suppressed.
+            "-hide_banner",
+            "-nostats",
+            "-loglevel", "error",
             "-y",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
@@ -392,15 +436,50 @@ class StreamFailoverRecorder:
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=65536
+                bufsize=0,
             )
+            stdout_fd = self._ffmpeg_process.stdout.fileno()
+            stderr_tail = self._drain_stderr(self._ffmpeg_process)
+            at_eof = False
+
+            def finish(outcome: "StreamOutcome") -> "StreamOutcome":
+                """Attach FFmpeg's own words to a failed attempt."""
+                if outcome is not StreamOutcome.COMPLETED and stderr_tail:
+                    detail = " | ".join(stderr_tail)[:500]
+                    candidate.last_error = detail
+                    self._log(f"FFmpeg said: {detail}", "ERROR")
+                return outcome
 
             while not self._stop_event.is_set():
                 if self._force_failover_flag:
                     self._log(f"Forced failover triggered on {candidate.name}", "WARN")
                     return StreamOutcome.INTERRUPTED
 
-                chunk = self._ffmpeg_process.stdout.read(32768)
+                # A blocking read(32768) parked this loop inside the kernel
+                # until a full 32KB had arrived, so a source that stalled
+                # mid-buffer was never noticed: the freeze timeout below could
+                # not be reached, a stop or force-failover was not seen until
+                # the pipe closed, and bytes_written advanced in 32KB steps so
+                # the dashboard read 0.00 MB for the first seconds of a
+                # low-bitrate stream. select() bounds the wait; os.read then
+                # takes whatever has actually arrived.
+                chunk = b""
+                if not at_eof:
+                    try:
+                        ready, _, _ = select.select(
+                            [stdout_fd], [], [], self.READ_POLL_SEC
+                        )
+                    except (OSError, ValueError):
+                        ready = []
+                        at_eof = True
+                    if ready:
+                        try:
+                            chunk = os.read(stdout_fd, self.READ_CHUNK_BYTES)
+                        except OSError:
+                            chunk = b""
+                        if not chunk:
+                            at_eof = True  # FFmpeg closed the pipe
+
                 if chunk:
                     out_f.write(chunk)
                     out_f.flush()
@@ -413,7 +492,7 @@ class StreamFailoverRecorder:
                 ret_code = self._ffmpeg_process.poll()
                 if ret_code is not None:
                     if written_for_this_session == 0:
-                        return StreamOutcome.FAILED
+                        return finish(StreamOutcome.FAILED)
                     if ret_code == 0:
                         return StreamOutcome.COMPLETED
                     # Non-zero exit after delivering data: FFmpeg died partway
@@ -423,15 +502,20 @@ class StreamFailoverRecorder:
                         f"on {candidate.name}; treating as interrupted", "ERROR"
                     )
                     candidate.fail_count += 1
-                    return StreamOutcome.INTERRUPTED
+                    return finish(StreamOutcome.INTERRUPTED)
 
                 if (time.time() - last_write_time) > self.freeze_timeout_sec:
                     self._log(f"Stream freeze detected! No data received for {self.freeze_timeout_sec}s", "ERROR")
                     candidate.fail_count += 1
                     if written_for_this_session == 0:
-                        return StreamOutcome.FAILED
-                    return StreamOutcome.INTERRUPTED
-                time.sleep(0.2)
+                        return finish(StreamOutcome.FAILED)
+                    return finish(StreamOutcome.INTERRUPTED)
+
+                if at_eof:
+                    # Pipe closed but the exit status has not landed yet. Short
+                    # sleep so this does not spin; the freeze timeout above is
+                    # the backstop if FFmpeg never reaps.
+                    time.sleep(0.05)
 
         # Loop exited because stop() was requested -- an operator stop is a
         # clean end, not a failure.
@@ -440,6 +524,37 @@ class StreamFailoverRecorder:
             if written_for_this_session > 0
             else StreamOutcome.FAILED
         )
+
+    def _drain_stderr(self, proc: subprocess.Popen) -> "collections.deque":
+        """Continuously drain FFmpeg's stderr, keeping only the tail.
+
+        Two jobs. The pipe must be read or FFmpeg eventually blocks writing to
+        it and stops producing video -- that is a hang, not a stream fault, and
+        no amount of failover logic can recover from it. And when an attempt
+        does fail, FFmpeg's last few lines are usually the only explanation of
+        why (403, 404, bad codec), which previously went nowhere.
+
+        Daemon thread, bounded buffer: it holds at most STDERR_TAIL_LINES lines
+        and exits on its own when the pipe closes.
+        """
+        tail: "collections.deque" = collections.deque(maxlen=self.STDERR_TAIL_LINES)
+        stream = proc.stderr
+        if stream is None:
+            return tail
+
+        def pump():
+            try:
+                for raw in iter(stream.readline, b""):
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line:
+                        tail.append(line)
+            except Exception:
+                pass  # pipe closed under us during shutdown; nothing to do
+
+        threading.Thread(
+            target=pump, name=f"pvarr-stderr-{self.recording_id}", daemon=True
+        ).start()
+        return tail
 
     def _recording_loop(self):
         """Main recording & failover loop."""
@@ -567,7 +682,9 @@ class StreamFailoverRecorder:
             "bytes_written": self.bytes_written,
             "elapsed_seconds": self.get_elapsed_seconds(),
             "started_at": self.start_time,
-            "current_candidate": self.current_candidate_index + 1,
+            # Clamped: the index runs one past the end when the candidate list
+            # is exhausted, which the dashboard rendered as "Stream 2 of 1".
+            "current_candidate": min(self.current_candidate_index + 1, len(self.candidates)),
             "total_candidates": len(self.candidates),
             "candidates": [c.to_dict() for c in self.candidates],
             "logs": self.log_history[-30:]

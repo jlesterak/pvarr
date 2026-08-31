@@ -255,8 +255,107 @@
   refused, so it cannot be turned into a local file reader. Do not expose PVArr
   to the internet.
 
+## Phase 11: Force-Failover & Completion Ordering
+
+- [x] **BUG FIX: force-failover killed single-URL recordings (`recorder.py`,
+      `server.py`).** The state machine was correct; the guard was missing.
+      With no backup configured, the request advanced past the last candidate,
+      which ends the recording -- so the button stopped a live capture and the
+      API still answered `200 success`. `has_next_candidate` now gates it:
+      `force_failover()` refuses and returns `False`, and the endpoint answers
+      `400` naming the reason. Reproduced live against the real subprocess
+      path before the fix (recording died at t=5s), and after (recording
+      continued past t=11s).
+
+- [x] **BUG FIX: dashboard showed "Stream 2 of 1" (`recorder.py`).**
+      `current_candidate` was `index + 1`, and the index legitimately runs one
+      past the end once candidates are exhausted. Clamped in the status summary.
+
+- [x] **BUG FIX: the failover button looked dead even when it worked
+      (`recorder.py`, `index.html`).** Three causes, all fixed:
+      the loop only set `failing_over` after the current attempt unwound and
+      held it ~1s against a 3s poll, so the state was never observed --
+      `force_failover()` now sets it on the spot; the dashboard's single
+      post-POST refresh fired before the recorder thread had reacted, so it
+      repainted the *old* candidate -- it now re-polls at 0.5/1.5/3s; and a
+      non-2xx reply was discarded silently, so the new refusal would have been
+      invisible -- it is now surfaced. The button also greys out with a tooltip
+      when no backup is configured.
+
+- [x] **BUG FIX: Plex/Emby were told to scan before the remux existed
+      (`server.py`).** `_on_complete` fired `notify_recording_finished` --
+      which triggers the library refresh -- and remuxed afterwards. The media
+      server therefore scanned while only the `.ts` was on disk, indexed a file
+      the remux was about to delete, and did not see the finished `.mp4` until
+      its next scheduled scan. The webhook also quoted the `.ts` name and its
+      pre-remux size. Order reversed; the notification now reports the final
+      file. Costs nothing: this already ran on the recorder thread, not the
+      event loop. Verified end to end with a real 3s TS -- at scan time the
+      `.ts` is gone, the `.mp4` is present and `ffprobe`-valid, and the
+      announcement names the `.mp4`.
+
+- [x] **Regression coverage.** 10 tests (195 -> 205). Nine fail against the
+      pre-fix tree and pass after; the tenth guards behaviour that was already
+      correct. The existing failover tests replaced `_stream_ffmpeg_process`
+      with a scripted fake, so none of this was reachable by them.
+
+## Phase 12: Capture-Loop Reliability  (sponsor-approved)
+
+- [x] **BUG FIX: freeze detection could not fire (`recorder.py`).**
+      `_stream_ffmpeg_process` read the FFmpeg pipe with `stdout.read(32768)`,
+      which parks the loop in the kernel until a full 32KB has arrived. A
+      source that stalled mid-buffer was therefore never noticed: the freeze
+      timeout below the read was unreachable. Measured before the fix --
+      `freeze_timeout_sec=5`, a child that wrote 1KB then hung, and the
+      recorder sat on the dead source for the full 20s of the test without
+      failing over. Now `select()` bounds the wait and `os.read` takes whatever
+      has actually arrived. After the fix the same scenario failed over at
+      ~12s (direct attempt, proxy retry, then the next candidate).
+
+- [x] **BUG FIX: every recording longer than ~9 minutes wedged
+      (`recorder.py`).** FFmpeg was spawned with `stderr=subprocess.PIPE` and
+      that pipe was never read. FFmpeg writes a progress line to stderr at
+      about 124 bytes/sec (measured), the pipe holds 64KB, so it filled in
+      under ten minutes -- after which FFmpeg blocked writing to stderr and
+      stopped producing video entirely. Not a stream fault, and no failover
+      logic could have recovered from it. Demonstrated by shrinking the stderr
+      pipe to one page (4KB) to compress the timeline: output stopped dead at
+      t=46s and the read blocked forever.
+
+      Fixed twice over, deliberately: `-nostats -loglevel error -hide_banner`
+      cuts the source of the spam (measured 3717 bytes -> **0 bytes** over 30s),
+      and a small daemon thread drains stderr continuously so the pipe cannot
+      fill even if a stream does produce real errors.
+
+      This one was masked by the freeze bug. Fixing freeze detection alone
+      would have turned a silent hang into a failover cascade -- the same
+      deadlock recurring on every candidate in turn.
+
+- [x] **FFmpeg's own errors are now surfaced.** The stderr drain keeps the last
+      15 lines in a bounded buffer. On a failed or interrupted attempt the tail
+      is logged and stored in `candidate.last_error`, so a `403`, a `404` or a
+      codec complaint reaches the dashboard instead of vanishing into an
+      unread pipe. Nothing is attached to a clean completion.
+
+- [x] **Byte counter now moves smoothly.** `bytes_written` advanced only in
+      32KB steps, so the dashboard showed `0.00 MB` for the first several
+      seconds of a low-bitrate stream.
+
+### Cost of the change
+One `select()` wakeup per 0.5s while a stream is idle, and one extra syscall
+per read while it is flowing -- roughly 20/sec on a 5 Mbps stream, which is
+noise. One daemon thread per recording attempt, blocked on a pipe read. No
+additional disk writes. `select()` on pipes is POSIX; PVArr is Linux/Docker.
+
+### Verified end to end
+- Real FFmpeg through the real recorder for 60s: continuous monotonic growth to
+  19.34 MB, no stalls, stderr thread exits cleanly on stop.
+- 211 tests pass (was 195 at the start of Phase 11).
+
 ## Still open
-- Nothing tracked. Next candidates if the project continues: a retention/cleanup
-  policy for old recordings on disk, integration coverage for the notification
-  webhooks (currently only exercised via mocks), and a headless-browser probe
-  path so JavaScript-built m3u8 URLs work without the external `detect-headers`.
+
+### Longer-term candidates
+- A retention/cleanup policy for old recordings on disk.
+- Integration coverage for the notification webhooks (currently mocks only).
+- A headless-browser probe path so JavaScript-built m3u8 URLs work without the
+  external `detect-headers`.

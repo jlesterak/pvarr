@@ -11,6 +11,7 @@ Run:
     python3 -m unittest discover -v
 """
 
+import io
 import logging
 import os
 import shutil
@@ -901,6 +902,59 @@ class TestForceFailover(FailoverLoopTestCase):
         self.assertFalse(rec._force_failover_flag,
                          "force-failover flag left set after being handled")
 
+    def test_force_failover_refused_when_no_backup_remains(self):
+        # With a single URL there is nothing to switch to, and advancing past
+        # the last candidate ends the recording. The button used to do exactly
+        # that -- killing a live capture -- while the API answered "success".
+        calls = []
+
+        def try_force_then_finish(rec, candidate):
+            calls.append(rec.force_failover())
+            return True
+
+        rec = self.make(["http://a/1.m3u8"], [try_force_then_finish])
+        self.run_loop(rec)
+        self.assertEqual(calls, [False], "force_failover claimed it switched")
+        self.assertFalse(rec._force_failover_flag,
+                         "a refused failover must not latch the flag")
+        self.assertEqual(rec.current_candidate_index, 0)
+        self.assertEqual(rec.status, "completed",
+                         "a refused failover ended the recording anyway")
+
+    def test_force_failover_refused_on_the_last_of_several_candidates(self):
+        calls = []
+
+        def die(rec, candidate):
+            return False
+
+        def try_force(rec, candidate):
+            calls.append(rec.force_failover())
+            return True
+
+        # Candidate 1 fails direct, then fails via the proxy, so the loop
+        # advances to candidate 2 -- the last one.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [die, die, try_force])
+        self.run_loop(rec)
+        self.assertEqual(calls, [False])
+        self.assertEqual(rec.current_candidate_index, 1)
+
+    def test_has_next_candidate_tracks_position(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertTrue(rec.has_next_candidate)
+        rec.current_candidate_index = 1
+        self.assertFalse(rec.has_next_candidate)
+
+    def test_force_failover_marks_status_immediately(self):
+        # The loop only reaches its own "failing_over" assignment once the
+        # current attempt unwinds, and holds it for about a second. Against a
+        # 3s dashboard poll the operator saw nothing change at all.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        rec.is_running = True
+        rec.status = "recording"
+        self.assertTrue(rec.force_failover())
+        self.assertEqual(rec.status, "failing_over")
+
     def test_two_forced_failovers_traverse_two_candidates(self):
         def force_then_die(rec, candidate):
             rec.force_failover()
@@ -913,6 +967,16 @@ class TestForceFailover(FailoverLoopTestCase):
 
 
 class TestStatusReporting(FailoverLoopTestCase):
+    def test_current_candidate_never_exceeds_total(self):
+        # The index runs one past the end once the list is exhausted, which the
+        # dashboard rendered literally as "Stream 2 of 1".
+        rec = self.make(["http://a/1.m3u8"], [False, False])
+        self.run_loop(rec)
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["total_candidates"], 1)
+        self.assertEqual(summary["current_candidate"], 1,
+                         "status summary reported a candidate that does not exist")
+
     def test_status_returns_to_recording_after_failover(self):
         # While candidate 2 is happily recording the dashboard must not still
         # be showing "failing_over".
@@ -935,21 +999,42 @@ class TestStatusReporting(FailoverLoopTestCase):
 # Drives the real method against a fake Popen so the stall path is reachable
 # without spawning FFmpeg or waiting out a real timeout.
 # --------------------------------------------------------------------------
-class _FakePipe:
-    def __init__(self, chunks):
-        self.chunks = list(chunks)
-
-    def read(self, n):
-        return self.chunks.pop(0) if self.chunks else b""
-
-
 class _FakeProc:
-    """Stands in for a running FFmpeg that has stopped producing output."""
+    """Stands in for FFmpeg, over a real OS pipe.
 
-    def __init__(self, chunks, returncode=None):
-        self.stdout = _FakePipe(chunks)
-        self.stderr = _FakePipe([])
+    The capture loop selects on the stdout file descriptor, so a fake with a
+    plain read() method would not exercise the code under test. Chunks are
+    written into the pipe up front; leaving the write end OPEN models the case
+    that matters most -- a source that has gone quiet without dropping the
+    connection, which is exactly what the freeze timeout exists to catch.
+    """
+
+    def __init__(self, chunks, returncode=None, close_stdout=False,
+                 stderr_lines=()):
+        read_fd, write_fd = os.pipe()
+        for chunk in chunks:
+            os.write(write_fd, chunk)   # total stays well under the 64KB pipe
+        if close_stdout:
+            os.close(write_fd)
+            self._write_fd = None
+        else:
+            self._write_fd = write_fd
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        # readline() walks these then hits EOF, so the drain thread exits.
+        self.stderr = io.BytesIO(b"".join(l + b"\n" for l in stderr_lines))
         self._rc = returncode
+
+    def close(self):
+        try:
+            self.stdout.close()
+        except Exception:
+            pass
+        if self._write_fd is not None:
+            try:
+                os.close(self._write_fd)
+            except Exception:
+                pass
+            self._write_fd = None
 
     def poll(self):
         return self._rc
@@ -972,15 +1057,22 @@ class TestFreezeDetection(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def drive(self, chunks, returncode=None, freeze_timeout=0):
+    def drive(self, chunks, returncode=None, freeze_timeout=0,
+              close_stdout=False, stderr_lines=()):
         from unittest.mock import patch
         rec = StreamFailoverRecorder(
             "test-id", ["http://a/1.m3u8"], self.out,
             freeze_timeout_sec=freeze_timeout,
         )
-        proc = _FakeProc(chunks, returncode)
-        with patch("app.recorder.subprocess.Popen", return_value=proc):
-            result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
+        # Shrink the select() wait so tests do not sit through the real 0.5s.
+        rec.READ_POLL_SEC = 0.01
+        proc = _FakeProc(chunks, returncode, close_stdout=close_stdout,
+                         stderr_lines=stderr_lines)
+        try:
+            with patch("app.recorder.subprocess.Popen", return_value=proc):
+                result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
+        finally:
+            proc.close()
         return rec, result
 
     def test_stall_before_any_data_is_a_failure(self):
@@ -1006,10 +1098,67 @@ class TestFreezeDetection(unittest.TestCase):
         from unittest.mock import patch
         rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out)
         rec._stop_event.set()
-        with patch("app.recorder.subprocess.Popen", return_value=_FakeProc([b"x" * 100])):
-            result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
+        proc = _FakeProc([b"x" * 100])
+        try:
+            with patch("app.recorder.subprocess.Popen", return_value=proc):
+                result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
+        finally:
+            proc.close()
         self.assertIs(result, StreamOutcome.FAILED)
         self.assertEqual(rec.bytes_written, 0)
+
+    def test_ffmpeg_stderr_explains_a_failure(self):
+        # FFmpeg's last words are usually the only account of why a stream
+        # would not play. They used to go into an undrained pipe and vanish.
+        rec, result = self.drive(
+            [], returncode=1,
+            stderr_lines=[b"[https] HTTP error 403 Forbidden",
+                          b"http://x/y.m3u8: Server returned 403 Forbidden"],
+        )
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertIn("403", rec.candidates[0].last_error)
+
+    def test_stderr_is_not_attached_to_a_clean_finish(self):
+        rec, result = self.drive([b"x" * 512], returncode=0, close_stdout=True,
+                                 stderr_lines=[b"some benign warning"])
+        self.assertIs(result, StreamOutcome.COMPLETED)
+        self.assertEqual(rec.candidates[0].last_error, "")
+
+    def test_ffmpeg_argv_suppresses_the_stats_spam(self):
+        # The progress line is ~124 B/s on a 64KB pipe that is only read on
+        # failure: at the default log level it filled in under ten minutes and
+        # FFmpeg then blocked, stopping video output entirely.
+        rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out)
+        cmd = rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertIn("-nostats", cmd)
+        self.assertEqual(cmd[cmd.index("-loglevel") + 1], "error")
+
+    def test_freeze_fires_while_the_pipe_is_still_open(self):
+        # The regression that mattered: a source that stalls mid-buffer without
+        # closing the connection. The old loop sat inside a blocking
+        # read(32768) waiting for a full 32KB, so this check was unreachable --
+        # measured at 20s of nothing against a 5s timeout. The write end of the
+        # pipe is deliberately left open here.
+        import time as _time
+        start = _time.time()
+        rec, result = self.drive([b"x" * 1024], freeze_timeout=0.2)
+        elapsed = _time.time() - start
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertLess(elapsed, 5.0,
+                        "freeze detection did not fire on a stalled-but-open pipe")
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    def test_partial_chunk_is_written_without_waiting_for_a_full_buffer(self):
+        # bytes_written used to advance only in 32KB steps, so the dashboard
+        # showed 0.00 MB for the first seconds of a low-bitrate stream.
+        rec, _ = self.drive([b"x" * 100], freeze_timeout=0.2)
+        self.assertEqual(rec.bytes_written, 100)
+        self.assertEqual(Path(self.out).stat().st_size, 100)
+
+    def test_eof_with_clean_exit_completes(self):
+        rec, result = self.drive([b"x" * 512], returncode=0, close_stdout=True)
+        self.assertIs(result, StreamOutcome.COMPLETED)
+        self.assertEqual(rec.bytes_written, 512)
 
     def test_mid_stream_freeze_after_data_is_interrupted(self):
         # A stall after data is NOT a clean finish. Reporting it as success is
@@ -1235,10 +1384,26 @@ class TestRecordingRoutes(ServerTestCase):
         from unittest.mock import MagicMock
         rec = MagicMock()
         rec.is_running = True
+        rec.has_next_candidate = True
         self.server.active_recorders["abc"] = rec
         r = self.client.post("/api/recordings/abc/failover")
         self.assertEqual(r.status_code, 200)
         rec.force_failover.assert_called_once()
+
+    def test_failover_refused_when_no_backup_configured(self):
+        # A single-URL session has nothing to fail over to. Honouring the
+        # request advanced past the last candidate and ended the recording,
+        # and the caller still got a 200 "success".
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.has_next_candidate = False
+        rec.candidates = ["http://a/1.m3u8"]
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/failover")
+        self.assertEqual(r.status_code, 400)
+        rec.force_failover.assert_not_called()
+        self.assertIn("backup", r.json()["detail"].lower())
 
     def test_stop_calls_recorder_stop(self):
         from unittest.mock import MagicMock
@@ -1273,6 +1438,91 @@ class TestRecordingRoutes(ServerTestCase):
             })
         candidates = ctor.call_args.kwargs["candidates"]
         self.assertEqual(candidates, ["http://a/1.m3u8", "http://c/3.m3u8"])
+
+
+class TestCompletionOrdering(ServerTestCase):
+    """Post-process first, announce second.
+
+    notify_recording_finished triggers a Plex/Emby library scan. It used to run
+    before the remux, so the media server scanned while only the .ts existed
+    and the .mp4 did not -- indexing a file the remux was about to delete, and
+    never seeing the finished recording until its next scheduled scan. The
+    webhook text also quoted the .ts name and its pre-remux size.
+    """
+
+    def _run_completion(self, remux_result, source_bytes=b"x" * 2048,
+                        final_bytes=b"y" * 1024):
+        from unittest.mock import patch, MagicMock
+
+        order = []
+        captured = {}
+
+        ts_path = Path(self.tmp) / "game.ts"
+        ts_path.write_bytes(source_bytes)
+        mp4_path = Path(self.tmp) / "game.mp4"
+
+        def fake_recorder(**kwargs):
+            captured["on_complete"] = kwargs["on_completion_callback"]
+            rec = MagicMock()
+            rec.get_status_summary.return_value = {}
+            rec.final_filepath = None  # a bare MagicMock attr is truthy
+            captured["recorder"] = rec
+            return rec
+
+        def fake_remux(path, **kwargs):
+            order.append("remux")
+            if remux_result.get("status") == "success":
+                mp4_path.write_bytes(final_bytes)
+                ts_path.unlink()
+            return remux_result
+
+        notifier = MagicMock()
+        notifier.notify_recording_finished.side_effect = (
+            lambda sid, name, size: order.append(("notify", name, size))
+        )
+
+        with patch.object(self.server, "StreamFailoverRecorder", fake_recorder), \
+             patch.object(self.server, "remux_recording", fake_remux), \
+             patch.object(self.server, "notifier", notifier):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+            self.assertEqual(r.status_code, 200)
+            captured["on_complete"](str(ts_path))
+
+        return order, captured
+
+    def test_remux_runs_before_the_library_scan(self):
+        order, _ = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        self.assertEqual(order[0], "remux",
+                         "the media server was told to scan before the mp4 existed")
+        self.assertEqual(order[1][0], "notify")
+
+    def test_notification_names_the_remuxed_file(self):
+        order, _ = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        _, name, size_mb = order[1]
+        self.assertEqual(name, "game.mp4",
+                         "notification quoted the .ts the remux just deleted")
+        self.assertEqual(size_mb, round(1024 / (1024 * 1024), 2))
+
+    def test_failed_remux_still_notifies_about_the_ts(self):
+        # If the remux fails the .ts is what is left on disk, so that is what
+        # the notification and the scan must refer to.
+        order, _ = self._run_completion({"status": "failed", "error": "boom"})
+        self.assertEqual(order[0], "remux")
+        _, name, size_mb = order[1]
+        self.assertEqual(name, "game.ts")
+        self.assertEqual(size_mb, round(2048 / (1024 * 1024), 2))
+
+    def test_session_points_at_the_remuxed_file(self):
+        _, captured = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        self.assertEqual(captured["recorder"].final_filepath,
+                         Path(self.tmp) / "game.mp4")
 
 
 class TestLibraryRoutes(ServerTestCase):
