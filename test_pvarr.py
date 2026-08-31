@@ -31,7 +31,7 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
-from app import notifications, ringbuffer, sessions
+from app import notifications, probe, ringbuffer, sessions
 from app.logging_config import redact_url_secrets
 from app.recorder import (
     DEFAULT_MAX_HOURS,
@@ -4330,6 +4330,137 @@ class TestNotificationsShipNoTokens(ServerTestCase):
                 "s1", "game.ts", "https://cdn.example/live.m3u8?token=SECRET")
         self.assertNotIn("SECRET", " ".join(str(a) for a in discord.call_args.args))
         self.assertNotIn("SECRET", " ".join(str(a) for a in telegram.call_args.args))
+
+
+
+class TestSegmentExtension(unittest.TestCase):
+    """FFmpeg refuses segments by extension, so the extension is a diagnosis."""
+
+    def test_ordinary_segment(self):
+        self.assertEqual(probe.segment_extension("https://a/b/seg.ts"), ".ts")
+
+    def test_query_string_is_ignored(self):
+        self.assertEqual(probe.segment_extension("https://a/seg.image?tok=1"), ".image")
+
+    def test_no_extension(self):
+        self.assertEqual(probe.segment_extension("https://a/b/noext"), "")
+
+    def test_empty(self):
+        self.assertEqual(probe.segment_extension(""), "")
+
+
+class TestProbeTrace(unittest.TestCase):
+    """The probe records what it tried, so a failed detection is diagnosable.
+
+    All of this data existed already; the dashboard discarded it on failure,
+    which is why "could not detect headers" was a dead end for the operator.
+    """
+
+    def _fake_fetch(self, script):
+        """script: url-substring -> (status, body). Returns a _fetch stand-in."""
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            for needle, (status, body) in script.items():
+                if needle in url:
+                    resp = MagicMock()
+                    resp.status_code = status
+                    resp.ok = 200 <= status < 300
+                    resp.url = url
+                    return resp, body
+            raise AssertionError(f"unscripted URL: {url}")
+
+        return fetch
+
+    def test_every_header_attempt_is_recorded_with_its_status(self):
+        from unittest.mock import patch
+        script = {"gated.m3u8": (403, b"denied")}
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/gated.m3u8", check_segment=False)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["attempts"], "no trace recorded")
+        for attempt in result["attempts"]:
+            self.assertEqual(attempt["stage"], "playlist")
+            self.assertEqual(attempt["status"], 403)
+        # More than one, because the point is showing *which* combinations were
+        # tried -- a bare request and then each guessed referer.
+        self.assertGreaterEqual(len(result["attempts"]), 2)
+
+    def test_a_disguised_segment_extension_is_named(self):
+        """The candidate 1 case: everything succeeds, and it still will not
+        record, for a reason no status code shows."""
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n#EXTINF:4.0,\nseg0.image?tok=abc\n"
+        script = {
+            "live.m3u8": (200, playlist),
+            "seg0.image": (200, b"\x47" + b"\x00" * 200),
+        }
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["segment_ok"])
+        segs = [a for a in result["attempts"] if a["stage"] == "segment"]
+        self.assertEqual(len(segs), 1)
+        self.assertIn(".image", segs[0]["note"])
+        self.assertIn("FFmpeg refuses", segs[0]["note"])
+
+    def test_an_ordinary_ts_segment_is_not_flagged(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n"
+        script = {
+            "live.m3u8": (200, playlist),
+            "seg0.ts": (200, b"\x47" + b"\x00" * 200),
+        }
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        segs = [a for a in result["attempts"] if a["stage"] == "segment"]
+        self.assertNotIn("refuses", segs[0]["note"])
+
+    def test_a_gated_segment_records_its_status(self):
+        """"Segments rejected" with no status is a shrug, not a diagnosis."""
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n#EXTINF:4.0,\nlocked.ts\n"
+        script = {
+            "open.m3u8": (200, playlist),
+            "locked.ts": (403, b"denied"),
+        }
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/open.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["segment_ok"])
+        segs = [a for a in result["attempts"] if a["stage"] == "segment"]
+        self.assertEqual(segs[0]["status"], 403)
+
+    def test_a_2xx_that_is_not_a_playlist_is_called_out(self):
+        from unittest.mock import patch
+        script = {"live.m3u8": (200, b"<html>are you a robot</html>")}
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8", check_segment=False)
+        self.assertFalse(result["ok"])
+        notes = [a.get("note", "") for a in result["attempts"]]
+        self.assertTrue(any("not a playlist" in n for n in notes), notes)
+
+    def test_a_rejected_status_is_not_also_called_not_a_playlist(self):
+        """A 403 body is obviously not a playlist. Saying so reads like a
+        second, unrelated problem."""
+        from unittest.mock import patch
+        script = {"live.m3u8": (403, b"denied")}
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8", check_segment=False)
+        notes = [a.get("note", "") for a in result["attempts"]]
+        self.assertFalse(any("not a playlist" in n for n in notes), notes)
+
+    def test_the_trace_reaches_the_api(self):
+        """The dashboard cannot show what the endpoint does not return."""
+        import app.server as server_mod
+        from unittest.mock import patch
+        client = TestClient(server_mod.app)
+        fake = {"ok": False, "message": "nope",
+                "attempts": [{"stage": "playlist", "status": 403, "referer": ""}]}
+        with patch("app.server.probe_stream", return_value=fake):
+            r = client.post("/api/probe", data={"url": "https://cdn.example/x.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["attempts"][0]["status"], 403)
 
 
 

@@ -1678,3 +1678,59 @@ above (candidate 1 recording, a short duration stopping on time, a rebroadcast
 channel unaffected by the cap). Recorded because if any of them misbehaves,
 this is the release to look at -- and the 6-hour default is the change most
 likely to surprise, since it alters what an existing untouched workflow does.
+
+## humantodo line 2, step 1: the probe says what it tried (2026-08-31)  [COMPLETED]
+
+Sponsor asked whether their testing would help line 2 ("resolve the instances
+where the app can't detect headers automatically") or whether to build first.
+Answer: their testing is the input -- I cannot invent failing providers, and
+every fix that stuck this session came from their data -- but it would have
+come back as "it didn't work", because the dashboard was throwing the evidence
+away.
+
+### What was already there
+`probe_stream()` has always recorded an `attempts` list -- every URL, the
+referer sent, the status returned -- and `/api/probe` has always returned it.
+The dashboard rendered only `message`, and on failure did
+`this.probes[key] = { ..., data: null }`, discarding the trace at exactly the
+moment it was worth having.
+
+### What was missing
+- **The segment check recorded nothing.** "Segments rejected -- stream may be
+  session gated" with no status code tells an operator something is wrong and
+  nothing about what. It now records status, and the variant-playlist descent
+  for a master playlist too.
+- **The segment's extension was never surfaced.** This is the candidate 1 case:
+  playlist 200, segment 200, everything "fine", and it still will not record,
+  because FFmpeg refuses `.image` by extension. That cost an hour to diagnose
+  from logs. The trace now names it at probe time.
+- **A 2xx that is not a playlist looked like an unexplained failure.** Usually
+  an anti-bot interstitial answering 200 with HTML. Now called out -- and
+  scoped to a *successful* status, because on a 403 the body is obviously not a
+  playlist and saying so reads like a second, unrelated problem.
+- **The page fetch was not a recorded step**, so a scrape that found no m3u8
+  showed nothing before the failure.
+
+### Dashboard
+Collapsed "Show what PVArr tried (n)" under the probe verdict, colour-coded by
+status, with a **Copy trace** button. Query strings are stripped from every URL
+in the trace, so it carries no access token and is safe to paste into a bug
+report. Falls back to a prompt() when the clipboard API is unavailable --
+plain-http LAN access is not a secure context, which is exactly how this
+dashboard is normally reached.
+
+### Proven
+- Three failure shapes driven end to end against a local origin: referer-gated
+  playlist with `.image` segments, the same with no referer hint, and a public
+  playlist with 403 segments. Each produced the right trace.
+- The UI guard was checked by restoring `data: null` and re-running the helper
+  in node: 1 trace row with the fix, **0 without it**.
+
+419 tests (was 408).
+
+### Next, and it needs the sponsor
+Throw the streams that fail header detection at the probe and send the traces.
+The fix depends entirely on what they show: a referer heuristic, a
+cookie-capture step, or -- if the m3u8 is built in JavaScript -- no amount of
+probing helps and the right answer is a better message pointing at DevTools and
+the optional `detect-headers` browser path.

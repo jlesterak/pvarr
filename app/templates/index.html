@@ -439,10 +439,42 @@
                   <span x-show="probes[slot.key].state === 'probing'" class="animate-pulse">◌</span>
                   <span x-show="probes[slot.key].state === 'ok'">✓</span>
                   <span x-show="probes[slot.key].state === 'fail'">✕</span>
-                  <div class="space-y-0.5 min-w-0">
+                  <div class="space-y-0.5 min-w-0 w-full">
                     <p x-text="probes[slot.key].message"></p>
                     <p x-show="probes[slot.key].resolved" class="font-mono text-[11px] text-slate-500 truncate"
                        x-text="'→ ' + probes[slot.key].resolved"></p>
+
+                    <!-- What PVArr actually tried. The probe has always
+                         recorded this; the dashboard used to discard it, so a
+                         failed detection was a dead end for the operator. -->
+                    <template x-if="probeTrace(slot.key).length">
+                      <div>
+                        <button type="button" @click="traceOpen[slot.key] = !traceOpen[slot.key]"
+                                class="text-[11px] text-slate-500 hover:text-arr-accent underline decoration-dotted">
+                          <span x-text="(traceOpen[slot.key] ? 'Hide' : 'Show') + ' what PVArr tried (' + probeTrace(slot.key).length + ')'"></span>
+                        </button>
+                        <div x-show="traceOpen[slot.key]" x-cloak class="mt-1.5 space-y-1">
+                          <div class="bg-black/60 rounded-md border border-slate-800 p-2 overflow-x-auto">
+                            <table class="text-[11px] font-mono text-slate-400 w-full">
+                              <template x-for="(a, i) in probeTrace(slot.key)" :key="i">
+                                <tr class="align-top">
+                                  <td class="pr-2 text-slate-600 whitespace-nowrap" x-text="a.stage || 'playlist'"></td>
+                                  <td class="pr-2 whitespace-nowrap"
+                                      :class="traceToneClass(a)" x-text="traceOutcome(a)"></td>
+                                  <td class="pr-2 whitespace-nowrap text-slate-500"
+                                      x-text="a.referer ? 'ref: ' + shortHost(a.referer) : (a.stage === 'playlist' ? 'no referer' : '')"></td>
+                                  <td class="text-slate-500 break-all" x-text="a.note || shortUrl(a.url)"></td>
+                                </tr>
+                              </template>
+                            </table>
+                          </div>
+                          <button type="button" @click="copyTrace(slot.key)"
+                                  class="text-[11px] text-slate-500 hover:text-arr-accent">
+                            <span x-text="traceCopied[slot.key] ? 'Copied' : 'Copy trace'"></span>
+                          </button>
+                        </div>
+                      </div>
+                    </template>
                   </div>
                 </div>
               </template>
@@ -515,6 +547,8 @@
           url_backup2: { referer: '', user_agent: '', cookie: '' }
         },
         probeSeq: { url_primary: 0, url_backup1: 0, url_backup2: 0 },
+        traceOpen: { url_primary: false, url_backup1: false, url_backup2: false },
+        traceCopied: { url_primary: false, url_backup1: false, url_backup2: false },
 
         init() {
           this.refreshStatus();
@@ -662,6 +696,62 @@
           this.advanced[key] = !this.advanced[key];
         },
 
+        probeTrace(key) {
+          const p = this.probes[key];
+          return (p && p.data && Array.isArray(p.data.attempts)) ? p.data.attempts : [];
+        },
+
+        traceOutcome(a) {
+          if (a.error) return 'error';
+          if (a.status === undefined || a.status === null) return '--';
+          return String(a.status);
+        },
+
+        traceToneClass(a) {
+          if (a.error) return 'text-rose-400';
+          const s = a.status;
+          if (s >= 200 && s < 300) return 'text-emerald-400';
+          if (s === 403 || s === 401) return 'text-amber-400';
+          if (s >= 400) return 'text-rose-400';
+          return 'text-slate-400';
+        },
+
+        shortHost(url) {
+          try { return new URL(url).host; } catch (e) { return url; }
+        },
+
+        shortUrl(url) {
+          if (!url) return '';
+          try {
+            const u = new URL(url);
+            // The query string is where the token lives -- never render it.
+            return u.host + u.pathname;
+          } catch (e) { return String(url).split('?')[0]; }
+        },
+
+        async copyTrace(key) {
+          // Plain text, so it can be pasted into a message or an issue. The
+          // whole point of the trace is being able to hand it to someone.
+          const lines = this.probeTrace(key).map(a =>
+            [(a.stage || 'playlist').padEnd(9),
+             this.traceOutcome(a).padEnd(6),
+             a.referer ? 'ref:' + this.shortHost(a.referer) : '',
+             a.note || '',
+             this.shortUrl(a.url)].filter(Boolean).join('  ')
+          );
+          const text = 'PVArr probe trace\n' + lines.join('\n');
+          try {
+            await navigator.clipboard.writeText(text);
+          } catch (e) {
+            // Clipboard needs a secure context; plain http:// LAN access has
+            // none, which is exactly how this dashboard is usually reached.
+            window.prompt('Copy the trace:', text);
+            return;
+          }
+          this.traceCopied[key] = true;
+          setTimeout(() => { this.traceCopied[key] = false; }, 1500);
+        },
+
         async probeSlot(key) {
           const url = (this.form[key] || '').trim();
           if (!url) { this.probes[key] = null; return; }
@@ -695,7 +785,15 @@
               this.overrides[key].referer = data.referer || '';
               this.overrides[key].cookie = data.cookie || '';
             } else {
-              this.probes[key] = { state: 'fail', message: data.message || 'Could not verify this stream.', data: null };
+              // Keep the payload. This used to be `data: null`, which threw
+              // away the attempt trace at exactly the moment it is worth
+              // having -- the operator was told "every header combination was
+              // rejected" with no way to see which ones, or what came back.
+              this.probes[key] = {
+                state: 'fail',
+                message: data.message || 'Could not verify this stream.',
+                data: data
+              };
               this.advanced[key] = true;
             }
           } catch (e) {
@@ -731,6 +829,7 @@
           // A duration belongs to the event just recorded, not to the next
           // one. Leaving it set would silently cap an unrelated recording.
           this.form.duration_minutes = '';
+          this.slots.forEach(slot => { this.traceOpen[slot.key] = false; });
         },
 
         async submitRecording() {

@@ -144,6 +144,29 @@ and `Cookie`. Anything the probe detected is filled in there, so you can correct
 one field rather than supply all three. A value you type wins, and is tried
 first on the next probe.
 
+**When it fails, click *Show what PVArr tried*.** Under a failed (or merely
+suspicious) probe result is the full attempt trace — every header combination
+PVArr sent, in order, and what came back:
+
+```
+playlist   403     no referer            cdn.example/live.m3u8
+playlist   403     ref: player.host      cdn.example/live.m3u8
+segment    200                           served as .image -- disguised segment,
+                                         FFmpeg refuses these by extension
+```
+
+That table is the diagnosis. A row of `403`s across every referer means no
+guessable referer will work and the stream wants a cookie. A `200` on the
+playlist with a `403` on the segment means the manifest is public and the media
+is session-gated. A `2xx but not a playlist` means something answered
+successfully with HTML — usually an anti-bot interstitial. And a segment
+*served as* something other than `.ts`/`.m4s`/`.mp4` is an anti-leech origin
+disguising its media, which fails for a reason no status code shows.
+
+**Copy trace** puts it on the clipboard as plain text for pasting into a bug
+report. URLs in the trace have their query strings stripped, so it carries no
+access token and is safe to share.
+
 Two cases genuinely need this:
 
 - **Cookie/session gated.** The stream needs a logged-in session. Copy the
@@ -456,13 +479,13 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-408 tests covering filename sanitisation and collision handling, storage
+419 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across
 containers, FFmpeg command construction, proxy credential cleanup, recording
-windows and the duration backstop, log and notification redaction, and
-every HTTP route.
+windows and the duration backstop, log and notification redaction, the
+probe attempt trace, and every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the

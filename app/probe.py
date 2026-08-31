@@ -16,7 +16,7 @@ longer be the first thing anyone has to do.
 import logging
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlsplit
 
 import requests
 
@@ -278,8 +278,17 @@ def probe_stream(
         try:
             resp, body = _fetch(session, target, page_headers, timeout)
         except requests.RequestException as exc:
+            result["attempts"].append(
+                {"stage": "page", "url": target, "error": str(exc)})
             result["message"] = f"Could not open {target}: {exc}"
             return result
+
+        result["attempts"].append({
+            "stage": "page",
+            "url": target,
+            "status": resp.status_code,
+            "note": "served a playlist directly" if _is_playlist_body(body) else "scraped for an m3u8",
+        })
 
         if _is_playlist_body(body):
             playlists = [resp.url]
@@ -300,19 +309,29 @@ def probe_stream(
             try:
                 resp, body = _fetch(session, playlist_url, headers, timeout)
             except requests.RequestException as exc:
-                result["attempts"].append(
-                    {"url": playlist_url, "referer": headers.get("Referer", ""), "error": str(exc)}
-                )
+                result["attempts"].append({
+                    "stage": "playlist",
+                    "url": playlist_url,
+                    "referer": headers.get("Referer", ""),
+                    "error": str(exc),
+                })
                 continue
 
             last_status = resp.status_code
-            result["attempts"].append(
-                {
-                    "url": playlist_url,
-                    "referer": headers.get("Referer", ""),
-                    "status": resp.status_code,
-                }
-            )
+            result["attempts"].append({
+                "stage": "playlist",
+                "url": playlist_url,
+                "referer": headers.get("Referer", ""),
+                "status": resp.status_code,
+                # A 2xx that is not a playlist is its own failure mode -- an
+                # HTML error page or an anti-bot interstitial answering 200 --
+                # and reads as an inexplicable success without this. Scoped to
+                # a successful status: on a 403 the body is obviously not a
+                # playlist, and saying so is noise that reads like a second,
+                # unrelated problem.
+                "note": ("" if (not resp.ok or _is_playlist_body(body))
+                         else "2xx but not a playlist (HTML or interstitial?)"),
+            })
 
             if not (resp.ok and _is_playlist_body(body)):
                 continue
@@ -342,7 +361,8 @@ def probe_stream(
 
             if check_segment:
                 result["segment_ok"] = _check_segment(
-                    session, parsed, headers, result["cookie"], timeout
+                    session, parsed, headers, result["cookie"], timeout,
+                    result["attempts"],
                 )
 
             result["message"] = _describe(result)
@@ -352,12 +372,26 @@ def probe_stream(
     return result
 
 
+def segment_extension(url: str) -> str:
+    """The extension the segment is *served as*, ignoring the query string.
+
+    Worth surfacing on its own. FFmpeg's HLS demuxer refuses segments by
+    extension, so an anti-leech origin serving MPEG-TS as ".image" or ".png"
+    fails for a reason that has nothing to do with headers -- and reads as an
+    inexplicable failure unless the trace says what the extension was.
+    """
+    path = urlsplit(url or "").path
+    _, _, ext = path.rpartition(".")
+    return f".{ext.lower()}" if ext and ext != path else ""
+
+
 def _check_segment(
     session: requests.Session,
     parsed: Dict[str, Any],
     headers: Dict[str, str],
     cookie: str,
     timeout: int,
+    attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[bool]:
     """Confirm the media the playlist points at is fetchable with the same headers.
 
@@ -365,28 +399,55 @@ def _check_segment(
     routinely serve the manifest to anyone and gate the segments. Checking one
     segment here turns a recording that fails minutes later into a red field in
     the browser now.
+
+    Every step is recorded into `attempts`. "Segments rejected" without a
+    status code tells an operator that something is wrong but nothing about
+    what, which is the difference between a diagnosis and a shrug.
     """
+    def record(entry: Dict[str, Any]) -> None:
+        if attempts is not None:
+            attempts.append(dict(entry, stage="segment"))
+
     target = parsed.get("first_segment")
     if not target and parsed.get("variants"):
         # Master playlist: descend one level to reach real segments.
         try:
             variant_url = parsed["variants"][0]["url"]
             resp, body = _fetch(session, variant_url, headers, timeout)
+            record({
+                "url": variant_url,
+                "status": resp.status_code,
+                "note": "variant playlist",
+            })
             if not (resp.ok and _is_playlist_body(body)):
                 return False
             target = _parse_playlist(body, resp.url).get("first_segment")
-        except (requests.RequestException, KeyError, IndexError):
+        except (requests.RequestException, KeyError, IndexError) as exc:
+            record({"url": parsed.get("variants", [{}])[0].get("url", ""),
+                    "error": str(exc), "note": "variant playlist"})
             return None
     if not target:
+        record({"url": "", "note": "playlist listed no segments"})
         return None
 
     probe_headers = dict(headers, Range="bytes=0-2047")
     if cookie:
         probe_headers["Cookie"] = cookie
+    ext = segment_extension(target)
     try:
         resp, body = _fetch(session, target, probe_headers, timeout, max_bytes=4096)
-        return bool(resp.ok and body)
-    except requests.RequestException:
+        ok = bool(resp.ok and body)
+        note = f"served as {ext}" if ext else ""
+        if ok and ext and ext not in (".ts", ".m4s", ".mp4", ".aac", ".m3u8"):
+            # Not a failure here -- it fetched fine. But it is exactly what
+            # makes FFmpeg refuse the stream later, so name it now.
+            note = (f"served as {ext} -- disguised segment, FFmpeg refuses "
+                    "these by extension")
+        record({"url": target, "status": resp.status_code, "note": note})
+        return ok
+    except requests.RequestException as exc:
+        record({"url": target, "error": str(exc),
+                "note": f"served as {ext}" if ext else ""})
         return None
 
 
