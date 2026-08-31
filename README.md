@@ -2,6 +2,8 @@
 
 > **🤖 AI Transparency Notice:** PVArr was designed, architected, and built by AI across multiple LLM sessions with a human in the loop. Google Gemini drew the initial architecture; Anthropic Claude has been the primary architect and maintainer since, and does the ongoing design, implementation, testing, and review. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint).
 
+**Pronounced *pee-vee-ARR*** — the "Arr" like a pirate. Not *pee-vee-ay-arr-arr*. This is not negotiable.
+
 **Default port:** 8999
 
 ---
