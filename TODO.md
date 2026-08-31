@@ -414,10 +414,10 @@ one before it.
         before it closes, keep retrying until the window ends (with backoff, so
         a dead origin is not hammered). With no window, exhausting the
         candidates ends the recording, as today.
-      - **Sponsor decision:** global backstop `PVARR_MAX_HOURS`, default **4**.
-        Flagged at decision time that 4h truncates NFL overtime and extra-innings
-        baseball -- the most likely things being recorded. Sponsor to confirm 4
-        vs 6, or a notify-instead-of-stop behaviour.
+      - **Sponsor decision:** global backstop `PVARR_MAX_HOURS`, default **6**.
+        4 was proposed and revised to 6 on the observation that 4h truncates NFL
+        overtime and extra-innings baseball -- the most likely things being
+        recorded. Per-recording limits override the backstop.
       - Timezone: the dashboard sends absolute timestamps and renders them back
         in local time, so the container's TZ (UTC, unset in compose) never
         matters. This holds only for one-shot windows.
