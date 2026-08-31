@@ -1,6 +1,6 @@
 # PVArr — Personal Video Recorder for the *arr Ecosystem
 
-> **🤖 AI Transparency Notice:** PVArr was designed, architected, and built by AI — Google Gemini (architecture) and Anthropic Claude (implementation) — across multiple LLM sessions with a human in the loop. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint).
+> **🤖 AI Transparency Notice:** PVArr was designed, architected, and built by AI across multiple LLM sessions with a human in the loop. Google Gemini drew the initial architecture; Anthropic Claude has been the primary architect and maintainer since, and does the ongoing design, implementation, testing, and review. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint).
 
 **Default port:** 8999
 
@@ -303,7 +303,7 @@ app/
 
 **Force Failover is greyed out, or returns "No backup stream to fail over to".** That session was started with a single URL. Failover moves to the *next* candidate, so with nothing to move to the request is refused rather than honoured — honouring it would end the recording. Add a backup URL when starting the recording.
 
-**Recordings stopped dead after roughly ten minutes (versions before 0.1.2).** FFmpeg's progress output filled its error pipe, which PVArr never drained; FFmpeg then blocked writing to it and stopped producing video, and the stall was not detected. Fixed — the pipe is drained continuously and the progress spam is switched off at the source. Upgrade if you are seeing this.
+**Recordings stopped dead after six to eight minutes (versions before 0.1.2).** FFmpeg's progress output filled its error pipe, which PVArr never drained; FFmpeg then blocked writing to it and stopped producing video, and the stall was not detected — so the recording simply ended early with no error. Measured on a live capture: FFmpeg writes ~184 bytes/sec to that 64KB pipe, and the pre-fix recorder stopped writing video at 7m45s. The exact point varies a little with stream bitrate. Fixed — the pipe is drained continuously and the progress output is switched off at the source. Upgrade if you are seeing this.
 
 **A dead stream was not failed over (versions before 0.1.2).** Freeze detection could not fire while the recorder was waiting on a full read buffer, so a source that went quiet without dropping the connection hung instead of failing over. Fixed.
 
@@ -400,7 +400,7 @@ git tag v1.0.1 && git push origin v1.0.1        # this is what builds the image
 
 ## AI Genesis & Environmental Footprint
 
-This program was written by machines. Gemini drew the architecture, Claude wrote the code, a human pointed and reviewed. Stated plainly, because the industry mostly doesn't.
+This program was written by machines. Gemini drew the first architecture; Claude has held the pen since — architecture, code, tests, and the audits that keep finding things wrong with all three — and a human points, decides, and reviews. Stated plainly, because the industry mostly doesn't.
 
 The Luddites are misremembered as people who hated machines. They were skilled workers who broke the specific machines being used to break them. The question was never *machines or no machines* — it was *whose hands are on them, and who eats*. Same question here. These models were trained on an enormous pile of other people's work. Nobody asked, nobody paid. That's a debt, and it has no payment address.
 

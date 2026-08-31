@@ -312,15 +312,32 @@
       has actually arrived. After the fix the same scenario failed over at
       ~12s (direct attempt, proxy retry, then the next candidate).
 
-- [x] **BUG FIX: every recording longer than ~9 minutes wedged
+- [x] **BUG FIX: every recording longer than ~8 minutes wedged
       (`recorder.py`).** FFmpeg was spawned with `stderr=subprocess.PIPE` and
-      that pipe was never read. FFmpeg writes a progress line to stderr at
-      about 124 bytes/sec (measured), the pipe holds 64KB, so it filled in
-      under ten minutes -- after which FFmpeg blocked writing to stderr and
+      that pipe was never read. FFmpeg writes a progress line to stderr, the
+      pipe holds 64KB, and once it filled FFmpeg blocked writing to stderr and
       stopped producing video entirely. Not a stream fault, and no failover
-      logic could have recovered from it. Demonstrated by shrinking the stderr
-      pipe to one page (4KB) to compress the timeline: output stopped dead at
-      t=46s and the read blocked forever.
+      logic could have recovered from it.
+
+      **Measurement, corrected.** The first estimate here (~124 B/s, "under ten
+      minutes") came from the wrong configuration -- `-c:v libx264` with stderr
+      redirected to a file, rather than the recorder's `-c copy` with stderr on
+      a pipe. Re-measured properly over 60s each:
+
+      | configuration | stderr rate | 64KB pipe fills in |
+      | --- | --- | --- |
+      | libx264, to file (the flawed original) | 68.6 B/s | 15.9 min |
+      | libx264, to pipe | 68.6 B/s | 15.9 min |
+      | `-c copy`, unthrottled | 51.5 B/s | 21.2 min |
+      | **`-c copy`, realtime (`-re`) -- the real case** | **184.1 B/s** | **5.9 min** |
+
+      File versus pipe makes no difference; realtime versus unthrottled makes a
+      large one, because the progress line is emitted on a wall-clock timer.
+
+      **Confirmed end to end, not extrapolated.** The pre-fix tree (`be14933`)
+      was checked out into a worktree and run against a realtime `-c copy`
+      source: video stopped at **t=465s (7m45s)** and never resumed. The same
+      test against the fixed tree ran past that point without a stall.
 
       Fixed twice over, deliberately: `-nostats -loglevel error -hide_banner`
       cuts the source of the spam (measured 3717 bytes -> **0 bytes** over 30s),
