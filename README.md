@@ -341,6 +341,8 @@ with the exact `chown` command to run. Set `PUID`/`PGID` rather than `user:`.
 
 **A dead stream was not failed over (versions before 0.1.2).** Freeze detection could not fire while the recorder was waiting on a full read buffer, so a source that went quiet without dropping the connection hung instead of failing over. Fixed.
 
+**Recordings left as raw `.ts` with no notification after a container restart (versions before 0.1.4).** Stopping the container killed the recorder thread mid-completion, so the remux to `.mp4`, the final rename and the Plex/Discord notification never ran. A stop now waits for in-flight recordings to finish that work — see `PVARR_SHUTDOWN_TIMEOUT`. Fixed.
+
 **FFmpeg not found.** Install it (`apt install ffmpeg`, `brew install ffmpeg`). The container already includes it.
 
 **Disk fills up.** Recordings are uncompressed TS and grow quickly — roughly 2.25 GB per hour at 5 Mbps. PVArr now aborts a recording when free space falls below `PVARR_MIN_FREE_GB` (default 5 GB) rather than filling the volume, keeping and post-processing whatever was captured; the session reports `aborted_no_space`. Still point `recordings/` at a large volume and prune on a schedule — the guard protects the host, it does not make room.
