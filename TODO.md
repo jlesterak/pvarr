@@ -791,3 +791,20 @@ Two more constraints, from Architect, that any implementation must respect:
   discontinuity at every switch. Invisible in a DVR file; it is exactly where a
   live client drops. Untested -- must be tried on icebox before promising 24/7.
 
+### Sponsor decisions on rebroadcast (2026-08-31)
+- **On-disk ring buffer confirmed.** In-memory fan-out rejected; the OOM risk
+  to concurrent recordings decided it.
+- **Persistence lands first.** Rebroadcast is blocked on Phase 13 items 2 and
+  3, because a permanent channel that vanishes on restart is not permanent.
+- **PVArr does not promise 24/7 recording.** So the PTS discontinuity at each
+  failover is low priority *as a live-streaming concern*. It stays open only
+  to the extent that it affects the recorded file -- see below.
+- [ ] **Check whether the failover discontinuity affects the finished file.**
+      Each failover spawns a fresh FFmpeg with its own timeline and appends to
+      the same .ts. The live-client drop is now explicitly out of scope, but
+      the same discontinuity sits in the middle of every multi-candidate
+      recording, where it could plausibly affect the remux to .mp4, seeking and
+      scrubbing in Plex, or the reported duration. That is an existing-recording
+      concern, not a rebroadcast one, so it is worth an hour to establish
+      empirically. Test locally, do not speculate.
+
