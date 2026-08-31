@@ -1461,3 +1461,28 @@ from the dev box's FFmpeg would have produced a confident, wrong fix.
 - [ ] Whether candidate 1 *records* for the sponsor now. This proves the
       mechanism against a synthetic origin of the same shape; it does not prove
       that particular provider stays up.
+
+## Release v0.2.3 (2026-08-31)  [COMPLETED]
+
+Patch. Sponsor-approved ("shipit"). One fix, but it reopens a whole path:
+
+- **The proxy fallback works again for streams that need no `Referer`.** The
+  channel mode was chosen from the referer, which decides nothing about whether
+  a URL is a playlist or a page to scrape. Any candidate without a Referer got
+  sent down the scrape path and came back `404 Channel not found or scrape
+  failed`. That is not a tuning issue — the fallback was non-functional for
+  that entire class of stream.
+- **Anti-leech segments (`.image`, `.png`, and friends) now record through the
+  fallback.** FFmpeg's option for this differs between builds and passing an
+  unknown one is fatal, so PVArr probes the binary and sends only what it
+  supports. Strict default kept on Direct Mode; `-protocol_whitelist` still
+  forbids `file://` on both paths.
+
+370 tests green at the tag. Nothing to do on upgrade beyond pulling the image.
+
+### Note for next time: the image is published twice
+`scripts/publish.sh` builds and pushes `:X.Y.Z` and `:latest` from whatever
+machine runs it, and *then* the `v*` tag makes CI build and push the same tags
+again. Same Dockerfile, so the same image — but only the CI build runs the test
+suite first, and only CI is reproducible. Worth switching the script to
+`--skip-docker` by default and letting the tag be the single publisher.
