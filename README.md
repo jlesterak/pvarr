@@ -16,6 +16,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 
 ## Features
 
+- **Rebroadcast without recording** — tick *Rebroadcast only* and PVArr serves the stream to Plex/Emby/Jellyfin as a live channel without keeping any of it. Failover, freeze detection and the guide entry all work exactly as they do for a recording; only the destination changes. Several clients watching one channel still cost a single upstream pull, so a session-gated stream is not re-fetched per viewer.
 - **Recordings survive a restart** — session state is written to `/config` on state changes only, so a `docker restart`, a Watchtower update or a host reboot no longer orphans an in-flight recording. On boot PVArr reattaches and keeps appending to the same file. A recording whose file has gone cold is finalised — remuxed and announced — rather than reconnected.
 - **A guide that says what is actually happening** — in Plex's channel guide, each programme is titled with the recording's name, sub-titled with the stream currently feeding it (`Primary`, `Backup 1`), and described with the file being written and how many backups are still in reserve. Press Info mid-game to see which feed you are on.
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
@@ -206,6 +207,8 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |
 | `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files; keep it below the compose `stop_grace_period` (30s) or Docker will `SIGKILL` first. |
 | `PVARR_MIN_FREE_GB` | `5` | Free space, in GB, below which an active recording aborts and a new one is refused. `0` disables the guard entirely — only sensible if the recordings volume is separate from the system disk. |
+| `PVARR_BUFFER_MB` | `71` | Size of a rebroadcast channel's buffer, per channel. Roughly 60 seconds at 10 Mbps — deep enough for a client to join late or stall briefly without a gap. It is a file, not memory, so the kernel reclaims it under pressure. |
+| `PVARR_BUFFER_DIR` | `<recordings>/.buffers` | Where rebroadcast buffers live. Each takes a steady ~1 MB/s of writes, so point it at an SSD if your library is on a spinning disk. Buffers are deleted when the channel stops. |
 | `DISCORD_WEBHOOK_URL` | unset | Discord webhook for notifications |
 | `TELEGRAM_BOT_TOKEN` | unset | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | unset | Telegram destination chat |
@@ -230,7 +233,7 @@ and mounts `./recordings` there.
 |---|---|---|
 | `GET` | `/` | Dashboard |
 | `POST` | `/api/probe` | Resolve a URL to a playlist and detect the headers it needs |
-| `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs). Returns `507` if the target volume is already below `PVARR_MIN_FREE_GB`. |
+| `POST` | `/api/recordings/start` | Start a recording (primary + backup URLs). Returns `507` if the target volume is already below `PVARR_MIN_FREE_GB`. Pass `rebroadcast=true` to serve the stream as a live channel without saving it; `channel_name` names it in the guide (defaults to the team names). |
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
 | `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
@@ -324,6 +327,10 @@ app/
 
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 
+**A rebroadcast channel is not in my library.** Correct — that is what rebroadcast means. Nothing is written to disk, the buffer is deleted when the channel stops, and the session shows a *Rebroadcast* badge on the dashboard rather than a filename. If you wanted the game kept, start it without ticking *Rebroadcast only*.
+
+**A viewer joining a rebroadcast channel starts from live, not the beginning.** Intended. The buffer holds about a minute, and replaying it would put every viewer a minute behind the event and further behind on every reconnect. A channel is live TV, not a recording.
+
 **The log says "Session persistence disabled: cannot use .../sessions".** The `config/` directory is not writable by the user PVArr runs as, so recordings will not survive a restart — everything else works normally. In Docker the entrypoint fixes this automatically; if you see it there, you have probably pinned `user:` in your compose file (use `PUID`/`PGID` instead). Running outside Docker, `sudo chown -R $(id -u):$(id -g) ./config`.
 
 **A recording came back as a shorter file after a restart.** It was resumed and appended to, which is expected — but if the container was down longer than `PVARR_MAX_RESUME_GAP` (default 5 minutes) PVArr finalises the recording instead of reconnecting, on the grounds that the event has moved on without it. Raise that value if your restarts are routinely slower.
@@ -374,7 +381,7 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-290 tests covering filename sanitisation and collision handling, storage
+323 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across

@@ -46,6 +46,7 @@ from app.tuner import (
 from app.notifications import NotificationManager
 from app.post_processor import remux_recording
 from app.cleanup import _shutdown_timeout
+from app.ringbuffer import RingBuffer
 from app.sessions import SessionStore, build_record, resume_decision
 from app.logging_config import configure_logging
 
@@ -345,6 +346,29 @@ async def probe_url(url: str = Form(...), referer: Optional[str] = Form(None)):
     return JSONResponse(content=result)
 
 
+def buffer_dir() -> Path:
+    """Where rebroadcast ring buffers live.
+
+    Under the recordings volume by default, in a dot-directory so it does not
+    show up as content. Overridable because a ring takes a steady ~1 MB/s of
+    writes per channel and an operator may want that off a spinning library
+    disk. Nothing here is kept: the file is deleted when the channel stops.
+    """
+    override = os.environ.get("PVARR_BUFFER_DIR")
+    return Path(override) if override else (RECORDINGS_DIR / ".buffers")
+
+
+def _default_channel_name(sport: str, team_a: str, team_b: str) -> str:
+    """A readable name for a rebroadcast channel in the Plex guide.
+
+    A rebroadcast writes no file, so there is no filename for the guide to
+    fall back on -- without this every channel would show as "Channel 1".
+    """
+    teams = " vs ".join(part for part in (team_a, team_b) if part and part.strip())
+    name = teams or (sport or "").strip()
+    return name or "PVArr Live"
+
+
 def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder:
     """Build a recorder from a session record, persist it, and start it.
 
@@ -354,6 +378,10 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
     """
     recording_id = record["id"]
     output_filepath = record["output_filepath"]
+
+    ring = None
+    if record.get("rebroadcast"):
+        ring = RingBuffer(output_filepath)
 
     def _on_complete(filepath):
         """Post-process first, announce second.
@@ -373,6 +401,16 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         persistence is unavailable there is nothing to resume from, so the
         remux still runs: better a finished file than an orphaned one.
         """
+        if ring is not None:
+            # A rebroadcast keeps nothing: there is no file to remux, no
+            # library entry to announce, and the ring is deleted outright.
+            # Leaving it would put 75 MB of footage nobody asked for on the
+            # volume, per channel, forever.
+            ring.close()
+            session_store.remove(recording_id)
+            logger.info("Rebroadcast channel %s stopped; buffer discarded.", recording_id)
+            return
+
         if recorder.stop_reason == "shutdown" and session_store.enabled:
             logger.info(
                 "Session %s interrupted by shutdown; keeping %s for resume.",
@@ -411,6 +449,8 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         on_failover_callback=_on_failover,
         header_overrides=record.get("header_overrides") or {},
         min_free_gb=record.get("min_free_gb", DEFAULT_MIN_FREE_GB),
+        ring=ring,
+        channel_name=record.get("channel_name") or None,
     )
     if record.get("started_at"):
         recorder.start_time = record["started_at"]
@@ -492,9 +532,17 @@ async def start_recording(
     url_backup1: Optional[str] = Form(None),
     url_backup2: Optional[str] = Form(None),
     freeze_timeout: int = Form(15),
-    stream_headers: Optional[str] = Form(None)
+    stream_headers: Optional[str] = Form(None),
+    rebroadcast: bool = Form(False),
+    channel_name: Optional[str] = Form(None),
 ):
-    """Create and start a new failover recording session."""
+    """Create and start a new failover recording session.
+
+    With `rebroadcast=true` nothing is kept: the stream is captured into a
+    bounded ring and served straight to Plex/Emby/Jellyfin as a live channel.
+    Failover, freeze detection and the guide entry all work exactly as they
+    do for a recording -- only the destination differs.
+    """
     candidates = [u for u in [url_primary, url_backup1, url_backup2] if u and u.strip()]
     if not candidates:
         raise HTTPException(status_code=400, detail="At least one candidate stream URL is required")
@@ -524,18 +572,31 @@ async def start_recording(
     resolved_output_dir = str(_resolve_library_dir(output_dir)) if output_dir else None
 
     recording_id = str(uuid.uuid4())[:8]
-    try:
-        output_path = storage.get_output_path(
-            sport=sport,
-            team_a=team_a,
-            team_b=team_b,
-            resolution=resolution,
-            custom_dir=resolved_output_dir,
-        )
-    except OSError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Could not prepare output directory: {exc}"
-        )
+    if rebroadcast:
+        # No recording path: the ring's backing file is the only thing that
+        # touches disk, and it is deleted when the channel stops. It still
+        # needs a real parent directory, because start_proxy() writes its
+        # channels.conf alongside the output path.
+        output_path = buffer_dir() / f"{recording_id}.buf"
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Could not prepare buffer directory: {exc}"
+            )
+    else:
+        try:
+            output_path = storage.get_output_path(
+                sport=sport,
+                team_a=team_a,
+                team_b=team_b,
+                resolution=resolution,
+                custom_dir=resolved_output_dir,
+            )
+        except OSError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Could not prepare output directory: {exc}"
+            )
 
     # Optional per-URL header overrides from the dashboard, keyed by URL:
     # {"https://.../x.m3u8": {"referer": "...", "user_agent": "...", "cookie": "..."}}
@@ -585,6 +646,9 @@ async def start_recording(
         header_overrides=header_overrides,
         freeze_timeout_sec=freeze_timeout,
         min_free_gb=min_free_gb,
+        rebroadcast=rebroadcast,
+        channel_name=(channel_name or "").strip()
+        or _default_channel_name(sport, team_a, team_b),
     )
     recorder = _launch_session(record, port)
 
@@ -711,6 +775,46 @@ async def stream_logs(recording_id: str):
 STREAM_IDLE_TIMEOUT_SEC = 300
 
 
+async def _tail_ring(recorder, recording_id: str):
+    """Serve a rebroadcast channel from its bounded ring.
+
+    Every viewer reads the same ring at their own absolute offset, so N clients
+    still cost exactly one upstream pull -- which is the whole point, since
+    re-fetching a session-gated stream per viewer is how an account gets
+    throttled.
+
+    A viewer always joins at the live edge. Replaying the buffer would put
+    every client a minute behind the event and further behind on every
+    reconnect, and this is a live channel, not a recording.
+
+    Nothing here can apply backpressure to the capture thread. A client that
+    stops reading is lapped and resynchronises; it never slows the stream down
+    for anyone else.
+    """
+    ring = recorder.ring
+    offset = ring.live_offset()
+    idle = 0.0
+    try:
+        while True:
+            chunk, offset = await asyncio.to_thread(ring.read, offset, 65536)
+            if chunk:
+                idle = 0.0
+                yield chunk
+                continue
+            if not recorder.is_running or ring.closed:
+                break
+            await asyncio.sleep(0.25)
+            idle += 0.25
+            if idle >= STREAM_IDLE_TIMEOUT_SEC:
+                logger.warning(
+                    "Rebroadcast stream %s idle for %ss; closing", recording_id, idle
+                )
+                break
+    except asyncio.CancelledError:
+        # Client hung up (Plex switching channels). Normal, not an error.
+        raise
+
+
 @app.get("/api/recordings/{recording_id}/stream")
 async def stream_recording(recording_id: str, live: bool = False):
     """Serve an in-progress recording as a continuous MPEG-TS feed.
@@ -727,6 +831,11 @@ async def stream_recording(recording_id: str, live: bool = False):
     recorder = active_recorders.get(recording_id)
     if not recorder:
         raise HTTPException(status_code=404, detail="Recording session not found")
+
+    if recorder.is_rebroadcast:
+        return StreamingResponse(
+            _tail_ring(recorder, recording_id), media_type="video/mp2t"
+        )
 
     path = Path(recorder.output_filepath)
 

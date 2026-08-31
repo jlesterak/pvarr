@@ -141,7 +141,15 @@
               <div class="space-y-1">
                 <div class="flex items-center space-x-3">
                   <span class="font-mono text-xs font-bold px-2 py-0.5 rounded bg-arr-blue/15 text-arr-accent border border-arr-blue/30" x-text="session.id"></span>
-                  <h3 class="text-base font-bold text-white truncate max-w-lg" x-text="session.output_filename"></h3>
+                  <div class="flex items-center space-x-2 min-w-0">
+                    <h3 class="text-base font-bold text-white truncate max-w-lg"
+                        x-text="session.is_rebroadcast ? session.channel_name : session.output_filename"></h3>
+                    <!-- Say plainly that nothing is being kept, so a channel is
+                         never mistaken for a recording that has gone missing. -->
+                    <span x-show="session.is_rebroadcast"
+                          class="shrink-0 px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wider bg-sky-500/10 text-sky-400 border border-sky-500/30"
+                          title="Streaming to your media server only — not saved to disk">Rebroadcast</span>
+                  </div>
                 </div>
                 <p class="text-xs text-slate-400 font-mono" x-text="session.output_file"></p>
               </div>
@@ -309,6 +317,28 @@
           </div>
         </div>
 
+        <!-- Rebroadcast: capture and serve to Plex without keeping anything.
+             Failover still applies; only the destination changes. -->
+        <div class="pt-2">
+          <label class="flex items-start space-x-3 cursor-pointer group">
+            <input type="checkbox" x-model="form.rebroadcast"
+                   class="mt-0.5 w-4 h-4 rounded border-slate-700 bg-slate-900 text-arr-blue focus:ring-arr-blue/40 cursor-pointer">
+            <span class="text-sm">
+              <span class="text-slate-200 group-hover:text-white transition">Rebroadcast only — don't save to disk</span>
+              <span class="block text-[11px] text-slate-500 mt-0.5">
+                Serve this as a live channel to Plex/Emby/Jellyfin without recording it.
+                Failover still works. Nothing is written to your library.
+              </span>
+            </span>
+          </label>
+          <div x-show="form.rebroadcast" x-transition class="mt-3">
+            <label class="block text-xs font-medium text-slate-400 mb-1">Channel Name (optional)</label>
+            <input type="text" x-model="form.channel_name"
+                   placeholder="Defaults to the team names above"
+                   class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white">
+          </div>
+        </div>
+
         <div class="space-y-3 pt-2">
           <div class="flex items-baseline justify-between">
             <label class="block text-xs font-bold text-arr-accent uppercase tracking-wider">Candidate Stream URLs (Up to 3)</label>
@@ -384,6 +414,8 @@
           team_b: 'RedSox',
           resolution: '1080p',
           freeze_timeout: 15,
+          rebroadcast: false,
+          channel_name: '',
           url_primary: '',
           url_backup1: '',
           url_backup2: ''

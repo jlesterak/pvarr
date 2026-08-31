@@ -195,6 +195,8 @@ def build_record(
     max_cycles: int = 3,
     min_free_gb: float = 5.0,
     resume_attempts: int = 0,
+    rebroadcast: bool = False,
+    channel_name: str = "",
 ) -> Dict[str, Any]:
     """The shape written to disk. Everything needed to rebuild the recorder.
 
@@ -213,6 +215,8 @@ def build_record(
         "max_cycles": int(max_cycles),
         "min_free_gb": float(min_free_gb),
         "resume_attempts": int(resume_attempts),
+        "rebroadcast": bool(rebroadcast),
+        "channel_name": str(channel_name or ""),
     }
 
 
@@ -235,6 +239,16 @@ def resume_decision(
     now = time.time() if now is None else now
     gap_limit = max_resume_gap() if gap_limit is None else gap_limit
     attempt_limit = max_resume_attempts() if attempt_limit is None else attempt_limit
+
+    if record.get("rebroadcast"):
+        # A channel keeps nothing, so there is no footage to weigh up and no
+        # gap that matters -- the buffer is deleted at shutdown by design.
+        # Bring it back: the sponsor left a channel running and expects it to
+        # be there. The attempt counter is deliberately not applied either;
+        # a channel whose upstream is genuinely dead ends itself through
+        # max_cycles and is removed that way, so there is no restart loop to
+        # guard against.
+        return "resume"
 
     path = Path(record.get("output_filepath", ""))
     try:

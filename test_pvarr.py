@@ -31,7 +31,7 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
-from app import sessions
+from app import ringbuffer, sessions
 from app.recorder import (
     CandidateStream,
     StreamFailoverRecorder,
@@ -928,6 +928,267 @@ class FailoverLoopTestCase(unittest.TestCase):
         from unittest.mock import patch
         with patch("app.recorder.time.sleep"):
             rec._recording_loop()
+
+
+class TestRebroadcastRecorder(unittest.TestCase):
+    """A channel captures like a recording but keeps nothing."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-rb-"))
+        self.ring = ringbuffer.RingBuffer(
+            self.tmp / "chan.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+
+    def tearDown(self):
+        self.ring.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, ring=None):
+        return StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(self.tmp / "unused.ts"),
+            ring=ring, channel_name="Bears vs Packers")
+
+    def test_a_recording_is_not_a_rebroadcast(self):
+        self.assertFalse(self.make().is_rebroadcast)
+
+    def test_a_ring_makes_it_a_rebroadcast(self):
+        self.assertTrue(self.make(self.ring).is_rebroadcast)
+
+    def test_bytes_go_to_the_ring_and_no_file_is_created(self):
+        rec = self.make(self.ring)
+        with rec._open_sink() as sink:
+            sink.write(b"payload")
+            sink.flush()
+        self.assertEqual(self.ring.read(0)[0], b"payload")
+        self.assertFalse((self.tmp / "unused.ts").exists())
+
+    def test_a_recording_still_writes_its_file(self):
+        rec = self.make()
+        with rec._open_sink() as sink:
+            sink.write(b"payload")
+        self.assertEqual((self.tmp / "unused.ts").read_bytes(), b"payload")
+
+    def test_filesize_is_zero_because_nothing_is_kept(self):
+        # The ring's backing file is a fixed size no matter how much has
+        # flowed through it; reporting it would show a constant "recording"
+        # that never grows.
+        rec = self.make(self.ring)
+        self.ring.write(b"x" * 5000)
+        self.assertEqual(rec.get_filesize_mb(), 0.0)
+
+    def test_status_says_it_is_a_rebroadcast_and_names_the_channel(self):
+        summary = self.make(self.ring).get_status_summary()
+        self.assertTrue(summary["is_rebroadcast"])
+        self.assertEqual(summary["channel_name"], "Bears vs Packers")
+        self.assertEqual(summary["output_filename"], "")
+
+    def test_guide_uses_the_channel_name_when_there_is_no_file(self):
+        summary = self.make(self.ring).get_status_summary()
+        summary["is_running"] = True
+        self.assertIn("Bears vs Packers", tuner.generate_m3u_playlist(
+            [summary], "http://h:8999"))
+
+    def test_guide_does_not_claim_to_be_recording(self):
+        # Saying "Recording to ..." on a channel that keeps nothing would be a
+        # promise PVArr is not making.
+        summary = self.make(self.ring).get_status_summary()
+        summary["is_running"] = True
+        xml = tuner.generate_xmltv_epg([summary])
+        self.assertIn("not being recorded", xml)
+        self.assertNotIn("Recording to", xml)
+
+
+class TestRebroadcastResumePolicy(unittest.TestCase):
+    """A channel is meant to be permanent; a recording is an event."""
+
+    def record(self, **over):
+        r = sessions.build_record(
+            recording_id="chan1", candidates=["http://a/1.m3u8"],
+            output_filepath="/nonexistent/chan1.buf", started_at=1000.0,
+            rebroadcast=True, channel_name="News")
+        r.update(over)
+        return r
+
+    def test_channel_resumes_even_though_its_buffer_is_gone(self):
+        # The buffer is deleted at shutdown by design, so the file check that
+        # governs recordings would discard every channel on every restart.
+        self.assertEqual(sessions.resume_decision(self.record()), "resume")
+
+    def test_channel_is_not_subject_to_the_attempt_limit(self):
+        # A channel whose upstream is genuinely dead ends itself via
+        # max_cycles, so there is no restart loop to guard against.
+        r = self.record(resume_attempts=99)
+        self.assertEqual(sessions.resume_decision(r), "resume")
+
+    def test_a_recording_with_no_file_is_still_discarded(self):
+        r = self.record(rebroadcast=False)
+        self.assertEqual(sessions.resume_decision(r), "discard")
+
+    def test_the_channel_name_is_persisted(self):
+        self.assertEqual(self.record()["channel_name"], "News")
+        self.assertTrue(self.record()["rebroadcast"])
+
+
+class TestRingBuffer(unittest.TestCase):
+    """The bounded buffer rebroadcast fans out from.
+
+    Correctness here is load-bearing: everything a viewer sees comes through
+    it, and a subtle wrap bug shows up as corrupted video rather than an error.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-ring-"))
+        self.path = self.tmp / "chan.buf"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def ring(self, capacity=None):
+        return ringbuffer.RingBuffer(self.path, capacity=capacity)
+
+    # -- shape ---------------------------------------------------------
+
+    def test_capacity_is_whole_packets(self):
+        r = self.ring(capacity=1000)
+        self.assertEqual(r.capacity % ringbuffer.TS_PACKET_SIZE, 0)
+        self.assertLessEqual(r.capacity, 1000)
+
+    def test_file_is_created_at_full_size(self):
+        # Readers pread anywhere; a short file would return b"" and look like
+        # a stalled stream rather than an empty ring.
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 10)
+        self.assertEqual(self.path.stat().st_size, r.capacity)
+
+    def test_file_never_grows(self):
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        for _ in range(50):
+            r.write(b"x" * cap)
+        self.assertEqual(self.path.stat().st_size, cap)
+
+    # -- reading -------------------------------------------------------
+
+    def test_roundtrip(self):
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        r.write(b"hello world")
+        data, offset = r.read(0)
+        self.assertEqual(data, b"hello world")
+        self.assertEqual(offset, 11)
+
+    def test_reader_that_is_current_gets_nothing_not_an_error(self):
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        r.write(b"abc")
+        _, offset = r.read(0)
+        self.assertEqual(r.read(offset), (b"", offset))
+
+    def test_a_keeping_up_reader_sees_every_byte_across_many_wraps(self):
+        # The real property: whatever went in comes out, in order, unchanged.
+        import random
+        rng = random.Random(1234)
+        cap = ringbuffer.TS_PACKET_SIZE * 50
+        r = self.ring(capacity=cap)
+        written = bytearray()
+        read = bytearray()
+        offset = 0
+        for _ in range(400):
+            chunk = bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 600)))
+            r.write(chunk)
+            written += chunk
+            while True:
+                data, offset = r.read(offset, max_bytes=4096)
+                if not data:
+                    break
+                read += data
+        self.assertEqual(bytes(read), bytes(written))
+
+    def test_writes_larger_than_the_ring_keep_the_tail(self):
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        payload = bytes(range(256)) * 100
+        r.write(payload)
+        data, _ = r.read(r.oldest_offset())
+        self.assertEqual(data, payload[-cap:])
+
+    # -- lapping -------------------------------------------------------
+
+    def test_a_lapped_reader_is_skipped_forward_not_fed_garbage(self):
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        r.write(b"A" * cap)          # reader is at 0 and still current
+        r.write(b"B" * cap * 3)      # now long gone
+        data, offset = r.read(0)
+        self.assertGreaterEqual(offset, r.oldest_offset())
+        self.assertNotIn(b"A", data)
+
+    def test_resync_lands_on_a_packet_boundary(self):
+        # Off-boundary on purpose: 7 is not a multiple of 188.
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        r.write(b"x" * (cap * 4 + 7))
+        _, offset = r.read(0)
+        self.assertEqual(offset % ringbuffer.TS_PACKET_SIZE, 0)
+
+    def test_alignment_survives_wrapping(self):
+        # offset % 188 is preserved across wraps only because capacity is a
+        # whole number of packets. This is the invariant the whole design
+        # rests on, so assert it directly.
+        cap = ringbuffer.TS_PACKET_SIZE * 7
+        r = self.ring(capacity=cap)
+        for _ in range(200):
+            r.write(b"y" * ringbuffer.TS_PACKET_SIZE)
+        self.assertEqual(r.live_offset() % ringbuffer.TS_PACKET_SIZE, 0)
+        self.assertEqual(r.oldest_offset() % ringbuffer.TS_PACKET_SIZE, 0)
+
+    def test_live_offset_joins_at_the_edge_not_the_history(self):
+        # Plex is tuning a live channel. Replaying the buffer would put every
+        # viewer a minute behind, and further behind on every reconnect.
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        r.write(b"z" * 5000)
+        self.assertGreater(r.live_offset(), 4000)
+        self.assertEqual(r.live_offset() % ringbuffer.TS_PACKET_SIZE, 0)
+        # It points at the START of the newest packet, so at most one
+        # part-arrived packet is still ahead of it -- never a backlog.
+        pending, _ = r.read(r.live_offset())
+        self.assertLess(len(pending), ringbuffer.TS_PACKET_SIZE)
+
+    # -- writer independence -------------------------------------------
+
+    def test_the_writer_never_blocks_on_a_stalled_reader(self):
+        # The capture thread must keep pace with the upstream stream no matter
+        # what a client does. This is why an unread ring overwrites instead of
+        # applying backpressure.
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        t0 = time.time()
+        for _ in range(2000):
+            r.write(b"q" * 512)
+        self.assertLess(time.time() - t0, 5.0)
+        self.assertEqual(r.write_offset, 2000 * 512)
+
+    # -- lifecycle -----------------------------------------------------
+
+    def test_close_removes_the_file(self):
+        # A rebroadcast buffer is not a recording; leaving it would fill the
+        # volume with footage nobody asked to keep.
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 10)
+        r.write(b"data")
+        r.close()
+        self.assertFalse(self.path.exists())
+
+    def test_operations_after_close_are_inert(self):
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 10)
+        r.close()
+        self.assertEqual(r.write(b"x"), 0)
+        self.assertEqual(r.read(0), (b"", 0))
+        r.close()  # idempotent
+
+    def test_capacity_from_environment(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_BUFFER_MB": "4"}):
+            self.assertEqual(ringbuffer.default_capacity(),
+                             4 * 1024 * 1024 // 188 * 188)
+        with patch.dict(os.environ, {"PVARR_BUFFER_MB": "nonsense"}):
+            self.assertEqual(ringbuffer.default_capacity(),
+                             ringbuffer.DEFAULT_CAPACITY_BYTES)
 
 
 class TestSessionStore(unittest.TestCase):
@@ -1840,6 +2101,8 @@ class TestHDHomeRunRoutes(ServerTestCase):
         from unittest.mock import MagicMock
         rec = MagicMock()
         rec.is_running = True
+        rec.is_rebroadcast = False
+        rec.ring = None
         rec.get_status_summary.return_value = {
             "id": rid, "output_filename": name, "is_running": True,
             "started_at": 1756000000.0,
@@ -1907,6 +2170,60 @@ class TestHDHomeRunRoutes(ServerTestCase):
         r = self.client.get("/device.xml")
         self.assertEqual(r.headers["content-type"], "application/xml")
         ET.fromstring(r.text)
+
+
+class TestRebroadcastRoutes(ServerTestCase):
+    """Starting a channel through the API."""
+
+    def start(self, **extra):
+        from unittest.mock import MagicMock, patch
+        data = {"url_primary": "https://example.com/live.m3u8",
+                "sport": "Sports", "team_a": "Bears", "team_b": "Packers"}
+        data.update(extra)
+        made = {}
+
+        def build(**kw):
+            rec = MagicMock()
+            rec.get_status_summary.return_value = {"id": "x", "is_running": True}
+            made.update(kw)
+            return rec
+
+        with patch.object(self.server, "StreamFailoverRecorder", side_effect=build), \
+             patch.object(self.server, "notifier", MagicMock()):
+            resp = self.client.post("/api/recordings/start", data=data)
+        return resp, made
+
+    def test_a_normal_start_gets_no_ring(self):
+        resp, made = self.start()
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(made.get("ring"))
+
+    def test_rebroadcast_start_gets_a_ring(self):
+        resp, made = self.start(rebroadcast="true")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNotNone(made.get("ring"))
+        made["ring"].close()
+
+    def test_rebroadcast_writes_no_recording_file(self):
+        # The output path must not land in the library tree.
+        resp, made = self.start(rebroadcast="true")
+        self.assertNotIn(str(self.server.RECORDINGS_DIR / "Sports"),
+                         made["output_filepath"])
+        made["ring"].close()
+
+    def test_channel_name_defaults_to_the_teams(self):
+        resp, made = self.start(rebroadcast="true")
+        self.assertEqual(made.get("channel_name"), "Bears vs Packers")
+        made["ring"].close()
+
+    def test_explicit_channel_name_wins(self):
+        resp, made = self.start(rebroadcast="true", channel_name="RedZone")
+        self.assertEqual(made.get("channel_name"), "RedZone")
+        made["ring"].close()
+
+    def test_url_scheme_is_still_validated_for_a_channel(self):
+        resp, _ = self.start(rebroadcast="true", url_primary="file:///etc/passwd")
+        self.assertEqual(resp.status_code, 400)
 
 
 class TestRecordingRoutes(ServerTestCase):
@@ -2320,6 +2637,11 @@ class TestTunerStream(ServerTestCase):
         rec = MagicMock()
         rec.output_filepath = path
         rec.is_running = running
+        # Explicit: on a MagicMock every attribute is truthy, so without this
+        # the endpoint takes the rebroadcast branch and tails a ring that does
+        # not exist.
+        rec.is_rebroadcast = False
+        rec.ring = None
         return rec
 
     def test_unknown_session_404s(self):
@@ -2346,6 +2668,8 @@ class TestTunerStream(ServerTestCase):
         rec = MagicMock()
         rec.output_filepath = Path(self.tmp) / "never-written.ts"
         rec.is_running = False
+        rec.is_rebroadcast = False
+        rec.ring = None
         self.server.active_recorders["abc"] = rec
         self.assertEqual(
             self.client.get("/api/recordings/abc/stream").status_code, 404

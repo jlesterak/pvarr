@@ -892,3 +892,82 @@ and compose file.
 Item 4 (recording windows, `PVARR_MAX_HOURS=6`) is still pending. Rebroadcast is
 now unblocked.
 
+## Phase 16b -- Rebroadcast without recording (2026-08-31)
+
+humantodo line 3, built after the sponsor confirmed the on-disk buffer and
+after persistence landed.
+
+### What was built
+`app/ringbuffer.py` -- a fixed-size file written in a circle, with many
+independent readers. `StreamFailoverRecorder` gained a *sink*: bytes go either
+to a growing file (recording) or to a ring (rebroadcast). The capture loop, the
+cycling failover, the backoff and the freeze detection are untouched and shared
+between both modes, which was the whole point of the sink approach -- there is
+no second copy of the loop this project has spent its history debugging.
+
+### Why a file and not memory
+Settled by DevOps' number and confirmed by the sponsor. At 10 Mbps a client
+that connects and stops reading accumulates ~75 MB/min; there is no `mem_limit`
+in `docker-compose.yml`, so the OOM killer takes uvicorn (PID 1) and every
+concurrent *recording* dies with it -- about 27 minutes from one wedged Plex
+client to losing the game. The same 75 MB as a file is page cache: reclaimed
+under pressure, and served from RAM anyway.
+
+### Why written in place, not rotated
+Architect's objection, and it holds. Log-style rotation truncates or renames
+the file out from under a reader holding an open fd, which hands it zero-fill
+in the middle of a transport stream. A fixed file written in a circle never
+changes size, so a reader's descriptor stays valid for the life of the channel.
+
+### Packet alignment
+MPEG-TS is 188-byte packets and a decoder starting mid-packet produces garbage
+until it resynchronises. Capacity is forced to a whole number of packets and
+positions derive from a monotonic absolute offset, so `offset % 188` survives
+every wrap. A lapped reader is skipped forward to the oldest data still held,
+rounded UP to a packet boundary -- rounding down would point at bytes already
+overwritten. There is a test asserting exactly this.
+
+### Decisions worth keeping
+- **Viewers join at the live edge, never at the start of the buffer.** Plex is
+  tuning a live channel; replaying a minute of history would put every viewer a
+  minute behind and further behind on every reconnect.
+- **The writer never blocks on a reader.** A stalled client is lapped and
+  resynchronises. Backpressure from a viewer to the capture thread would let
+  one bad client stall the upstream pull for everyone.
+- **A channel always resumes after a restart, ignoring the file check and the
+  attempt limit.** Its buffer is deleted at shutdown by design, so the
+  recording rules would discard every channel on every restart. There is no
+  restart-loop risk: a channel whose upstream is genuinely dead ends itself
+  through `max_cycles` and is removed that way.
+- **The guide says "Live rebroadcast -- not being recorded".** Saying
+  "Recording to ..." on a channel that keeps nothing would be a promise PVArr
+  is not making.
+
+### Verified end to end
+Real recorder, real subprocess, real ring, real uvicorn on a real socket, three
+concurrent HTTP viewers:
+- **3/3 viewers served, 1 upstream pull.** This is the claim that matters --
+  re-fetching a session-gated stream per viewer is how an account gets
+  throttled.
+- All three landed at the live edge (counters 167-178) with ordered, valid data.
+- `recordings/` empty, library empty, `output_filename` empty.
+- Buffer deleted on stop; session record forgotten.
+
+Note: the FastAPI `TestClient` cannot serve three simultaneous streaming reads
+from threads -- it drives ASGI through a single portal -- so the fan-out half of
+that test runs against a real uvicorn. Worth remembering before concluding a
+streaming endpoint is broken.
+
+323 tests (was 305).
+
+### Still open
+- [ ] The failover PTS discontinuity is where a live client drops. Out of scope
+      for recordings (measured: the finished .mp4 is fine) but it DOES apply to
+      a rebroadcast viewer. Untested against a real player. PVArr does not
+      promise 24/7, so this stays low -- but it is the first thing to look at
+      if the sponsor reports Plex dropping a channel at a failover.
+- [ ] No cap on concurrent channels or on viewers per channel. Each viewer read
+      goes through `asyncio.to_thread` onto the default executor
+      (`min(32, cpu+4)` workers).
+- [ ] The healthcheck still cannot see a wedged channel.
+

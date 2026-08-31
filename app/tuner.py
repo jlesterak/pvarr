@@ -38,7 +38,11 @@ def _channel_title(session: Dict[str, Any], index: int) -> str:
     that finished remuxing while still advertised would otherwise have shown up
     in the guide as "Bears vs Packers.mp4".
     """
-    name = session.get("output_filename") or f"Channel {index}"
+    # A rebroadcast writes no file, so there is no filename to derive a name
+    # from -- it carries an explicit channel name instead.
+    name = (session.get("channel_name")
+            or session.get("output_filename")
+            or f"Channel {index}")
     stem, ext = os.path.splitext(name)
     return stem if ext.lower() in RECORDING_EXTENSIONS else name
 
@@ -72,7 +76,11 @@ def _programme_description(session: Dict[str, Any], index: int) -> str:
     """
     parts = []
     filename = session.get("output_filename")
-    if filename:
+    if session.get("is_rebroadcast"):
+        # Say so plainly. "Recording to ..." on a channel that keeps nothing
+        # would be a promise PVArr is not making.
+        parts.append("Live rebroadcast — not being recorded")
+    elif filename:
         parts.append(f"Recording to {filename}")
 
     source = _source_name(session)

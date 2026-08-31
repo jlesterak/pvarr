@@ -98,6 +98,32 @@ class StreamOutcome(str, Enum):
     INTERRUPTED = "interrupted"  # delivered data, then stalled or exited non-zero
 
 
+class _RingSink:
+    """Adapts a RingBuffer to the file-like write/flush the capture loop uses.
+
+    The capture loop is the most-debugged code in this project. Rebroadcast
+    changes only where the bytes land, so it presents the same tiny interface
+    the loop already writes to rather than forking the loop.
+    """
+
+    def __init__(self, ring):
+        self.ring = ring
+
+    def write(self, data: bytes) -> int:
+        return self.ring.write(data)
+
+    def flush(self) -> None:
+        # The ring is positional writes to an already-sized file; there is no
+        # userspace buffer to push.
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class CandidateStream:
     def __init__(self, url: str, name: str = "Stream"):
         self.url = url.strip()
@@ -168,6 +194,8 @@ class StreamFailoverRecorder:
         candidates: List[str],
         output_filepath: str,
         base_port: int = 8090,
+        ring=None,
+        channel_name: Optional[str] = None,
         freeze_timeout_sec: int = 15,
         log_callback: Optional[Callable[[str], None]] = None,
         on_completion_callback: Optional[Callable[[str], None]] = None,
@@ -199,6 +227,12 @@ class StreamFailoverRecorder:
         # .ts is deleted at that point, so size/name lookups must follow here.
         self.final_filepath: Optional[Path] = None
         self.base_port = base_port
+        # Rebroadcast: bytes go to a bounded ring instead of a growing file,
+        # and nothing is kept. None means this is an ordinary recording.
+        self.ring = ring
+        # What Plex should call this channel. A rebroadcast writes no file, so
+        # there is no filename for the guide to fall back on.
+        self.channel_name = channel_name
         self.freeze_timeout_sec = freeze_timeout_sec
         self.log_callback = log_callback
         self.on_completion_callback = on_completion_callback
@@ -731,7 +765,7 @@ class StreamFailoverRecorder:
         written_for_this_session = 0
         last_write_time = time.time()
 
-        with open(self.output_filepath, "ab") as out_f:
+        with self._open_sink() as out_f:
             self._ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
@@ -828,6 +862,22 @@ class StreamFailoverRecorder:
             if written_for_this_session > 0
             else StreamOutcome.FAILED
         )
+
+    @property
+    def is_rebroadcast(self) -> bool:
+        """True when this session streams without keeping anything."""
+        return self.ring is not None
+
+    def _open_sink(self):
+        """Where captured bytes go: a growing file, or a bounded ring.
+
+        Append mode for a recording is what makes failover invisible -- every
+        attempt continues the same file. The ring is the same idea with a
+        ceiling.
+        """
+        if self.ring is not None:
+            return _RingSink(self.ring)
+        return open(self.output_filepath, "ab")
 
     def _drain_stderr(self, proc: subprocess.Popen) -> "collections.deque":
         """Continuously drain FFmpeg's stderr, keeping only the tail.
@@ -1023,6 +1073,11 @@ class StreamFailoverRecorder:
         return self.final_filepath or self.output_filepath
 
     def get_filesize_mb(self) -> float:
+        # A rebroadcast keeps nothing. The ring's backing file is a fixed size
+        # regardless of how much has flowed through it, so reporting it here
+        # would show a constant 75 MB "recording" that never grows.
+        if self.is_rebroadcast:
+            return 0.0
         target = self.current_filepath
         if target.exists():
             return round(target.stat().st_size / (1024 * 1024), 2)
@@ -1033,8 +1088,11 @@ class StreamFailoverRecorder:
             "id": self.recording_id,
             "status": self.status,
             "is_running": self.is_running,
-            "output_file": str(self.current_filepath),
-            "output_filename": self.current_filepath.name,
+            "output_file": "" if self.is_rebroadcast else str(self.current_filepath),
+            "output_filename": "" if self.is_rebroadcast else self.current_filepath.name,
+            # The guide falls back to this when there is no filename.
+            "channel_name": self.channel_name or "",
+            "is_rebroadcast": self.is_rebroadcast,
             "filesize_mb": self.get_filesize_mb(),
             "bytes_written": self.bytes_written,
             "elapsed_seconds": self.get_elapsed_seconds(),
