@@ -1641,3 +1641,40 @@ the operator's own input from them. It is an API contract decision rather than
 a bug fix, so it is recorded here rather than made quietly. Note that PVArr has
 no authentication at all, so port 8999 is trusted-LAN-only either way -- which
 is the real reason this one is not urgent.
+
+## Release v0.3.0 (2026-08-31)  [COMPLETED]
+
+Minor, not patch: recording windows are new capability, and the API grew two
+optional fields. Backward compatible -- every existing call, compose file and
+mount works unchanged. Sponsor-approved ("ship it").
+
+**What a user gets that they did not have before:**
+- **Recording windows.** *Stop After (min)* on the new-recording form, or
+  `duration_minutes` / `end_time` on `POST /api/recordings/start`. The
+  recording stops cleanly at the deadline and post-processes normally, and the
+  card shows the time remaining.
+- **A 6-hour backstop** (`PVARR_MAX_HOURS`) for recordings given no length,
+  because a capture pointed at a 24/7 channel never ends by itself. Live
+  rebroadcast channels are exempt.
+- **Stream tokens no longer leave the box.** Every "recording started"
+  notification had been shipping the fully tokenised primary URL to Discord and
+  Telegram; a failed Plex or Emby refresh had been printing its token to
+  stdout. Both fixed, plus redaction of every recorder log line.
+- **The proxy's `channels.conf` can no longer outlive its session**, so a
+  tokenised URL is not left on the recordings share by a failed fallback.
+
+**On upgrade:** nothing to do. Pull and restart.
+
+  - One behaviour change worth knowing: a recording started with no duration
+    now stops after 6 hours where previously it ran until the disk guard or the
+    stream ended. Set a duration per recording, raise `PVARR_MAX_HOURS`, or set
+    it to `0` to restore the old behaviour.
+
+408 tests green at the tag.
+
+### Shipped without the icebox pass
+The sponsor chose to ship before field-testing the three checks recommended
+above (candidate 1 recording, a short duration stopping on time, a rebroadcast
+channel unaffected by the cap). Recorded because if any of them misbehaves,
+this is the release to look at -- and the 6-hour default is the change most
+likely to surprise, since it alters what an existing untouched workflow does.
