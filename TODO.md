@@ -2243,12 +2243,99 @@ Sponsor-approved ("sheeeep eeeetttt").
   the session Cookie as the next step, instead of looping the operator between
   an expired DevTools m3u8 and a page with no m3u8 in it.
 
-**On upgrade:** nothing to do. Pull and restart. The image grows ~2 MB
-(apprise). Notifications keep working unchanged.
+**On upgrade:** nothing to do. Pull and restart. Notifications keep working
+unchanged. The image grows 20 MB (1.11 GB -> 1.13 GB), all of it comskip and
+its `libav*` dependencies -- measured, not estimated. The "333 KB" quoted to
+the sponsor when comskip was approved was the binary alone and was wrong.
 
 500 tests green at the tag.
 
 ### What this does not fix
-Streams fronted by `strmd.st`. That infrastructure returns an identical 403 to
-every client either of us can produce -- including a real browser -- and to its
-own front page. No release fixes that; the remaining lever is VPN egress (#7).
+Streams fronted by `strmd.st`. **This verdict was wrong -- see Phase 18.**
+
+## Phase 18 — Why `strmd.st` streams were unrecordable (2026-09-01)  [PENDING]
+
+Sponsor field-tested a set of sites. Every one resolved to one of two
+upstreams: `edgestream*.pro` (already works) or `strmd.st` (did not). Five
+front-end domains, two actual providers. **No provider domain belongs in the
+code** -- sponsor's explicit instruction, and correct: those front-ends are
+disposable and rotate.
+
+### My earlier verdict was wrong
+v0.5.0 recorded that `strmd.st` "returns an identical 403 to every client
+including a real browser". That was measured by *pasting the URL into a
+browser*, which sends no Referer, no Origin, and none of the context the
+embedded player has. It was never a test of the request the player makes.
+I then repeated the conclusion for several sessions without rechecking it.
+
+### What is actually happening, proven from the sponsor's machine
+Firefox plays the stream. `curl` on the same machine, same second, same IP,
+replaying Firefox's own exported request header-for-header, gets 403. The
+`If-None-Match` value differed on every capture while the URL stayed the same,
+which proves the token is neither single-use nor expiring -- the browser
+re-fetches that exact URL continuously and succeeds.
+
+That leaves only the TLS handshake. Confirmed with `curl_cffi`:
+
+| impersonation | playlist |
+|---|---|
+| `firefox135` | 403 |
+| `firefox133` | 403 |
+| `chrome`     | **200, 1177 bytes** |
+| `safari17_0` | 403 |
+
+1177 bytes matches the length in the browser's own ETag exactly. They appear to
+allowlist known-good fingerprints rather than block bad ones -- the sponsor's
+real browser is Firefox, and the Firefox profiles are refused.
+
+### Two gates, not one -- and they are different gates
+- **Playlist** (`lb7.strmd.st`): needs a Chrome TLS fingerprint **and**
+  `Referer`/`Origin`. This is the part FFmpeg cannot do; OpenSSL has one
+  fingerprint and no way to forge another.
+- **Segments** (`data.ossiketola.workers.dev` -- a Cloudflare Worker, a
+  different host from the playlist): need **only** `Referer`/`Origin`.
+  `plain, headers` returned 200 and 5.8 MB. No fingerprint needed.
+
+Measured, all four combinations:
+
+| | segment |
+|---|---|
+| chrome + headers | 200, 5838528 bytes |
+| chrome, no Referer | 403 |
+| plain + headers | **200, 5838528 bytes** |
+| plain, no Referer | 403 |
+
+### Consequence for the design
+The relay only has to carry the **playlist**, not the video. ~1.2 KB every 6s
+(~200 B/s), no measurable CPU, and the video path is unchanged -- FFmpeg still
+pulls segments straight from the CDN. Segment URLs are absolute and on another
+host, so no playlist rewriting is needed. No `#EXT-X-KEY`, so no key fetch.
+
+Live rolling playlist (`#EXT-X-MEDIA-SEQUENCE`, no `#EXT-X-ENDLIST`) with a
+3-segment / ~18s window, so the relay must keep serving fresh copies for the
+life of the recording. Falling 18s behind loses video.
+
+### The Referer is the iframe origin, not the page
+`Referer: https://embed.st/` -- the player lives in an iframe on a third
+domain, and the CDN wants *that* origin, not the page the operator pasted.
+Deriving Referer from the pasted URL sends the wrong value and still 403s.
+The generic fix is to follow the `<iframe src>` chain while scraping and use
+the origin of the document that actually yielded the playlist. Discovered per
+stream, so it survives any domain rotation.
+
+### Also found: path-embedded tokens defeat our redaction
+`/secure/PDWbrz.../rtmp/stream/nyU-.../playlist.m3u8` carries the credential in
+the **path**. `redact_url_secrets()` strips the query string and keeps the path,
+so a URL of this shape still reaches Discord/Telegram with the token intact.
+Same leak class as the one fixed in 0.4.0, different URL shape. Fix generically,
+not by matching this layout.
+
+### Not yet built -- needs sponsor go-ahead
+New loopback listener + change to the recorder's core path. Escalation
+required per Directive 3.
+
+### Still unexplained
+`tnt-usa.biz` serves different JavaScript when DevTools is open (a `debugger;`
+trap plus "Incorrect contents fetched, please reload"), so no m3u8 was ever
+captured. `chrome://net-export/` is the way around it -- untested so far.
+Unknown whether it is a third upstream or a repaint of these two.
