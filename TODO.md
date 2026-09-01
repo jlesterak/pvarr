@@ -2339,3 +2339,56 @@ required per Directive 3.
 trap plus "Incorrect contents fetched, please reload"), so no m3u8 was ever
 captured. `chrome://net-export/` is the way around it -- untested so far.
 Unknown whether it is a third upstream or a repaint of these two.
+
+### Resolved: `tnt-usa.biz` is not a third upstream (2026-09-01)
+Chased from a plain HTTP client on the sponsor's own machine, no browser
+involved. Four hops:
+
+1. `tnt-usa.biz/Tnt-42/Em1/604.html` — `<iframe src>` in the HTML
+2. `embedhd.st/source/fetch.php?hd=604` — sets `window.fid="mchicagocubs"`,
+   loads an external script
+3. `exposestrat.com/maestrohd1.js` — `document.write`s the next iframe,
+   interpolating `fid`. **Not in any HTML**, which is why scraping found
+   nothing.
+4. `exposestrat.com/maestrohd1.php?player=desktop&live=<fid>` — the player.
+   The playlist URL is a per-character array joined at runtime:
+   `["h","t","t","p","s",...].join("")`
+
+Result: `cdn13.zohanayaan.com:1686` — the **same provider** already seen at
+`cdn11`. Two upstreams total across everything tested, not three.
+
+Also confirms the sponsor's DevTools problem: the player times a `debugger;`
+statement with `performance.now()` every 200ms and wipes the document when it
+trips. Nothing to work around in PVArr -- we never run their JS.
+
+### The Referer must be the innermost document, measured
+Against the extracted `zohanayaan` playlist:
+
+| Referer sent | result |
+|---|---|
+| `exposestrat.com` (the document containing the URL) | **200** |
+| `embedhd.st` (intermediate iframe) | 403 |
+| `tnt-usa.biz` (the page the operator pastes) | 403 |
+| none | 403 |
+
+Only the origin of the document that actually yielded the playlist works.
+Intermediate hops are refused. This is the rule to implement.
+
+### Corrected gate matrix -- the two providers differ
+| | playlist | segments |
+|---|---|---|
+| `zohanayaan` | Referer only | **nothing at all** (200 bare) |
+| `strmd.st` | Chrome TLS fingerprint + Referer | Referer only |
+
+`zohanayaan` needs **no relay**: FFmpeg can fetch the playlist itself given
+`-headers 'Referer: ...'`. Only `strmd.st`'s playlist needs the fingerprint,
+and only that one justifies the loopback relay. Build the resolver first; the
+relay is a smaller, separable second step that need not block it.
+
+Segment window is ~72s here (15 x ~4.8s) vs ~18s on `strmd.st`.
+
+### What the resolver has to handle
+Beyond `<iframe src>`: scripts that `document.write` an iframe using a variable
+set by the parent (`window.fid`), and character-array-joined URLs. All three
+are generic obfuscations, not site-specific, and all three are resolvable
+without executing JavaScript. No headless browser needed for this chain.
