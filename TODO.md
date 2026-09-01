@@ -2021,3 +2021,41 @@ Runs after the remux, off the capture path entirely. ~20-40 min of CPU for a
 - **FlareSolverr**, narrowed: Cloudflare cookies only, since the m3u8 is not in
   the DOM. Worth it only if a provider turns out to be Cloudflare-gated *and*
   yt-dlp cannot resolve it.
+
+## Release v0.4.0 (2026-08-31)  [COMPLETED]
+
+Minor: new capability and two new Python dependencies, backward compatible.
+Sponsor-approved ("ship it").
+
+**What a user gets that they did not have before:**
+- **yt-dlp resolution.** PVArr can now resolve a page whose player fetches its
+  manifest over XHR -- the case its own scraper structurally cannot see,
+  because the m3u8 never enters the HTML. Extractors for thousands of sites,
+  plus a real browser TLS fingerprint via `curl_cffi`.
+- **The probe says what it tried.** "Show what PVArr tried" under a failed
+  probe lists every header combination, its status, the segment fetch and its
+  extension, with a Copy trace button. Query strings stripped, so it is safe
+  to paste into a bug report.
+- **It stops blaming headers for things that are not headers.** A host that
+  refuses its own front page is named as such; a rejected access token is named
+  as such, with the advice to paste the page URL instead of hunting DevTools
+  for a header that does not exist.
+- **Recording windows and a 6-hour backstop** (from v0.3.x work carried here in
+  full).
+- **Stream tokens no longer reach logs or notifications.**
+- **Buccaneers vs Raiders** as the example fixture.
+
+**On upgrade:** nothing to do. Pull and restart.
+
+  - The image grows ~16 MB (yt-dlp + curl_cffi).
+  - Unchanged from v0.3.0: a recording started with no duration stops after
+    6 hours. Set a duration, raise `PVARR_MAX_HOURS`, or set it to `0`.
+
+452 tests green at the tag.
+
+### Known limitation shipped knowingly
+The sponsor's five failing providers are not fixed by this. yt-dlp may resolve
+some of them -- that is the test to run -- but for a provider it has no
+extractor for, whose manifest is XHR-only, the remaining answer is real
+request interception in a browser, which is not built. What v0.4.0 guarantees
+is an accurate diagnosis instead of a misleading one.
