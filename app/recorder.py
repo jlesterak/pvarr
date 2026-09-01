@@ -23,6 +23,7 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 
 from app.check_deps import find_executable
 from app.logging_config import redact_url_secrets
+from app import ytdlp
 from app.probe import DEFAULT_USER_AGENT, probe_stream
 
 logger = logging.getLogger("PVArrRecorder")
@@ -463,14 +464,22 @@ class StreamFailoverRecorder:
         dashboard found when the recording was created: playlist URLs carry
         short-lived tokens, and a failover an hour in needs a fresh answer.
 
-        Order is in-process probe, then the external detect-headers script, then
-        the URL as given. The probe handles the ordinary cases with no extra
-        install; the script is worth keeping for pages that only assemble their
-        m3u8 in JavaScript, which needs a real browser.
+        Order is cheapest-first: the in-process probe, then yt-dlp, then the
+        external detect-headers script, then the URL as given.
+
+        The probe handles the ordinary cases with no extra install. yt-dlp is
+        next because it is the one that resolves a page whose player fetches
+        its manifest over XHR -- the URL never enters the document, so no
+        amount of HTML scraping will find it -- and because it can impersonate
+        a browser's TLS fingerprint, which is what gets past an origin that
+        refuses every plain HTTP client identically.
         """
         candidate.slug = candidate.slug or f"cand_{self.current_candidate_index}"
 
         if self.auto_probe and self._probe_candidate(candidate):
+            return True
+
+        if self._resolve_via_ytdlp(candidate):
             return True
 
         if self._detect_via_script(candidate):
@@ -514,6 +523,45 @@ class StreamFailoverRecorder:
             f"Probe resolved {candidate.name}: {result.get('kind', 'playlist')}, "
             f"headers {', '.join(required)}."
         )
+        return True
+
+    def _resolve_via_ytdlp(self, candidate: CandidateStream) -> bool:
+        """Ask yt-dlp to resolve the candidate. False so the caller falls through.
+
+        Absent yt-dlp is normal, not an error: it is an optional dependency and
+        the probe already handles most streams without it.
+        """
+        if not ytdlp.ytdlp_path():
+            return False
+        # Skip it when the operator pasted a playlist directly. The probe has
+        # already tried that exact URL with every header combination it knows,
+        # and yt-dlp's generic extractor would do strictly less -- so this
+        # would be up to 45 seconds of stall, on the failover path, to learn
+        # nothing. yt-dlp earns its place on *page* URLs, where the manifest is
+        # fetched over XHR and there is nothing in the HTML to find.
+        if ".m3u8" in urlsplit(candidate.url).path.lower():
+            return False
+        self._log(f"Asking yt-dlp to resolve {candidate.name}...")
+        try:
+            found = ytdlp.resolve(candidate.url)
+        except Exception as exc:  # a resolver must never kill a recording
+            self._log(f"yt-dlp error for {candidate.name}: {exc}", "WARN")
+            return False
+        if not found:
+            self._log(f"yt-dlp found nothing playable for {candidate.name}.", "WARN")
+            return False
+
+        candidate.m3u8_url = found["m3u8_url"]
+        # Only overwrite what yt-dlp actually supplied. An operator's manually
+        # entered Referer outranks a blank one from the extractor.
+        for field in ("referer", "user_agent", "cookie"):
+            if found.get(field):
+                setattr(candidate, field, found[field])
+        candidate.detected = True
+        candidate.detect_source = "yt-dlp"
+        extractor = found.get("extractor") or "generic"
+        candidate.detect_note = f"Resolved by yt-dlp ({extractor})."
+        self._log(f"yt-dlp resolved {candidate.name} via the {extractor} extractor.")
         return True
 
     def _detect_via_script(self, candidate: CandidateStream) -> bool:

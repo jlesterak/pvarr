@@ -46,7 +46,11 @@ def find_executable(name: str, alt_names: list = None) -> str:
 # Why each optional tool matters, so a WARN line says what is actually lost.
 OPTIONAL_NOTES = {
     "hls-proxy": "no bridge for streams needing continuous token refresh",
-    "detect-headers": "built-in probe covers everything but JS-built URLs",
+    # This used to claim the probe "covers everything but JS-built URLs", which
+    # read as though detect-headers covered those. It does not: the shipped
+    # version is the shell one, which is curl following iframes.
+    "detect-headers": "one fewer route for pages that hide their m3u8 behind redirects",
+    "yt-dlp": "no way to resolve a page whose player fetches its manifest over XHR",
 }
 
 
@@ -64,6 +68,7 @@ def check_dependencies(verbose: bool = True) -> dict:
     optional = {
         "hls-proxy":      find_executable("hls-proxy.py",         ["hls-proxy"]),
         "detect-headers": find_executable("detect-headers-py.py", ["detect-headers.sh", "detect-headers"]),
+        "yt-dlp":         find_executable("yt-dlp"),
     }
 
     all_required_ok = all(v for v in required.values())

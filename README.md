@@ -84,9 +84,10 @@ Rolling back is then a one-line edit. Unset it to follow `latest` again.
 
 - **FFmpeg** — required. Does the actual recording.
 - **Python 3.8+** and the packages in `requirements.txt` (FastAPI, uvicorn, requests, jinja2).
-- **[hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy)** — *optional*. Two fallbacks live here. `hls-proxy` bridges a stream when a direct FFmpeg connection fails despite correct headers, usually because the token needs continuous refreshing. `detect-headers` drives a real browser, and is tried only when PVArr's own probe cannot find the m3u8 — pages that build their URL in JavaScript.
+- **yt-dlp** + **curl_cffi** — installed from `requirements.txt`, ~16 MB together. Resolves pages whose player fetches its manifest over XHR, which PVArr's own scraper cannot see, and lets it present a real browser's TLS fingerprint. Optional at runtime: if `yt-dlp` is not on `PATH`, that step is skipped and everything else works.
+- **[hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy)** — *optional*. Two fallbacks live here. `hls-proxy` bridges a stream when a direct FFmpeg connection fails despite correct headers, usually because the token needs continuous refreshing. `detect-headers` tries harder than the built-in probe at following redirect and iframe chains — it is **not** a browser (see [When the probe can't work it out](#when-the-probe-cant-work-it-out)).
 
-  PVArr resolves both on `PATH` at runtime and degrades gracefully if they're absent: header detection and direct recording are built in and need no external tools. The provided `Dockerfile` installs both into the image automatically.
+  PVArr resolves these on `PATH` at runtime and degrades gracefully if they're absent: header detection and direct recording are built in and need no external tools. The provided `Dockerfile` installs them into the image automatically.
 
 Verify the app is up by loading the dashboard:
 
@@ -116,6 +117,19 @@ When you paste a URL, PVArr:
 4. Reports back in the form: a green line with what it found (master or media
    playlist, variant count, which headers were needed), or a red line saying
    what the origin returned.
+
+If the built-in probe comes up empty, PVArr asks **yt-dlp** next. That matters
+for the case the probe structurally cannot handle: a modern player fetches its
+manifest over XHR and hands it straight to hls.js, so the m3u8 URL never
+appears in the page's HTML and no amount of scraping will find it. yt-dlp
+carries site-specific extractors for thousands of streaming sites and resolves
+those in one step, returning the `Referer` and `User-Agent` the stream expects
+along with the URL. With `curl_cffi` installed (it is, in the container) it can
+also present a real browser's TLS fingerprint, which some origins check.
+
+It is skipped when you paste a playlist URL directly — the probe has already
+tried that exact URL with every header combination it knows, so calling yt-dlp
+would add up to 20 seconds to a failover to learn nothing.
 
 The same probe runs again inside the recorder each time it connects to a
 candidate — including on failover an hour later. **What you pasted is what gets
@@ -506,13 +520,13 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-434 tests covering filename sanitisation and collision handling, storage
+452 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across
 containers, FFmpeg command construction, proxy credential cleanup, recording
 windows and the duration backstop, log and notification redaction, the
-probe attempt trace, and every HTTP route.
+probe attempt trace, yt-dlp resolution, and every HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the

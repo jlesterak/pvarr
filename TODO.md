@@ -1921,3 +1921,103 @@ Whether the DevTools m3u8 failed *immediately* or worked briefly first. Pure
 TTL means a manual stopgap exists for short recordings; immediate failure means
 it is bound to the browser session or IP and there is no stopgap. The fix is
 the same either way.
+
+## humantodo line 1: integrate rather than build (2026-08-31)
+
+Sponsor confirmed line 1 was pointing at exactly the FlareSolverr discussion:
+when a problem is already solved by a tool in this ecosystem, wire it up rather
+than growing our own. Sizes, measured rather than guessed:
+
+    comskip     333 KB installed (deps already present)
+    yt-dlp      3.1 MB
+    curl_cffi   13 MB   (prebuilt wheel, no compiler)
+    Chromium    935 MB
+
+### Decided and built: yt-dlp  [COMPLETED]
+`app/ytdlp.py`, wired into `detect_candidate_headers` between the built-in
+probe and the detect-headers script. Cheapest first.
+
+It exists for the case the probe *structurally* cannot handle. The sponsor ran
+`document.documentElement.outerHTML.includes('m3u8')` on their pages and got
+**false**: the player fetches its manifest over XHR and hands it to hls.js, so
+the URL is never in the document. No scraper will ever find it. That result
+also downgrades FlareSolverr for this purpose -- it returns rendered HTML, not
+intercepted requests, so it would not find the URL either. Its remaining value
+is Cloudflare cookies.
+
+Design notes:
+- **Subprocess, not import.** yt-dlp can hang on a slow origin; a subprocess
+  takes a timeout and an in-process call does not. It is also then replaceable
+  without a PVArr release, which matters for a tool that ships fortnightly.
+- **`-J`, not `-g`.** `-g` prints only the URL; the JSON carries
+  `http_headers`, which is where the Referer and User-Agent live. The URL
+  without them just moves the 403 one step later.
+- **Skipped for pasted playlist URLs.** The probe has already tried that exact
+  URL with every header combination it has. Calling yt-dlp would add up to 20s
+  to a *failover* to learn nothing. Caught because the suite jumped from 1.3s
+  to 15.1s the moment it was wired in -- the dev box has yt-dlp installed, so
+  tests were really shelling out. Same class of defect as the disk guard
+  reading the host's free space.
+- **Timeout 20s, not 45.** This runs while a live recording is off the air.
+
+### `--impersonate` is another extension_picky
+`--help` on yt-dlp 2024.04.09 mentions impersonate three times, and
+`--impersonate chrome` exits with a Python traceback: the option is recognised,
+but every target needs `curl_cffi`. Passing it on such a build turns every
+resolution into a hard failure -- and the first version of this module passed
+it unconditionally, with a comment claiming it was "silently ignored". It is
+not.
+
+`impersonation_available()` runs `--list-impersonate-targets` and looks for a
+row not marked "(not available)". Cached per binary. Exactly the lesson from
+`hls_extension_flags`: ask the binary what it can do, never what its help text
+mentions.
+
+`curl_cffi` is now in requirements, so the container can impersonate.
+**Measured against the sponsor's wall: it does not help there.**
+`curl_cffi.get('https://lb7.strmd.st/', impersonate='chrome')` returns the same
+403, same 139 bytes, as plain requests. That host blocks by network, not by TLS
+fingerprint -- more evidence the link was simply dead. Kept anyway: it is 13 MB
+and the capability is general.
+
+Verified against real yt-dlp output, not only mocks: resolves a public Mux HLS
+test stream, correctly reports impersonation unavailable on the system binary
+and available in the venv.
+
+452 tests (was 434).
+
+### Decided, not yet built: comskip  [PENDING]
+Sponsor decision: **comchap (chapter marks) as the default, comcut (actual
+removal) as an option.** Non-destructive by default is the right call next to
+everything else this project does to avoid losing footage -- a false positive
+in a cut eats a play that cannot be re-recorded.
+
+Sponsor corrected my pessimism: many of these streams rebroadcast **OTA
+channels**, which is comskip's home turf -- real station logos, real black
+frames, real ad breaks. Others show a static card ("MLB Commercial Break In
+Progress"), which comskip will likely miss because it is neither black nor
+logo-free.
+
+The shipped FFmpeg already has `freezedetect`, `blackdetect`, `blackframe` and
+`silencedetect` -- verified inside `ghcr.io/jlesterak/pvarr:0.3.0`. A static
+break card is a frozen frame, so `freezedetect` catches precisely the case
+comskip misses, at zero added dependency. Plan: comskip for the OTA
+rebroadcasts, a freezedetect pass for the static-card streams, both writing
+chapters.
+
+Runs after the remux, off the capture path entirely. ~20-40 min of CPU for a
+3-hour recording, single-threaded.
+
+### Considered and declined
+- **Tdarr / Unmanic** -- do not build transcoding. Point them at the recordings
+  folder; that is what they are for.
+- **Sonarr / Radarr APIs** -- PVArr is not indexer-driven, there is no release
+  to grab. The Plex/Emby tuner integration already covers the ecosystem need.
+- **Bazarr** -- live streams do not carry subtitles worth fetching.
+
+### Still open
+- **Apprise** would replace the hand-rolled Discord/Telegram code with 100+
+  targets and let us delete code rather than add it. Not urgent.
+- **FlareSolverr**, narrowed: Cloudflare cookies only, since the m3u8 is not in
+  the DOM. Worth it only if a provider turns out to be Cloudflare-gated *and*
+  yt-dlp cannot resolve it.

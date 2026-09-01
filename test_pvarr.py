@@ -31,7 +31,7 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
-from app import notifications, probe, ringbuffer, sessions
+from app import notifications, probe, ringbuffer, sessions, ytdlp
 from app.logging_config import redact_url_secrets
 from app.recorder import (
     DEFAULT_MAX_HOURS,
@@ -4650,6 +4650,222 @@ class TestExpiredTokenAdvice(unittest.TestCase):
             result = probe.probe_stream(url)
         self.assertIn("expired", result["message"])
         self.assertIn("page URL", result["message"])
+
+
+
+class TestYtdlpResolver(unittest.TestCase):
+    """yt-dlp resolves the case the probe structurally cannot.
+
+    A modern player fetches its manifest over XHR and hands it to hls.js, so
+    the URL is never in the document. The sponsor confirmed this across all
+    five of their providers. No amount of HTML scraping finds it.
+    """
+
+    def _run(self, stdout="", returncode=0, raises=None):
+        from unittest.mock import patch, MagicMock
+        if raises is not None:
+            return patch("app.ytdlp.subprocess.run", side_effect=raises)
+        return patch("app.ytdlp.subprocess.run",
+                     return_value=MagicMock(stdout=stdout, stderr="", returncode=returncode))
+
+    def test_missing_binary_is_not_an_error(self):
+        from unittest.mock import patch
+        with patch("app.ytdlp.shutil.which", return_value=None):
+            self.assertIsNone(ytdlp.resolve("https://site.example/watch"))
+
+    def test_it_extracts_the_url_and_the_headers(self):
+        """-J rather than -g precisely because the headers come with it.
+
+        Getting the URL without its Referer just moves the 403 one step later.
+        """
+        payload = json.dumps({
+            "extractor_key": "Generic", "title": "Game",
+            "formats": [{
+                "url": "https://cdn.example/live/master.m3u8",
+                "protocol": "m3u8_native", "tbr": 3000,
+                "http_headers": {"Referer": "https://site.example/",
+                                 "User-Agent": "Mozilla/5.0", "Cookie": "sid=1"},
+            }],
+        })
+        with self._run(stdout=payload):
+            got = ytdlp.resolve("https://site.example/watch", binary="/usr/bin/yt-dlp")
+        self.assertEqual(got["m3u8_url"], "https://cdn.example/live/master.m3u8")
+        self.assertEqual(got["referer"], "https://site.example/")
+        self.assertEqual(got["user_agent"], "Mozilla/5.0")
+        self.assertEqual(got["cookie"], "sid=1")
+
+    def test_the_highest_bandwidth_media_playlist_wins(self):
+        payload = json.dumps({"formats": [
+            {"url": "https://c/low.m3u8", "protocol": "m3u8_native",
+             "format_id": "480", "tbr": 800},
+            {"url": "https://c/high.m3u8", "protocol": "m3u8_native",
+             "format_id": "1080", "tbr": 5000},
+        ]})
+        with self._run(stdout=payload):
+            got = ytdlp.resolve("https://site.example/watch", binary="/usr/bin/yt-dlp")
+        self.assertEqual(got["m3u8_url"], "https://c/high.m3u8")
+
+    def test_non_hls_formats_are_ignored(self):
+        payload = json.dumps({"formats": [
+            {"url": "https://c/video.mp4", "protocol": "https", "tbr": 9000},
+        ]})
+        with self._run(stdout=payload):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_a_failed_run_returns_none(self):
+        with self._run(stdout="", returncode=1):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_unparseable_output_returns_none(self):
+        with self._run(stdout="not json at all"):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_a_timeout_returns_none_rather_than_raising(self):
+        """This runs on the failover path. It may never propagate."""
+        import subprocess as _sp
+        with self._run(raises=_sp.TimeoutExpired(cmd="yt-dlp", timeout=20)):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_the_command_is_an_argv_list_never_a_shell_string(self):
+        """Project directive: every subprocess is an explicit list. These URLs
+        come from an unauthenticated caller."""
+        from unittest.mock import patch, MagicMock
+        with patch("app.ytdlp.impersonation_available", return_value=True), \
+             patch("app.ytdlp.subprocess.run",
+                   return_value=MagicMock(stdout="{}", stderr="", returncode=0)) as run:
+            ytdlp.resolve("https://s/w; rm -rf /", binary="/usr/bin/yt-dlp")
+        cmd = run.call_args.args[0]
+        self.assertIsInstance(cmd, list)
+        self.assertNotIn("shell", run.call_args.kwargs)
+        # The metacharacters survive intact as one argv element -- they are
+        # data, never parsed by a shell.
+        self.assertEqual(cmd[-1], "https://s/w; rm -rf /")
+        self.assertIn("--impersonate", cmd)
+        self.assertIn("-J", cmd)
+
+    def test_impersonate_is_omitted_when_the_build_cannot_do_it(self):
+        """A build without curl_cffi does not ignore --impersonate, it dies on
+        it -- exits with a traceback and resolves nothing."""
+        from unittest.mock import patch, MagicMock
+        with patch("app.ytdlp.impersonation_available", return_value=False), \
+             patch("app.ytdlp.subprocess.run",
+                   return_value=MagicMock(stdout="{}", stderr="", returncode=0)) as run:
+            ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp")
+        self.assertNotIn("--impersonate", run.call_args.args[0])
+
+
+class TestImpersonationCapability(unittest.TestCase):
+    """Ask what the binary can do, not what its --help mentions.
+
+    Measured on yt-dlp 2024.04.09: --help names impersonate three times and
+    `--impersonate chrome` exits with a Python traceback, because every target
+    needs curl_cffi. A flag-name check would have turned every resolution on
+    that build into a hard failure.
+    """
+
+    def setUp(self):
+        ytdlp._IMPERSONATE_CACHE.clear()
+        self.addCleanup(ytdlp._IMPERSONATE_CACHE.clear)
+
+    def _targets(self, text):
+        from unittest.mock import patch, MagicMock
+        return patch("app.ytdlp.subprocess.run",
+                     return_value=MagicMock(stdout=text, stderr="", returncode=0))
+
+    def test_all_targets_unavailable_means_no(self):
+        listing = (
+            "[info] Available impersonate targets\n"
+            "Client   OS   Source\n"
+            "---------------------------------------\n"
+            "Chrome   -    curl_cffi (not available)\n"
+            "Edge     -    curl_cffi (not available)\n"
+        )
+        with self._targets(listing):
+            self.assertFalse(ytdlp.impersonation_available("/usr/bin/yt-dlp"))
+
+    def test_a_usable_target_means_yes(self):
+        listing = (
+            "[info] Available impersonate targets\n"
+            "Client          OS           Source\n"
+            "--------------------------------------\n"
+            "Chrome-133      Macos-15     curl_cffi\n"
+        )
+        with self._targets(listing):
+            self.assertTrue(ytdlp.impersonation_available("/usr/bin/yt-dlp"))
+
+    def test_the_answer_is_cached(self):
+        from unittest.mock import patch, MagicMock
+        with patch("app.ytdlp.subprocess.run",
+                   return_value=MagicMock(stdout="", stderr="", returncode=0)) as run:
+            ytdlp.impersonation_available("/usr/bin/yt-dlp")
+            ytdlp.impersonation_available("/usr/bin/yt-dlp")
+        self.assertEqual(run.call_count, 1)
+
+    def test_a_binary_that_cannot_run_is_not_fatal(self):
+        from unittest.mock import patch
+        with patch("app.ytdlp.subprocess.run", side_effect=OSError("nope")):
+            self.assertFalse(ytdlp.impersonation_available("/usr/bin/yt-dlp"))
+
+
+class TestRecorderUsesYtdlp(unittest.TestCase):
+    """Where yt-dlp sits in the resolution chain, and where it must not."""
+
+    def make(self, url):
+        tmp = tempfile.mkdtemp(prefix="pvarr-ytdlp-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return StreamFailoverRecorder(
+            "y1", [url], str(Path(tmp) / "out.ts"), min_free_gb=0, auto_probe=False)
+
+    def test_a_pasted_playlist_never_reaches_ytdlp(self):
+        """Up to 20s of stall on the failover path, to learn nothing.
+
+        The probe has already tried that exact URL with every header
+        combination it has; yt-dlp's generic extractor would do strictly less.
+        """
+        from unittest.mock import patch
+        rec = self.make("https://cdn.example/live/master.m3u8")
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve") as resolve:
+            self.assertFalse(rec._resolve_via_ytdlp(rec.candidates[0]))
+        resolve.assert_not_called()
+
+    def test_a_page_url_does_reach_ytdlp(self):
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        found = {"m3u8_url": "https://cdn.example/x.m3u8", "referer": "https://site.example/",
+                 "user_agent": "UA", "cookie": "", "extractor": "Generic"}
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve", return_value=found):
+            self.assertTrue(rec._resolve_via_ytdlp(rec.candidates[0]))
+        cand = rec.candidates[0]
+        self.assertEqual(cand.m3u8_url, "https://cdn.example/x.m3u8")
+        self.assertEqual(cand.referer, "https://site.example/")
+        self.assertEqual(cand.detect_source, "yt-dlp")
+
+    def test_it_does_not_blank_an_operator_supplied_header(self):
+        """A referer typed by hand outranks an empty one from an extractor."""
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        rec.candidates[0].referer = "https://typed-by-hand.example/"
+        found = {"m3u8_url": "https://cdn.example/x.m3u8", "referer": "",
+                 "user_agent": "", "cookie": "", "extractor": "Generic"}
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve", return_value=found):
+            rec._resolve_via_ytdlp(rec.candidates[0])
+        self.assertEqual(rec.candidates[0].referer, "https://typed-by-hand.example/")
+
+    def test_a_raising_resolver_does_not_kill_detection(self):
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve", side_effect=RuntimeError("boom")):
+            self.assertFalse(rec._resolve_via_ytdlp(rec.candidates[0]))
+
+    def test_absent_ytdlp_is_normal(self):
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value=None):
+            self.assertFalse(rec._resolve_via_ytdlp(rec.candidates[0]))
 
 
 
