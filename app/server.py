@@ -48,6 +48,7 @@ from app.notifications import NotificationManager
 from app.post_processor import remux_recording
 from app.cleanup import _shutdown_timeout
 from app.ringbuffer import RingBuffer
+from app import commercials
 from app.sessions import SessionStore, build_record, resume_decision
 from app.logging_config import configure_logging
 
@@ -511,6 +512,22 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         # Genuinely finished: stop tracking it, so a later restart does not
         # try to resume a recording that has already been remuxed and shipped.
         session_store.remove(recording_id)
+
+        # Commercial detection runs last, deliberately. It is 20-40 minutes of
+        # CPU on a three-hour recording, and the file is already remuxed, in
+        # the library and announced -- so this only ever adds chapters to
+        # something the operator can already watch. Off by default; failure
+        # here changes nothing about the recording.
+        try:
+            outcome = commercials.process(str(final_path))
+            if outcome.get("ran"):
+                logger.info(
+                    "Commercial detection on %s: %s breaks found, chapters %s.",
+                    final_path.name, outcome["breaks"],
+                    "written" if outcome["applied"] else "not written",
+                )
+        except Exception as exc:
+            logger.warning("Commercial detection failed for %s: %s", final_path.name, exc)
 
     def _on_failover(rec_id, next_name):
         notifier.notify_failover_triggered(rec_id, next_name)

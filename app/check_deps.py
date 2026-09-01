@@ -51,6 +51,7 @@ OPTIONAL_NOTES = {
     # version is the shell one, which is curl following iframes.
     "detect-headers": "one fewer route for pages that hide their m3u8 behind redirects",
     "yt-dlp": "no way to resolve a page whose player fetches its manifest over XHR",
+    "comskip": "no commercial detection (only used when PVARR_COMSKIP=1)",
 }
 
 
@@ -69,6 +70,7 @@ def check_dependencies(verbose: bool = True) -> dict:
         "hls-proxy":      find_executable("hls-proxy.py",         ["hls-proxy"]),
         "detect-headers": find_executable("detect-headers-py.py", ["detect-headers.sh", "detect-headers"]),
         "yt-dlp":         find_executable("yt-dlp"),
+        "comskip":        find_executable("comskip"),
     }
 
     all_required_ok = all(v for v in required.values())

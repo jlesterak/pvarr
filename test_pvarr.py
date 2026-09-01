@@ -31,7 +31,7 @@ from app.naming import (
     sanitize_token,
 )
 from app.post_processor import remux_recording
-from app import notifications, probe, ringbuffer, sessions, ytdlp
+from app import commercials, notifications, probe, ringbuffer, sessions, ytdlp
 from app.logging_config import redact_url_secrets
 from app.recorder import (
     DEFAULT_MAX_HOURS,
@@ -4866,6 +4866,166 @@ class TestRecorderUsesYtdlp(unittest.TestCase):
         rec = self.make("https://site.example/watch/game")
         with patch("app.recorder.ytdlp.ytdlp_path", return_value=None):
             self.assertFalse(rec._resolve_via_ytdlp(rec.candidates[0]))
+
+
+
+class TestCommercialEdlParsing(unittest.TestCase):
+    """comskip's EDL is start<TAB>end<TAB>action, seconds as floats."""
+
+    def test_cut_ranges_are_read(self):
+        edl = "12.5\t42.0\t0\n900.25\t1020.5\t0\n"
+        self.assertEqual(commercials.parse_edl(edl),
+                         [(12.5, 42.0), (900.25, 1020.5)])
+
+    def test_non_cut_actions_are_ignored(self):
+        """Action 3 is a mute, not a commercial to skip."""
+        self.assertEqual(commercials.parse_edl("10\t20\t3\n"), [])
+
+    def test_malformed_lines_are_skipped_not_fatal(self):
+        """A detector must never be why a finished recording is lost."""
+        edl = "garbage\n\n5\n1.0\t2.0\t0\nx\ty\t0\n"
+        self.assertEqual(commercials.parse_edl(edl), [(1.0, 2.0)])
+
+    def test_a_zero_length_range_is_dropped(self):
+        self.assertEqual(commercials.parse_edl("10\t10\t0\n"), [])
+
+    def test_empty_input(self):
+        self.assertEqual(commercials.parse_edl(""), [])
+        self.assertEqual(commercials.parse_edl(None), [])
+
+
+class TestCommercialGating(unittest.TestCase):
+    """Off unless asked for, and safe by default."""
+
+    def test_off_by_default(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVARR_COMSKIP", None)
+            self.assertFalse(commercials.enabled())
+
+    def test_enabled_by_env(self):
+        from unittest.mock import patch
+        for value in ("1", "true", "yes", "on", "ON"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP": value}):
+                self.assertTrue(commercials.enabled(), value)
+
+    def test_mode_defaults_to_chapters(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVARR_COMSKIP_MODE", None)
+            self.assertEqual(commercials.mode(), "chapters")
+
+    def test_anything_unrecognised_means_chapters(self):
+        """Never guess your way into the destructive branch."""
+        from unittest.mock import patch
+        for value in ("", "CHAPTERS", "remove", "delete", "yes", "cuts"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP_MODE": value}):
+                self.assertEqual(commercials.mode(), "chapters", value)
+
+    def test_stray_whitespace_still_means_cut(self):
+        """A trailing space in a .env is a typo, not a request for a different
+        mode. Switching behaviour on an invisible character would be worse than
+        being forgiving here."""
+        from unittest.mock import patch
+        for value in ("cut ", " cut", "\tCut\n"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP_MODE": value}):
+                self.assertEqual(commercials.mode(), "cut", repr(value))
+
+    def test_cut_must_be_spelled_exactly(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP_MODE": "cut"}):
+            self.assertEqual(commercials.mode(), "cut")
+
+    def test_disabled_does_no_work_at_all(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "0"}), \
+             patch.object(commercials, "detect") as detect:
+            out = commercials.process("/tmp/whatever.mp4")
+        detect.assert_not_called()
+        self.assertFalse(out["ran"])
+
+    def test_missing_comskip_is_not_an_error(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
+             patch.object(commercials, "comskip_path", return_value=None), \
+             patch.object(commercials, "detect") as detect:
+            out = commercials.process("/tmp/whatever.mp4")
+        detect.assert_not_called()
+        self.assertFalse(out["ran"])
+
+
+class TestCommercialsNeverDamageARecording(unittest.TestCase):
+    """The whole point of chapters-by-default.
+
+    Everything else in this project is built so a capture is never silently
+    lost. A heuristic that edits recordings by default would undo that.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-com-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.video = self.tmp / "game.mp4"
+        self.video.write_bytes(b"original recording bytes")
+        self.meta = self.tmp / "game.ffmeta"
+        self.meta.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/100\nSTART=0\nEND=100\n")
+
+    def test_a_failed_chapter_write_leaves_the_original_untouched(self):
+        from unittest.mock import patch
+        from unittest.mock import MagicMock
+        with patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=1, stdout="", stderr="boom")):
+            ok = commercials.apply_chapters(str(self.video), str(self.meta))
+        self.assertFalse(ok)
+        self.assertEqual(self.video.read_bytes(), b"original recording bytes")
+        # And no debris left beside it.
+        self.assertEqual(list(self.tmp.glob(".*chapters*")), [])
+
+    def test_a_raising_ffmpeg_leaves_the_original_untouched(self):
+        from unittest.mock import patch
+        with patch("app.commercials.subprocess.run", side_effect=OSError("nope")):
+            self.assertFalse(commercials.apply_chapters(str(self.video), str(self.meta)))
+        self.assertEqual(self.video.read_bytes(), b"original recording bytes")
+
+    def test_a_missing_metadata_file_is_refused(self):
+        self.assertFalse(commercials.apply_chapters(str(self.video), str(self.tmp / "nope.ffmeta")))
+        self.assertEqual(self.video.read_bytes(), b"original recording bytes")
+
+    def test_cut_mode_does_not_silently_delete_anything_yet(self):
+        """Cut is accepted as a setting but not implemented. It must fall back
+        to chapters rather than half-doing the destructive thing."""
+        from unittest.mock import patch
+        scratch = Path(tempfile.mkdtemp(prefix="pvarr-com-scratch-"))
+        self.addCleanup(shutil.rmtree, scratch, True)
+        found = {"workdir": str(scratch), "ffmeta": str(self.meta),
+                 "edl": "", "breaks": [(10.0, 20.0)]}
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1", "PVARR_COMSKIP_MODE": "cut"}), \
+             patch.object(commercials, "comskip_path", return_value="/usr/bin/comskip"), \
+             patch.object(commercials, "detect", return_value=found), \
+             patch.object(commercials, "apply_chapters", return_value=True) as chapters:
+            out = commercials.process(str(self.video))
+        chapters.assert_called_once()
+        self.assertEqual(out["mode"], "cut")
+        self.assertTrue(self.video.exists())
+
+    def test_detection_failure_is_survivable(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
+             patch.object(commercials, "comskip_path", return_value="/usr/bin/comskip"), \
+             patch.object(commercials, "detect", return_value=None):
+            out = commercials.process(str(self.video))
+        self.assertFalse(out["ran"])
+        self.assertTrue(self.video.exists())
+
+    def test_the_argv_is_a_list_never_a_shell_string(self):
+        from unittest.mock import patch
+        from unittest.mock import MagicMock
+        with patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")) as run, \
+             patch.object(commercials, "comskip_path", return_value="/usr/bin/comskip"):
+            commercials.detect(str(self.video))
+        cmd = run.call_args.args[0]
+        self.assertIsInstance(cmd, list)
+        self.assertNotIn("shell", run.call_args.kwargs)
 
 
 

@@ -2059,3 +2059,84 @@ some of them -- that is the test to run -- but for a provider it has no
 extractor for, whose manifest is XHR-only, the remaining answer is real
 request interception in a browser, which is not built. What v0.4.0 guarantees
 is an accurate diagnosis instead of a misleading one.
+
+## Commercial detection (comskip)  [COMPLETED — needs field validation]
+
+`app/commercials.py`. Off by default (`PVARR_COMSKIP=1`), chapters by default
+(`PVARR_COMSKIP_MODE=chapters`), operator's own ini honoured
+(`PVARR_COMSKIP_INI`). comskip added to the Dockerfile: 333 KB, dependencies
+already present.
+
+### Design
+- **Chapters, not cuts.** A false positive in chapter mode costs a click. In
+  cut mode it deletes a play that cannot be re-recorded. `cut` is accepted as a
+  setting but deliberately **not implemented** -- it needs its own verification
+  pass (confirm the output is playable and the duration dropped by the expected
+  amount before replacing the original), and shipping the destructive half
+  without that is how a heuristic eats someone's recording. It logs and falls
+  back to chapters. There is a test for that.
+- **Runs last, after the notification.** 20-40 min of CPU on a three-hour
+  capture. Putting it before the notification would make an operator wait half
+  an hour to be told about a recording they could already watch.
+- **Chapters are written via stream copy** to a temp file and moved into place
+  only on success -- the file is already in the library and someone may be
+  watching it.
+
+### The sponsor corrected me twice, both times usefully
+1. I expected comskip to do badly on these streams. Wrong for the OTA
+   rebroadcasts, which are exactly what it was built for -- real logos, real
+   black frames, real ad breaks.
+2. I proposed `freezedetect` for the "commercial break in progress" cards.
+   **The sponsor pointed out those cards usually have a moving background**,
+   which defeats it. Measured, and they are right: a synthetic static card
+   produces 3 freeze events, an animated one produces **0**.
+
+So the animated-card case is still unsolved and is NOT claimed to be. See the
+open item below.
+
+### A sharp edge the tests caught
+`process()` removed whatever directory `detect()` handed back. In practice
+`detect()` always makes its own `mkdtemp`, so it was safe -- but a recursive
+delete resting on an assumption is the wrong shape of code in a project this
+careful about not losing footage. `_discard_workdir()` now refuses to remove
+anything that is not under the temp root, or that is the recording's own
+directory.
+
+### Verified end to end inside `ghcr.io/jlesterak/pvarr:0.4.0`
+Real comskip, real ffmpeg, on a real MP4:
+
+    comskip found   : /usr/bin/comskip
+    result          : {'ran': True, 'breaks': 0, 'mode': 'chapters', 'applied': True}
+    file intact     : True
+    ffprobe chapters: TAG:title=Show Segment
+
+471 tests (was 452).
+
+### Open
+- [ ] **Detecting an animated break card.** freezedetect is out. Candidate
+      signals: an abnormally long gap with no scene cuts (live sport cuts
+      constantly, a card does not), and the very low encoded bitrate of a
+      simple loop. **Needs a real sample to measure against** -- building a
+      detector from my guess about what these cards look like would repeat the
+      `-allowed_extensions ALL` mistake exactly. A 60-second clip spanning one
+      break would settle it.
+- [ ] Whether comskip's defaults are any good on the sponsor's OTA
+      rebroadcasts, or whether a tuned ini is needed.
+
+## Integration candidates — SPONSOR GO/NOGO
+
+Everything raised this session, with measured costs. Nothing below is built.
+
+| # | Candidate | Cost | What it buys | My call |
+|---|---|---|---|---|
+| 1 | **Apprise** | ~2 MB, *removes* code | Replaces the hand-rolled Discord/Telegram sender with one interface to 100+ targets: ntfy, Gotify, Pushover, Matrix, Slack, email, webhooks. `notifications.py` gets smaller, not bigger. | **GO.** Best value on the list. |
+| 2 | **FlareSolverr** | 0 MB in our image; one optional container | Cloudflare cookies only. It returns rendered HTML, not intercepted requests, and the sponsor's `includes('m3u8')` came back false -- so it will **not** find their manifests. Worth it only for a provider that is Cloudflare-gated *and* yt-dlp cannot resolve. | **HOLD.** Narrower than I first pitched. Revisit if a specific provider needs it. |
+| 3 | **Headless browser with request interception** (Playwright) | **+935 MB** measured, plus RAM per resolution | The only thing that resolves an XHR-only manifest yt-dlp has no extractor for. This is the real answer to the sponsor's five providers if yt-dlp does not get them. | **HOLD pending v0.4.0 field test.** If yt-dlp resolves them, never needed. Prefer a sidecar over baking it in. |
+| 4 | **Tdarr / Unmanic** | 0 | Automated transcode/health pipelines. They already watch folders. | **NOGO.** Point them at `recordings/`. Building transcoding into PVArr is scope creep. |
+| 5 | **Sonarr / Radarr APIs** | 0 | Nothing. PVArr is not indexer-driven; there is no release to grab. The Plex/Emby tuner already covers the ecosystem hook. | **NOGO.** |
+| 6 | **Bazarr** | 0 | Subtitles. Live streams do not carry any worth fetching. | **NOGO.** |
+| 7 | **Gluetun / VPN egress** | 0 in image; a compose change | Would have answered "is this host blocking my IP?" directly, and several providers this session refused whole networks. Not an integration so much as a documented compose recipe. | **GO (docs only).** Cheap, and it is a real operational answer. |
+| 8 | **`comcut` (finishing the destructive half)** | 0 | Actually removes breaks rather than marking them. Needs a verification pass before it can be trusted. | **Sponsor's call.** Chapters cover the use case; this is convenience with real downside. |
+
+Recommended order if all are approved: 1, 7, then 3 only if the v0.4.0 field
+test shows yt-dlp cannot resolve those providers.

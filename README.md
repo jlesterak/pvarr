@@ -24,6 +24,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 - **Paste-and-record header detection** — give it an m3u8 (or the page playing one) and PVArr resolves the playlist, works out the `Referer`/`Cookie` the origin demands, and verifies a real segment downloads before you start. See [Finding Your Stream URL](#finding-your-stream-url).
 - **3-stage cycling failover** — a primary m3u8 URL plus two backups. If the active stream stalls, dies, or goes quiet without dropping the connection, the recorder moves to the next candidate automatically, and **wraps back round to the first** rather than giving up at the end of the list. The usual failure is an expiring token, which fixes itself in minutes, so a blip that touches all three sources no longer ends a recording that still has hours to run. It gives up only after three complete laps with no data — and any data at all resets that budget.
 - **Recording windows** — give a recording a length and it stops cleanly at the deadline and post-processes normally, so a two-hour event does not leave a capture running all night. While the window is open PVArr keeps retrying every candidate rather than giving up after three fruitless laps: a stream that is down at kick-off is often back minutes later. Recordings with no length set are held to `PVARR_MAX_HOURS` (default 6). Set it from **Stop After (min)** on the new-recording form, or `duration_minutes` on the API.
+- **Commercial detection** *(optional, off by default)* — with `PVARR_COMSKIP=1`, each finished recording is scanned by [comskip](https://github.com/erikkaashoek/Comskip) and the breaks are written in as **chapter marks**, so Plex gives you skip points. Nothing is deleted: a false positive should cost you a click, not a play you cannot re-record. Runs after the recording is already remuxed, in the library and announced.
 - **Disk-space guard** — every active recording watches free space on its volume and aborts cleanly before filling it, keeping what was captured and post-processing it normally. Recordings are uncompressed TS on what is usually the same filesystem as everything else, so an unattended capture that runs out of room does not just lose itself, it takes the host with it. Floor set by `PVARR_MIN_FREE_GB` (default 5 GB); a start request is refused up front with `507` if the volume is already below it.
 - **Manual stream control** — force a failover, or click any candidate in the dashboard to switch straight to it. That is the only route *back* to the primary once it recovers, since automatic failover only ever moves forwards.
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
@@ -274,6 +275,9 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |
 | `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files; keep it below the compose `stop_grace_period` (30s) or Docker will `SIGKILL` first. |
 | `PVARR_MIN_FREE_GB` | `5` | Free space, in GB, below which an active recording aborts and a new one is refused. `0` disables the guard entirely — only sensible if the recordings volume is separate from the system disk. |
+| `PVARR_COMSKIP` | `0` | Set to `1` to run commercial detection on each finished recording. Off by default because it costs roughly 20–40 minutes of CPU on a three-hour capture. Runs *after* the recording is remuxed, in the library and announced, so it never delays anything you were waiting for. |
+| `PVARR_COMSKIP_MODE` | `chapters` | `chapters` writes skip points into the file and changes nothing else. `cut` is accepted but **not implemented yet** and falls back to chapters — removing footage on a heuristic needs its own verification pass first. |
+| `PVARR_COMSKIP_INI` | unset | Path to your own `comskip.ini`. Tuning is per-source and genuinely matters — logo and blank-frame thresholds that suit one broadcaster are wrong for another. Without it PVArr writes a minimal default. |
 | `PVARR_MAX_HOURS` | `6` | Longest any one recording may run without an explicit duration, in hours. A capture pointed at a 24/7 channel never ends on its own — the stream does not stop, so nothing in the failover logic ever fires. 6 rather than 4 so NFL overtime and extra-innings baseball are not truncated. A per-recording duration overrides it; `0` disables it. Rebroadcast channels are never capped by it. |
 | `PVARR_BUFFER_MB` | `71` | Size of a rebroadcast channel's buffer, per channel. Roughly 60 seconds at 10 Mbps — deep enough for a client to join late or stall briefly without a gap. It is a file, not memory, so the kernel reclaims it under pressure. |
 | `PVARR_BUFFER_DIR` | `<recordings>/.buffers` | Where rebroadcast buffers live. Each takes a steady ~1 MB/s of writes, so point it at an SSD if your library is on a spinning disk. Buffers are deleted when the channel stops. |
@@ -492,6 +496,8 @@ recordings directory means exactly that happened. PVArr now detects this within
 15 seconds and recreates the recording file, but the footage written into the
 orphan is not recoverable.
 
+**Commercial detection found nothing, or marked the wrong things.** comskip was built for broadcast TV: it leans on station logos vanishing, black frames at boundaries, aspect-ratio changes and audio silence. A rebroadcast OTA channel gives it all of those and it does well. A stream that fills its breaks with an animated "commercial break in progress" card gives it almost none — that card is not black, not silent, and not a frozen frame — so expect misses there. Point `PVARR_COMSKIP_INI` at a tuned `comskip.ini` for your source; that is where the real gains are.
+
 **A `.proxy_conf` folder in your recordings directory.** When a candidate
 falls back to the bundled proxy, PVArr writes that proxy a small config file
 there. It contains the stream URL *with its access token*, so treat it as a
@@ -520,13 +526,14 @@ python3 test_pvarr.py                 # full suite, verbose
 python3 -m unittest discover          # quiet
 ```
 
-452 tests covering filename sanitisation and collision handling, storage
+471 tests covering filename sanitisation and collision handling, storage
 operations, M3U/XMLTV generation, dependency resolution, the failover state
 machine, cycling failover and manual candidate switching, freeze detection,
 stream-completion ordering, the disk-space guard, library listing across
 containers, FFmpeg command construction, proxy credential cleanup, recording
 windows and the duration backstop, log and notification redaction, the
-probe attempt trace, yt-dlp resolution, and every HTTP route.
+probe attempt trace, yt-dlp resolution, commercial detection, and every
+HTTP route.
 
 Most spawn no subprocesses — the recorder tests drive the real loop against
 scripted fakes. The capture-loop tests run over a real OS pipe, because the
