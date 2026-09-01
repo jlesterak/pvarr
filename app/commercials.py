@@ -189,12 +189,159 @@ def apply_chapters(video_path: str, ffmeta_path: str) -> bool:
         return False
 
 
+def keep_ranges(breaks: List[Tuple[float, float]], duration: float) -> List[Tuple[float, float]]:
+    """Invert the commercial ranges into the parts worth keeping.
+
+    Overlapping or out-of-order ranges are merged first: comskip can emit them,
+    and naively inverting an unsorted list produces negative-length keeps that
+    silently drop content.
+    """
+    if duration <= 0:
+        return []
+    merged: List[List[float]] = []
+    for start, end in sorted(breaks):
+        start, end = max(0.0, start), min(duration, end)
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    keeps: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in merged:
+        if start - cursor > 0.1:        # ignore slivers shorter than a frame or two
+            keeps.append((cursor, start))
+        cursor = end
+    if duration - cursor > 0.1:
+        keeps.append((cursor, duration))
+    return keeps
+
+
+def media_duration(video_path: str) -> Optional[float]:
+    """Duration in seconds via ffprobe, or None."""
+    ffprobe = find_executable("ffprobe") or "ffprobe"
+    cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=nw=1:nk=1", str(video_path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return float((result.stdout or "").strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def cut_breaks(
+    video_path: str,
+    breaks: List[Tuple[float, float]],
+    tolerance: float = 30.0,
+) -> bool:
+    """Remove the commercial ranges, but only replace the original if verified.
+
+    This is the destructive path, so it is built to refuse rather than guess.
+    The new file is written beside the original and is only moved into place
+    after ffprobe says it is playable *and* its duration dropped by roughly the
+    length of what was cut. A stream-copy concat that silently produced a
+    30-second file from a three-hour recording would otherwise replace the
+    recording with the wreckage.
+
+    Cuts land on keyframes because the parts are copied, not re-encoded --
+    a second or two of slop at each boundary, in exchange for not spending
+    hours of CPU re-encoding a recording.
+    """
+    source = Path(video_path)
+    if not source.is_file() or not breaks:
+        return False
+    duration = media_duration(video_path)
+    if not duration:
+        logger.warning("Refusing to cut %s: could not read its duration.", source.name)
+        return False
+
+    keeps = keep_ranges(breaks, duration)
+    if not keeps:
+        logger.warning("Refusing to cut %s: nothing would be left.", source.name)
+        return False
+
+    expected = sum(end - start for start, end in keeps)
+    if expected <= 0 or expected > duration + 1:
+        logger.warning("Refusing to cut %s: implausible target duration.", source.name)
+        return False
+
+    ffmpeg = find_executable("ffmpeg") or "ffmpeg"
+    workdir = Path(tempfile.mkdtemp(prefix="pvarr-comcut-"))
+    try:
+        parts: List[Path] = []
+        for index, (start, end) in enumerate(keeps):
+            part = workdir / f"part{index:04d}{source.suffix}"
+            cmd = [ffmpeg, "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+                   "-i", str(source), "-c", "copy",
+                   "-avoid_negative_ts", "make_zero", str(part)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            if result.returncode != 0 or not part.is_file() or part.stat().st_size == 0:
+                logger.warning("Refusing to cut %s: segment %s failed.", source.name, index)
+                return False
+            parts.append(part)
+
+        listing = workdir / "parts.txt"
+        listing.write_text(
+            "".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
+        cut = workdir / f"cut{source.suffix}"
+        concat = [ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                  "-i", str(listing), "-c", "copy", str(cut)]
+        result = subprocess.run(concat, capture_output=True, text=True, timeout=3600)
+        if result.returncode != 0 or not cut.is_file() or cut.stat().st_size == 0:
+            logger.warning("Refusing to cut %s: concat failed.", source.name)
+            return False
+
+        # The verification that makes this safe to ship.
+        actual = media_duration(str(cut))
+        if actual is None:
+            logger.warning("Refusing to replace %s: the cut file is unreadable.", source.name)
+            return False
+        if abs(actual - expected) > tolerance:
+            logger.warning(
+                "Refusing to replace %s: cut is %.1fs but %.1fs was expected "
+                "(tolerance %.0fs). Keeping the original.",
+                source.name, actual, expected, tolerance,
+            )
+            return False
+
+        if keep_original():
+            backup = source.with_name(f"{source.stem}.original{source.suffix}")
+            shutil.copy2(source, backup)
+            logger.info("Kept the uncut recording as %s", backup.name)
+
+        shutil.move(str(cut), str(source))
+        logger.info(
+            "Cut %s: %.1fs removed across %s breaks.",
+            source.name, duration - actual, len(breaks),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Cut failed for %s: %s", source.name, exc)
+        return False
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def keep_original() -> bool:
+    """Whether to keep an uncut copy beside the cut recording.
+
+    On by default. Cutting is a heuristic acting on footage that cannot be
+    re-recorded, so the safe default is the one that costs disk rather than the
+    one that costs a play.
+    """
+    return os.getenv("PVARR_COMSKIP_KEEP_ORIGINAL", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def process(video_path: str) -> Dict[str, Any]:
     """Detect commercials and mark (or remove) them. Never raises.
 
     Returns a small summary for the log and the session record.
     """
-    result: Dict[str, Any] = {"ran": False, "breaks": 0, "mode": mode(), "applied": False}
+    result: Dict[str, Any] = {"ran": False, "breaks": 0, "mode": mode(),
+                              "applied": False, "cut": False}
     if not enabled():
         return result
     if not comskip_path():
@@ -211,15 +358,10 @@ def process(video_path: str) -> Dict[str, Any]:
         if found["ffmeta"]:
             result["applied"] = apply_chapters(video_path, found["ffmeta"])
         if result["mode"] == "cut" and found["breaks"]:
-            # Deliberately not implemented yet. Cutting needs its own
-            # verification pass -- confirm the output is playable and the
-            # duration dropped by the expected amount before replacing the
-            # original -- and shipping the destructive half without that is how
-            # a heuristic eats someone's recording.
-            logger.warning(
-                "PVARR_COMSKIP_MODE=cut is not implemented yet; chapters were "
-                "written instead for %s.", Path(video_path).name,
-            )
+            # Chapters were written first deliberately: if the cut refuses its
+            # own verification, the operator is left with a marked-up recording
+            # rather than nothing.
+            result["cut"] = cut_breaks(video_path, found["breaks"])
     finally:
         _discard_workdir(found.get("workdir"), video_path)
     return result

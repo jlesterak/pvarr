@@ -2123,20 +2123,66 @@ Real comskip, real ffmpeg, on a real MP4:
 - [ ] Whether comskip's defaults are any good on the sponsor's OTA
       rebroadcasts, or whether a tuned ini is needed.
 
-## Integration candidates — SPONSOR GO/NOGO
+## Integration candidates — decided (2026-08-31)
 
-Everything raised this session, with measured costs. Nothing below is built.
+Sponsor reviewed the register: **#1 and #8 approved and built. #4-6 closed as
+NOGO, not to be raised again.**
 
-| # | Candidate | Cost | What it buys | My call |
-|---|---|---|---|---|
-| 1 | **Apprise** | ~2 MB, *removes* code | Replaces the hand-rolled Discord/Telegram sender with one interface to 100+ targets: ntfy, Gotify, Pushover, Matrix, Slack, email, webhooks. `notifications.py` gets smaller, not bigger. | **GO.** Best value on the list. |
-| 2 | **FlareSolverr** | 0 MB in our image; one optional container | Cloudflare cookies only. It returns rendered HTML, not intercepted requests, and the sponsor's `includes('m3u8')` came back false -- so it will **not** find their manifests. Worth it only for a provider that is Cloudflare-gated *and* yt-dlp cannot resolve. | **HOLD.** Narrower than I first pitched. Revisit if a specific provider needs it. |
-| 3 | **Headless browser with request interception** (Playwright) | **+935 MB** measured, plus RAM per resolution | The only thing that resolves an XHR-only manifest yt-dlp has no extractor for. This is the real answer to the sponsor's five providers if yt-dlp does not get them. | **HOLD pending v0.4.0 field test.** If yt-dlp resolves them, never needed. Prefer a sidecar over baking it in. |
-| 4 | **Tdarr / Unmanic** | 0 | Automated transcode/health pipelines. They already watch folders. | **NOGO.** Point them at `recordings/`. Building transcoding into PVArr is scope creep. |
-| 5 | **Sonarr / Radarr APIs** | 0 | Nothing. PVArr is not indexer-driven; there is no release to grab. The Plex/Emby tuner already covers the ecosystem hook. | **NOGO.** |
-| 6 | **Bazarr** | 0 | Subtitles. Live streams do not carry any worth fetching. | **NOGO.** |
-| 7 | **Gluetun / VPN egress** | 0 in image; a compose change | Would have answered "is this host blocking my IP?" directly, and several providers this session refused whole networks. Not an integration so much as a documented compose recipe. | **GO (docs only).** Cheap, and it is a real operational answer. |
-| 8 | **`comcut` (finishing the destructive half)** | 0 | Actually removes breaks rather than marking them. Needs a verification pass before it can be trusted. | **Sponsor's call.** Chapters cover the use case; this is convenience with real downside. |
+### Built
+- **#1 Apprise** — `notifications.py` rewritten around it. One interface to
+  100+ services; the hand-rolled Discord and Telegram senders are gone, which
+  means one payload format, one error path, and **one place where redaction
+  happens** rather than two to forget. Existing `DISCORD_WEBHOOK_URL` and
+  `TELEGRAM_*` are translated into Apprise URLs at startup -- an upgrade that
+  silently stops notifying is worse than one that never started. New:
+  `PVARR_APPRISE_URLS` for anything else. 1.8 MB.
+- **#8 comcut** — `PVARR_COMSKIP_MODE=cut` now really cuts, with the
+  verification that was missing. The cut is written beside the recording and
+  only replaces it if ffprobe can read it *and* the duration is within 30s of
+  the expected length. `PVARR_COMSKIP_KEEP_ORIGINAL=1` (the default) keeps the
+  uncut file too. Overlapping comskip ranges are merged before inversion --
+  inverting them unsorted silently drops content.
 
-Recommended order if all are approved: 1, 7, then 3 only if the v0.4.0 field
-test shows yt-dlp cannot resolve those providers.
+### Still open, sponsor's call
+- **#2 FlareSolverr** — HOLD. Returns rendered HTML, not intercepted requests,
+  and the sponsor's `includes('m3u8')` was false, so it will not find their
+  manifests. Value is Cloudflare cookies only.
+- **#3 Headless browser with request interception** — HOLD, +935 MB measured.
+  The real answer for an XHR-only manifest yt-dlp has no extractor for. Prefer
+  a sidecar over baking it in.
+- **#7 Gluetun / VPN egress (docs only)** — **now more relevant than when it
+  was proposed.** Confirmed this session that `lb7.strmd.st` and
+  `lb10.strmd.st` return an identical 403 to their own front page, from the
+  sponsor's network *and* from this dev box, to requests, curl, curl_cffi with
+  a Chrome TLS fingerprint, and a real browser. That whole infrastructure
+  refuses everyone we can be. `edgestream6.pro` answers normally and its
+  streams record. A documented VPN-egress recipe is the only lever left for
+  providers fronted by strmd.st.
+
+### Closed — NOGO, do not revisit
+- **#4 Tdarr / Unmanic** — point them at `recordings/`; transcoding is not
+  PVArr's job.
+- **#5 Sonarr / Radarr APIs** — PVArr is not indexer-driven; there is no
+  release to grab.
+- **#6 Bazarr** — live streams carry no subtitles worth fetching.
+
+## Field results from v0.4.0 (2026-08-31)
+
+The sponsor tested live while this was being built. Three findings:
+
+1. **The dashboard probe was not calling yt-dlp.** It was wired into the
+   recorder only, so an operator testing a page from the dashboard was told to
+   go to DevTools while the recorder would have resolved it. Fixed: the
+   fallback now lives inside `probe_stream()`, so the dashboard and the
+   recorder cannot drift apart -- the same reasoning as `_launch_session()`
+   being shared between a fresh start and a resume.
+2. **A DevTools m3u8 from `edgestream6.pro` records fine.** Probe clean, needs
+   a Referer, segments fetch as `.ts`. Its token carried `e=1788234877` --
+   about **4 hours** of life, which is plenty for one event and means the
+   manual workflow is viable per-recording. It cannot survive a token expiry
+   mid-capture, because a pasted m3u8 has nothing to re-resolve.
+3. **The origin check earned its place immediately.** On a `lb10.strmd.st`
+   link it correctly reported a wholesale refusal rather than a missing
+   header, first time, with no analysis from me.
+
+

@@ -1,97 +1,165 @@
 #!/usr/bin/env python3
 """
-PVArr Notification & Media Server Refresh Integration Module
-Handles Webhook alerts (Discord, Telegram) and Media Server Library Refresh API calls (Plex, Emby, Jellyfin).
+PVArr Notifications & Media Server Refresh
+
+Notification delivery goes through Apprise, which speaks 100+ services behind
+one interface. This replaced hand-rolled Discord and Telegram senders: two
+bespoke payload formats, two error paths, two places to forget to redact a
+token, and no way to reach anything else without writing a third.
+
+Existing configuration keeps working. `DISCORD_WEBHOOK_URL`,
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are translated into Apprise URLs at
+startup, so nobody has to rewrite a working `.env` to upgrade. Anything Apprise
+supports can be added directly through `PVARR_APPRISE_URLS` -- ntfy, Gotify,
+Pushover, Matrix, Slack, email, a plain webhook.
+
+The Plex and Emby library refreshes are deliberately NOT Apprise. They are not
+notifications; they are API calls to a specific endpoint with a specific token,
+and pretending otherwise would obscure what they do.
 """
 
-import json
 import logging
 import os
+import re
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
+
 import requests
-from typing import Dict, Any, Optional
 
 from app.logging_config import redact_url_secrets
 
 logger = logging.getLogger("PVArrNotifications")
 
+try:
+    import apprise
+    APPRISE_AVAILABLE = True
+except ImportError:      # optional at runtime; PVArr records fine without it
+    APPRISE_AVAILABLE = False
+
+# https://discord.com/api/webhooks/<id>/<token>  ->  discord://<id>/<token>
+_DISCORD_WEBHOOK = re.compile(
+    r"^https?://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/(\d+)/([\w-]+)", re.I)
+
+
+def _split_urls(raw: str) -> List[str]:
+    """Apprise URLs from a config string, comma- or whitespace-separated."""
+    return [part for part in re.split(r"[,\s]+", raw or "") if part.strip()]
+
+
+def discord_to_apprise(webhook_url: str) -> Optional[str]:
+    """Translate a Discord webhook URL into Apprise's scheme.
+
+    Kept as a translation rather than asking operators to re-enter their
+    webhook in a new format: the value in their `.env` already works, and an
+    upgrade that silently stops notifying is worse than one that never started.
+    """
+    match = _DISCORD_WEBHOOK.match((webhook_url or "").strip())
+    if not match:
+        return None
+    return f"discord://{match.group(1)}/{match.group(2)}"
+
 
 class NotificationManager:
     def __init__(self):
-        self.discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
-        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-        self.plex_url = os.getenv("PLEX_URL", "")  # e.g. http://192.168.1.50:32400
+        self.plex_url = os.getenv("PLEX_URL", "")     # e.g. http://192.168.1.50:32400
         self.plex_token = os.getenv("PLEX_TOKEN", "")
-        self.emby_url = os.getenv("EMBY_URL", "")  # e.g. http://192.168.1.50:8096
+        self.emby_url = os.getenv("EMBY_URL", "")     # e.g. http://192.168.1.50:8096
         self.emby_api_key = os.getenv("EMBY_API_KEY", "")
+        self.targets: List[str] = self._build_targets()
+        if self.targets and not APPRISE_AVAILABLE:
+            logger.warning(
+                "Notification targets are configured but apprise is not installed; "
+                "no notifications will be sent."
+            )
 
-    def send_discord(self, title: str, description: str, color: int = 3447003):
-        """Send Discord webhook embed notification."""
-        if not self.discord_webhook_url:
-            return
+    # -- configuration -----------------------------------------------------
 
-        payload = {
-            "embeds": [{
-                "title": f"PVArr — {title}",
-                "description": description,
-                "color": color,
-                "footer": {"text": "PVArr Personal Video Recorder"}
-            }]
-        }
+    def _build_targets(self) -> List[str]:
+        """Every configured destination, as Apprise URLs."""
+        targets: List[str] = []
+
+        webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+        if webhook:
+            translated = discord_to_apprise(webhook)
+            if translated:
+                targets.append(translated)
+            else:
+                logger.warning(
+                    "DISCORD_WEBHOOK_URL does not look like a Discord webhook; "
+                    "ignoring it. Expected https://discord.com/api/webhooks/<id>/<token>"
+                )
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        if token and chat:
+            targets.append(f"tgram://{token}/{chat}")
+
+        targets.extend(_split_urls(os.getenv("PVARR_APPRISE_URLS", "")))
+        return targets
+
+    # -- delivery ----------------------------------------------------------
+
+    def send(self, title: str, body: str) -> bool:
+        """Deliver one message to every configured target.
+
+        The single choke point for outbound text, which is why redaction lives
+        here. A notification leaves the network for good -- there is no taking
+        it back out of a Discord channel and no expiring it -- so a stream
+        token must never reach this call, whatever a caller passes in.
+        """
+        if not self.targets or not APPRISE_AVAILABLE:
+            return False
+        payload = apprise.Apprise()
+        for url in self.targets:
+            if not payload.add(url):
+                logger.warning("Ignoring unusable notification target: %s",
+                               redact_url_secrets(url))
+        if not len(payload):
+            return False
         try:
-            requests.post(self.discord_webhook_url, json=payload, timeout=5)
-        except Exception as e:
-            logger.error("Failed to send Discord webhook: %s", redact_url_secrets(str(e)))
+            return bool(payload.notify(
+                title=redact_url_secrets(title),
+                body=redact_url_secrets(body),
+            ))
+        except Exception as exc:
+            logger.error("Notification failed: %s", redact_url_secrets(str(exc)))
+            return False
 
-    def send_telegram(self, message: str):
-        """Send Telegram message notification."""
-        if not self.telegram_bot_token or not self.telegram_chat_id:
-            return
-
-        url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-        payload = {
-            "chat_id": self.telegram_chat_id,
-            "text": f"<b>PVArr</b>\n{message}",
-            "parse_mode": "HTML"
-        }
-        try:
-            requests.post(url, json=payload, timeout=5)
-        except Exception as e:
-            logger.error("Failed to send Telegram notification: %s", redact_url_secrets(str(e)))
+    # -- events ------------------------------------------------------------
 
     def notify_recording_started(self, session_id: str, filename: str, candidate_name: str):
-        # Belt and braces. The call site is fixed to pass a candidate *name*,
-        # but a notification leaves the network for good -- there is no taking
-        # it back out of a Discord channel -- so the sink refuses to carry a
-        # token even if a future caller hands it a URL again.
-        candidate_name = redact_url_secrets(candidate_name)
-        msg = f"🎥 <b>Recording Started</b>\nSession: <code>{session_id}</code>\nFile: <code>{filename}</code>\nActive Stream: {candidate_name}"
-        self.send_discord("Recording Started 🎥", f"**Session:** `{session_id}`\n**File:** `{filename}`\n**Stream:** {candidate_name}", color=3066993)
-        self.send_telegram(msg)
+        self.send(
+            "PVArr — Recording Started 🎥",
+            f"Session: {session_id}\nFile: {filename}\nStream: {candidate_name}",
+        )
 
     def notify_failover_triggered(self, session_id: str, next_candidate_name: str):
-        msg = f"⚠️ <b>Failover Triggered!</b>\nSession: <code>{session_id}</code>\nSwitched to: {next_candidate_name}"
-        self.send_discord("Stream Failover Triggered ⚠️", f"**Session:** `{session_id}`\n**Switched to:** {next_candidate_name}", color=15105570)
-        self.send_telegram(msg)
+        self.send(
+            "PVArr — Stream Failover Triggered ⚠️",
+            f"Session: {session_id}\nSwitched to: {next_candidate_name}",
+        )
 
     def notify_recording_finished(self, session_id: str, filename: str, size_mb: float):
-        msg = f"✅ <b>Recording Finished</b>\nSession: <code>{session_id}</code>\nFile: <code>{filename}</code>\nSize: {size_mb} MB"
-        self.send_discord("Recording Finished ✅", f"**Session:** `{session_id}`\n**File:** `{filename}`\n**Size:** {size_mb} MB", color=3066993)
-        self.send_telegram(msg)
+        self.send(
+            "PVArr — Recording Finished ✅",
+            f"Session: {session_id}\nFile: {filename}\nSize: {size_mb} MB",
+        )
         self.trigger_media_server_refresh()
 
+    # -- media servers -----------------------------------------------------
+
     def trigger_media_server_refresh(self):
-        """Trigger Plex & Emby library refresh endpoints."""
-        # Plex refresh
+        """Ask Plex and Emby to rescan. Not a notification -- an API call."""
         if self.plex_url and self.plex_token:
             url = f"{self.plex_url.rstrip('/')}/library/sections/all/refresh?X-Plex-Token={self.plex_token}"
             try:
                 requests.get(url, timeout=5)
                 logger.info("Plex library refresh triggered successfully.")
             except Exception as e:
+                # requests puts the failing URL in its exception text, and that
+                # URL carries the Plex token.
                 logger.error("Plex refresh failed: %s", redact_url_secrets(str(e)))
 
-        # Emby / Jellyfin refresh
         if self.emby_url and self.emby_api_key:
             url = f"{self.emby_url.rstrip('/')}/Library/Refresh?api_key={self.emby_api_key}"
             try:

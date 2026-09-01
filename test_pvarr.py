@@ -4322,14 +4322,19 @@ class TestNotificationsShipNoTokens(ServerTestCase):
         self.assertIn("Candidate 1", shipped)
 
     def test_the_sink_redacts_a_url_handed_to_it_anyway(self):
+        """send() is the single choke point for outbound text, which is why
+        redaction lives there rather than in each notify_* method."""
         from unittest.mock import patch
         manager = notifications.NotificationManager()
-        with patch.object(manager, "send_discord") as discord, \
-             patch.object(manager, "send_telegram") as telegram:
+        manager.targets = ["json://example.com/hook"]
+        with patch("app.notifications.apprise.Apprise") as Apprise:
+            Apprise.return_value.add.return_value = True
+            Apprise.return_value.__len__ = lambda self: 1
             manager.notify_recording_started(
                 "s1", "game.ts", "https://cdn.example/live.m3u8?token=SECRET")
-        self.assertNotIn("SECRET", " ".join(str(a) for a in discord.call_args.args))
-        self.assertNotIn("SECRET", " ".join(str(a) for a in telegram.call_args.args))
+        sent = Apprise.return_value.notify.call_args.kwargs
+        self.assertNotIn("SECRET", sent["title"] + sent["body"])
+        self.assertIn("cdn.example", sent["body"])
 
 
 
@@ -5026,6 +5031,255 @@ class TestCommercialsNeverDamageARecording(unittest.TestCase):
         cmd = run.call_args.args[0]
         self.assertIsInstance(cmd, list)
         self.assertNotIn("shell", run.call_args.kwargs)
+
+
+
+class TestNotificationTargets(unittest.TestCase):
+    """Existing config must keep working across the Apprise change.
+
+    An upgrade that silently stops notifying is worse than one that never
+    started -- nobody checks a channel that has always been quiet.
+    """
+
+    def _manager(self, **env):
+        from unittest.mock import patch
+        clean = {k: "" for k in (
+            "DISCORD_WEBHOOK_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+            "PVARR_APPRISE_URLS", "PLEX_URL", "PLEX_TOKEN", "EMBY_URL", "EMBY_API_KEY")}
+        clean.update(env)
+        with patch.dict(os.environ, clean):
+            return notifications.NotificationManager()
+
+    def test_a_discord_webhook_is_translated(self):
+        m = self._manager(DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/123/abcXYZ-_1")
+        self.assertEqual(m.targets, ["discord://123/abcXYZ-_1"])
+
+    def test_the_old_discordapp_host_still_works(self):
+        m = self._manager(DISCORD_WEBHOOK_URL="https://discordapp.com/api/webhooks/9/tok")
+        self.assertEqual(m.targets, ["discord://9/tok"])
+
+    def test_a_nonsense_discord_url_is_dropped_not_passed_through(self):
+        """Passing it through would hand Apprise something it cannot use and
+        produce a confusing failure at send time instead of at startup."""
+        m = self._manager(DISCORD_WEBHOOK_URL="https://example.com/not-a-webhook")
+        self.assertEqual(m.targets, [])
+
+    def test_telegram_needs_both_halves(self):
+        self.assertEqual(self._manager(TELEGRAM_BOT_TOKEN="123:AA").targets, [])
+        self.assertEqual(self._manager(TELEGRAM_CHAT_ID="99").targets, [])
+        self.assertEqual(
+            self._manager(TELEGRAM_BOT_TOKEN="123:AA", TELEGRAM_CHAT_ID="99").targets,
+            ["tgram://123:AA/99"])
+
+    def test_arbitrary_apprise_urls_are_accepted(self):
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic, gotify://host/tok")
+        self.assertEqual(m.targets, ["ntfy://host/topic", "gotify://host/tok"])
+
+    def test_whitespace_separated_urls_too(self):
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://a/b\n  gotify://c/d")
+        self.assertEqual(m.targets, ["ntfy://a/b", "gotify://c/d"])
+
+    def test_legacy_and_new_config_combine(self):
+        m = self._manager(
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/1/t",
+            TELEGRAM_BOT_TOKEN="2:BB", TELEGRAM_CHAT_ID="3",
+            PVARR_APPRISE_URLS="ntfy://host/topic")
+        self.assertEqual(m.targets,
+                         ["discord://1/t", "tgram://2:BB/3", "ntfy://host/topic"])
+
+    def test_no_config_means_no_targets_and_no_send(self):
+        m = self._manager()
+        self.assertEqual(m.targets, [])
+        self.assertFalse(m.send("t", "b"))
+
+    def test_send_is_a_no_op_without_apprise_installed(self):
+        """apprise is optional at runtime; recording must not depend on it."""
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch.object(notifications, "APPRISE_AVAILABLE", False):
+            self.assertFalse(m.send("t", "b"))
+
+    def test_a_raising_apprise_does_not_propagate(self):
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch("app.notifications.apprise.Apprise") as Apprise:
+            Apprise.return_value.add.return_value = True
+            Apprise.return_value.__len__ = lambda self: 1
+            Apprise.return_value.notify.side_effect = RuntimeError("network down")
+            self.assertFalse(m.send("t", "b"))
+
+    def test_every_event_reaches_the_single_send_path(self):
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch.object(m, "send", return_value=True) as send, \
+             patch.object(m, "trigger_media_server_refresh"):
+            m.notify_recording_started("s", "f.ts", "Candidate 1")
+            m.notify_failover_triggered("s", "Candidate 2")
+            m.notify_recording_finished("s", "f.mp4", 12.5)
+        self.assertEqual(send.call_count, 3)
+
+
+
+class TestProbeFallsBackToYtdlp(unittest.TestCase):
+    """The dashboard must give the same answer the recording will get.
+
+    yt-dlp was wired into the recorder but not into /api/probe, so an operator
+    testing a page from the dashboard was told to go to DevTools while the
+    recorder would have resolved it. The sponsor hit exactly that.
+    """
+
+    def _fetch(self, status, body):
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            resp = MagicMock(status_code=status, ok=200 <= status < 300, url=url)
+            return resp, body
+
+        return fetch
+
+    def test_a_page_with_no_m3u8_is_handed_to_ytdlp(self):
+        from unittest.mock import patch
+        found = {"m3u8_url": "https://cdn.example/live.m3u8",
+                 "referer": "https://site.example/", "user_agent": "UA",
+                 "cookie": "", "extractor": "Generic"}
+        with patch("app.probe._fetch", self._fetch(200, b"<html>no manifest here</html>")), \
+             patch("app.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.ytdlp.resolve", return_value=found):
+            result = probe.probe_stream("https://site.example/watch", check_segment=False)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["m3u8_url"], "https://cdn.example/live.m3u8")
+        self.assertEqual(result["referer"], "https://site.example/")
+        self.assertIn("Referer", result["headers_required"])
+        self.assertIn("yt-dlp", result["message"])
+
+    def test_the_attempt_shows_up_in_the_trace(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fetch(200, b"<html>nope</html>")), \
+             patch("app.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.ytdlp.resolve", return_value=None):
+            result = probe.probe_stream("https://site.example/watch", check_segment=False)
+        stages = [a["stage"] for a in result["attempts"]]
+        self.assertIn("yt-dlp", stages)
+        self.assertFalse(result["ok"])
+
+    def test_the_failure_message_no_longer_just_says_devtools(self):
+        """It should say yt-dlp also failed, and warn about the token clock."""
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fetch(200, b"<html>nope</html>")), \
+             patch("app.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.ytdlp.resolve", return_value=None):
+            result = probe.probe_stream("https://site.example/watch", check_segment=False)
+        self.assertIn("yt-dlp could not resolve", result["message"])
+        self.assertIn("token", result["message"])
+
+    def test_it_can_be_switched_off(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fetch(200, b"<html>nope</html>")), \
+             patch("app.ytdlp.resolve") as resolve:
+            probe.probe_stream("https://site.example/watch",
+                               check_segment=False, use_ytdlp=False)
+        resolve.assert_not_called()
+
+
+class TestKeepRanges(unittest.TestCase):
+    """Inverting commercial ranges into the parts worth keeping."""
+
+    def test_simple_case(self):
+        self.assertEqual(commercials.keep_ranges([(10, 20), (50, 60)], 100),
+                         [(0.0, 10), (20, 50), (60, 100)])
+
+    def test_overlapping_ranges_are_merged_first(self):
+        """comskip can emit these, and inverting them naively drops content."""
+        self.assertEqual(commercials.keep_ranges([(50, 60), (10, 25), (20, 30)], 100),
+                         [(0.0, 10), (30, 50), (60, 100)])
+
+    def test_a_break_at_the_start(self):
+        self.assertEqual(commercials.keep_ranges([(0, 10)], 100), [(10, 100)])
+
+    def test_a_break_at_the_end(self):
+        self.assertEqual(commercials.keep_ranges([(90, 100)], 100), [(0.0, 90)])
+
+    def test_everything_flagged_leaves_nothing(self):
+        self.assertEqual(commercials.keep_ranges([(0, 100)], 100), [])
+
+    def test_ranges_past_the_end_are_clamped(self):
+        self.assertEqual(commercials.keep_ranges([(90, 500)], 100), [(0.0, 90)])
+
+    def test_no_duration_means_no_keeps(self):
+        self.assertEqual(commercials.keep_ranges([(1, 2)], 0), [])
+
+
+class TestCutRefusesRatherThanGuesses(unittest.TestCase):
+    """The destructive path. It must refuse anything it cannot verify.
+
+    A stream-copy concat that silently produced a 30-second file from a
+    three-hour recording would otherwise replace the recording with wreckage,
+    and there is no re-recording a live game.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-cut-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.video = self.tmp / "game.mp4"
+        self.video.write_bytes(b"the original recording")
+
+    def test_it_refuses_when_the_duration_cannot_be_read(self):
+        from unittest.mock import patch
+        with patch.object(commercials, "media_duration", return_value=None):
+            self.assertFalse(commercials.cut_breaks(str(self.video), [(10, 20)]))
+        self.assertEqual(self.video.read_bytes(), b"the original recording")
+
+    def test_it_refuses_when_nothing_would_be_left(self):
+        from unittest.mock import patch
+        with patch.object(commercials, "media_duration", return_value=100.0):
+            self.assertFalse(commercials.cut_breaks(str(self.video), [(0, 100)]))
+        self.assertEqual(self.video.read_bytes(), b"the original recording")
+
+    def test_it_refuses_when_the_cut_is_the_wrong_length(self):
+        """The check that makes this safe to ship: expected 70s, got 12s."""
+        from unittest.mock import patch, MagicMock
+
+        # Keyed on the exact filename: the scratch directory is named
+        # "pvarr-comcut-…", so a bare "cut" substring test also matches the
+        # source path and quietly makes this assert nothing.
+        def durations(path):
+            return 12.0 if Path(path).name.startswith("cut") else 100.0
+
+        with patch.object(commercials, "media_duration", side_effect=durations), \
+             patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch("app.commercials.Path.is_file", return_value=True), \
+             patch("app.commercials.Path.stat",
+                   return_value=MagicMock(st_size=1024)), \
+             patch("app.commercials.shutil.move") as move:
+            ok = commercials.cut_breaks(str(self.video), [(10, 40)])
+        self.assertFalse(ok)
+        move.assert_not_called()
+
+    def test_a_failed_segment_extraction_aborts(self):
+        from unittest.mock import patch, MagicMock
+        with patch.object(commercials, "media_duration", return_value=100.0), \
+             patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=1, stdout="", stderr="boom")), \
+             patch("app.commercials.shutil.move") as move:
+            self.assertFalse(commercials.cut_breaks(str(self.video), [(10, 20)]))
+        move.assert_not_called()
+        self.assertEqual(self.video.read_bytes(), b"the original recording")
+
+    def test_no_breaks_means_no_work(self):
+        self.assertFalse(commercials.cut_breaks(str(self.video), []))
+
+    def test_keeping_the_original_is_the_default(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVARR_COMSKIP_KEEP_ORIGINAL", None)
+            self.assertTrue(commercials.keep_original())
+
+    def test_the_backup_can_be_turned_off(self):
+        from unittest.mock import patch
+        for value in ("0", "false", "no", "off"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP_KEEP_ORIGINAL": value}):
+                self.assertFalse(commercials.keep_original(), value)
 
 
 

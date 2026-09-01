@@ -231,6 +231,7 @@ def probe_stream(
     cookie: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
     check_segment: bool = True,
+    use_ytdlp: bool = True,
 ) -> Dict[str, Any]:
     """Resolve a pasted URL to a playlist plus the headers needed to fetch it.
 
@@ -297,9 +298,22 @@ def probe_stream(
             playlists = _extract_playlists(body, resp.url)
             if not playlists:
                 result["page_url"] = resp.url
+                # Nothing in the HTML. That is the XHR case: the player fetches
+                # its manifest at runtime, so it was never in the document to
+                # find. yt-dlp is the one route left that can resolve it, and
+                # it must be tried here as well as in the recorder -- an
+                # operator testing from the dashboard has to see the same
+                # answer the recording will get.
+                if use_ytdlp:
+                    resolved = _try_ytdlp(target, result)
+                    if resolved:
+                        return resolved
                 result["message"] = (
-                    f"No .m3u8 found on that page (HTTP {resp.status_code}). If the player "
-                    "builds its URL in JavaScript, grab the m3u8 from DevTools and paste that."
+                    f"No .m3u8 found on that page (HTTP {resp.status_code}), and "
+                    "yt-dlp could not resolve it either. The player probably builds "
+                    "its URL in JavaScript. Take the m3u8 from DevTools (Network "
+                    "tab, filter m3u8) and paste that -- note its token is usually "
+                    "good for a few hours, so start the recording promptly."
                 )
                 return result
 
@@ -464,6 +478,45 @@ def _describe(result: Dict[str, Any]) -> str:
     if result["segment_ok"] is False:
         parts.append("segments rejected — stream may be session gated")
     return ", ".join(parts) + "."
+
+
+def _try_ytdlp(target: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Last resort for a page with no m3u8 in its HTML.
+
+    Imported lazily: probe.py is imported by the recorder on every connect, and
+    there is no reason to pull yt-dlp's module graph in for the common case
+    where the page scrape already worked.
+    """
+    from app import ytdlp
+
+    if not ytdlp.ytdlp_path():
+        return None
+    found = ytdlp.resolve(target)
+    result["attempts"].append({
+        "stage": "yt-dlp",
+        "url": target,
+        "status": 200 if found else None,
+        "note": (f"resolved by the {found['extractor']} extractor" if found
+                 else "no extractor could resolve this page"),
+    })
+    if not found:
+        return None
+
+    result.update({
+        "ok": True,
+        "m3u8_url": found["m3u8_url"],
+        "page_url": target,
+        "referer": found.get("referer", ""),
+        "user_agent": found.get("user_agent") or result["user_agent"],
+        "cookie": found.get("cookie", ""),
+        "kind": "media",
+        "headers_required": [
+            name for name, key in (("Referer", "referer"), ("Cookie", "cookie"))
+            if found.get(key)
+        ],
+        "message": f"Resolved by yt-dlp ({found.get('extractor') or 'generic'}).",
+    })
+    return result
 
 
 def _check_origin(
