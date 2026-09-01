@@ -2218,3 +2218,37 @@ did so with no analysis from me in either case.
 The tokenised-URL message now says what to do when the page URL *also* fails --
 copy the session Cookie -- rather than leaving the operator in the loop the
 sponsor actually hit: DevTools m3u8 is expired, page URL finds no m3u8, repeat.
+
+## Release v0.5.0 (2026-09-01)  [COMPLETED]
+
+Minor: new capability and one new dependency, backward compatible.
+Sponsor-approved ("sheeeep eeeetttt").
+
+**The one that matters for the sponsor's testing:**
+- **The dashboard probe now calls yt-dlp.** It was wired into the recorder
+  only, so testing a page from the dashboard reported "No .m3u8 found on that
+  page" while the recorder would have resolved it. Every page-URL test run
+  against v0.4.0 was therefore meaningless. The fallback now lives inside
+  `probe_stream()`, so the dashboard and the recorder cannot drift apart.
+
+**Also new:**
+- **Notifications through Apprise.** ntfy, Gotify, Pushover, Matrix, Slack,
+  email and plain webhooks via `PVARR_APPRISE_URLS`. Existing
+  `DISCORD_WEBHOOK_URL` and `TELEGRAM_*` are translated automatically and keep
+  working -- no `.env` edit needed.
+- **`PVARR_COMSKIP_MODE=cut` really cuts now**, and refuses to replace a
+  recording unless ffprobe can read the result and its duration is within 30s
+  of expected. `PVARR_COMSKIP_KEEP_ORIGINAL` defaults to on.
+- **Better failure advice.** A gated stream whose host is answering now names
+  the session Cookie as the next step, instead of looping the operator between
+  an expired DevTools m3u8 and a page with no m3u8 in it.
+
+**On upgrade:** nothing to do. Pull and restart. The image grows ~2 MB
+(apprise). Notifications keep working unchanged.
+
+500 tests green at the tag.
+
+### What this does not fix
+Streams fronted by `strmd.st`. That infrastructure returns an identical 403 to
+every client either of us can produce -- including a real browser -- and to its
+own front page. No release fixes that; the remaining lever is VPN egress (#7).
