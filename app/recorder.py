@@ -517,7 +517,15 @@ class StreamFailoverRecorder:
         return True
 
     def _detect_via_script(self, candidate: CandidateStream) -> bool:
-        """Fallback to the optional detect-headers CLI (browser-backed)."""
+        """Fallback to the optional detect-headers CLI.
+
+        NOT browser-backed, despite what this used to say. The image clones
+        upstream hls-restream-proxy, which ships only the shell version --
+        curl following the iframe chain, trying more header combinations than
+        the built-in probe. Useful for a page whose m3u8 is reachable by
+        following redirects and iframes; useless for one that builds its URL in
+        JavaScript, which is the case it was documented as solving.
+        """
         if not self.detect_headers_path or not os.path.exists(self.detect_headers_path):
             return False
 

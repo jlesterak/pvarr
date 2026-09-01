@@ -1861,3 +1861,63 @@ Whether this actually resolves the sponsor's five. It explains all the observed
 evidence, but the confirming test is theirs to run: paste the **page** URL for
 those same five streams. If a page URL still fails on a host whose root answers,
 that is a genuine header-detection gap and the trace will finally show it.
+
+## humantodo line 2: the root cause, and a decision for the sponsor (2026-08-31)
+
+Sponsor pasted the page URL for the failing streams and got "No .m3u8 found on
+that page (HTTP 200)". So both exits are closed:
+
+- **page URL** -> the player builds the m3u8 in JavaScript; nothing to scrape
+- **DevTools m3u8** -> token is session-bound and short-lived; 403
+
+Their original instinct ("could it be the javascript limitation you mentioned")
+was right. It was wrongly ruled out on the strmd.st URL, where a dead host
+made it look like something else, and not revisited when the pattern turned out
+to hold across five providers.
+
+### The capability PVArr documents for this has never shipped
+1. The Dockerfile clones `pcruz1905/hls-restream-proxy` and copies
+   `detect-headers-py.py` *if present*.
+2. That repo ships only `detect-headers.sh` -- 11 curl calls, no browser.
+3. `/home/jake/hls-restream-proxy/detect-headers-py.py` is **untracked in
+   git**. It exists on this dev box and nowhere else.
+
+So the Dockerfile's condition for the Playwright script has never once been
+true, in any build. `_detect_via_script` was documented "(browser-backed)" and
+the README claimed it "drives a real browser". Both described a file that was
+never published. Docstring and README both corrected.
+
+The five failures are therefore not five awkward providers. They are one
+missing feature.
+
+### Measured cost of the real fix
+Inside `ghcr.io/jlesterak/pvarr:0.3.0`, `pip install playwright` plus
+`playwright install --with-deps chromium`:
+
+    baseline image   710 MB
+    after            1645 MB
+    DELTA            935 MB      (2.3x the image)
+
+RAM is transient rather than resident -- a few hundred MB while a page renders,
+released after. CPU is a few seconds per candidate at connect and at each
+failover, not continuous. Nothing touches the capture path: if the browser is
+absent or fails, PVArr behaves exactly as it does today.
+
+### Two architectures -- SPONSOR DECISION NEEDED
+- **A: bake it into the image.** +935 MB for every user, including the majority
+  who never hit a JS-built URL. Simplest to operate, worst to distribute.
+- **B: optional sidecar container.** Main image unchanged; a second container
+  runs the browser and PVArr asks it over HTTP for a page's m3u8. Costs nothing
+  for anyone who does not need it, and the sponsor pulls it only on icebox.
+  This is exactly the FlareSolverr pattern the *arr ecosystem already uses for
+  Cloudflare challenges, so it will be familiar to users.
+- **C: do nothing.** These providers stay unusable in PVArr.
+
+Recommended: **B**. An optional heavyweight dependency should be opt-in, and
+the ecosystem precedent is strong.
+
+### Open question for the sponsor
+Whether the DevTools m3u8 failed *immediately* or worked briefly first. Pure
+TTL means a manual stopgap exists for short recordings; immediate failure means
+it is bound to the browser session or IP and there is no stopgap. The fix is
+the same either way.
