@@ -2186,3 +2186,35 @@ The sponsor tested live while this was being built. Three findings:
    header, first time, with no analysis from me.
 
 
+
+## Field session, continued: the sponsor is testing a build without the fix
+
+Every "No .m3u8 found on that page (HTTP 200)" the sponsor reported carries a
+trace of exactly one line -- `page 200 scraped for an m3u8`. That is the
+**v0.4.0** message and the v0.4.0 code path. The probe -> yt-dlp wiring landed
+after that tag, so their page-URL tests are currently exercising a build that
+never tries yt-dlp at all. Until they are on a build that has it, a page URL
+failing tells us nothing.
+
+That is the blocker, not any individual stream.
+
+### Two distinct failure classes, now cleanly separated by the trace
+1. **The host refuses everyone.** `lb7.strmd.st`, `lb10.strmd.st`: identical
+   403 to every referer, every user-agent, requests/curl/curl_cffi-with-a-
+   Chrome-fingerprint/a real browser, and to their own front page -- from the
+   sponsor's network *and* from this dev box. Unwinnable from any client we
+   have. The sponsor reports that most aggregators they try ultimately front
+   onto strmd.st, which makes #7 (VPN egress) the only remaining lever.
+2. **The host answers, the stream is gated.** `cdn11.zohanayaan.com:1686`
+   returns **200** on its own root (confirmed independently from this box) and
+   403s the playlist. That is winnable: it needs the right token, and possibly
+   a session cookie. Reaching it requires resolving the page, which requires
+   yt-dlp, which is not in their build.
+
+The origin check is what makes these two distinguishable at a glance, and it
+did so with no analysis from me in either case.
+
+### Message improved
+The tokenised-URL message now says what to do when the page URL *also* fails --
+copy the session Cookie -- rather than leaving the operator in the loop the
+sponsor actually hit: DevTools m3u8 is expired, page URL finds no m3u8, repeat.

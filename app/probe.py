@@ -616,11 +616,13 @@ def _failure_message(
     if status in (401, 403, 404) and looks_tokenised(url):
         expired = "has probably expired" if status == 404 else "was rejected"
         return (
-            f"The access token in this URL {expired} ({status}). These are usually "
-            "tied to one browser session and last minutes, so an m3u8 copied from "
-            "DevTools is often dead by the time it is pasted. Paste the **page URL** "
-            "you watch the stream on instead — PVArr re-resolves it every time it "
-            "connects, including on failover, so it gets a fresh token each time."
+            f"The access token in this URL {expired} ({status}), though the host "
+            "itself is answering — so this is the stream being gated, not a "
+            "missing header. Paste the **page URL** you watch the stream on "
+            "instead: PVArr re-resolves it on every connect and failover, so it "
+            "gets a fresh token each time. If the page URL also fails, the "
+            "stream is session-gated — copy the **Cookie** header from the same "
+            "DevTools request into the advanced fields."
         )
     if status == 403:
         return (

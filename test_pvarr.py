@@ -4628,7 +4628,9 @@ class TestExpiredTokenAdvice(unittest.TestCase):
             result = probe.probe_stream(url)
         self.assertIn("access token", result["message"])
         self.assertIn("page URL", result["message"])
-        # And it must stop blaming headers for it.
+        # And the next step if the page URL fails too, which is the loop the
+        # sponsor got stuck in: session cookie, not more referer guessing.
+        self.assertIn("Cookie", result["message"])
         self.assertNotIn("copy them from DevTools", result["message"])
 
     def test_an_untokenised_url_keeps_the_header_advice(self):
