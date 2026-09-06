@@ -276,7 +276,14 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PVARR_MAX_RESUME_GAP` | `300` | Seconds a recording's file may sit untouched before a restart finalises it instead of reconnecting. Measured from the file's last write, not from when the recording started. |
 | `PVARR_MAX_RESUME_ATTEMPTS` | `3` | How many times a session may be resumed before it is finalised instead. Stops a reproducibly broken recording from restart-looping forever. |
 | `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |
-| `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files; keep it below the compose `stop_grace_period` (30s) or Docker will `SIGKILL` first. |
+| `PVARR_GRACEFUL_TIMEOUT` | `5` | Seconds PVArr may spend closing open HTTP connections before it stops the recorders. Open dashboard tabs and live stream clients hold connections indefinitely, so without a bound a `docker stop` waits on them and never gets to the recorders at all. |
+| `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files. |
+
+These two run **in sequence** and together must fit inside the compose
+`stop_grace_period` (30s), or Docker `SIGKILL`s partway through and an
+in-flight recording loses the marker that lets it resume. The defaults leave
+five seconds of headroom (5 + 20 = 25). Raise one and lower the other, or raise
+`stop_grace_period` to match.
 | `PVARR_MIN_FREE_GB` | `5` | Free space, in GB, below which an active recording aborts and a new one is refused. `0` disables the guard entirely — only sensible if the recordings volume is separate from the system disk. |
 | `PVARR_COMSKIP` | `0` | Set to `1` to run commercial detection on each finished recording. Off by default because it costs roughly 20–40 minutes of CPU on a three-hour capture. Runs *after* the recording is remuxed, in the library and announced, so it never delays anything you were waiting for. |
 | `PVARR_COMSKIP_MODE` | `chapters` | `chapters` writes skip points into the file and changes nothing else. `cut` also removes the detected breaks — see the safety notes below. Anything unrecognised means `chapters`. |
@@ -447,6 +454,8 @@ remux fails.
 **A recording was replaced by a later one of the same fixture (versions before 0.5.1).** Filenames are derived from the date, sport, teams and resolution, and the collision check looked only for an existing `.ts`. Post-processing remuxes to `.mp4` and deletes the `.ts`, so recording the same fixture again on the same day found the name apparently free, reused it, and the second remux — which runs `ffmpeg -y` — overwrote the first recording's `.mp4` without a word. The check now reserves the whole name across `.ts`, `.mp4` and `.mkv`, and the file is created the moment the name is chosen, so two recordings started seconds apart cannot be handed the same one either. The second recording becomes `..._1`. Fixed.
 
 **After a restart, a recording went back to the primary that had just failed (versions before 0.5.1).** PVArr recorded which candidate was actually working every time it failed over, but nothing read that back on resume, so a recovered recording always restarted at candidate 1 and had to walk the list again — a fresh stall, and another gap in the footage, for a stream that was already known to be down. Resume now reattaches to the candidate that was working. Fixed.
+
+**A recording did not resume after a container restart, and its `.ts` was left raw (versions before 0.5.1).** The dashboard tails the recorder log over a connection that stays open for as long as the browser tab does, and PVArr closed open connections *before* stopping its recorders — with no limit on how long it would wait. So restarting the container with the dashboard open anywhere waited on that tab, Docker's 30-second `stop_grace_period` expired first, and the container was `SIGKILL`ed before any recorder had been told to stop: no resume marker, no remux, and FFmpeg killed mid-write. Measured at ~80 seconds with a single tab open. Connection draining is now bounded by `PVARR_GRACEFUL_TIMEOUT` (5s), which leaves the full `PVARR_SHUTDOWN_TIMEOUT` for the recorders. Fixed.
 
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 

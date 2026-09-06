@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -5997,3 +5998,60 @@ class TestResumeReattachesToTheWorkingCandidate(unittest.TestCase):
             with self.subTest(value=junk):
                 recorder = self._launch(current_candidate_index=junk)
                 self.assertEqual(recorder.current_candidate_index, 0)
+
+
+class TestShutdownBudgetFitsTheGracePeriod(unittest.TestCase):
+    """The two shutdown phases run in sequence inside Docker's grace period.
+
+    Uvicorn drains open connections first, and only then runs the lifespan hook
+    that stops the recorders and marks their sessions for resume. The dashboard
+    holds a log-tailing EventSource open for as long as a browser tab is on it,
+    so before the drain was bounded a `docker stop` with the UI open waited on
+    that tab (measured at ~80s), Docker's stop_grace_period expired, and the
+    container was SIGKILLed before a single recorder had been told to stop --
+    no resume marker, FFmpeg killed mid-write. Exactly the situation resume
+    exists for.
+
+    If these numbers drift apart again, that failure comes back silently.
+    """
+
+    ROOT = Path(__file__).resolve().parent
+
+    def _graceful_default(self) -> int:
+        text = (self.ROOT / "start.sh").read_text()
+        match = re.search(r'GRACEFUL_TIMEOUT="\$\{PVARR_GRACEFUL_TIMEOUT:-(\d+)\}"', text)
+        self.assertIsNotNone(match, "start.sh no longer sets a graceful-shutdown default")
+        return int(match.group(1))
+
+    def _grace_period(self) -> int:
+        text = (self.ROOT / "docker-compose.yml").read_text()
+        match = re.search(r"stop_grace_period:\s*(\d+)s", text)
+        self.assertIsNotNone(match, "docker-compose.yml no longer sets stop_grace_period")
+        return int(match.group(1))
+
+    def test_uvicorn_is_launched_with_a_bounded_drain(self):
+        # Without this flag the drain is unlimited and a single open dashboard
+        # tab postpones the recorder shutdown indefinitely.
+        text = (self.ROOT / "start.sh").read_text()
+        self.assertIn("--timeout-graceful-shutdown", text)
+
+    def test_the_two_phases_fit_inside_the_grace_period(self):
+        from app.cleanup import DEFAULT_SHUTDOWN_TIMEOUT_SEC
+        total = self._graceful_default() + DEFAULT_SHUTDOWN_TIMEOUT_SEC
+        self.assertLess(
+            total, self._grace_period(),
+            f"drain ({self._graceful_default()}s) + reap/remux "
+            f"({DEFAULT_SHUTDOWN_TIMEOUT_SEC}s) = {total}s must fit inside "
+            f"stop_grace_period ({self._grace_period()}s), or Docker SIGKILLs "
+            "an in-flight recording before it is marked for resume.",
+        )
+
+    def test_an_invalid_graceful_timeout_falls_back_rather_than_failing_to_boot(self):
+        # start.sh runs under `set -euo pipefail`; an unvalidated value would
+        # reach uvicorn's argument parser and the container would crash-loop.
+        result = subprocess.run(
+            ["bash", "-n", str(self.ROOT / "start.sh")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('=~ ^[0-9]+$', (self.ROOT / "start.sh").read_text())

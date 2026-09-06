@@ -84,6 +84,28 @@ echo "[+] Starting Web Dashboard Server on http://${HOST}:${PORT}..."
 echo "[+] Press Ctrl+C to stop all active streams and exit gracefully."
 echo ""
 
+# How long uvicorn may spend waiting for open connections before it closes them
+# and moves on to the application shutdown hook -- the hook that stops the
+# recorders and marks their sessions for resume.
+#
+# Without a bound this is unlimited, and the dashboard holds a log-tailing
+# EventSource open for as long as a browser tab is on it. So a `docker stop`
+# with the UI open anywhere waited on that tab, Docker's stop_grace_period (30s)
+# expired first, and the container was SIGKILLed before a single recorder had
+# been told to stop: no resume marker, and FFmpeg killed mid-write. Measured at
+# ~80s with one tab open.
+#
+# The whole shutdown must fit inside stop_grace_period:
+#   PVARR_GRACEFUL_TIMEOUT (drain) + PVARR_SHUTDOWN_TIMEOUT (reap + remux) < 30s
+# Defaults are 5 + 20 = 25s. Raise one and lower the other, or raise
+# stop_grace_period in docker-compose.yml to match.
+GRACEFUL_TIMEOUT="${PVARR_GRACEFUL_TIMEOUT:-5}"
+if ! [[ "$GRACEFUL_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    echo "[!] Ignoring invalid PVARR_GRACEFUL_TIMEOUT=${GRACEFUL_TIMEOUT}; using 5." >&2
+    GRACEFUL_TIMEOUT=5
+fi
+
 # --reload-dir without --reload is a no-op; omitted rather than shipping a
 # reloader in production.
-exec python3 -m uvicorn app.server:app --host "$HOST" --port "$PORT"
+exec python3 -m uvicorn app.server:app --host "$HOST" --port "$PORT" \
+    --timeout-graceful-shutdown "$GRACEFUL_TIMEOUT"

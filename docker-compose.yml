@@ -11,7 +11,8 @@ services:
     ports:
       - "8999:8999"
     # Docker's default is 10s, which is not enough to reap FFmpeg and let a
-    # remux finish. PVARR_SHUTDOWN_TIMEOUT (default 20s) must stay inside this.
+    # remux finish. PVARR_GRACEFUL_TIMEOUT + PVARR_SHUTDOWN_TIMEOUT (5 + 20s by
+    # default) run in sequence and must both stay inside this.
     stop_grace_period: 30s
     # Unrotated container logs grow without bound; a crash loop fills the disk.
     logging:
@@ -45,6 +46,13 @@ services:
       - PVARR_CONFIG_DIR=/config
       - PVARR_ALLOWED_DIRS=/recordings
       - PVARR_LOG_LEVEL=${PVARR_LOG_LEVEL:-INFO}
+      # Shutdown budget. These two run in sequence and must both fit inside
+      # stop_grace_period above, or Docker SIGKILLs mid-shutdown and an
+      # in-flight recording loses its resume marker:
+      #   GRACEFUL (close open connections) + SHUTDOWN (reap FFmpeg, remux)
+      #   5 + 20 = 25s, inside the 30s grace period.
+      - PVARR_GRACEFUL_TIMEOUT=${PVARR_GRACEFUL_TIMEOUT:-5}
+      - PVARR_SHUTDOWN_TIMEOUT=${PVARR_SHUTDOWN_TIMEOUT:-20}
     volumes:
       - ./config:/config
       - ./recordings:/recordings

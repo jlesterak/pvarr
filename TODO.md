@@ -2641,3 +2641,63 @@ SIGKILLs first: the recorder never marks the session for resume and FFmpeg dies
 with the container. This defeats the resume feature precisely when it is needed
 -- a `docker restart` or a Watchtower update with the UI open. Likely the reason
 resume has felt unreliable in production.
+
+---
+
+## Phase 17: An open dashboard tab no longer blocks shutdown (2026-09-05) [COMPLETED]
+
+Found in Phase 16's live bounce; fixed here as its own change.
+
+### What was wrong
+Uvicorn drains open HTTP connections *before* running the ASGI lifespan
+shutdown hook -- and that hook is what calls `stop_all()`, which stops each
+recorder with `reason="shutdown"` and leaves the `.ts` marked for resume. The
+dashboard holds an `EventSource` on `/api/recordings/{id}/logs` open for as long
+as a browser tab is on it, and `log_generator` loops until `recorder.is_running`
+goes false -- which only happens inside the hook it is blocking. Deadlock by
+construction, broken only when the operator closes the tab.
+
+`register_signal_handlers` (`cleanup.py`) was written to prevent exactly this:
+stop the recorders on SIGTERM, *then* chain to uvicorn so the streams can drain.
+It does not work, and the docstring's reasoning is inverted. It registers at
+import; uvicorn then calls `install_signal_handlers()`, which uses
+`loop.add_signal_handler` and **replaces** the `signal.signal` handler. Ours ran
+last, after `Finished server process`, doing nothing useful.
+
+### Measured
+Bounced the server under a live recording with one dashboard tab open:
+80 seconds from SIGTERM to `Application shutdown complete`. `docker-compose.yml`
+sets `stop_grace_period: 30s`, so in a container Docker SIGKILLs at 30 -- before
+`stop_all()` has run at all. No resume marker, no remux, FFmpeg killed
+mid-write, on precisely the recording resume exists to protect.
+
+### Fixed
+`start.sh` now passes `--timeout-graceful-shutdown` (public uvicorn option,
+`PVARR_GRACEFUL_TIMEOUT`, default 5). The drain is bounded, so the lifespan hook
+always runs and always has the full `PVARR_SHUTDOWN_TIMEOUT` budget.
+
+Chosen over the alternatives deliberately: making `log_generator` watch a
+shutdown flag needs a pre-drain hook we cannot reliably get, because uvicorn
+owns the signal handlers by then; re-installing our own via
+`loop.add_signal_handler` at lifespan startup would work but needs
+`loop._signal_handlers` (private) to chain to uvicorn's, and a shutdown path is
+the worst place to depend on an internal. The flag is supported, one line, and
+bounds *every* long-lived response -- the tuner and live `/stream` endpoints
+too, not just the log SSE.
+
+### Verified
+- Isolated second instance, own config and recordings dir, one SSE client held
+  open: **15.0s before, 5.5s after**, with `Application shutdown complete` and
+  the recorders stopped in both. (The 15s floor is because the test recorder
+  gave up on a dead URL and ended the stream itself; a healthy recording never
+  does, which is the 80s case.)
+- 562 tests (was 559). Two mutations bite: removing the flag from `start.sh`
+  fails 1; shrinking `stop_grace_period` below the budget fails 1.
+- The budget test parses `start.sh`, `cleanup.py` and `docker-compose.yml`, so
+  the three cannot drift apart again silently.
+
+### Left alone, deliberately
+`register_signal_handlers` still runs and is now redundant under uvicorn, but it
+is the only shutdown path for the `stream-recorder.py` CLI entry point. Removing
+it would break that; correcting its docstring is worth doing but is not this
+change.
