@@ -144,6 +144,14 @@ storage = StorageManager(record_dir=str(RECORDINGS_DIR))
 # Active recorder sessions: recording_id -> StreamFailoverRecorder
 active_recorders: Dict[str, StreamFailoverRecorder] = {}
 
+# The session record behind each recorder, kept so a finished session can be
+# offered back to the operator as "record this again". The recorder holds the
+# running state; the record holds what the operator asked for, and only the
+# record still knows the sport/teams/resolution that produced the filename.
+# Pruned in lockstep with active_recorders -- two dicts that disagree are a
+# leak, so there is exactly one place that removes from either.
+session_records: Dict[str, Dict[str, Any]] = {}
+
 # Register SIGINT / SIGTERM handlers for container & process safety
 register_signal_handlers(active_recorders)
 
@@ -394,6 +402,7 @@ def _prune_finished_sessions() -> None:
     finished.sort(key=lambda kv: kv[1].stop_time or 0.0)
     for rid, _ in finished[:excess]:
         active_recorders.pop(rid, None)
+        session_records.pop(rid, None)
 
 
 def _allocate_proxy_port(base: int = 8090) -> int:
@@ -557,6 +566,7 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
 
     session_store.save(record)
     active_recorders[recording_id] = recorder
+    session_records[recording_id] = record
     recorder.start_recording()
     return recorder
 
@@ -781,6 +791,17 @@ async def start_recording(
         or _default_channel_name(sport, team_a, team_b),
         end_time=resolved_end,
         max_hours=session_max_hours,
+        naming={
+            # str() is not decoration. SessionStore.save() catches TypeError
+            # from json.dump and responds by disabling persistence for the
+            # entire process -- every in-flight recording silently loses its
+            # ability to resume. One Path object in here would do it.
+            "sport": str(sport),
+            "team_a": str(team_a),
+            "team_b": str(team_b),
+            "resolution": str(resolution),
+            "output_dir": str(resolved_output_dir or ""),
+        },
     )
     recorder = _launch_session(record, port)
 
@@ -802,6 +823,91 @@ async def start_recording(
         "message": f"Started recording session {recording_id}",
         "session": recorder.get_status_summary()
     })
+
+
+@app.get("/api/recordings/{recording_id}/config")
+async def recording_config(recording_id: str):
+    """The inputs that created a session, so the dashboard can offer it again.
+
+    This deliberately pre-fills the start form rather than restarting outright.
+    Candidate URLs carry short-lived `st=`/token query parameters -- a few hours
+    at best -- so a one-click restart would, for most of a URL's life, fail at
+    the probe and lose the operator the time. Showing the URLs first means a
+    stale one is pasted over instead.
+
+    Scope is the in-memory sessions only. A finished recording on disk is just
+    an .mp4 and carries none of this, so there is nothing to offer for a
+    session the process has already forgotten.
+
+    What is NOT returned: the per-candidate cookie. `CandidateStream.to_dict()`
+    withholds it from /api/status on purpose -- port 8999 has no authentication,
+    and a cookie is a live credential for the operator's account that, unlike a
+    stream token, does not expire on its own. `cookie_required` says which slots
+    need one re-pasted; the value stays in this process.
+    """
+    record = session_records.get(recording_id)
+    if not record:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No stored configuration for that session. PVArr keeps the last "
+                f"{MAX_FINISHED_SESSIONS} finished sessions in memory and forgets "
+                "them when it restarts."
+            ),
+        )
+
+    naming = record.get("naming") or {}
+    overrides = record.get("header_overrides") or {}
+    candidates = list(record.get("candidates") or [])
+
+    # An absolute end_time belongs to the event that has already been and gone.
+    # Replaying it into a new session would either cap the recording at a time
+    # in the past or, worse, be silently accepted. Offer the length the operator
+    # originally asked for instead, measured from whenever they press Start.
+    duration_minutes = None
+    end_time = record.get("end_time")
+    started_at = record.get("started_at")
+    if end_time and started_at and end_time > started_at:
+        # 1440 is the ceiling /api/recordings/start enforces. An end_time set
+        # by API rather than by the dashboard is only checked for being in the
+        # future, so it can exceed that -- and a pre-filled form that the
+        # server then refuses is worse than a clamped one.
+        duration_minutes = min(round((end_time - started_at) / 60.0, 2), 24 * 60)
+
+    headers: Dict[str, Dict[str, str]] = {}
+    cookie_required: List[str] = []
+    for url in candidates:
+        override = overrides.get(url) or {}
+        entry = {
+            field: override[field]
+            for field in ("referer", "user_agent")
+            if override.get(field)
+        }
+        if entry:
+            headers[url] = entry
+        if override.get("cookie"):
+            cookie_required.append(url)
+
+    return {
+        "status": "success",
+        "source_session": recording_id,
+        "config": {
+            "sport": naming.get("sport") or "Sports",
+            "team_a": naming.get("team_a") or "TeamA",
+            "team_b": naming.get("team_b") or "TeamB",
+            "resolution": naming.get("resolution") or "1080p",
+            "output_dir": naming.get("output_dir") or "",
+            "channel_name": record.get("channel_name") or "",
+            "rebroadcast": bool(record.get("rebroadcast")),
+            "freeze_timeout": record.get("freeze_timeout_sec", 15),
+            "duration_minutes": duration_minutes,
+            "url_primary": candidates[0] if len(candidates) > 0 else "",
+            "url_backup1": candidates[1] if len(candidates) > 1 else "",
+            "url_backup2": candidates[2] if len(candidates) > 2 else "",
+            "stream_headers": headers,
+            "cookie_required": cookie_required,
+        },
+    }
 
 
 @app.post("/api/recordings/{recording_id}/stop")

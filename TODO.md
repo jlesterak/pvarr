@@ -2504,3 +2504,93 @@ timeline to rejoin because it is discarded with the process.
 - One corrupt frame at each splice, where the previous segment's final PES is
   cut off mid-packet. Unavoidable without re-muxing the boundary; one frame
   against a full playback reset.
+
+---
+
+## Phase 15: Record again, and the filename overwrite it exposed (2026-09-05) [COMPLETED]
+
+### The report
+Sponsor stopped a recording by mistake during live testing, after post-processing
+had already remuxed and deleted the `.ts`. Asked for a way to recreate a recently
+finished stream, writing to a new file, and then widened it: "not just for this
+stream/recording, but all please."
+
+### Decided with the sponsor before building
+- **Scope**: in-memory sessions only (last 20, cleared on restart). Persisting
+  finished configs would put live account cookies and tokenised URLs at rest in
+  `/config` indefinitely, and the tokens expire in hours anyway -- a config that
+  survives a restart is mostly a dead config.
+- **Behaviour**: pre-fill the start form, do not start outright. Candidate URLs
+  carry `st=` tokens with a few hours' life; one-click would fail at the probe
+  for most of a URL's life and cost the operator the time.
+
+### The data-loss bug this uncovered
+`get_output_path` de-duplicated with `while path.exists()` against the `.ts`
+only. Post-processing remuxes to `.mp4` and **deletes** the `.ts`, so recording
+the same fixture twice on one day found the stem apparently free, reused it, and
+`remux_recording`'s `ffmpeg -y` overwrote the first recording's finished `.mp4`
+silently. Live in every version to date; "Record again" would have triggered it
+on first use. Nothing to do with the new feature -- it just needed the same two
+teams twice.
+
+### Findings from the agent team that changed the implementation
+- **Security**: `/api/status` already exposes tokenised candidate URLs, referer
+  and user-agent to any unauthenticated caller, so returning those changes
+  nothing. But `CandidateStream.to_dict()` withholds the **cookie** on purpose
+  (`app/recorder.py:493-520`) -- a live credential for the sponsor's paid
+  account that, unlike a stream token, never expires on its own. The endpoint as
+  designed would have reverted that fix. Now returns `cookie_required` (a list
+  of URLs) and the value stays in-process.
+- **DevOps**: the collision fix alone left a wide TOCTOU window. Nothing creates
+  the file at name-selection time -- `_FileSink` opens it on the capture thread
+  seconds later -- so two "Record again" clicks a second apart both stat an
+  empty directory, both get the same path, and both open it `"ab"`. Result is
+  two FFmpeg processes interleaving TS packets into one file, which looks like a
+  valid recording, and `_output_ok`'s inode check cannot see it because both
+  handles hold the same inode. Fixed with `O_CREAT|O_EXCL` at reservation time.
+  That also converts two silent failures into loud ones: `Path.exists()` answers
+  False on OSError, so a stale NFS handle read as "name is free", and an
+  `output_dir` owned by another uid failed only later on a background thread
+  after the API had returned 200. Both are now the existing 400.
+- **Architect**: do **not** bump `SCHEMA_VERSION` for an additive record field --
+  `sessions.py:166` discards any record whose schema does not match exactly, so
+  a bump would drop every in-flight recording at boot, with no remux and an
+  orphaned `.ts`. Also: `SessionStore.save()` catches `TypeError` and responds by
+  disabling persistence for the whole process, so one non-JSON value in the new
+  field would silently cost every recording its ability to resume -- values are
+  coerced to `str` by construction. And the original absolute `end_time` must
+  not be replayed: it is in the past by then and `/start` answers 400. A
+  duration derived from `end_time - started_at` is offered instead, clamped to
+  the 1440 ceiling `/start` enforces.
+
+### Where the reviews overlapped, and how it was settled
+Security and Architect independently reached the same conclusion about the
+cookie, from different directions -- one from the threat model on port 8999, one
+from noticing that `recorder.candidates[i].cookie` is a *scraped* token by then,
+not the operator's input, because `detect_candidate_headers` re-scrapes at every
+connect. Both point at the same fix, and it also settles where to read config
+from: the session record (`header_overrides`, never mutated after `__init__`),
+not the live recorder.
+
+### Verified
+- 555 tests (was 537). Suite green.
+- Three mutations confirm the new tests bite: de-duplicating on `.ts` only fails
+  3; returning the name without creating it fails 3 + 1 error; adding `cookie`
+  to the returned headers fails 2.
+- `reserve_output_path` against a directory holding a finished `game.mp4`
+  returns `game_1.ts` and leaves the `.mp4` byte-identical.
+
+### Known, not fixed here (separate commits)
+- `server.py` calls `recorder.stop()` synchronously on the event loop, blocking
+  the FastAPI thread for up to ~7s (`proc.wait(timeout=5)` + `wait(timeout=2)`)
+  -- the dashboard freezes while a recording stops. The obvious fix
+  (`asyncio.to_thread`) opens a port-reuse race, because `recorder.stop()` sets
+  `is_running = False` *before* `stop_proxy()`, and `_allocate_proxy_port`
+  excludes only running recorders. The two must move together.
+- `stop_proxy()` sets `self._proxy_process = None` even when both `terminate()`
+  and `kill()` throw, so a proxy that refuses to die is forgotten and its port
+  is reported free.
+- On an `aborted_no_space` finish, `_on_complete` still remuxes unconditionally.
+  Remuxing a 20 GB `.ts` needs 20 GB that by definition is not there; FFmpeg
+  hits ENOSPC and the `.ts` is correctly kept, but the partial `.mp4` that
+  `ffmpeg -y` already created is left on the volume and shows up in the library.

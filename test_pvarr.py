@@ -29,6 +29,7 @@ from app import check_deps, tuner
 from app.naming import (
     StorageManager,
     generate_sports_filename,
+    reserve_output_path,
     sanitize_token,
 )
 from app.post_processor import remux_recording
@@ -2057,6 +2058,8 @@ class ServerTestCase(unittest.TestCase):
         self._storage_patch.start()
         self._recorders_patch = patch.object(server, "active_recorders", {})
         self._recorders_patch.start()
+        self._records_patch = patch.object(server, "session_records", {})
+        self._records_patch.start()
         self._dir_patch = patch.object(server, "RECORDINGS_DIR", Path(self.tmp))
         self._dir_patch.start()
         # Disable the free-space floor by default. Left live, every start test
@@ -2069,6 +2072,7 @@ class ServerTestCase(unittest.TestCase):
     def tearDown(self):
         self._storage_patch.stop()
         self._recorders_patch.stop()
+        self._records_patch.stop()
         self._dir_patch.stop()
         self._disk_patch.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -5743,3 +5747,197 @@ class TestRealFailoverSpliceIsMonotonic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOutputPathReservation(unittest.TestCase):
+    """The naming layer must not hand two recordings the same file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-reserve-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_it_creates_the_file_it_returns(self):
+        # The reservation is the file. Returning a name without creating it is
+        # what let two starts claim the same one.
+        path = reserve_output_path(self.tmp / "game.ts")
+        self.assertTrue(path.exists())
+        self.assertEqual(path.stat().st_size, 0)
+
+    def test_a_finished_mp4_blocks_its_own_stem(self):
+        # The bug this exists for: capture writes .ts, the remux makes .mp4 and
+        # DELETES the .ts, so a .ts-only check saw a free name and ffmpeg -y
+        # then overwrote the finished recording.
+        (self.tmp / "game.mp4").write_bytes(b"a finished recording")
+        path = reserve_output_path(self.tmp / "game.ts")
+        self.assertEqual(path.name, "game_1.ts")
+        self.assertEqual((self.tmp / "game.mp4").read_bytes(), b"a finished recording")
+
+    def test_an_mkv_blocks_the_stem_too(self):
+        (self.tmp / "game.mkv").write_bytes(b"x")
+        self.assertEqual(reserve_output_path(self.tmp / "game.ts").name, "game_1.ts")
+
+    def test_repeated_reservations_never_collide(self):
+        # Two "Record again" clicks a second apart used to receive the same
+        # path and open it "ab" -- two FFmpegs interleaving into one file.
+        names = [reserve_output_path(self.tmp / "game.ts").name for _ in range(5)]
+        self.assertEqual(len(set(names)), 5)
+        self.assertEqual(names[0], "game.ts")
+        self.assertEqual(names[1], "game_1.ts")
+
+    def test_it_closes_the_descriptor_it_opens(self):
+        # Leaking one fd per start would exhaust the process over a long uptime.
+        before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+        if before is None:
+            self.skipTest("no /proc/self/fd on this platform")
+        for _ in range(20):
+            reserve_output_path(self.tmp / "game.ts")
+        self.assertLessEqual(len(os.listdir("/proc/self/fd")), before + 2)
+
+    def test_an_unwritable_directory_raises_rather_than_lying(self):
+        # Path.exists() answers False on OSError, so an unreadable or stale
+        # directory used to read as "this name is free" and the failure landed
+        # later, on the capture thread, after the API had returned 200.
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o500)
+        try:
+            with self.assertRaises(OSError):
+                reserve_output_path(locked / "game.ts")
+        finally:
+            os.chmod(locked, 0o700)
+
+    def test_storage_manager_uses_the_reservation(self):
+        storage = StorageManager(str(self.tmp))
+        first = storage.get_output_path("NFL", "A", "B", "1080p")
+        first.rename(first.with_suffix(".mp4"))          # simulate the remux
+        second = storage.get_output_path("NFL", "A", "B", "1080p")
+        self.assertNotEqual(first.stem, second.stem)
+        self.assertTrue(first.with_suffix(".mp4").exists())
+
+
+class TestRecordAgainConfig(ServerTestCase):
+    """GET /api/recordings/{id}/config -- the settings behind a finished run."""
+
+    def _seed(self, **overrides):
+        from app.sessions import build_record
+        record = build_record(
+            recording_id="abc123",
+            candidates=["http://a/1.m3u8?st=tok", "http://b/2.m3u8"],
+            output_filepath=str(Path(self.tmp) / "old.ts"),
+            started_at=1000.0,
+            header_overrides={
+                "http://a/1.m3u8?st=tok": {
+                    "referer": "http://a/",
+                    "user_agent": "PVArr",
+                    "cookie": "session=supersecret",
+                },
+            },
+            freeze_timeout_sec=22,
+            channel_name="Test Channel",
+            end_time=1000.0 + 5400.0,
+            naming={
+                "sport": "NCAA-FBS", "team_a": "Wyoming", "team_b": "Colorado_State",
+                "resolution": "1080p", "output_dir": "",
+            },
+        )
+        record.update(overrides)
+        self.server.session_records["abc123"] = record
+        return record
+
+    def test_unknown_session_404s(self):
+        r = self.client.get("/api/recordings/nope/config")
+        self.assertEqual(r.status_code, 404)
+
+    def test_it_returns_the_operators_original_inputs(self):
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["sport"], "NCAA-FBS")
+        self.assertEqual(cfg["team_a"], "Wyoming")
+        self.assertEqual(cfg["team_b"], "Colorado_State")
+        self.assertEqual(cfg["resolution"], "1080p")
+        self.assertEqual(cfg["freeze_timeout"], 22)
+        self.assertEqual(cfg["channel_name"], "Test Channel")
+        self.assertEqual(cfg["url_primary"], "http://a/1.m3u8?st=tok")
+        self.assertEqual(cfg["url_backup1"], "http://b/2.m3u8")
+        self.assertEqual(cfg["url_backup2"], "")
+
+    def test_it_never_returns_a_cookie(self):
+        # /api/status withholds the cookie on purpose: port 8999 has no
+        # authentication and a cookie is a live account credential that does
+        # not expire the way a stream token does. This endpoint must not be
+        # the way back out.
+        self._seed()
+        body = self.client.get("/api/recordings/abc123/config").text
+        self.assertNotIn("supersecret", body)
+        self.assertNotIn("cookie", json.loads(body)["config"]["stream_headers"]
+                         ["http://a/1.m3u8?st=tok"])
+
+    def test_it_flags_which_candidates_need_a_cookie_repasted(self):
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["cookie_required"], ["http://a/1.m3u8?st=tok"])
+
+    def test_referer_and_user_agent_do_come_back(self):
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["stream_headers"]["http://a/1.m3u8?st=tok"],
+                         {"referer": "http://a/", "user_agent": "PVArr"})
+
+    def test_an_absolute_end_time_becomes_a_duration(self):
+        # Replaying the old absolute epoch would be refused as "in the past".
+        # What the operator meant was "ninety minutes", so offer that.
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["duration_minutes"], 90.0)
+
+    def test_the_duration_is_clamped_to_what_start_accepts(self):
+        self._seed(end_time=1000.0 + (72 * 3600))
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["duration_minutes"], 1440)
+
+    def test_no_end_time_offers_no_duration(self):
+        self._seed(end_time=None)
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertIsNone(cfg["duration_minutes"])
+
+    def test_it_does_not_hand_out_the_live_record(self):
+        # _on_failover mutates and re-saves this dict; a caller must not be
+        # able to reach it.
+        record = self._seed()
+        self.client.get("/api/recordings/abc123/config")
+        self.assertEqual(record["candidates"], ["http://a/1.m3u8?st=tok", "http://b/2.m3u8"])
+        self.assertEqual(record["header_overrides"]["http://a/1.m3u8?st=tok"]["cookie"],
+                         "session=supersecret")
+
+    def test_a_started_recording_is_immediately_re_recordable(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock(name="c1")]
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            started = self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8",
+                "sport": "NFL", "team_a": "Bucs", "team_b": "Raiders",
+                "resolution": "720p", "freeze_timeout": 30,
+            })
+        self.assertEqual(started.status_code, 200)
+        rid = next(iter(self.server.session_records))
+        cfg = self.client.get(f"/api/recordings/{rid}/config").json()["config"]
+        self.assertEqual(cfg["team_a"], "Bucs")
+        self.assertEqual(cfg["resolution"], "720p")
+        self.assertEqual(cfg["freeze_timeout"], 30)
+
+    def test_pruning_forgets_the_record_with_the_recorder(self):
+        # Two dicts that disagree are a leak. They must be pruned together.
+        from unittest.mock import MagicMock
+        for n in range(self.server.MAX_FINISHED_SESSIONS + 3):
+            rec = MagicMock()
+            rec.is_running = False
+            rec.stop_time = float(n)
+            self.server.active_recorders[f"s{n}"] = rec
+            self.server.session_records[f"s{n}"] = {"id": f"s{n}"}
+        self.server._prune_finished_sessions()
+        self.assertEqual(set(self.server.active_recorders), set(self.server.session_records))

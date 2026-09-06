@@ -275,6 +275,15 @@
                 </button>
                 <div x-show="expandedFinished[session.id]" x-cloak class="px-4 pb-3 space-y-2 border-t border-slate-800/80 pt-3">
                   <p class="text-xs text-slate-500 font-mono truncate" x-text="session.output_file"></p>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" @click="recordAgain(session.id)"
+                            class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/90 hover:bg-emerald-500 text-white transition shrink-0">
+                      Record again
+                    </button>
+                    <span class="text-[11px] text-slate-500">
+                      Loads these settings into a new recording, writing to a new file. You press Start.
+                    </span>
+                  </div>
                   <div class="bg-black/90 rounded-lg p-3 font-mono text-xs text-slate-300 h-36 overflow-y-auto border border-slate-800 space-y-1">
                     <template x-for="log in session.logs" :key="log">
                       <p class="leading-relaxed hover:bg-slate-900/50 px-1 rounded" x-text="log"></p>
@@ -492,9 +501,21 @@
                        class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
                 <input type="text" x-model="overrides[slot.key].user_agent" placeholder="User-Agent"
                        class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
-                <input type="text" x-model="overrides[slot.key].cookie" placeholder="Cookie"
-                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+                <input type="text" x-model="overrides[slot.key].cookie"
+                       :placeholder="cookieNeeded[slot.key] ? 'Cookie \u2014 paste again' : 'Cookie'"
+                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200"
+                       :class="cookieNeeded[slot.key] && !overrides[slot.key].cookie ? 'ring-1 ring-amber-500/70' : ''">
               </div>
+              <!-- PVArr never sends a stored cookie back to the browser: port
+                   8999 has no authentication, and a cookie is a live account
+                   credential that does not expire on its own the way a stream
+                   token does. So a re-recorded candidate that needed one has
+                   to have it pasted in again. -->
+              <p x-show="advanced[slot.key] && cookieNeeded[slot.key] && !overrides[slot.key].cookie" x-cloak
+                 class="text-[11px] text-amber-400/90 pt-1">
+                This candidate used a cookie. PVArr does not hand stored cookies back to the
+                browser, so paste it in again before starting.
+              </p>
             </div>
           </template>
         </div>
@@ -528,6 +549,7 @@
           duration_minutes: '',
           rebroadcast: false,
           channel_name: '',
+          output_dir: '',
           url_primary: '',
           url_backup1: '',
           url_backup2: ''
@@ -548,6 +570,11 @@
           url_backup2: { referer: '', user_agent: '', cookie: '' }
         },
         probeSeq: { url_primary: 0, url_backup1: 0, url_backup2: 0 },
+        // Set by "Record again" for candidates whose original run carried a
+        // cookie. The value itself stays on the server -- this is only a flag
+        // saying the operator has to supply it once more.
+        cookieNeeded: { url_primary: false, url_backup1: false, url_backup2: false },
+        reusedFrom: null,
         traceOpen: { url_primary: false, url_backup1: false, url_backup2: false },
         traceCopied: { url_primary: false, url_backup1: false, url_backup2: false },
 
@@ -826,11 +853,76 @@
             this.probes[slot.key] = null;
             this.advanced[slot.key] = false;
             this.overrides[slot.key] = { referer: '', user_agent: '', cookie: '' };
+            this.cookieNeeded[slot.key] = false;
           });
+          this.reusedFrom = null;
           // A duration belongs to the event just recorded, not to the next
           // one. Leaving it set would silently cap an unrelated recording.
           this.form.duration_minutes = '';
+          this.form.output_dir = '';
           this.slots.forEach(slot => { this.traceOpen[slot.key] = false; });
+        },
+
+        // Load a finished session's settings back into the start form. It
+        // deliberately stops short of starting: candidate URLs carry tokens
+        // that expire in hours, so the operator needs to see them -- and
+        // replace a stale one -- before pressing Start.
+        async recordAgain(id) {
+          let data;
+          try {
+            const res = await fetch(`/api/recordings/${id}/config`);
+            data = await res.json();
+            if (!res.ok) {
+              alert(data.detail || 'Could not load that session\'s settings');
+              return;
+            }
+          } catch (e) {
+            alert('Error loading session settings: ' + e);
+            return;
+          }
+
+          const c = data.config || {};
+          // Clear first, so anything the old session did not set cannot be
+          // inherited from whatever was last typed into the form.
+          this.resetStreamForm();
+
+          ['sport', 'team_a', 'team_b', 'resolution', 'channel_name',
+           'output_dir'].forEach(k => {
+            if (c[k] !== undefined && c[k] !== null) this.form[k] = c[k];
+          });
+          this.form.rebroadcast = !!c.rebroadcast;
+          this.form.freeze_timeout = c.freeze_timeout;
+          // The original end was an absolute time that has already passed. The
+          // server hands back the LENGTH that was asked for instead, so the
+          // new recording gets the same window measured from Start.
+          this.form.duration_minutes =
+            (c.duration_minutes === null || c.duration_minutes === undefined)
+              ? '' : c.duration_minutes;
+          this.form.url_primary = c.url_primary || '';
+          this.form.url_backup1 = c.url_backup1 || '';
+          this.form.url_backup2 = c.url_backup2 || '';
+
+          const headers = c.stream_headers || {};
+          const needsCookie = c.cookie_required || [];
+          this.slots.forEach(slot => {
+            const url = (this.form[slot.key] || '').trim();
+            if (!url) return;
+            const h = headers[url] || {};
+            this.overrides[slot.key] = {
+              referer: h.referer || '',
+              user_agent: h.user_agent || '',
+              cookie: ''
+            };
+            if (needsCookie.includes(url)) {
+              this.cookieNeeded[slot.key] = true;
+              // Open the panel rather than hiding the one thing that will
+              // stop this recording from starting.
+              this.advanced[slot.key] = true;
+            }
+          });
+
+          this.reusedFrom = data.source_session || id;
+          this.openNewModal = true;
         },
 
         async submitRecording() {

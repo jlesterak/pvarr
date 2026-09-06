@@ -199,6 +199,7 @@ def build_record(
     channel_name: str = "",
     end_time: Optional[float] = None,
     max_hours: Optional[float] = None,
+    naming: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The shape written to disk. Everything needed to rebuild the recorder.
 
@@ -224,6 +225,15 @@ def build_record(
         # the end the operator asked for.
         "end_time": float(end_time) if end_time else None,
         "max_hours": None if max_hours is None else float(max_hours),
+        # What the operator typed, as opposed to the path it produced. The
+        # record already carries output_filepath, but a filename cannot be
+        # taken apart again into sport/teams/resolution with any confidence
+        # (sanitize_token is lossy -- "St. Louis" and "St_Louis" collapse to
+        # the same thing), and "record this again" needs the inputs, not the
+        # output. Everything else it needs -- candidates, header_overrides,
+        # freeze_timeout_sec, channel_name -- is already above, so this adds
+        # no URL or cookie to the record that was not there before.
+        "naming": dict(naming or {}),
     }
 
 

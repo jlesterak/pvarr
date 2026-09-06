@@ -103,6 +103,65 @@ def generate_sports_filename(
     return filename
 
 
+def reserve_output_path(path: Path) -> Path:
+    """Claim the first free slot for `path`, atomically, and return it.
+
+    Two problems, one fix.
+
+    First, collision. Capture writes `.ts`; the post-processor remuxes to
+    `.mp4` (or `.mkv`) and then deletes the `.ts`. A check that looked only at
+    the extension it was handed saw a free name where a *finished* recording of
+    the same event already sat -- and `remux_recording` runs `ffmpeg -y`, which
+    overwrote it without a word. Recording the same fixture twice on one day
+    was enough to destroy the first copy. So the whole stem is reserved, across
+    every container a recording can end up in.
+
+    Second, the race. Nothing creates the file at this point -- `_FileSink`
+    opens it on the capture thread, seconds later, once the candidate has been
+    probed. Two starts a second apart therefore both saw an empty directory,
+    both got the same path, and both opened it "ab": two FFmpeg processes
+    interleaving TS packets into one file. That is worse than an overwrite,
+    because the result looks like a valid recording, and the sink's inode check
+    cannot see it -- both handles hold the same inode.
+
+    Creating the file here with O_EXCL closes both. The 0-byte file is a no-op
+    for a sink that opens append-mode, and it turns two silent failures into
+    loud ones: `Path.exists()` answers False on OSError, so a stale NFS handle
+    or an unreadable parent directory used to read as "this name is free", and
+    a caller-supplied `output_dir` owned by another uid failed only later, on a
+    background thread, long after the API had returned 200. Both now raise here
+    and become the 400 the start endpoint already returns.
+    """
+    target_dir = path.parent
+    stem, ext = path.stem, path.suffix
+
+    counter = 0
+    candidate = path
+    # A bound, so a directory that somehow refuses every name fails loudly
+    # instead of spinning a request thread forever.
+    while counter <= 999:
+        occupied = any(
+            (target_dir / f"{candidate.stem}{other}").exists()
+            for other in RECORDING_EXTENSIONS
+        )
+        if not occupied:
+            try:
+                handle = os.open(
+                    candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666
+                )
+            except FileExistsError:
+                # Lost the race to another start between the stat and the
+                # create. Take the next slot rather than sharing the file.
+                pass
+            else:
+                os.close(handle)
+                return candidate
+        counter += 1
+        candidate = target_dir / f"{stem}_{counter}{ext}"
+
+    raise OSError(f"Could not find a free filename for {path.name} in {target_dir}")
+
+
 class StorageManager:
     def __init__(self, record_dir: str = "recordings"):
         self.record_dir = Path(record_dir).resolve()
@@ -120,17 +179,7 @@ class StorageManager:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         filename = generate_sports_filename(sport, team_a, team_b, resolution)
-        path = target_dir / filename
-
-        # Avoid collision
-        counter = 1
-        stem = path.stem
-        ext = path.suffix
-        while path.exists():
-            path = target_dir / f"{stem}_{counter}{ext}"
-            counter += 1
-
-        return path
+        return reserve_output_path(target_dir / filename)
 
     def list_recordings(self, target_dir: Optional[str] = None) -> List[Dict[str, Any]]:
         dir_path = Path(target_dir).resolve() if target_dir else self.record_dir
