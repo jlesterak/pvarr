@@ -27,6 +27,7 @@ PVArr records HLS streams to disk. Point it at an `.m3u8` URL, give it up to two
 - **Commercial detection** *(optional, off by default)* — with `PVARR_COMSKIP=1`, each finished recording is scanned by [comskip](https://github.com/erikkaashoek/Comskip) and the breaks are written in as **chapter marks**, so Plex gives you skip points. Nothing is deleted by default: a false positive should cost you a click, not a play you cannot re-record. `PVARR_COMSKIP_MODE=cut` will remove them, and refuses to replace your recording unless the cut file is readable and its duration dropped by roughly the amount removed. Runs after the recording is already remuxed, in the library and announced.
 - **Notifications anywhere** — delivery goes through [Apprise](https://github.com/caronc/apprise), so ntfy, Gotify, Pushover, Matrix, Slack, email and plain webhooks all work via `PVARR_APPRISE_URLS`. Existing `DISCORD_WEBHOOK_URL` and Telegram settings keep working unchanged.
 - **Disk-space guard** — every active recording watches free space on its volume and aborts cleanly before filling it, keeping what was captured and post-processing it normally. Recordings are uncompressed TS on what is usually the same filesystem as everything else, so an unattended capture that runs out of room does not just lose itself, it takes the host with it. Floor set by `PVARR_MIN_FREE_GB` (default 5 GB); a start request is refused up front with `507` if the volume is already below it.
+- **Continuous timeline across a failover** — each switch continues the recording's clock instead of restarting it, so the file plays, seeks and reports its length correctly while it is still being written. Before v0.5.1 every failover reset the timestamps to zero, which made players jump back to the start mid-recording and made a duration probe see only the first segment.
 - **Manual stream control** — force a failover, or click any candidate in the dashboard to switch straight to it. That is the only route *back* to the primary once it recovers, since automatic failover only ever moves forwards.
 - **Direct FFmpeg recording** — writes straight to disk with minimal overhead, and falls back to an `hls-proxy-stream` bridge when the upstream needs injected headers or token refreshing.
 - **Sports-friendly auto-naming** — derives readable filenames for broadcasts instead of opaque timestamps.
@@ -358,8 +359,11 @@ Set `PLEX_URL`/`PLEX_TOKEN` or `EMBY_URL`/`EMBY_API_KEY` to have PVArr trigger a
 
 Each active recording appears as a live channel. The channel streams the file as
 it is being written, so you can start watching a game that is still recording.
-Because failover appends to the same file, a mid-event switch to a backup URL is
-invisible to the player — the feed just continues.
+Because failover appends to the same file, a mid-event switch to a backup URL
+keeps the same channel — the feed just continues, and the timeline continues
+with it (see **Failover and the file's timeline** below). Expect a gap of a
+second or two at the switch, which is the footage that genuinely did not arrive
+while PVArr was reconnecting.
 
 The playlist and guide list **running** recordings only; a channel disappears
 when its recording stops. Completed recordings are in the library, not the tuner.
@@ -390,6 +394,39 @@ app/
 
 `recorder.py` holds the core loop: it walks the candidate URL list, prefers a direct FFmpeg connection, drops to the proxy bridge when headers are required, and advances to the next candidate on stall, failure, or a forced failover. Before each connection it calls `probe.py` to re-resolve that candidate — playlist URLs carry short-lived tokens, so a failover an hour in needs a fresh answer rather than the one the dashboard found at submit time.
 
+### Failover and the file's timeline
+
+Every failover starts a **fresh FFmpeg process**, and FFmpeg normalises whatever
+it reads to its own zero — a source whose own clock says one hour still comes
+out starting at ~1.4 seconds. Those bytes are appended to the same `.ts`, so
+without correction the file's clock walks *backwards* at every switch.
+
+That is what a player trips over. mpv logs `Invalid audio PTS ... Reset playback
+due to audio timestamp reset` and restarts its clock mid-stream, `--start=` and
+seeking land in the wrong place, and `ffprobe` reports only the length of the
+first segment — a three-hour game with two failovers claiming to be forty
+minutes long.
+
+PVArr now reads the last timestamp back out of the bytes it just wrote and hands
+the next FFmpeg an `-output_ts_offset`, so each segment continues the timeline
+instead of restarting it. It applies to every splice: a candidate switch, the
+proxy-bridge retry, and a **resume after a restart**, where the offset is
+recovered from the tail of the existing file rather than starting at zero.
+
+Two things to expect, both harmless:
+
+- **A gap of a second or two at each switch.** Real footage that did not arrive
+  while PVArr reconnected. The timeline steps forward over it rather than
+  pretending it was continuous.
+- **mpv may still print `Invalid audio PTS: 10.03 -> 11.38` at a splice.** That
+  is mpv noting the forward step and carrying on. The line to worry about is
+  `Reset playback due to audio timestamp reset`, which should no longer appear.
+
+Finished recordings were never affected: `_on_complete` remuxes to `.mp4`, and
+that pass re-times the splice regardless. The bug only ever showed up in the raw
+`.ts` — which is exactly what the live tuner feed serves, and what you get if a
+remux fails.
+
 ---
 
 ## Troubleshooting
@@ -399,6 +436,8 @@ app/
 **A recording ended early when all sources blipped at once (versions before 0.1.3).** The candidate list was a one-way walk: once it ran off the end the recording stopped, with no route back to candidate 1 even after it recovered. The list now wraps. Fixed.
 
 **Finished recordings missing from the library, and deleting one errors (versions before 0.1.3).** The library only listed `.ts` files. Post-processing remuxes to `.mp4` and deletes the `.ts`, so a recording vanished from the library the moment it succeeded — and a delete clicked against the stale `.ts` entry `404`'d on a file that no longer existed. Renaming was affected too: `.ts` was forced onto every rename, turning `highlights.mp4` into `highlights.mp4.ts`. The library now covers `.ts`, `.mp4` and `.mkv`, renames keep the container the file is actually in, and downloads carry the right `Content-Type`. Fixed.
+
+**mpv resets to the start, or seeks land in the wrong place, on a live `.ts` (versions before 0.5.1).** Every failover restarted the file's timestamps at zero, so a player reading the file while it was still being written saw time run backwards at each switch and resynced. `ffprobe` reported only the first segment's duration for the same reason. Segments now continue the timeline — see **Failover and the file's timeline**. Finished `.mp4` files were never affected. Fixed.
 
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 

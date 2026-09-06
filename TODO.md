@@ -960,11 +960,9 @@ streaming endpoint is broken.
 323 tests (was 305).
 
 ### Still open
-- [ ] The failover PTS discontinuity is where a live client drops. Out of scope
-      for recordings (measured: the finished .mp4 is fine) but it DOES apply to
-      a rebroadcast viewer. Untested against a real player. PVArr does not
-      promise 24/7, so this stays low -- but it is the first thing to look at
-      if the sponsor reports Plex dropping a channel at a failover.
+- [x] **FIXED (2026-09-05): the failover PTS discontinuity.** See "Phase 14"
+      below. The sponsor reported it against mpv on a live .ts, which is the
+      report this item was waiting for.
 - [ ] No cap on concurrent channels or on viewers per channel. Each viewer read
       goes through `asyncio.to_thread` onto the default executor
       (`min(32, cpu+4)` workers).
@@ -2392,3 +2390,117 @@ Beyond `<iframe src>`: scripts that `document.write` an iframe using a variable
 set by the parent (`window.fid`), and character-array-joined URLs. All three
 are generic obfuscations, not site-specific, and all three are resolvable
 without executing JavaScript. No headless browser needed for this chain.
+
+
+## Phase 14: Failover timeline continuity (2026-09-05)  [COMPLETED]
+
+### The report
+The sponsor watches the live `.ts` with mpv while a recording runs, and uses
+`--start=` to skip around it. Failover broke both.
+
+### What was wrong
+Every failover spawns a fresh FFmpeg, and FFmpeg normalises each input to its
+own zero -- verified against a source whose own clock read one hour, which still
+came out of `-c copy -f mpegts` starting at 1.42s. Those bytes are appended to
+the same file, so the timeline stepped *backwards* at every switch.
+
+Reproduced locally in ten minutes with two 10s clips spliced the way the
+recorder splices them:
+- `ffprobe` read the 20s file as **10.02s** -- everything after the splice was
+  invisible to a duration probe.
+- One backward jump at the splice: `11.383 -> 1.423`.
+- mpv: `DTS 128090 < 1024490 out of order`, `Invalid audio PTS: 10.031 ->
+  0.000`, **`Reset playback due to audio timestamp reset`**, then an A/V
+  desynchronisation warning.
+
+This was previously measured (2026-08-31) and correctly judged not to affect the
+finished `.mp4`, because `_on_complete` remuxes and the remux re-times the
+splice. That finding still stands. What it missed is that the raw `.ts` is not
+an intermediate nobody looks at -- it is what the live tuner endpoint serves and
+what the sponsor actually watches.
+
+### The fix
+Read the last timestamp back out of the bytes we just wrote, and pass the next
+FFmpeg `-output_ts_offset`. No new process, no new file, no measurable CPU.
+
+- `last_timeline_position()` walks the 188-byte packet grid for PES headers and
+  takes the **maximum** PTS, not the last one found: audio and video interleave
+  and neither is reliably ahead, so "last" under-reports and an offset that is
+  too small puts the backward jump straight back.
+- `_ts_alignment()` finds the packet grid by looking for three sync bytes at
+  188-byte spacing, rather than making callers track a running byte count --
+  which a resumed recording could not reconstruct anyway. The capture loop reads
+  64KB chunks, which is not a multiple of 188, so a sliced tail almost never
+  starts on a boundary.
+- `_TailBuffer` keeps ~256KB as a deque of the original chunks. The obvious
+  version, `buf = (buf + chunk)[-CAP:]`, copies a quarter of a megabyte on every
+  chunk, ~10x/sec per recording, for the life of every recording, to serve a
+  value read once. (DevOps caught this; it is what I was about to write.)
+
+### Findings from the agent team that changed the implementation
+- **Architect, blocking:** "advance the offset at the end of
+  `_stream_ffmpeg_process`" is unreachable on the paths that matter. The body
+  returns from six places and all but one are followed by another FFmpeg
+  appending to the same file; only the operator-stop path falls off the end, and
+  that is the one case with no next segment. Now funnelled through a
+  `try/finally`. There is a regression test that fails without it.
+- **Architect:** resume was a second instance of the same bug -- a resumed
+  session is a new recorder object appending to a file an earlier process wrote,
+  so the offset would start at zero against a timeline hours in, reintroducing
+  the jump on every container restart. `_seed_timeline()` recovers it from the
+  tail of the existing file.
+- **Architect:** a 33-bit PTS wraps every ~26.5h while our own offset keeps
+  counting, so past the wrap a raw reading is *smaller* than where we are.
+  `advance_timeline_position()` treats a reading as a distance travelled the
+  short way round the circle, and refuses to move backwards.
+- **Security, blocking:** the offset is derived from stream content, which is
+  remote and therefore hostile. `str()` of a float is not a safe serialisation
+  for an FFmpeg argument -- `nan`/`inf` render as words and large magnitudes
+  render in exponent notation, none of which FFmpeg accepts as a duration.
+  `output_ts_offset_flags()` validates finiteness, sign and magnitude and
+  formats fixed-point, failing closed to *no offset* rather than a bad one.
+- **Security:** skip the scan entirely when an attempt delivered no bytes -- a
+  stream that fails instantly can cycle candidates quickly, and there is no
+  splice to measure anyway. An empty `_TailBuffer` is falsey, so this is the
+  same check as "did we get data".
+- **DevOps:** `-output_ts_offset` is a core muxer option present in every FFmpeg
+  of the last decade, confirmed against the 6.1.1 in this environment and the
+  5.1.9 in the shipped image. It does **not** need the runtime `ffmpeg -h`
+  probe that `hls_extension_flags()` uses -- that machinery exists for options
+  with genuine build-to-build variance, and adding a subprocess call per
+  recording start here would buy nothing.
+
+### Where the reviews disagreed, and how it was settled
+Architect flagged that `_RingSink` writes positionally into a wraparound buffer,
+so reading "the last 256KB" of a rebroadcast ring is not meaningful once it has
+wrapped, and asked whether rebroadcast was in scope. It dissolves: the tail is
+captured from the chunks on their way to the sink, before the sink sees them, so
+it is identical for a file and a ring. Rebroadcast splices are corrected the
+same way. Only the start-up *seeding* is file-only, and a ring has no prior
+timeline to rejoin because it is discarded with the process.
+
+### Verified
+- Four appended segments, real FFmpeg: timeline rises monotonically across all
+  1000 video packets; duration reads 44.17s for 40s of content (the extra is
+  three splices' worth of gap).
+- mpv on the four-segment file: **no timestamp reset, no DTS-out-of-order**.
+  `--start=38` into the final segment plays with `A-V: 0.000`.
+- Both defects the reviews caught were re-introduced deliberately to confirm the
+  new tests fail: neutering the argv fails 2 tests + 1 error; removing the
+  `try/finally` funnel fails 3.
+- 537 tests (was 500). Suite green.
+
+### Residual, accepted
+- mpv still prints `Invalid audio PTS: 10.03 -> 11.38` at a splice. That is a
+  *forward* step and mpv carries on; the line that mattered,
+  `Reset playback due to audio timestamp reset`, is gone.
+- Each splice leaves a ~1.4s gap, from FFmpeg's default muxer preload. Closing
+  it would mean subtracting a version-specific constant, and that cushion is
+  load-bearing: a PES header carries only the timestamp of the *first* frame it
+  packs, so the reading under-reports the true end of a segment by up to ~70ms.
+  The cushion absorbs that. In production the real gap is larger than 1.4s
+  anyway -- the footage genuinely did not arrive -- so a seamless splice would
+  be a lie about the timeline. Not worth chasing.
+- One corrupt frame at each splice, where the previous segment's final PES is
+  cut off mid-packet. Unavoidable without re-muxing the boundary; one frame
+  against a full playback reset.

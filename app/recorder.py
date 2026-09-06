@@ -8,6 +8,7 @@ dynamic HTTP header injection, freeze detection, and continuous segment appendin
 import collections
 import json
 import logging
+import math
 import os
 import select
 import shutil
@@ -164,6 +165,221 @@ def hls_extension_flags(ffmpeg_path: Optional[str]) -> List[str]:
 
     _HLS_EXT_FLAGS_CACHE[key] = list(flags)
     return flags
+
+
+# --- MPEG-TS output timeline ------------------------------------------------
+#
+# Every failover starts a fresh FFmpeg, and FFmpeg normalises each input to its
+# own zero -- a source whose own clock reads one hour still comes out of
+# `-c copy -f mpegts` starting at ~1.42s. Those bytes are appended to the same
+# .ts, so without intervention the file's timeline jumps *backwards* at every
+# switch. A player reads that as time travel: mpv logs "Invalid audio PTS ...
+# Reset playback due to audio timestamp reset", the demuxer resyncs, and
+# ffprobe reports only the duration of the first segment.
+#
+# The cure is `-output_ts_offset`, which needs to know where the previous
+# segment ended. Nothing tells us that except the bytes themselves, so we read
+# the timestamps back out of our own output.
+
+TS_PACKET_SIZE = 188
+TS_SYNC_BYTE = 0x47
+PTS_CLOCK_HZ = 90000.0
+# A PTS is 33 bits at 90kHz, so the counter wraps at ~26.5 hours. Past that an
+# offset stops being meaningful and the muxer would wrap mid-file.
+PTS_WRAP_SECONDS = (1 << 33) / PTS_CLOCK_HZ
+# Bytes of our own output kept in memory so a segment's final timestamp can be
+# read when it ends. Comfortably more than one PES interval at any sane bitrate.
+TIMELINE_TAIL_BYTES = 262144
+# Hard ceiling on an offset before it is treated as garbage rather than clamped.
+# Well past any plausible capture, and far enough above the 26.5h wrap that a
+# genuinely long rebroadcast channel is not cut off by it.
+MAX_TIMELINE_OFFSET_SECONDS = 30 * 24 * 3600.0
+
+
+def _ts_alignment(buf: bytes) -> Optional[int]:
+    """Find where the 188-byte packet grid starts inside `buf`.
+
+    The capture loop reads in 64KB chunks, which is not a multiple of 188, so a
+    buffer sliced out of that stream almost never begins on a packet boundary.
+    Rather than have callers track a running byte count -- which a resumed
+    recording could not reconstruct anyway -- the grid is found by looking for
+    an offset where several sync bytes line up. Three in a row is enough to be
+    sure; 0x47 appears in payload often, three times at exactly 188-byte spacing
+    does not.
+    """
+    if len(buf) < TS_PACKET_SIZE:
+        return None
+    probes = min(3, len(buf) // TS_PACKET_SIZE)
+    for off in range(TS_PACKET_SIZE):
+        if off + (probes - 1) * TS_PACKET_SIZE >= len(buf):
+            break
+        if all(buf[off + k * TS_PACKET_SIZE] == TS_SYNC_BYTE for k in range(probes)):
+            return off
+    return None
+
+
+def _packet_pts(packet: bytes) -> Optional[float]:
+    """Presentation timestamp from one TS packet, or None if it carries none.
+
+    Every field consulted here comes off the wire, including the adaptation
+    field length used as a skip distance, so each step is bounds-checked before
+    it is trusted. A malformed packet must yield None, never an exception: this
+    runs on the capture thread, where an unhandled IndexError would end a
+    recording that was otherwise healthy.
+    """
+    if len(packet) != TS_PACKET_SIZE or packet[0] != TS_SYNC_BYTE:
+        return None
+    # Only the first packet of a PES carries the header holding the timestamp.
+    if not packet[1] & 0x40:
+        return None
+    adaptation = (packet[3] >> 4) & 0x3
+    if not adaptation & 0x1:
+        return None  # adaptation field only, no payload
+    pos = 4
+    if adaptation & 0x2:
+        pos += 1 + packet[4]  # attacker-controlled length: may run off the end
+    # start code (3) + stream id (1) + length (2) + flags (2) + hdr len (1)
+    # + PTS (5)
+    if pos + 14 > TS_PACKET_SIZE:
+        return None
+    if packet[pos:pos + 3] != b"\x00\x00\x01":
+        return None
+    stream_id = packet[pos + 3]
+    # Audio (0xC0-0xDF) and video (0xE0-0xEF) only. Padding, private and
+    # PSI streams either carry no PTS or carry one that is not the programme's.
+    if not (0xC0 <= stream_id <= 0xEF):
+        return None
+    if not packet[pos + 7] & 0x80:
+        return None  # PTS_DTS_flags says no PTS present
+    b = packet[pos + 9:pos + 14]
+    # Marker bits are fixed 1s in a well-formed PTS field. Checking them is the
+    # cheapest way to reject a header that only looks like one.
+    if not (b[0] & 0x01 and b[2] & 0x01 and b[4] & 0x01):
+        return None
+    ticks = (
+        ((b[0] >> 1) & 0x07) << 30
+        | b[1] << 22
+        | ((b[2] >> 1) & 0x7F) << 15
+        | b[3] << 7
+        | ((b[4] >> 1) & 0x7F)
+    )
+    return ticks / PTS_CLOCK_HZ
+
+
+def last_timeline_position(buf: bytes) -> Optional[float]:
+    """Highest presentation timestamp in a run of MPEG-TS packets.
+
+    The maximum rather than the last one found: audio and video are interleaved
+    and neither is reliably ahead, so taking whichever PES header happens to
+    come last would under-report the end of the segment -- and an offset that
+    is too small puts the backward jump straight back.
+    """
+    start = _ts_alignment(buf)
+    if start is None:
+        return None
+    best: Optional[float] = None
+    for off in range(start, len(buf) - TS_PACKET_SIZE + 1, TS_PACKET_SIZE):
+        pts = _packet_pts(buf[off:off + TS_PACKET_SIZE])
+        if pts is not None and (best is None or pts > best):
+            best = pts
+    return best
+
+
+def advance_timeline_position(previous: float, observed: float) -> float:
+    """Move the running timeline to a freshly-read PTS, allowing for wraparound.
+
+    A PTS field is 33 bits at 90kHz, so it restarts every ~26.5 hours. Our own
+    running offset does not: it keeps counting. Past the wrap the value read
+    back out of the file is therefore *smaller* than where we know we are, and
+    assigning it directly would recreate the very backward jump this exists to
+    remove -- a day late rather than at every failover.
+
+    So the reading is treated as a distance travelled since `previous`, measured
+    the short way round. A distance in the far half of the circle means the read
+    went backwards rather than nearly all the way around, which happens if the
+    tail scan under-reports; in that case the timeline holds still. Standing
+    still can only cost a small forward gap at the splice. Moving backwards
+    breaks playback, so that is the direction to refuse.
+    """
+    span = (observed - previous) % PTS_WRAP_SECONDS
+    if span > PTS_WRAP_SECONDS / 2:
+        return previous
+    return previous + span
+
+
+def tail_timeline_position(path, tail_bytes: int = TIMELINE_TAIL_BYTES):
+    """Where the timeline of an existing .ts file has reached.
+
+    Used when a recording resumes onto a file an earlier process wrote: that
+    append is a splice like any other, and starting the offset back at zero
+    would reintroduce exactly the discontinuity this exists to prevent.
+    """
+    try:
+        size = os.path.getsize(path)
+        if size <= 0:
+            return None
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - tail_bytes))
+            return last_timeline_position(fh.read())
+    except OSError:
+        return None
+
+
+def output_ts_offset_flags(offset: Optional[float]) -> List[str]:
+    """`-output_ts_offset` argv for a continuing segment, or nothing.
+
+    The value is derived from stream content, which is remote and therefore
+    hostile input, so it is validated here rather than trusted from the caller:
+    NaN and infinity render as words that FFmpeg would reject or misread, a
+    negative would push timestamps below zero, and anything past the 33-bit
+    wrap is meaningless. Fixed-point formatting keeps exponent notation --
+    which FFmpeg does not accept as a duration -- out of the argv.
+    """
+    if offset is None:
+        return []
+    try:
+        value = float(offset)
+    except (TypeError, ValueError):
+        return []
+    if not math.isfinite(value) or value <= 0.0:
+        return []
+    if value > MAX_TIMELINE_OFFSET_SECONDS:
+        return []
+    return ["-output_ts_offset", f"{value:.6f}"]
+
+
+class _TailBuffer:
+    """The last ~256KB of one FFmpeg invocation's output, kept for its PTS.
+
+    Deliberately a deque of the original chunks rather than a single bytes
+    object trimmed on each write. The obvious version --
+    `buf = (buf + chunk)[-CAP:]` -- reallocates and copies a quarter of a
+    megabyte on every chunk, roughly ten times a second per recording, for the
+    life of every recording, to serve a value that is read exactly once when
+    the invocation ends. Appending references and dropping them from the front
+    copies nothing; the single join happens at the one moment the bytes are
+    actually needed.
+    """
+
+    def __init__(self, cap: int = TIMELINE_TAIL_BYTES):
+        self.cap = cap
+        self._chunks: "collections.deque" = collections.deque()
+        self._size = 0
+
+    def __bool__(self) -> bool:
+        """True once anything has been captured -- i.e. the attempt got data."""
+        return bool(self._chunks)
+
+    def append(self, chunk: bytes) -> None:
+        self._chunks.append(chunk)
+        self._size += len(chunk)
+        # Keep the first chunk that still straddles the cap: dropping it would
+        # take the buffer below the window we promised to retain.
+        while len(self._chunks) > 1 and self._size - len(self._chunks[0]) >= self.cap:
+            self._size -= len(self._chunks.popleft())
+
+    def bytes(self) -> bytes:
+        return b"".join(self._chunks)
 
 
 class _FileSink:
@@ -403,6 +619,11 @@ class StreamFailoverRecorder:
         self.max_hours: Optional[float] = (
             None if max_hours is None else max(0.0, float(max_hours))
         )
+        # Where this recording's output timeline has reached, in seconds. Every
+        # FFmpeg after the first is offset by it so the appended segments form
+        # one rising timeline instead of each restarting at zero.
+        self._timeline_offset: float = 0.0
+        self._timeline_seeded: bool = False
         self._last_disk_check: float = 0.0
         self._last_output_check: float = 0.0
         self._output_reopens: int = 0
@@ -1138,6 +1359,16 @@ class StreamFailoverRecorder:
         cmd.extend([
             "-i", stream_url,
             "-c", "copy",
+        ])
+
+        # Continue the timeline instead of restarting it. FFmpeg normalises
+        # every input to its own zero, so without this each failover segment
+        # would be appended starting at ~1.42s again and the file would tell a
+        # player that time had run backwards. Empty for the first segment,
+        # which has nothing to continue from.
+        cmd.extend(output_ts_offset_flags(self._timeline_offset))
+
+        cmd.extend([
             "-f", "mpegts",
             "pipe:1"
         ])
@@ -1146,6 +1377,51 @@ class StreamFailoverRecorder:
 
     def _stream_ffmpeg_process(
         self, ffmpeg_cmd: List[str], candidate: CandidateStream
+    ) -> "StreamOutcome":
+        """Stream FFmpeg stdout to the output file and report how the attempt ended.
+
+        The timeline bookkeeping lives out here, in a `finally`, because the
+        capture body returns from half a dozen places -- forced failover, a
+        freeze, a non-zero exit, a clean exit -- and all but one of them are
+        followed by another FFmpeg appending to the same file. Advancing the
+        offset "at the end of" the body would therefore run only on the
+        operator-stop path: the single case where no next segment exists and
+        the offset is not needed. Every path that matters would skip it and the
+        discontinuity would survive the fix.
+        """
+        tail = _TailBuffer()
+        try:
+            return self._capture_ffmpeg_output(ffmpeg_cmd, candidate, tail)
+        finally:
+            self._advance_timeline(tail)
+
+    def _advance_timeline(self, tail: "_TailBuffer") -> None:
+        """Move `_timeline_offset` to the end of the segment just captured.
+
+        An empty tail means the attempt never delivered a byte, so there is
+        nothing appended to the file and nothing to move past -- and a stream
+        that fails instantly can cycle candidates quickly, so skipping the scan
+        there also keeps a failure storm from paying for it.
+
+        Everything in here is best-effort. It runs on the capture thread, where
+        an unhandled exception would kill a recording that is otherwise
+        healthy, and the worst a failure costs is one uncorrected splice.
+        """
+        if not tail:
+            return
+        try:
+            observed = last_timeline_position(tail.bytes())
+            if observed is None:
+                return
+            self._timeline_offset = advance_timeline_position(
+                self._timeline_offset, observed
+            )
+        except Exception as exc:  # noqa: BLE001 - never lose a recording to this
+            self._log(f"Could not read the output timeline: {exc}", "WARN")
+
+    def _capture_ffmpeg_output(
+        self, ffmpeg_cmd: List[str], candidate: CandidateStream,
+        tail: "_TailBuffer",
     ) -> "StreamOutcome":
         """Stream FFmpeg stdout to the output file and report how the attempt ended."""
         written_for_this_session = 0
@@ -1203,6 +1479,7 @@ class StreamFailoverRecorder:
                 if chunk:
                     out_f.write(chunk)
                     out_f.flush()
+                    tail.append(chunk)
                     len_chunk = len(chunk)
                     self.bytes_written += len_chunk
                     written_for_this_session += len_chunk
@@ -1304,6 +1581,36 @@ class StreamFailoverRecorder:
         ).start()
         return tail
 
+    def _seed_timeline(self) -> None:
+        """Pick the timeline up where a previous process left it, if there is one.
+
+        A resumed session is a brand-new recorder object appending to a .ts an
+        earlier process already wrote, so `_timeline_offset` would start at zero
+        against a file whose timeline is hours in -- reintroducing, on every
+        container restart, exactly the backward jump this machinery exists to
+        prevent. The splice at a resume is no different from the splice at a
+        failover; it just spans a process boundary.
+
+        Rebroadcast is exempt: a ring holds only a moving window, is discarded
+        when the process goes away, and has no prior timeline to rejoin. Its
+        failover splices are still corrected -- the tail is captured from the
+        bytes on their way to the sink, so it works the same for either one --
+        only this start-up seeding does not apply.
+        """
+        if self._timeline_seeded:
+            return
+        self._timeline_seeded = True
+        if self.is_rebroadcast:
+            return
+        observed = tail_timeline_position(self.output_filepath)
+        if observed is None:
+            return
+        self._timeline_offset = observed
+        self._log(
+            f"Continuing the timeline of an existing recording at "
+            f"{observed:.2f}s; appended segments will follow it."
+        )
+
     def _recording_loop(self):
         """Main recording & failover loop.
 
@@ -1314,6 +1621,8 @@ class StreamFailoverRecorder:
         that touched all three sources could end a three-hour capture while
         every one of them was healthy again. The index now wraps.
         """
+        self._seed_timeline()
+
         while not self._stop_event.is_set():
             # A deadline can pass while the loop is in a failover backoff,
             # which is up to 60s of not writing anything -- so the write-path

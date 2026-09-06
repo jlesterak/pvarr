@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import time
 import tempfile
@@ -35,10 +36,18 @@ from app import commercials, notifications, probe, ringbuffer, sessions, ytdlp
 from app.logging_config import redact_url_secrets
 from app.recorder import (
     DEFAULT_MAX_HOURS,
+    MAX_TIMELINE_OFFSET_SECONDS,
+    PTS_WRAP_SECONDS,
+    TS_PACKET_SIZE,
     CandidateStream,
     StreamFailoverRecorder,
     StreamOutcome,
+    _TailBuffer,
+    advance_timeline_position,
+    last_timeline_position,
+    output_ts_offset_flags,
     safe_stream_url,
+    tail_timeline_position,
 )
 
 # The modules log at INFO on import; silence it so test output stays readable.
@@ -5282,6 +5291,453 @@ class TestCutRefusesRatherThanGuesses(unittest.TestCase):
         for value in ("0", "false", "no", "off"):
             with patch.dict(os.environ, {"PVARR_COMSKIP_KEEP_ORIGINAL": value}):
                 self.assertFalse(commercials.keep_original(), value)
+
+
+# --------------------------------------------------------------------------
+# Failover timeline continuity
+#
+# Every failover starts a fresh FFmpeg, and FFmpeg normalises each input to its
+# own zero. Appending those bytes to one .ts used to walk the file's clock
+# backwards at every switch: ffprobe reported only the first segment's
+# duration, and mpv logged "Invalid audio PTS ... Reset playback due to audio
+# timestamp reset" and resynced mid-recording. These tests hold the timeline
+# rising.
+# --------------------------------------------------------------------------
+
+def _ts_packet(pid=0x0100, pts_seconds=None, stream_id=0xE0,
+               adaptation=b"", payload_start=True):
+    """One well-formed 188-byte TS packet, optionally carrying a PES PTS."""
+    afc = 0x3 if adaptation else 0x1
+    head = bytes([
+        0x47,
+        (0x40 if payload_start else 0x00) | ((pid >> 8) & 0x1F),
+        pid & 0xFF,
+        (afc << 4) | 0x1,
+    ])
+    body = bytes([len(adaptation)]) + adaptation if adaptation else b""
+    if pts_seconds is None:
+        payload = b"\xde\xad\xbe\xef"
+    else:
+        ticks = int(round(pts_seconds * 90000))
+        pts = bytes([
+            0x21 | ((ticks >> 29) & 0x0E),
+            (ticks >> 22) & 0xFF,
+            0x01 | ((ticks >> 14) & 0xFE),
+            (ticks >> 7) & 0xFF,
+            0x01 | ((ticks << 1) & 0xFE),
+        ])
+        payload = (b"\x00\x00\x01" + bytes([stream_id]) + b"\x00\x00"
+                   + b"\x80\x80\x05" + pts)
+    packet = head + body + payload
+    return packet + b"\xff" * (TS_PACKET_SIZE - len(packet))
+
+
+class TestTimelineParser(unittest.TestCase):
+    """Reading our own output back to find where a segment ended."""
+
+    def test_finds_the_highest_timestamp_not_the_last_one(self):
+        # Audio and video interleave and neither is reliably ahead. Taking
+        # whichever PES header came last would under-report the end of the
+        # segment, and an offset that is too small puts the backward jump
+        # straight back where it was.
+        buf = (_ts_packet(pts_seconds=10.0, stream_id=0xE0)
+               + _ts_packet(pts_seconds=12.0, stream_id=0xC0)
+               + _ts_packet(pts_seconds=11.0, stream_id=0xE0))
+        self.assertAlmostEqual(last_timeline_position(buf), 12.0, places=4)
+
+    def test_recovers_the_packet_grid_from_an_unaligned_buffer(self):
+        # The capture loop reads 64KB at a time, which is not a multiple of
+        # 188, so a tail sliced out of that stream almost never starts on a
+        # packet boundary.
+        buf = b"\x00" * 77 + b"".join(
+            _ts_packet(pts_seconds=t) for t in (1.0, 2.0, 3.0))
+        self.assertAlmostEqual(last_timeline_position(buf), 3.0, places=4)
+
+    def test_an_adaptation_field_is_skipped_to_reach_the_pes_header(self):
+        buf = _ts_packet(pts_seconds=7.5, adaptation=b"\x00" * 20) * 3
+        self.assertAlmostEqual(last_timeline_position(buf), 7.5, places=4)
+
+    def test_packets_without_a_timestamp_are_ignored(self):
+        self.assertIsNone(last_timeline_position(_ts_packet() * 4))
+
+    def test_padding_and_private_streams_do_not_count(self):
+        # Only audio (0xC0-0xDF) and video (0xE0-0xEF) carry the programme's
+        # own clock; a padding stream's timestamp is not the segment's end.
+        buf = _ts_packet(pts_seconds=99.0, stream_id=0xBE) * 3
+        self.assertIsNone(last_timeline_position(buf))
+
+    def test_no_input_survives_the_parser_by_raising(self):
+        # This runs on the capture thread. An unhandled IndexError here would
+        # end a recording that was otherwise perfectly healthy, so a malformed
+        # stream must yield None, never an exception.
+        hostile = [
+            b"", b"\x47", b"\x47" * 1000, b"\x00" * 5000,
+            os.urandom(4000),
+            # an adaptation field claiming to run past the end of the packet
+            bytes([0x47, 0x40, 0x00, 0x30, 0xFF]) + b"\x00" * 183,
+            # a truncated final packet, which the rolling tail produces
+            # routinely at its own boundary without any malice at all
+            (_ts_packet(pts_seconds=3.0) * 2)[:-40],
+        ]
+        for buf in hostile:
+            with self.subTest(sample=buf[:8]):
+                last_timeline_position(buf)  # must simply not raise
+
+    def test_a_truncated_tail_still_reads_the_packets_that_are_whole(self):
+        buf = (_ts_packet(pts_seconds=4.0) * 3)[:-40]
+        self.assertAlmostEqual(last_timeline_position(buf), 4.0, places=4)
+
+
+class TestTimelineAdvance(unittest.TestCase):
+    """Moving the running offset, including across the 33-bit PTS wrap."""
+
+    def test_a_normal_segment_moves_the_timeline_forward(self):
+        self.assertAlmostEqual(advance_timeline_position(0.0, 11.4), 11.4)
+        self.assertAlmostEqual(advance_timeline_position(11.4, 22.8), 22.8)
+
+    def test_the_wrap_does_not_send_the_timeline_backwards(self):
+        # A PTS is 33 bits at 90kHz, so it restarts every ~26.5 hours while our
+        # own offset keeps counting. Read at face value past the wrap, the
+        # timeline would leap backwards a day into a recording -- the original
+        # bug, merely delayed.
+        moved = advance_timeline_position(PTS_WRAP_SECONDS - 2.0, 3.0)
+        self.assertAlmostEqual(moved, PTS_WRAP_SECONDS + 3.0, places=3)
+        self.assertGreater(moved, PTS_WRAP_SECONDS - 2.0)
+
+    def test_a_reading_that_went_backwards_holds_the_timeline_still(self):
+        # Standing still costs a small forward gap at the splice. Moving
+        # backwards breaks playback, so that is the direction to refuse.
+        self.assertEqual(advance_timeline_position(500.0, 10.0), 500.0)
+
+
+class TestTimelineOffsetArgv(unittest.TestCase):
+    """The offset is derived from stream content, so it is hostile input."""
+
+    def test_a_sound_offset_becomes_a_fixed_point_argument(self):
+        self.assertEqual(output_ts_offset_flags(11.3382),
+                         ["-output_ts_offset", "11.338200"])
+
+    def test_the_first_segment_gets_no_offset(self):
+        self.assertEqual(output_ts_offset_flags(0.0), [])
+        self.assertEqual(output_ts_offset_flags(None), [])
+
+    def test_nothing_unparseable_can_reach_the_argv(self):
+        # str() of a float is not a safe serialisation for an FFmpeg argument:
+        # nan and inf render as words, and a large magnitude renders in
+        # exponent notation, which FFmpeg does not accept as a duration.
+        for bad in (float("nan"), float("inf"), float("-inf"), -5.0,
+                    1e21, MAX_TIMELINE_OFFSET_SECONDS * 2, "banana", None):
+            with self.subTest(value=bad):
+                self.assertEqual(output_ts_offset_flags(bad), [])
+
+    def test_a_long_channel_past_the_wrap_is_still_offset(self):
+        # The 26.5h wrap is not the ceiling; a rebroadcast channel can run
+        # past it and still needs its splices corrected.
+        self.assertTrue(output_ts_offset_flags(PTS_WRAP_SECONDS + 500))
+
+    def test_every_rendered_offset_parses_as_a_plain_number(self):
+        for value in (0.001, 1.5, 11.338222, 95000.0, 1e6):
+            flags = output_ts_offset_flags(value)
+            if flags:
+                float(flags[1])  # must not raise
+                self.assertNotIn("e", flags[1].lower())
+
+
+class TestTailBuffer(unittest.TestCase):
+    """A bounded tail that does not copy on the capture hot path."""
+
+    def test_it_keeps_the_recent_bytes_and_drops_the_old_ones(self):
+        tail = _TailBuffer(cap=1000)
+        for i in range(50):
+            tail.append(bytes([i]) * 400)
+        kept = tail.bytes()
+        self.assertLess(len(kept), 2000)
+        self.assertGreaterEqual(len(kept), 1000)
+        self.assertTrue(kept.endswith(bytes([49]) * 400))
+
+    def test_it_stores_chunks_rather_than_recopying_a_flat_buffer(self):
+        # The naive version reallocates and copies a quarter of a megabyte on
+        # every chunk, ten times a second per recording, to serve a value read
+        # once. Appending must not copy the chunk.
+        tail = _TailBuffer(cap=1000)
+        chunk = b"payload"
+        tail.append(chunk)
+        self.assertIs(tail._chunks[0], chunk)
+
+    def test_emptiness_reports_whether_the_attempt_got_any_data(self):
+        tail = _TailBuffer()
+        self.assertFalse(tail)
+        tail.append(b"x")
+        self.assertTrue(tail)
+
+
+class TestTimelineSurvivesEveryExitPath(unittest.TestCase):
+    """The offset must advance however the capture attempt ended.
+
+    `_stream_ffmpeg_process` returns from half a dozen places, and all but one
+    are followed by another FFmpeg appending to the same file. Advancing the
+    offset only where the body falls off the end would run it solely on the
+    operator-stop path -- the single case with no next segment -- so every
+    failover would still splice backwards.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-tl-"))
+        self.rec = StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(self.tmp / "out.ts"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, outcome):
+        from unittest.mock import patch
+        captured = _ts_packet(pts_seconds=42.0) * 4
+
+        def fake_capture(cmd, candidate, tail):
+            tail.append(captured)
+            return outcome
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", fake_capture):
+            self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        return self.rec._timeline_offset
+
+    def test_the_offset_advances_on_every_outcome(self):
+        for outcome in StreamOutcome:
+            with self.subTest(outcome=outcome):
+                self.rec._timeline_offset = 0.0
+                self.assertAlmostEqual(self._run(outcome), 42.0, places=3)
+
+    def test_it_advances_even_when_the_capture_raises(self):
+        from unittest.mock import patch
+
+        def exploding(cmd, candidate, tail):
+            tail.append(_ts_packet(pts_seconds=17.0) * 4)
+            raise RuntimeError("pipe died")
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", exploding):
+            with self.assertRaises(RuntimeError):
+                self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        self.assertAlmostEqual(self.rec._timeline_offset, 17.0, places=3)
+
+    def test_an_attempt_that_got_nothing_leaves_the_timeline_alone(self):
+        from unittest.mock import patch
+        self.rec._timeline_offset = 30.0
+
+        def no_data(cmd, candidate, tail):
+            return StreamOutcome.FAILED
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", no_data):
+            self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        # Nothing was appended, so there is nothing to move past -- and a
+        # stream that fails instantly can cycle candidates fast enough for the
+        # skipped scan to matter.
+        self.assertEqual(self.rec._timeline_offset, 30.0)
+
+    def test_unreadable_output_does_not_kill_the_recording(self):
+        from unittest.mock import patch
+
+        def garbage(cmd, candidate, tail):
+            tail.append(os.urandom(3000))
+            return StreamOutcome.INTERRUPTED
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", garbage):
+            self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        self.assertEqual(self.rec._timeline_offset, 0.0)
+
+
+class TestFailoverArgvCarriesTheOffset(unittest.TestCase):
+    """What the offset actually does to the FFmpeg command line."""
+
+    def setUp(self):
+        self.rec = StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], "/tmp/pvarr-argv.ts")
+
+    def test_the_first_segment_is_not_offset(self):
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertNotIn("-output_ts_offset", cmd)
+
+    def test_a_later_segment_continues_the_timeline(self):
+        self.rec._timeline_offset = 63.5
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertIn("-output_ts_offset", cmd)
+        self.assertEqual(cmd[cmd.index("-output_ts_offset") + 1], "63.500000")
+
+    def test_the_offset_applies_to_the_output_not_the_input(self):
+        # Placed after -i it shifts what is written; placed before -i it would
+        # shift what is read, which is a different operation entirely.
+        self.rec._timeline_offset = 10.0
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertGreater(cmd.index("-output_ts_offset"), cmd.index("-i"))
+
+    def test_the_proxy_fallback_is_offset_too(self):
+        # The proxy retry is a second FFmpeg appending to the same file, so it
+        # is a splice exactly like a candidate switch.
+        self.rec._timeline_offset = 5.0
+        cmd = self.rec._build_ffmpeg_cmd("http://127.0.0.1:9/p.m3u8",
+                                         local_proxy=True)
+        self.assertIn("-output_ts_offset", cmd)
+
+    def test_the_command_is_still_a_plain_argv_list(self):
+        self.rec._timeline_offset = 63.5
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertTrue(all(isinstance(part, str) for part in cmd))
+
+
+class TestResumePicksUpTheTimeline(unittest.TestCase):
+    """A resumed session appends to a file another process already wrote."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-resume-"))
+        self.out = self.tmp / "game.ts"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, ring=None):
+        return StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(self.out), ring=ring)
+
+    def test_it_continues_where_the_previous_process_stopped(self):
+        # Starting back at zero against a file whose timeline is already hours
+        # in would reintroduce the backward jump on every container restart.
+        self.out.write_bytes(_ts_packet(pts_seconds=1800.0) * 8)
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertAlmostEqual(rec._timeline_offset, 1800.0, places=2)
+
+    def test_a_fresh_recording_starts_at_zero(self):
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertEqual(rec._timeline_offset, 0.0)
+
+    def test_an_empty_file_starts_at_zero(self):
+        self.out.write_bytes(b"")
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertEqual(rec._timeline_offset, 0.0)
+
+    def test_an_unreadable_file_does_not_stop_the_recording(self):
+        self.out.write_bytes(b"not a transport stream at all")
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertEqual(rec._timeline_offset, 0.0)
+
+    def test_seeding_happens_once(self):
+        self.out.write_bytes(_ts_packet(pts_seconds=100.0) * 8)
+        rec = self.make()
+        rec._seed_timeline()
+        rec._timeline_offset = 250.0
+        rec._seed_timeline()  # a second call must not rewind it
+        self.assertEqual(rec._timeline_offset, 250.0)
+
+    def test_a_rebroadcast_channel_has_no_prior_timeline_to_rejoin(self):
+        # A ring holds a moving window and is discarded with the process. Its
+        # failover splices are still corrected; only this seeding is skipped.
+        self.out.write_bytes(_ts_packet(pts_seconds=1800.0) * 8)
+        ring = ringbuffer.RingBuffer(
+            self.tmp / "chan.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        try:
+            rec = self.make(ring=ring)
+            rec._seed_timeline()
+            self.assertEqual(rec._timeline_offset, 0.0)
+        finally:
+            ring.close()
+
+    def test_the_tail_of_a_long_file_is_enough_to_read_it(self):
+        padding = _ts_packet(pts_seconds=5.0) * 4000
+        self.out.write_bytes(padding + _ts_packet(pts_seconds=900.0) * 8)
+        self.assertAlmostEqual(
+            tail_timeline_position(self.out), 900.0, places=2)
+
+    def test_a_missing_file_reads_as_no_timeline(self):
+        self.assertIsNone(tail_timeline_position(self.tmp / "nope.ts"))
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+class TestRealFailoverSpliceIsMonotonic(unittest.TestCase):
+    """The whole thing, against real FFmpeg output.
+
+    Before this fix the same construction produced a file that ffprobe read as
+    10s of a 20s recording, with the timeline dropping back to ~1.4s at the
+    splice -- which is what made mpv reset playback mid-stream.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-splice-"))
+        self.ffmpeg = check_deps.find_executable("ffmpeg")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _source(self, name, freq):
+        path = self.tmp / name
+        subprocess.run(
+            [self.ffmpeg, "-hide_banner", "-v", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10:duration=4",
+             "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=4",
+             "-c:v", "libx264", "-preset", "ultrafast", "-g", "10",
+             "-c:a", "aac", "-f", "mpegts", str(path)], check=True)
+        return path
+
+    def _pts_series(self, path):
+        out = subprocess.run(
+            [check_deps.find_executable("ffprobe"), "-v", "error",
+             "-select_streams", "v", "-show_entries", "packet=pts_time",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True).stdout
+        return [float(line.rstrip(",")) for line in out.split() if line.strip()]
+
+    def test_three_appended_segments_never_walk_the_clock_backwards(self):
+        sources = [self._source("a.ts", 440), self._source("b.ts", 880),
+                   self._source("c.ts", 1320)]
+        out = self.tmp / "joined.ts"
+        out.write_bytes(b"")
+        offset = 0.0
+        for src in sources:
+            cmd = [self.ffmpeg, "-hide_banner", "-v", "error", "-i", str(src),
+                   "-c", "copy"]
+            cmd += output_ts_offset_flags(offset)
+            cmd += ["-f", "mpegts", "pipe:1"]
+            produced = subprocess.run(cmd, capture_output=True,
+                                      check=True).stdout
+            with open(out, "ab") as fh:
+                fh.write(produced)
+            observed = last_timeline_position(produced[-262144:])
+            self.assertIsNotNone(observed, "no timestamp found in real output")
+            offset = advance_timeline_position(offset, observed)
+
+        series = self._pts_series(out)
+        self.assertGreater(len(series), 60)
+        for earlier, later in zip(series, series[1:]):
+            self.assertGreaterEqual(
+                later, earlier,
+                f"timeline went backwards: {earlier} -> {later}")
+
+    def test_the_reported_duration_covers_every_segment(self):
+        # The symptom a user sees first: a 12s recording that claims to be 4s,
+        # because a duration probe reads the container timeline and everything
+        # after the first splice was invisible to it.
+        sources = [self._source("a.ts", 440), self._source("b.ts", 880),
+                   self._source("c.ts", 1320)]
+        out = self.tmp / "joined.ts"
+        out.write_bytes(b"")
+        offset = 0.0
+        for src in sources:
+            cmd = [self.ffmpeg, "-hide_banner", "-v", "error", "-i", str(src),
+                   "-c", "copy"] + output_ts_offset_flags(offset)
+            cmd += ["-f", "mpegts", "pipe:1"]
+            produced = subprocess.run(cmd, capture_output=True,
+                                      check=True).stdout
+            with open(out, "ab") as fh:
+                fh.write(produced)
+            offset = advance_timeline_position(
+                offset, last_timeline_position(produced[-262144:]))
+
+        duration = float(subprocess.run(
+            [check_deps.find_executable("ffprobe"), "-v", "error",
+             "-show_entries", "format=duration", "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True, check=True).stdout.strip())
+        self.assertGreater(duration, 11.0)
 
 
 
