@@ -2594,3 +2594,50 @@ not the live recorder.
   Remuxing a 20 GB `.ts` needs 20 GB that by definition is not there; FFmpeg
   hits ENOSPC and the `.ts` is correctly kept, but the partial `.mp4` that
   `ffmpeg -y` already created is left on the volume and shows up in the library.
+
+---
+
+## Phase 16: Resume reattaches to the working candidate (2026-09-05) [COMPLETED]
+
+Found while live-testing the resume path with the sponsor, by bouncing the
+server under a running recording.
+
+### What was wrong
+`_on_failover` writes `current_candidate_index` to the session record on every
+failover (`server.py:546`), with a comment stating the intent outright: "a
+resume should reattach to the candidate that was actually working, not start
+again from the primary that had already failed." Nothing ever read it back.
+`_launch_session` did not restore it and `recorder.py:598` always initialises to
+0, so the saved value was dead data and every resume restarted at candidate 1 --
+the one already known to be down. Cost is a fresh stall and another gap in the
+footage, on a recording that had just been interrupted.
+
+### Observed
+Bounced the server mid-recording at 18:45. The record on disk read
+`current_candidate_index: 1`; the recorder came back logging
+`=== Active Stream: Candidate 1/2 (Candidate 1) ===`.
+
+### Fixed
+`_launch_session` restores the index after construction, coercing to int and
+clamping anything outside the candidate list to 0 -- the record is JSON on disk
+and the list can be shorter than it was when written.
+
+### Verified
+- 559 tests (was 555). Removing the restore fails 1.
+- Same live run confirmed the timeline work end to end: 22885 video packets,
+  1.471 -> 767.446, **zero backward jumps**, across both a candidate switch
+  (+1.604s at 121.4s) and a container restart (+1.638s at 694.6s). Resume logged
+  `Continuing the timeline of an existing recording at 694.77s` and the live
+  FFmpeg argv carried `-output_ts_offset 694.775000`.
+
+### Also found, NOT fixed (needs its own change)
+**An open dashboard tab blocks shutdown.** The dashboard holds an EventSource on
+`/api/recordings/{id}/logs` for as long as the tab is open. Uvicorn's graceful
+shutdown waits for open connections *before* running the lifespan shutdown hook,
+so `stop_all()` never fires while a tab is watching. Measured at ~80 seconds
+from SIGTERM to `Application shutdown complete` with one tab open.
+`docker-compose.yml` sets `stop_grace_period: 30s`, so in a container Docker
+SIGKILLs first: the recorder never marks the session for resume and FFmpeg dies
+with the container. This defeats the resume feature precisely when it is needed
+-- a `docker restart` or a Watchtower update with the UI open. Likely the reason
+resume has felt unreliable in production.

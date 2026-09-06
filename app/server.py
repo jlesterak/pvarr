@@ -564,6 +564,20 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
     if record.get("started_at"):
         recorder.start_time = record["started_at"]
 
+    # Reattach to the candidate that was actually working. _on_failover has
+    # been writing this to the record all along, with a comment saying exactly
+    # that -- but nothing ever read it back, so every resume restarted from the
+    # primary that had already failed and had to walk the list again from
+    # scratch. Out-of-range is clamped rather than trusted: the record is JSON
+    # on disk and the candidate list can be shorter than it was.
+    resume_index = record.get("current_candidate_index") or 0
+    try:
+        resume_index = int(resume_index)
+    except (TypeError, ValueError):
+        resume_index = 0
+    if 0 < resume_index < len(recorder.candidates):
+        recorder.current_candidate_index = resume_index
+
     session_store.save(record)
     active_recorders[recording_id] = recorder
     session_records[recording_id] = record

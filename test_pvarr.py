@@ -5941,3 +5941,59 @@ class TestRecordAgainConfig(ServerTestCase):
             self.server.session_records[f"s{n}"] = {"id": f"s{n}"}
         self.server._prune_finished_sessions()
         self.assertEqual(set(self.server.active_recorders), set(self.server.session_records))
+
+
+class TestResumeReattachesToTheWorkingCandidate(unittest.TestCase):
+    """_on_failover saves current_candidate_index -- _launch_session must use it.
+
+    It was written to the record and never read back, so every resume started
+    again from the primary that had already failed.
+    """
+
+    def _launch(self, **record_bits):
+        from unittest.mock import patch, MagicMock
+        from app import server
+        from app.sessions import build_record
+
+        record = build_record(
+            recording_id="rid",
+            candidates=["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+            output_filepath="/tmp/pvarr-resume-test.ts",
+            started_at=1000.0,
+        )
+        record.update(record_bits)
+
+        built = {}
+
+        def _capture(*args, **kwargs):
+            rec = MagicMock()
+            rec.candidates = [MagicMock() for _ in kwargs.get("candidates", [])]
+            rec.current_candidate_index = 0
+            built["recorder"] = rec
+            return rec
+
+        with patch.object(server, "StreamFailoverRecorder", side_effect=_capture), \
+             patch.object(server, "session_store", MagicMock()), \
+             patch.object(server, "active_recorders", {}), \
+             patch.object(server, "session_records", {}):
+            server._launch_session(record, 8090)
+        return built["recorder"]
+
+    def test_it_resumes_on_the_candidate_that_was_working(self):
+        recorder = self._launch(current_candidate_index=1)
+        self.assertEqual(recorder.current_candidate_index, 1)
+
+    def test_a_fresh_start_still_begins_at_the_primary(self):
+        recorder = self._launch(current_candidate_index=0)
+        self.assertEqual(recorder.current_candidate_index, 0)
+
+    def test_an_index_past_the_candidate_list_is_clamped(self):
+        # The record is JSON on disk and the list can be shorter than it was.
+        recorder = self._launch(current_candidate_index=9)
+        self.assertEqual(recorder.current_candidate_index, 0)
+
+    def test_a_junk_index_does_not_crash_the_resume(self):
+        for junk in ("two", None, [1]):
+            with self.subTest(value=junk):
+                recorder = self._launch(current_candidate_index=junk)
+                self.assertEqual(recorder.current_candidate_index, 0)
