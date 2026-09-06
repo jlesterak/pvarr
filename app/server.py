@@ -144,14 +144,6 @@ storage = StorageManager(record_dir=str(RECORDINGS_DIR))
 # Active recorder sessions: recording_id -> StreamFailoverRecorder
 active_recorders: Dict[str, StreamFailoverRecorder] = {}
 
-# The session record behind each recorder, kept so a finished session can be
-# offered back to the operator as "record this again". The recorder holds the
-# running state; the record holds what the operator asked for, and only the
-# record still knows the sport/teams/resolution that produced the filename.
-# Pruned in lockstep with active_recorders -- two dicts that disagree are a
-# leak, so there is exactly one place that removes from either.
-session_records: Dict[str, Dict[str, Any]] = {}
-
 # Register SIGINT / SIGTERM handlers for container & process safety
 register_signal_handlers(active_recorders)
 
@@ -402,7 +394,6 @@ def _prune_finished_sessions() -> None:
     finished.sort(key=lambda kv: kv[1].stop_time or 0.0)
     for rid, _ in finished[:excess]:
         active_recorders.pop(rid, None)
-        session_records.pop(rid, None)
 
 
 def _allocate_proxy_port(base: int = 8090) -> int:
@@ -458,6 +449,30 @@ def _default_channel_name(sport: str, team_a: str, team_b: str) -> str:
     teams = " vs ".join(part for part in (team_a, team_b) if part and part.strip())
     name = teams or (sport or "").strip()
     return name or "PVArr Live"
+
+
+def _discard_reservation(path) -> None:
+    """Remove an output name reserved for a start that never happened.
+
+    get_output_path() claims the name by creating the file, so that two starts
+    a second apart cannot be handed the same one. That claim has to be given
+    back if the start is then refused -- by the disk-space floor, or by
+    anything that fails before the recorder takes ownership. Otherwise every
+    rejected attempt leaves a 0-byte .ts behind and burns a slot, so the
+    fixture climbs _1, _2, ... and eventually cannot be recorded at all.
+
+    Only ever removes an empty file: if anything has been written, the recorder
+    owns it and this is not ours to delete.
+    """
+    if path is None:
+        return
+    try:
+        if path.stat().st_size == 0:
+            path.unlink()
+    except OSError:
+        # Already gone, or not ours to remove. A leftover 0-byte file is a
+        # blemish; failing the request over it would be worse.
+        pass
 
 
 def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder:
@@ -580,7 +595,12 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
 
     session_store.save(record)
     active_recorders[recording_id] = recorder
-    session_records[recording_id] = record
+    # Hung on the recorder rather than kept in a second dict beside
+    # active_recorders. What "record this again" needs is what the operator
+    # asked for, and that has exactly the recorder's lifetime -- a parallel
+    # dict would have to be pruned in lockstep, and the first pop that forgot
+    # it would orphan the record silently.
+    recorder.session_record = record
     recorder.start_recording()
     return recorder
 
@@ -752,72 +772,81 @@ async def start_recording(
                 status_code=400, detail=f"Could not prepare output directory: {exc}"
             )
 
-    # Optional per-URL header overrides from the dashboard, keyed by URL:
-    # {"https://.../x.m3u8": {"referer": "...", "user_agent": "...", "cookie": "..."}}
-    # Malformed input is ignored rather than fatal -- the recorder probes each
-    # candidate itself, so these are a hint, not a requirement.
-    header_overrides: Dict[str, Dict[str, str]] = {}
-    if stream_headers:
-        try:
-            parsed = json.loads(stream_headers)
-            if isinstance(parsed, dict):
-                for key, value in parsed.items():
-                    if isinstance(value, dict):
-                        header_overrides[str(key).strip()] = {
-                            field: str(value[field])
-                            for field in ("referer", "user_agent", "cookie")
-                            if value.get(field)
-                        }
-        except (ValueError, TypeError):
-            logger.warning("Ignoring malformed stream_headers payload")
+    # Everything from here until the recorder exists can still refuse the
+    # request, and the output name has already been claimed on disk. Hand it
+    # back on any failure rather than leaving a 0-byte file and a burnt slot.
+    recorder = None
+    reserved = None if rebroadcast else output_path
+    try:
+        # Optional per-URL header overrides from the dashboard, keyed by URL:
+        # {"https://.../x.m3u8": {"referer": "...", "user_agent": "...", "cookie": "..."}}
+        # Malformed input is ignored rather than fatal -- the recorder probes each
+        # candidate itself, so these are a hint, not a requirement.
+        header_overrides: Dict[str, Dict[str, str]] = {}
+        if stream_headers:
+            try:
+                parsed = json.loads(stream_headers)
+                if isinstance(parsed, dict):
+                    for key, value in parsed.items():
+                        if isinstance(value, dict):
+                            header_overrides[str(key).strip()] = {
+                                field: str(value[field])
+                                for field in ("referer", "user_agent", "cookie")
+                                if value.get(field)
+                            }
+            except (ValueError, TypeError):
+                logger.warning("Ignoring malformed stream_headers payload")
 
-    # Fail fast rather than starting a capture that the disk guard will abort
-    # moments later -- and rather than being the thing that fills the volume.
-    min_free_gb = _min_free_gb()
-    if min_free_gb > 0:
-        try:
-            free_gb = shutil.disk_usage(output_path.parent).free / 1024 ** 3
-        except OSError:
-            free_gb = None
-        if free_gb is not None and free_gb < min_free_gb:
-            raise HTTPException(
-                status_code=507,
-                detail=(
-                    f"Only {free_gb:.2f} GB free on {output_path.parent}, below "
-                    f"the {min_free_gb:.2f} GB floor (PVARR_MIN_FREE_GB). "
-                    "Free some space or lower the floor."
-                ),
-            )
+        # Fail fast rather than starting a capture that the disk guard will abort
+        # moments later -- and rather than being the thing that fills the volume.
+        min_free_gb = _min_free_gb()
+        if min_free_gb > 0:
+            try:
+                free_gb = shutil.disk_usage(output_path.parent).free / 1024 ** 3
+            except OSError:
+                free_gb = None
+            if free_gb is not None and free_gb < min_free_gb:
+                raise HTTPException(
+                    status_code=507,
+                    detail=(
+                        f"Only {free_gb:.2f} GB free on {output_path.parent}, below "
+                        f"the {min_free_gb:.2f} GB floor (PVARR_MIN_FREE_GB). "
+                        "Free some space or lower the floor."
+                    ),
+                )
 
-    _prune_finished_sessions()
-    port = _allocate_proxy_port()
+        _prune_finished_sessions()
+        port = _allocate_proxy_port()
 
-    record = build_record(
-        recording_id=recording_id,
-        candidates=candidates,
-        output_filepath=str(output_path),
-        started_at=time.time(),
-        header_overrides=header_overrides,
-        freeze_timeout_sec=freeze_timeout,
-        min_free_gb=min_free_gb,
-        rebroadcast=rebroadcast,
-        channel_name=(channel_name or "").strip()
-        or _default_channel_name(sport, team_a, team_b),
-        end_time=resolved_end,
-        max_hours=session_max_hours,
-        naming={
-            # str() is not decoration. SessionStore.save() catches TypeError
-            # from json.dump and responds by disabling persistence for the
-            # entire process -- every in-flight recording silently loses its
-            # ability to resume. One Path object in here would do it.
-            "sport": str(sport),
-            "team_a": str(team_a),
-            "team_b": str(team_b),
-            "resolution": str(resolution),
-            "output_dir": str(resolved_output_dir or ""),
-        },
-    )
-    recorder = _launch_session(record, port)
+        record = build_record(
+            recording_id=recording_id,
+            candidates=candidates,
+            output_filepath=str(output_path),
+            started_at=time.time(),
+            header_overrides=header_overrides,
+            freeze_timeout_sec=freeze_timeout,
+            min_free_gb=min_free_gb,
+            rebroadcast=rebroadcast,
+            channel_name=(channel_name or "").strip()
+            or _default_channel_name(sport, team_a, team_b),
+            end_time=resolved_end,
+            max_hours=session_max_hours,
+            naming={
+                # str() is not decoration. SessionStore.save() catches TypeError
+                # from json.dump and responds by disabling persistence for the
+                # entire process -- every in-flight recording silently loses its
+                # ability to resume. One Path object in here would do it.
+                "sport": str(sport),
+                "team_a": str(team_a),
+                "team_b": str(team_b),
+                "resolution": str(resolution),
+                "output_dir": str(resolved_output_dir or ""),
+            },
+        )
+        recorder = _launch_session(record, port)
+    finally:
+        if recorder is None:
+            _discard_reservation(reserved)
 
     # Runs in the threadpool after the response is sent. Called inline this
     # would block the event loop for up to 15s (three HTTP calls, timeout=5).
@@ -859,7 +888,8 @@ async def recording_config(recording_id: str):
     stream token, does not expire on its own. `cookie_required` says which slots
     need one re-pasted; the value stays in this process.
     """
-    record = session_records.get(recording_id)
+    recorder = active_recorders.get(recording_id)
+    record = recorder.session_record if recorder else None
     if not record:
         raise HTTPException(
             status_code=404,

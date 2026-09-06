@@ -2701,3 +2701,68 @@ too, not just the log SSE.
 is the only shutdown path for the `stream-recorder.py` CLI entry point. Removing
 it would break that; correcting its docstring is worth doing but is not this
 change.
+
+---
+
+## Phase 18: Acting on the pre-release cloud review (2026-09-05) [COMPLETED]
+
+Ultrareview run against `v0.5.0` before shipping 0.5.1. Three findings, all
+confirmed against the code here, all fixed.
+
+### 1. Twenty-five tests never ran in CI (the serious one)
+`if __name__ == "__main__": unittest.main()` sat at line 5749, and every test
+class added this session was appended *below* it. `unittest.main()` reflects
+over `__main__`'s globals at the moment it is called and then `sys.exit()`s, so
+those classes were never defined, never discovered, and never run -- and nothing
+failed, the count simply dropped.
+
+Measured: `python test_pvarr.py` (what CI runs) collected **537**;
+`python -m unittest test_pvarr` (what I ran, which imports the module and
+executes the whole file) collected **562**. The four classes guarding the
+`.mp4` overwrite fix, the atomic reservation, the whole `/config` endpoint
+including its "never return the cookie" contract, the resume candidate index,
+and the shutdown budget were all invisible to CI while I reported them green.
+
+Fixed by moving the entry point to the end of the file, and guarded by
+`TestEveryTestInThisFileActuallyRuns`, which fails and names any class stranded
+below it, and separately asserts the two ways of running the suite collect the
+same count. Re-stranding a class fails 2 tests and prints the offending line.
+
+**Process lesson, worth keeping:** verify a suite the way CI invokes it, not the
+way that is convenient locally. `-m unittest` and `python test_pvarr.py` are not
+equivalent, and the difference is silent.
+
+### 2. A refused start left a 0-byte stub and burnt a slot
+Regression introduced by Phase 15's `reserve_output_path`. The name is claimed
+by creating the file (`server.py:742`), but the disk-space floor rejects with
+507 afterwards (`server.py:782`), and nothing gave the name back. Every refused
+start left a 0-byte `.ts`, so the same fixture climbed `_1`, `_2`, ... and after
+999 could not be recorded at all. Before Phase 15 no file was created, so a 507
+left nothing behind.
+
+Fixed with a `finally` that calls `_discard_reservation()` whenever the recorder
+was never created. It removes the file **only if it is still empty** -- once
+anything is written the recorder owns it, and cleanup must never be able to
+delete footage on a late failure. Five tests, and two mutations bite: removing
+the rollback fails 3, letting it delete a non-empty file fails 1.
+
+### 3. The parallel `session_records` dict (nit, taken anyway)
+Phase 15 added a second module-level dict that had to be inserted and pruned in
+lockstep with `active_recorders` -- the docstring itself called drift "a leak",
+which is a fair sign the shape was wrong. Collapsed onto the recorder as
+`recorder.session_record`, declared in `StreamFailoverRecorder.__init__`. One
+object, one lifetime, no paired pop, and `_prune_finished_sessions` goes back to
+touching one dict.
+
+### Accepted, not fixed
+A session that was *already running* when PVArr is upgraded to 0.5.1 has no
+`naming` block in its persisted record, so "Record again" offers `Sports` /
+`TeamA` / `TeamB`. Its URLs, headers and freeze timeout are still correct, and
+the operator sees the form before pressing Start. Reconstructing the teams from
+the filename is not possible without guessing -- `sanitize_token` is lossy, which
+is why the inputs are stored in the first place. One-off, affects only the
+upgrade window, and now stated in the README.
+
+### Verified
+- 569 tests, CI-style (`python test_pvarr.py`) and via `-m unittest`, both green
+  and both reporting the same count.

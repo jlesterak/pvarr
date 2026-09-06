@@ -2059,8 +2059,6 @@ class ServerTestCase(unittest.TestCase):
         self._storage_patch.start()
         self._recorders_patch = patch.object(server, "active_recorders", {})
         self._recorders_patch.start()
-        self._records_patch = patch.object(server, "session_records", {})
-        self._records_patch.start()
         self._dir_patch = patch.object(server, "RECORDINGS_DIR", Path(self.tmp))
         self._dir_patch.start()
         # Disable the free-space floor by default. Left live, every start test
@@ -2073,7 +2071,6 @@ class ServerTestCase(unittest.TestCase):
     def tearDown(self):
         self._storage_patch.stop()
         self._recorders_patch.stop()
-        self._records_patch.stop()
         self._dir_patch.stop()
         self._disk_patch.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -5746,10 +5743,6 @@ class TestRealFailoverSpliceIsMonotonic(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestOutputPathReservation(unittest.TestCase):
     """The naming layer must not hand two recordings the same file."""
 
@@ -5818,6 +5811,84 @@ class TestOutputPathReservation(unittest.TestCase):
         self.assertTrue(first.with_suffix(".mp4").exists())
 
 
+class TestRejectedStartLeavesNothingBehind(ServerTestCase):
+    """A refused start must give back the output name it reserved.
+
+    get_output_path() claims the name by creating the file, so two starts a
+    second apart cannot be handed the same one. Nothing rolled that back, so
+    every rejected attempt left a 0-byte .ts and burnt a slot: the same fixture
+    climbed _1, _2, ... and after 999 could not be recorded at all.
+    """
+
+    def _start(self, **extra):
+        data = {"url_primary": "http://a/1.m3u8", "sport": "NFL",
+                "team_a": "Bucs", "team_b": "Raiders", "resolution": "1080p"}
+        data.update(extra)
+        return self.client.post("/api/recordings/start", data=data)
+
+    def _files(self):
+        return sorted(p.name for p in Path(self.tmp).iterdir() if p.is_file())
+
+    def test_a_507_leaves_no_stub_behind(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "999999"}):
+            r = self._start()
+        self.assertEqual(r.status_code, 507)
+        self.assertEqual(self._files(), [])
+
+    def test_repeated_refusals_do_not_burn_slot_numbers(self):
+        from unittest.mock import patch, MagicMock
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "999999"}):
+            for _ in range(4):
+                self.assertEqual(self._start().status_code, 507)
+        self.assertEqual(self._files(), [])
+
+        # The next real start must get the plain name, not ..._4.
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock()]
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            self.assertEqual(self._start().status_code, 200)
+        self.assertEqual(len(self._files()), 1)
+        # Not "..._1080p_1.ts". Checking for "_1" alone would match the
+        # resolution in the middle of the name.
+        self.assertIsNone(re.search(r"_\d+\.ts$", self._files()[0]),
+                          f"slot number burnt by refused starts: {self._files()[0]}")
+
+    def test_a_launch_failure_also_gives_the_name_back(self):
+        from unittest.mock import patch
+        with patch.object(self.server, "_launch_session", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._start()
+        self.assertEqual(self._files(), [])
+
+    def test_a_successful_start_keeps_its_reserved_file(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock()]
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            self.assertEqual(self._start().status_code, 200)
+        self.assertEqual(len(self._files()), 1)
+
+    def test_a_non_empty_file_is_never_removed(self):
+        # If anything has been written the recorder owns it. Cleanup must not
+        # be able to delete footage on a late failure.
+        from unittest.mock import patch
+
+        def _write_then_fail(record, port):
+            Path(record["output_filepath"]).write_bytes(b"captured bytes")
+            raise RuntimeError("failed after the first write")
+
+        with patch.object(self.server, "_launch_session", side_effect=_write_then_fail):
+            with self.assertRaises(RuntimeError):
+                self._start()
+        self.assertEqual(len(self._files()), 1)
+        self.assertEqual((Path(self.tmp) / self._files()[0]).read_bytes(), b"captured bytes")
+
+
 class TestRecordAgainConfig(ServerTestCase):
     """GET /api/recordings/{id}/config -- the settings behind a finished run."""
 
@@ -5844,7 +5915,10 @@ class TestRecordAgainConfig(ServerTestCase):
             },
         )
         record.update(overrides)
-        self.server.session_records["abc123"] = record
+        from unittest.mock import MagicMock
+        recorder = MagicMock()
+        recorder.session_record = record
+        self.server.active_recorders["abc123"] = recorder
         return record
 
     def test_unknown_session_404s(self):
@@ -5925,23 +5999,26 @@ class TestRecordAgainConfig(ServerTestCase):
                 "resolution": "720p", "freeze_timeout": 30,
             })
         self.assertEqual(started.status_code, 200)
-        rid = next(iter(self.server.session_records))
+        rid = next(iter(self.server.active_recorders))
         cfg = self.client.get(f"/api/recordings/{rid}/config").json()["config"]
         self.assertEqual(cfg["team_a"], "Bucs")
         self.assertEqual(cfg["resolution"], "720p")
         self.assertEqual(cfg["freeze_timeout"], 30)
 
-    def test_pruning_forgets_the_record_with_the_recorder(self):
-        # Two dicts that disagree are a leak. They must be pruned together.
+    def test_a_pruned_session_is_no_longer_offered(self):
+        # The record has the recorder's lifetime, so pruning one loses both and
+        # the endpoint 404s rather than serving a config for a dead session.
         from unittest.mock import MagicMock
         for n in range(self.server.MAX_FINISHED_SESSIONS + 3):
             rec = MagicMock()
             rec.is_running = False
             rec.stop_time = float(n)
+            rec.session_record = {"id": f"s{n}"}
             self.server.active_recorders[f"s{n}"] = rec
-            self.server.session_records[f"s{n}"] = {"id": f"s{n}"}
         self.server._prune_finished_sessions()
-        self.assertEqual(set(self.server.active_recorders), set(self.server.session_records))
+        self.assertEqual(len(self.server.active_recorders),
+                         self.server.MAX_FINISHED_SESSIONS)
+        self.assertEqual(self.client.get("/api/recordings/s0/config").status_code, 404)
 
 
 class TestResumeReattachesToTheWorkingCandidate(unittest.TestCase):
@@ -5975,8 +6052,7 @@ class TestResumeReattachesToTheWorkingCandidate(unittest.TestCase):
 
         with patch.object(server, "StreamFailoverRecorder", side_effect=_capture), \
              patch.object(server, "session_store", MagicMock()), \
-             patch.object(server, "active_recorders", {}), \
-             patch.object(server, "session_records", {}):
+             patch.object(server, "active_recorders", {}):
             server._launch_session(record, 8090)
         return built["recorder"]
 
@@ -5998,6 +6074,46 @@ class TestResumeReattachesToTheWorkingCandidate(unittest.TestCase):
             with self.subTest(value=junk):
                 recorder = self._launch(current_candidate_index=junk)
                 self.assertEqual(recorder.current_candidate_index, 0)
+
+
+class TestEveryTestInThisFileActuallyRuns(unittest.TestCase):
+    """The `__main__` entry point must be the last thing in this file.
+
+    CI runs `python test_pvarr.py`. `unittest.main()` reflects over __main__'s
+    globals at the moment it is called and then sys.exit()s, so any class
+    defined below it is never defined, never discovered and never run -- and
+    nothing fails, the count just quietly drops. Twenty-five tests were added
+    below that block and were invisible to CI while passing locally under
+    `-m unittest`, which imports the module and executes the whole file.
+
+    This guard is the reason that cannot happen again silently.
+    """
+
+    def test_no_test_class_is_defined_after_the_entry_point(self):
+        source = Path(__file__).resolve().read_text().splitlines()
+        entry = [i for i, line in enumerate(source)
+                 if line.startswith('if __name__ == "__main__"')]
+        self.assertEqual(len(entry), 1, "expected exactly one __main__ block")
+        stranded = [
+            f"line {i + 1}: {line}"
+            for i, line in enumerate(source)
+            if i > entry[0] and line.startswith("class ")
+        ]
+        self.assertEqual(
+            stranded, [],
+            "these classes sit below `if __name__ == \"__main__\"` and will "
+            "never run under `python test_pvarr.py`:\n  " + "\n  ".join(stranded),
+        )
+
+    def test_the_two_ways_of_running_the_suite_agree(self):
+        # `python test_pvarr.py` (CI) and `-m unittest test_pvarr` (local) must
+        # collect the same tests, or a green local run means nothing.
+        loader = unittest.TestLoader()
+        imported = loader.loadTestsFromModule(
+            __import__("test_pvarr") if __name__ == "__main__" else sys.modules[__name__]
+        )
+        as_main = loader.loadTestsFromModule(sys.modules[__name__])
+        self.assertEqual(imported.countTestCases(), as_main.countTestCases())
 
 
 class TestShutdownBudgetFitsTheGracePeriod(unittest.TestCase):
@@ -6055,3 +6171,7 @@ class TestShutdownBudgetFitsTheGracePeriod(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('=~ ^[0-9]+$', (self.ROOT / "start.sh").read_text())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

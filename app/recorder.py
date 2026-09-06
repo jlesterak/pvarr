@@ -622,6 +622,11 @@ class StreamFailoverRecorder:
         # Where this recording's output timeline has reached, in seconds. Every
         # FFmpeg after the first is offset by it so the appended segments form
         # one rising timeline instead of each restarting at zero.
+        # What the operator asked for when this session was created, set by
+        # the server once the record exists. Kept here so it lives and dies
+        # with the recorder instead of in a second dict that has to be pruned
+        # in step with it.
+        self.session_record: Optional[Dict[str, Any]] = None
         self._timeline_offset: float = 0.0
         self._timeline_seeded: bool = False
         self._last_disk_check: float = 0.0
