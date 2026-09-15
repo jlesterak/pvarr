@@ -139,11 +139,15 @@ class NotificationManager:
             f"Session: {session_id}\nSwitched to: {next_candidate_name}",
         )
 
-    def notify_recording_finished(self, session_id: str, filename: str, size_mb: float):
-        self.send(
-            "PVArr — Recording Finished ✅",
-            f"Session: {session_id}\nFile: {filename}\nSize: {size_mb} MB",
-        )
+    def notify_recording_finished(self, session_id: str, filename: str, size_mb: float,
+                                  segments_lost: int = 0):
+        body = f"Session: {session_id}\nFile: {filename}\nSize: {size_mb} MB"
+        # Said here because this is the message someone reads before deciding
+        # whether to watch: a file with gaps looks complete in the library.
+        if isinstance(segments_lost, int) and segments_lost > 0:
+            body += (f"\n⚠️ {segments_lost} stream segment(s) lost — the recording "
+                     "has gaps of a few seconds where the source failed to deliver.")
+        self.send("PVArr — Recording Finished ✅", body)
         self.trigger_media_server_refresh()
 
     # -- media servers -----------------------------------------------------

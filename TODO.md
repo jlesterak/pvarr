@@ -2832,7 +2832,7 @@ the recorder thread's own teardown can now run concurrently.
 ### Still open from Phase 15
 The `aborted_no_space` remux leaving a partial `.mp4` on a full volume.
 
-## Phase 20: Recordings lose whole HLS segments (2026-09-14) [PENDING]
+## Phase 20: Recordings lose whole HLS segments (2026-09-14) [COMPLETED -- retries deferred]
 
 ### The report
 Sponsor: the recording is lower quality than the same stream in Firefox/Chrome,
@@ -2882,9 +2882,9 @@ reach its threshold.
    logic in PVArr could have chosen better.
 
 ### Proposed next steps -- need sponsor go-ahead (changes FFmpeg execution)
-1. Raise FFmpeg to `-loglevel warning` (stderr is already drained to a bounded
-   tail, so no pipe-fill risk), count skipped/failed segments, and show the
-   count on the dashboard and in the completion notification.
+1. **[DONE -- see "Built" below]** Raise FFmpeg to `-loglevel warning`, count
+   skipped/failed segments, and show the count on the dashboard and in the
+   completion notification.
 2. Add `-seg_max_retry` where the binary supports it.
 3. Reproduce locally against a served live playlist with injected segment
    failures and a short window, to prove which of 1/2 produces this exact
@@ -2925,3 +2925,72 @@ segment warnings and a skipped-segment count, so the next bad source is
 diagnosed on the night instead of from the finished file. Retries remain
 blocked on a newer FFmpeg in the image, with no evidence yet that they would
 have helped.
+
+### Built: segment-loss visibility (2026-09-14) -- sponsor approved ("1-y")
+- FFmpeg runs at `-loglevel repeat+level+warning`. `_drain_stderr(ffmpeg=True)`
+  reads stderr buffered, counts lost segments from two hls-demuxer warnings, and
+  keeps warnings out of the 15-line failure tail.
+- Counted: `Failed to open segment N of playlist P` (deduplicated per FFmpeg
+  process, since 6.1 repeats it per retry) and `skipping N segments ahead,
+  expired from playlists`. Both anchored to the whole line and to the hls
+  context. "Packet corrupt" follows a loss and is deliberately not counted.
+- Logged once on the first loss, then at most one summary a minute, flushed at
+  the end of each attempt and at finish. Exposed as `segments_lost` /
+  `segments_failed` / `segments_expired` in `/api/status`, shown under On Disk
+  and on finished rows, and appended to the finished notification when > 0.
+- Counts are in memory: a resumed recording starts again from zero (README).
+
+**Proof the parsing matches real FFmpeg.** A local fake live source
+(`hls_lab.py` in the session scratchpad: 2s segments, 10s window, 404 on segment
+8, 14s stall on segment 14) produced the exact warning lines on host 6.1 and
+on the image's 5.1.9 in a throwaway container; those literal lines are the
+test fixtures. Then an end-to-end run of the *real* capture path
+(`_build_ffmpeg_cmd` -> FFmpeg -> pump -> counters -> log, no mocks) against
+the same source reported `segments_lost=3 failed=1 expired=2` on both versions,
+first loss logged at once and the rest as one summary.
+
+### Agent team review -- what changed the implementation
+Architect, Security and DevOps reviewed the diff in parallel. No blockers.
+- **stderr was read one byte per syscall** (Architect, DevOps). `bufsize=0`
+  makes it raw `FileIO`. DevOps measured 86 us/line unbuffered vs 1 us
+  buffered -- ~5% of a core per recording at 200 warnings/s. Now wrapped in a
+  64 KB `BufferedReader`, lines capped at 4 KB.
+- **Unanchored patterns let source-controlled text inflate counts** (Security):
+  any warning quoting an HTTP reason phrase or a playlist URI could carry
+  "skipping 999999999999 segments ahead". Now anchored to the hls context's own
+  line; one line adds at most 10,000.
+- **Nested context prefixes** (`[a @ ..] [b @ ..] [warning]`) escaped the
+  warning filter into the tail (Architect, Security). Prefix group now `*`.
+- **Failure explanation cut before redaction, and stored raw** (Security,
+  pre-existing, worsened by the new tag prefixes). Now redacted per line
+  before the 500-char cut; `last_error` is stored redacted.
+- DevOps: operator notes added to README (FFmpeg's level, `PVARR_LOG_LEVEL`
+  does not change it, the count depends on FFmpeg's wording).
+
+**Where the reviews disagreed.** Architect and Security expected FFmpeg to
+collapse identical warnings into an untagged "Last message repeated N times"
+(undercounting repeated expiries, and cluttering the tail); DevOps measured 6.1
+and saw no collapsing. Not settled by guessing which build does what: added
+`repeat` to the log flags, which disables collapsing on every version.
+Verified accepted by 5.1.9 and 6.1; with buffered reads the extra lines cost
+~1 us each.
+
+**Declined, recorded here:**
+- `finish()` can read the tail before the pump has consumed FFmpeg's last error
+  lines (Architect). Pre-existing race, cosmetic; fixing needs the pump thread
+  handed back and joined.
+- Losses counted after the final flush miss the "Recorder finished" line
+  (Architect, DevOps). `/api/status` and the notification read the live counter.
+- `stop_all()` reaps recorders serially, up to ~7s each, before the shutdown
+  budget starts (DevOps). Pre-existing; several FFmpegs ignoring SIGTERM could
+  outlast Docker's 30s grace period. Worth its own change.
+- A configurable FFmpeg log level (DevOps suggested only as an escape hatch).
+  Not added; no evidence it is needed once reads are buffered.
+
+### Verified
+- 593 tests green. The 10 tests added with the feature fail against the
+  previous commit; the 6 added for review findings fail against the pre-review
+  code (each fix reverted in a scratch copy) and pass on the final code.
+- End-to-end on the final code (buffered reads, `repeat` flag) against the lab
+  source: `segments_lost=3 failed=1 expired=2`, empty `last_error`, one log line
+  plus one summary -- identical on host FFmpeg 6.1 and the image's 5.1.9.

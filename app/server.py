@@ -538,7 +538,8 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
 
         final_path = recorder.final_filepath or Path(filepath)
         sz = round(final_path.stat().st_size / (1024*1024), 2) if final_path.exists() else 0
-        notifier.notify_recording_finished(recording_id, final_path.name, sz)
+        notifier.notify_recording_finished(recording_id, final_path.name, sz,
+                                           segments_lost=recorder.segments_lost)
         # Genuinely finished: stop tracking it, so a later restart does not
         # try to resume a recording that has already been remuxed and shipped.
         session_store.remove(recording_id)

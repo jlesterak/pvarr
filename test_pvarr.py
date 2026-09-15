@@ -1347,6 +1347,86 @@ class TestResumeDecision(unittest.TestCase):
             sessions.resume_decision(self.record(), gap_limit=500), "resume")
 
 
+class TestSegmentLossReporting(unittest.TestCase):
+    """Losses are counted exactly but logged sparingly: a source dropping one
+    segment in three would otherwise write a line every few seconds for hours."""
+
+    def make(self):
+        return StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts", min_free_gb=0)
+
+    @staticmethod
+    def _loss_lines(rec):
+        return [l for l in rec.log_history if "segments lost" in l.lower()]
+
+    def test_first_loss_is_logged_then_at_most_once_a_minute(self):
+        from unittest.mock import patch
+        rec = self.make()
+        clock = [1000.0]
+        with patch("app.recorder.time.time", side_effect=lambda: clock[0]):
+            rec._note_segment_loss(failed=1)
+            for _ in range(20):
+                clock[0] += 2
+                rec._note_segment_loss(expired=1)
+            self.assertEqual(len(self._loss_lines(rec)), 1, self._loss_lines(rec))
+            clock[0] += 60
+            rec._note_segment_loss(failed=1)
+        lines = self._loss_lines(rec)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("21 more", lines[-1])
+        self.assertEqual(rec.segments_lost, 22)
+
+    def test_losses_held_back_are_flushed(self):
+        rec = self.make()
+        rec._note_segment_loss(failed=1)
+        rec._note_segment_loss(expired=3)
+        rec._flush_segment_loss()
+        self.assertIn("3 more", rec.log_history[-1])
+        rec._flush_segment_loss()  # nothing pending: no new line
+        self.assertEqual(len(self._loss_lines(rec)), 2)
+
+    def _account(self, rec, line):
+        import collections
+        rec._account_ffmpeg_warning(line, collections.OrderedDict())
+
+    def test_source_text_in_another_warning_cannot_inflate_the_count(self):
+        """Only the hls demuxer's own line counts. An HTTP reason phrase or a
+        playlist URI quoted in some other warning is source-controlled text."""
+        rec = self.make()
+        self._account(rec, "[http @ 0x1] [warning] HTTP error 404 skipping 999999 "
+                           "segments ahead, expired from playlists")
+        self._account(rec, "[hls @ 0x1] [warning] Opening x: skipping 999999 segments "
+                           "ahead, expired from playlists")
+        self._account(rec, "[https @ 0x2] [warning] Failed to open segment 1 of playlist 0")
+        self.assertEqual(rec.segments_lost, 0)
+        # The genuine lines, including 6.1's input-prefixed context, still count.
+        self._account(rec, "[hls @ 0x59cc51483000] [warning] Failed to open segment 8 of playlist 0")
+        self._account(rec, "[in#0/hls @ 0x5e] [warning] skipping 2 segments ahead, "
+                           "expired from playlists")
+        self.assertEqual((rec.segments_failed, rec.segments_expired), (1, 2))
+
+    def test_an_absurd_expiry_count_is_capped(self):
+        from app.recorder import _MAX_EXPIRED_PER_LINE
+        rec = self.make()
+        self._account(rec, "[hls @ 0x1] [warning] skipping 999999999999 segments "
+                           "ahead, expired from playlists")
+        self.assertEqual(rec.segments_expired, _MAX_EXPIRED_PER_LINE)
+
+    def test_nested_contexts_are_still_recognised_as_warnings(self):
+        """FFmpeg prints two context prefixes for nested components; a pattern
+        allowing only one let those warnings into the failure tail."""
+        from app.recorder import _FFMPEG_LEVEL_RE
+        m = _FFMPEG_LEVEL_RE.match("[hls @ 0x1] [https @ 0x2] [warning] Packet corrupt")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "warning")
+
+    def test_the_status_summary_reports_them(self):
+        rec = self.make()
+        rec._note_segment_loss(failed=2, expired=5)
+        s = rec.get_status_summary()
+        self.assertEqual(
+            (s["segments_lost"], s["segments_failed"], s["segments_expired"]), (7, 2, 5))
+
+
 class TestStopReason(unittest.TestCase):
     """Operator stop and process-going-away are not the same event.
 
@@ -1983,7 +2063,112 @@ class TestFreezeDetection(unittest.TestCase):
         rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out)
         cmd = rec._build_ffmpeg_cmd("http://a/1.m3u8")
         self.assertIn("-nostats", cmd)
-        self.assertEqual(cmd[cmd.index("-loglevel") + 1], "error")
+        # Warning, with each line's level tagged: lost segments are only ever
+        # warnings, and at "error" 20% of a recording vanished without a line.
+        self.assertEqual(cmd[cmd.index("-loglevel") + 1], "repeat+level+warning")
+
+    # Real FFmpeg output, captured 2026-09-14 from the shipped image's 5.1.9
+    # and from 6.1, against a local live source that 404s segment 8 and stalls
+    # segment 14 past the playlist window.
+    FFMPEG_5_1_LOSS = [
+        b"[http @ 0x568bc844f340] [warning] HTTP error 404 Not Found",
+        b"[hls @ 0x568bc8448a40] [warning] Failed to open segment 8 of playlist 0",
+        b"[mpegts @ 0x568bc844f740] [warning] Packet corrupt (stream = 0, dts = 1563000).",
+        b"[warning] http://127.0.0.1:18999/live.m3u8: corrupt input packet in stream 0",
+        b"[hls @ 0x568bc8448a40] [warning] skipping 2 segments ahead, expired from playlists",
+    ]
+    FFMPEG_6_1_LOSS = [
+        b"[http @ 0x7e3708003100] [warning] HTTP error 404 Not Found",
+        b"[hls @ 0x59cc51483000] [warning] Failed to open segment 8 of playlist 0",
+        b"[hls @ 0x59cc51483000] [warning] Segment 8 of playlist 0 failed too many times, skipping",
+        b"[hls @ 0x59cc51483000] [warning] skipping 2 segments ahead, expired from playlists",
+        b"[mpegts @ 0x59cc51488b40] [warning] Packet corrupt (stream = 0, dts = 2823000).",
+        b"[in#0/hls @ 0x59cc51482f00] [warning] corrupt input packet in stream 0",
+    ]
+
+    def _wait_for(self, predicate, timeout=2.0):
+        """The stderr pump is its own thread; give it a moment to catch up."""
+        import time as _time
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if predicate():
+                return True
+            _time.sleep(0.01)
+        return predicate()
+
+    def test_lost_segments_are_counted_from_real_ffmpeg_output(self):
+        rec, _ = self.drive([b"x" * 1024], returncode=0, close_stdout=True,
+                            stderr_lines=self.FFMPEG_5_1_LOSS)
+        self.assertTrue(self._wait_for(lambda: rec.segments_lost == 3), rec.segments_lost)
+        self.assertEqual((rec.segments_failed, rec.segments_expired), (1, 2))
+        self.assertTrue(any("Stream segments lost" in l for l in rec.log_history))
+
+    def test_a_retried_segment_counts_once(self):
+        """6.1 repeats "Failed to open segment" per retry; one hole is one loss."""
+        lines = (self.FFMPEG_6_1_LOSS[:2] + [self.FFMPEG_6_1_LOSS[1]]
+                 + self.FFMPEG_6_1_LOSS[2:])
+        rec, _ = self.drive([b"x" * 1024], returncode=0, close_stdout=True,
+                            stderr_lines=lines)
+        # Counts pass through 1, 1, 3 when deduplicated and 1, 2, 4 when not,
+        # so waiting for exactly 3 cannot pass on the broken version.
+        self.assertTrue(self._wait_for(lambda: rec.segments_lost == 3), rec.segments_lost)
+        self.assertEqual(rec.segments_failed, 1)
+
+    def test_warnings_stay_out_of_the_failure_explanation(self):
+        """A burst of warnings must not push the line that explains a failure
+        out of the 15-line tail -- it holds what it held at "error"."""
+        lines = self.FFMPEG_5_1_LOSS * 4 + [
+            b"[https @ 0x1] [error] http://x/y.m3u8: Server returned 403 Forbidden (access denied)"]
+        rec, result = self.drive([], returncode=1, stderr_lines=lines)
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertIn("403", rec.candidates[0].last_error)
+        self.assertNotIn("Packet corrupt", rec.candidates[0].last_error)
+
+    def test_counting_can_never_stop_the_pipe_draining(self):
+        """Accounting that raised out of the pump would end the drain, and FFmpeg
+        would then block on a full pipe -- a hang, not a stream fault."""
+        from unittest.mock import patch
+        lines = [self.FFMPEG_5_1_LOSS[1],
+                 b"[https @ 0x1] [error] Server returned 403 Forbidden"]
+        with patch.object(StreamFailoverRecorder, "_account_ffmpeg_warning",
+                          side_effect=RuntimeError("boom")):
+            rec, _ = self.drive([], returncode=1, stderr_lines=lines)
+        self.assertIn("403", rec.candidates[0].last_error)
+
+    def test_the_failure_explanation_is_redacted_before_it_is_cut(self):
+        """last_error is served by /api/status and logged; cut first, a path
+        token could be shortened until it no longer looked like one."""
+        token_line = (b"[https @ 0x1] [error] https://cdn.example/secure/"
+                      b"PDWbrzK7fQx2LmN9aB3cYe/playlist.m3u8: Server returned 403 Forbidden")
+        rec, _ = self.drive([], returncode=1, stderr_lines=[token_line])
+        self.assertIn("403", rec.candidates[0].last_error)
+        self.assertNotIn("PDWbrz", rec.candidates[0].last_error)
+
+    def test_stderr_is_read_buffered(self):
+        """bufsize=0 hands the pump a raw FileIO, whose readline() is a system
+        call per byte -- 86 us a line, measured, against 1 us buffered."""
+        import types
+        reads = [0]
+
+        class CountingFileIO(io.FileIO):
+            def read(self, n=-1):
+                reads[0] += 1
+                return super().read(n)
+
+            def readinto(self, b):
+                reads[0] += 1
+                return super().readinto(b)
+
+        r, w = os.pipe()
+        line = b"[mpegts @ 0x1] [warning] Packet corrupt (stream = 0, dts = 1563000)." + b"x" * 40
+        os.write(w, (line + b"\n") * 50 + b"[https @ 0x1] [error] the last line\n")
+        os.close(w)
+        rec = StreamFailoverRecorder("t", ["http://a/1.m3u8"], self.out, min_free_gb=0)
+        tail = rec._drain_stderr(types.SimpleNamespace(stderr=CountingFileIO(r, "rb")),
+                                 ffmpeg=True)
+        self.assertTrue(self._wait_for(lambda: "the last line" in " ".join(tail)))
+        # ~6,000 reads unbuffered; a handful buffered.
+        self.assertLess(reads[0], 20, reads[0])
 
     def test_freeze_fires_while_the_pipe_is_still_open(self):
         # The regression that mattered: a source that stalls mid-buffer without
@@ -2227,7 +2412,7 @@ class TestProxyChannelMode(unittest.TestCase):
         proc.return_value.poll.return_value = None
         self._sleep = patch("app.recorder.time.sleep")
         self._sleep.start()
-        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p: [])
+        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p, **k: [])
         self._drain.start()
 
     def tearDown(self):
@@ -3065,7 +3250,8 @@ class TestCompletionOrdering(ServerTestCase):
 
         notifier = MagicMock()
         notifier.notify_recording_finished.side_effect = (
-            lambda sid, name, size: order.append(("notify", name, size))
+            lambda sid, name, size, **kw: (order.append(("notify", name, size)),
+                                           captured.setdefault("notify_kwargs", kw))
         )
 
         with patch.object(self.server, "StreamFailoverRecorder", fake_recorder), \
@@ -3110,6 +3296,13 @@ class TestCompletionOrdering(ServerTestCase):
         )
         self.assertEqual(captured["recorder"].final_filepath,
                          Path(self.tmp) / "game.mp4")
+
+    def test_notification_carries_the_segment_loss_count(self):
+        _, captured = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        self.assertIs(captured["notify_kwargs"]["segments_lost"],
+                      captured["recorder"].segments_lost)
 
 
 class TestLibraryRoutes(ServerTestCase):
@@ -3955,7 +4148,7 @@ class TestProxyConfNeverOutlivesTheSession(unittest.TestCase):
         proc.return_value.poll.return_value = None
         self._sleep = patch("app.recorder.time.sleep")
         self._sleep.start()
-        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p: [])
+        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p, **k: [])
         self._drain.start()
         # Patching Popen also breaks subprocess.run, which this probe uses to
         # ask the ffmpeg binary what it supports. Not what is under test here.
@@ -5248,6 +5441,19 @@ class TestNotificationTargets(unittest.TestCase):
             m.notify_failover_triggered("s", "Candidate 2")
             m.notify_recording_finished("s", "f.mp4", 12.5)
         self.assertEqual(send.call_count, 3)
+
+    def test_a_finished_recording_with_gaps_says_so(self):
+        """A file with holes looks complete in the library; the message read
+        before deciding to watch is where that has to be said."""
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch.object(m, "send", return_value=True) as send, \
+             patch.object(m, "trigger_media_server_refresh"):
+            m.notify_recording_finished("s", "f.mp4", 12.5, segments_lost=4)
+            m.notify_recording_finished("s", "f.mp4", 12.5)
+        with_gaps, clean = (c.args[1] for c in send.call_args_list)
+        self.assertIn("4 stream segment(s) lost", with_gaps)
+        self.assertNotIn("lost", clean)
 
 
 

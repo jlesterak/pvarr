@@ -195,6 +195,10 @@
                                 ? 'Data is arriving but the file on disk is not growing. Something may have removed it.'
                                 : 'Size of the file on disk'"
                       x-text="session.filesize_mb + ' MB'"></span>
+                <span x-show="session.segments_lost > 0"
+                      class="text-[11px] block text-amber-400 font-mono"
+                      :title="'The source failed to deliver these: ' + session.segments_failed + ' would not download, ' + session.segments_expired + ' expired before FFmpeg reached them. Each is a gap of a few seconds in picture and sound. A climbing count means this source is unreliable.'"
+                      x-text="session.segments_lost + (session.segments_lost === 1 ? ' segment lost' : ' segments lost')"></span>
               </div>
               <!-- Captured is the recorder's own counter. It and On Disk must
                    agree; when they do not, bytes are going somewhere the file
@@ -268,6 +272,10 @@
                         x-text="formatSeconds(session.elapsed_seconds)"></span>
                   <span class="text-xs font-mono text-cyan-400/70 shrink-0"
                         x-show="!session.is_rebroadcast" x-text="session.filesize_mb + ' MB'"></span>
+                  <span class="text-xs font-mono text-amber-400 shrink-0"
+                        x-show="session.segments_lost > 0"
+                        :title="session.segments_lost + ' stream segments lost: gaps of a few seconds in this recording'"
+                        x-text="'⚠ ' + session.segments_lost"></span>
                   <span class="text-xs capitalize shrink-0" :class="statusTextClass(session)"
                         x-text="prettyStatus(session.status)"></span>
                   <span class="text-slate-500 shrink-0 text-[10px]"

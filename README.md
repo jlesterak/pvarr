@@ -323,7 +323,7 @@ and mounts `./recordings` there.
 | `POST` | `/api/recordings/{id}/stop` | Stop a recording |
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
 | `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
-| `GET` | `/api/status` | The running version, every session, its candidates and recent logs. Polled by the dashboard. Candidate cookies are **not** included — see below. |
+| `GET` | `/api/status` | The running version, every session, its candidates and recent logs, and `segments_lost` (split into `segments_failed` and `segments_expired`) — stream segments the source failed to deliver. Polled by the dashboard. Candidate cookies are **not** included — see below. |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
@@ -445,6 +445,8 @@ remux fails.
 ## Troubleshooting
 
 **Recording drops repeatedly.** Confirm the primary URL still resolves by pasting it back into Add Recording. Expiring tokens are the usual cause — configure backups from a different source. The recorder cycles through all candidates repeatedly and only gives up after three complete laps with no data, so brief outages across every source are survivable.
+
+**Playback freezes for a few seconds and then races to catch up — or the dashboard says "segments lost".** The source failed to deliver pieces of the stream: a segment that would not download, or a stall long enough that the live playlist moved on before FFmpeg got to it. Each lost segment is a gap of a few seconds in picture *and* sound. Players such as mpv play the audio straight across the gap but hold the last video frame, so it looks like a video-only freeze. PVArr counts these from FFmpeg's own warnings and reports the total under **On Disk**, in the session log (the first loss straight away, then at most one summary a minute) and in the finished notification. A count that keeps climbing means that source is unreliable — switch to a backup candidate. A healthy source stays at zero. The count covers the current run of PVArr only: a recording resumed after a container restart starts again from zero. To see these, FFmpeg runs at its *warning* log level; `PVARR_LOG_LEVEL` controls PVArr's own logging, not FFmpeg's. The count relies on the exact wording of two FFmpeg warnings, checked against FFmpeg 5.1 (the one in the image) and 6.1 — on a build that rewords them it would quietly read zero. Watching the `.ts` in a player while it records does not cause gaps. Sound dropping out while the picture carries on is usually the source muting an ad break, not a lost segment.
 
 **A recording ended early when all sources blipped at once (versions before 0.1.3).** The candidate list was a one-way walk: once it ran off the end the recording stopped, with no route back to candidate 1 even after it recovered. The list now wraps. Fixed.
 

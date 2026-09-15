@@ -6,10 +6,12 @@ dynamic HTTP header injection, freeze detection, and continuous segment appendin
 """
 
 import collections
+import io
 import json
 import logging
 import math
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -348,6 +350,26 @@ def output_ts_offset_flags(offset: Optional[float]) -> List[str]:
     return ["-output_ts_offset", f"{value:.6f}"]
 
 
+# FFmpeg's HLS demuxer reports a lost segment only at warning level. Wording
+# checked against real output of both the shipped 5.1.9 and 6.1, driven by a
+# local live source that 404s one segment and stalls another past the window.
+#
+# The segment patterns are anchored to the whole line *and* to the hls demuxer's
+# own context. Unanchored, any warning that quotes source-controlled text -- an
+# HTTP reason phrase, a URI from the playlist -- could carry "skipping
+# 999999999999 segments ahead" and inflate the count shown to the operator.
+_FFMPEG_LEVEL_RE = re.compile(
+    r"^(?:\[[^\]]+\] )*\[(panic|fatal|error|warning|info|verbose|debug|trace)\] ")
+_HLS_WARNING = r"^\[(?:[^\]/]*/)?hls @ 0x[0-9a-fA-F]+\] \[warning\] "
+_SEGMENT_FAILED_RE = re.compile(
+    _HLS_WARNING + r"Failed to open segment (\d{1,12}) of playlist (\d{1,6})$")
+_SEGMENTS_EXPIRED_RE = re.compile(
+    _HLS_WARNING + r"skipping (\d{1,12}) segments ahead, expired from playlists?$")
+# No live window expires more than this in one go; FFmpeg's 15s read timeout
+# fails the attempt long before. Anything larger is not a real count.
+_MAX_EXPIRED_PER_LINE = 10000
+
+
 def url_for_log(url: Optional[str], limit: int = 70) -> str:
     """A URL shortened for a log line, redacted *before* it is cut.
 
@@ -541,6 +563,8 @@ class StreamFailoverRecorder:
     READ_CHUNK_BYTES = 65536
     # Tail of FFmpeg's stderr kept for diagnostics when an attempt fails.
     STDERR_TAIL_LINES = 15
+    SEGMENT_LOSS_LOG_INTERVAL_SEC = 60
+    _MAX_TRACKED_FAILURES = 256
     # Lines of recorder log kept for the dashboard. Older lines are dropped.
     LOG_HISTORY_LIMIT = 500
     # How often free space is checked while recording. statvfs is cheap but not
@@ -647,6 +671,15 @@ class StreamFailoverRecorder:
         self.start_time: Optional[float] = None
         self.stop_time: Optional[float] = None
         self.bytes_written: int = 0
+        # Segments FFmpeg reported lost: failed to download, or expired from
+        # the live window before it reached them. Each is a hole of a few
+        # seconds that nothing else can see -- the freeze detector watches
+        # bytes, and holes this short never trip it. A recording lost 20% of
+        # its footage this way without a line in the log.
+        self.segments_failed: int = 0
+        self.segments_expired: int = 0
+        self._loss_unlogged: int = 0
+        self._loss_logged_at: float = 0.0
         self.log_history: List[str] = []
         # Total lines ever logged, never reset. log_history is trimmed to the
         # last LOG_HISTORY_LIMIT, so a plain index into it stops advancing once
@@ -1368,7 +1401,15 @@ class StreamFailoverRecorder:
             # through; only the stats spam is suppressed.
             "-hide_banner",
             "-nostats",
-            "-loglevel", "error",
+            # Warning, not error: the HLS demuxer reports a lost segment ("Failed
+            # to open segment", "skipping N segments ahead") only at warning
+            # level, so at "error" whole segments vanished from recordings
+            # without a trace. "level" tags every line with its severity, which
+            # is how _drain_stderr() keeps warnings apart from real errors.
+            # "repeat" stops FFmpeg collapsing identical lines into an untagged
+            # "Last message repeated N times", which would hide repeated
+            # expiries from the count and push real errors out of the tail.
+            "-loglevel", "repeat+level+warning",
             # Belt and braces with safe_stream_url(): even if a non-http URL
             # reached here, FFmpeg is not permitted to open a local file or an
             # arbitrary socket. 'file' is deliberately absent. crypto and data
@@ -1442,6 +1483,7 @@ class StreamFailoverRecorder:
             return self._capture_ffmpeg_output(ffmpeg_cmd, candidate, tail)
         finally:
             self._advance_timeline(tail)
+            self._flush_segment_loss()
 
     def _advance_timeline(self, tail: "_TailBuffer") -> None:
         """Move `_timeline_offset` to the end of the segment just captured.
@@ -1483,13 +1525,18 @@ class StreamFailoverRecorder:
                 bufsize=0,
             )
             stdout_fd = self._ffmpeg_process.stdout.fileno()
-            stderr_tail = self._drain_stderr(self._ffmpeg_process)
+            stderr_tail = self._drain_stderr(self._ffmpeg_process, ffmpeg=True)
             at_eof = False
 
             def finish(outcome: "StreamOutcome") -> "StreamOutcome":
                 """Attach FFmpeg's own words to a failed attempt."""
                 if outcome is not StreamOutcome.COMPLETED and stderr_tail:
-                    detail = " | ".join(stderr_tail)[:500]
+                    # Redacted per line *before* the cut: truncating first can
+                    # shorten a path token until it no longer looks like one.
+                    # And stored redacted, since last_error is served by
+                    # /api/status. list() first: the pump may still be appending.
+                    detail = " | ".join(
+                        redact_url_secrets(l) for l in list(stderr_tail))[:500]
                     candidate.last_error = detail
                     self._log(f"FFmpeg said: {detail}", "ERROR")
                 return outcome
@@ -1598,14 +1645,20 @@ class StreamFailoverRecorder:
             return _RingSink(self.ring)
         return _FileSink(self.output_filepath)
 
-    def _drain_stderr(self, proc: subprocess.Popen) -> "collections.deque":
-        """Continuously drain FFmpeg's stderr, keeping only the tail.
+    def _drain_stderr(self, proc: subprocess.Popen, ffmpeg: bool = False) -> "collections.deque":
+        """Continuously drain a child's stderr, keeping only the tail.
 
         Two jobs. The pipe must be read or FFmpeg eventually blocks writing to
         it and stops producing video -- that is a hang, not a stream fault, and
         no amount of failover logic can recover from it. And when an attempt
         does fail, FFmpeg's last few lines are usually the only explanation of
         why (403, 404, bad codec), which previously went nowhere.
+
+        With `ffmpeg=True` each line carries FFmpeg's severity tag (see
+        _build_ffmpeg_cmd). Warnings are counted for lost segments and kept out
+        of the tail, so a burst of "Packet corrupt" cannot push the line that
+        explains a failure out of a 15-line buffer -- the tail holds what it
+        held when FFmpeg ran at "error". hls-proxy has no tags; kept whole.
 
         Daemon thread, bounded buffer: it holds at most STDERR_TAIL_LINES lines
         and exits on its own when the pipe closes.
@@ -1614,13 +1667,35 @@ class StreamFailoverRecorder:
         stream = proc.stderr
         if stream is None:
             return tail
+        seen_failures: "collections.OrderedDict" = collections.OrderedDict()
 
         def pump():
             try:
-                for raw in iter(stream.readline, b""):
+                reader = stream
+                if isinstance(stream, io.RawIOBase):
+                    # bufsize=0 makes FFmpeg's stderr a raw FileIO, whose
+                    # readline() costs one system call per byte: measured at
+                    # 86 us a line against 1 us buffered. Harmless at "error",
+                    # where lines were rare; not at "warning".
+                    reader = io.BufferedReader(stream, buffer_size=65536)
+                # Bounded: a line with no newline must not grow without limit.
+                for raw in iter(lambda: reader.readline(4096), b""):
                     line = raw.decode("utf-8", "replace").strip()
-                    if line:
-                        tail.append(line)
+                    if not line:
+                        continue
+                    if ffmpeg:
+                        level = _FFMPEG_LEVEL_RE.match(line)
+                        if level and level.group(1) == "warning":
+                            try:
+                                self._account_ffmpeg_warning(line, seen_failures)
+                            except Exception:
+                                # Counting is a diagnostic. Letting it raise
+                                # would end this loop, stop draining the pipe,
+                                # and hang FFmpeg -- the one failure this
+                                # thread exists to prevent.
+                                pass
+                            continue
+                    tail.append(line)
             except Exception:
                 pass  # pipe closed under us during shutdown; nothing to do
 
@@ -1628,6 +1703,75 @@ class StreamFailoverRecorder:
             target=pump, name=f"pvarr-stderr-{self.recording_id}", daemon=True
         ).start()
         return tail
+
+    @property
+    def segments_lost(self) -> int:
+        return self.segments_failed + self.segments_expired
+
+    def _account_ffmpeg_warning(self, line: str, seen: "collections.OrderedDict") -> None:
+        """Count a lost segment reported in one FFmpeg warning line.
+
+        A failed segment is keyed by playlist and sequence number: FFmpeg 6.1
+        logs "Failed to open segment" again on each retry, and one hole must
+        count once. Expiry carries its own count. Anything else is ignored --
+        "Packet corrupt" follows a lost segment and would count it twice.
+        """
+        failed = _SEGMENT_FAILED_RE.search(line)
+        if failed:
+            key = (failed.group(2), failed.group(1))
+            if key in seen:
+                return
+            seen[key] = None
+            if len(seen) > self._MAX_TRACKED_FAILURES:
+                seen.popitem(last=False)
+            self._note_segment_loss(failed=1)
+            return
+        expired = _SEGMENTS_EXPIRED_RE.search(line)
+        if expired:
+            self._note_segment_loss(
+                expired=min(int(expired.group(1)), _MAX_EXPIRED_PER_LINE))
+
+    def _note_segment_loss(self, failed: int = 0, expired: int = 0) -> None:
+        """Count lost segments. Log the first at once, then at most once a minute.
+
+        Called from the stderr pump thread. A source dropping one segment in
+        three warns every few seconds for hours; a log line for each would bury
+        everything else the dashboard's log shows.
+        """
+        with self._lock:
+            self.segments_failed += failed
+            self.segments_expired += expired
+            self._loss_unlogged += failed + expired
+            now = time.time()
+            if (self._loss_logged_at
+                    and now - self._loss_logged_at < self.SEGMENT_LOSS_LOG_INTERVAL_SEC):
+                return
+            message = self._take_segment_loss_message(now)
+        if message:
+            self._log(message, "WARN")  # outside the lock: _log() takes it
+
+    def _flush_segment_loss(self) -> None:
+        """Log losses still held back by the once-a-minute limit."""
+        with self._lock:
+            message = self._take_segment_loss_message(time.time())
+        if message:
+            self._log(message, "WARN")
+
+    def _take_segment_loss_message(self, now: float) -> Optional[str]:
+        """The log line for losses not yet logged, resetting them. Holds _lock."""
+        pending = self._loss_unlogged
+        if not pending:
+            return None
+        first = not self._loss_logged_at
+        self._loss_unlogged = 0
+        self._loss_logged_at = now
+        detail = (f"{self.segments_failed} failed to download, "
+                  f"{self.segments_expired} expired before FFmpeg reached them")
+        if first:
+            return (f"Stream segments lost: {pending} ({detail}). Each is a gap of "
+                    "a few seconds in the recording, picture and sound alike.")
+        return (f"{pending} more stream segments lost -- "
+                f"{self.segments_failed + self.segments_expired} in total ({detail}).")
 
     def _seed_timeline(self) -> None:
         """Pick the timeline up where a previous process left it, if there is one.
@@ -1854,9 +1998,11 @@ class StreamFailoverRecorder:
                 finally:
                     self.status = final_status
 
+        self._flush_segment_loss()
         self.is_running = False
         self.stop_time = time.time()
-        self._log(f"Recorder finished. Total recorded: {self.get_filesize_mb():.2f} MB ({self.bytes_written} bytes)")
+        lost = f", {self.segments_lost} stream segments lost" if self.segments_lost else ""
+        self._log(f"Recorder finished. Total recorded: {self.get_filesize_mb():.2f} MB ({self.bytes_written} bytes){lost}")
 
     def get_elapsed_seconds(self) -> float:
         if not self.start_time:
@@ -1898,6 +2044,9 @@ class StreamFailoverRecorder:
             # is exhausted, which the dashboard rendered as "Stream 2 of 1".
             "current_candidate": min(self.current_candidate_index + 1, len(self.candidates)),
             "cycles_without_data": self.cycles_without_data,
+            "segments_lost": self.segments_lost,
+            "segments_failed": self.segments_failed,
+            "segments_expired": self.segments_expired,
             "free_disk_gb": (
                 round(free / 1024 ** 3, 2) if (free := self.free_bytes()) is not None else None
             ),
