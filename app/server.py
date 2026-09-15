@@ -397,12 +397,18 @@ def _prune_finished_sessions() -> None:
 
 
 def _allocate_proxy_port(base: int = 8090) -> int:
-    """Lowest free proxy port among *running* sessions.
+    """Lowest proxy port block not held by any session.
 
     Deriving this from the total session count made the port climb for the
     life of the process and never reuse a freed one.
+
+    "Held" is running *or* still owning an hls-proxy. stop() clears is_running
+    before it tears the proxy down, so with the stop running in a worker thread
+    a session started in that window was handed a port whose proxy had not yet
+    exited. A proxy that would not die at all keeps its block indefinitely.
     """
-    used = {r.base_port for r in active_recorders.values() if r.is_running}
+    used = {r.base_port for r in active_recorders.values()
+            if r.is_running or r.holds_proxy_port}
     port = base
     while port in used:
         # Step by the whole reserved block, not by 2. A session binds
@@ -964,7 +970,12 @@ async def stop_recording(recording_id: str):
     # An operator stop genuinely finishes the recording, so _on_complete
     # remuxes and the session record is removed there. Contrast stop_all(),
     # which passes reason="shutdown" precisely so this does not happen.
-    recorder.stop(reason="operator")
+    #
+    # Off the event loop: stop() waits up to ~7s for FFmpeg and hls-proxy to
+    # exit, and run inline that froze every other request -- the dashboard,
+    # other sessions' log streams, the Plex tuner -- for the duration. The port
+    # race this used to open is closed in _allocate_proxy_port().
+    await asyncio.to_thread(recorder.stop, reason="operator")
     return {"status": "success", "message": f"Stopped session {recording_id}"}
 
 

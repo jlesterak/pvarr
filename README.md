@@ -195,8 +195,9 @@ successfully with HTML — usually an anti-bot interstitial. And a segment
 disguising its media, which fails for a reason no status code shows.
 
 **Copy trace** puts it on the clipboard as plain text for pasting into a bug
-report. URLs in the trace have their query strings stripped, so it carries no
-access token and is safe to share.
+report. URLs in the trace have their query strings and any token-shaped path
+segments stripped — the same rule as the logs — so it carries no access token
+and is safe to share.
 
 The last row is often the most useful one. When every attempt fails, PVArr also
 asks the origin for its **own front page**. If that is refused with the same
@@ -457,6 +458,8 @@ remux fails.
 
 **A recording did not resume after a container restart, and its `.ts` was left raw (versions before 0.5.1).** The dashboard tails the recorder log over a connection that stays open for as long as the browser tab does, and PVArr closed open connections *before* stopping its recorders — with no limit on how long it would wait. So restarting the container with the dashboard open anywhere waited on that tab, Docker's 30-second `stop_grace_period` expired first, and the container was `SIGKILL`ed before any recorder had been told to stop: no resume marker, no remux, and FFmpeg killed mid-write. Measured at ~80 seconds with a single tab open. Connection draining is now bounded by `PVARR_GRACEFUL_TIMEOUT` (5s), which leaves the full `PVARR_SHUTDOWN_TIMEOUT` for the recorders. Fixed.
 
+**The whole dashboard froze for a few seconds whenever a recording was stopped (versions up to 0.5.1).** Stopping waits up to ~7 seconds for FFmpeg and the proxy to exit, and that wait ran on the thread that serves every request — so the dashboard, other sessions' live logs and the Plex tuner all stalled with it. The wait now runs in the background; only the Stop request itself takes that long. Fixed.
+
 **I want to go back to the primary stream.** Click its badge in the session panel. Automatic failover only moves forwards — deliberately, since switching away from a working stream to chase a better one risks losing footage — so returning to an earlier candidate is a manual action.
 
 **A rebroadcast channel is not in my library.** Correct — that is what rebroadcast means. Nothing is written to disk, the buffer is deleted when the channel stops, and the session shows a *Rebroadcast* badge on the dashboard rather than a filename. If you wanted the game kept, start it without ticking *Rebroadcast only*.
@@ -568,7 +571,7 @@ the attempt fails or PVArr is stopped. The folder itself stays behind, empty,
 and is safe to leave alone. A `channels_*.conf` file sitting in it while
 nothing is recording is a bug — please report it.
 
-**Stream URLs in the logs and notifications.** PVArr strips the query string — where stream access tokens live — from every URL before it reaches the event log, the container's stdout, or a Discord/Telegram message. You will see `https://cdn.example/live.m3u8?<redacted>`; the host and path stay, because that is what tells you which candidate is talking. The candidate URLs shown on the dashboard and returned by `/api/status` are **not** redacted: you typed them, and the advanced header fields are keyed by them. PVArr has no authentication, so treat port 8999 as trusted-LAN-only regardless.
+**Stream URLs in the logs and notifications.** PVArr strips the query string — where stream access tokens usually live — from every URL before it reaches the event log, the container's stdout, or a Discord/Telegram message. You will see `https://cdn.example/live.m3u8?<redacted>`; the host and path stay, because that is what tells you which candidate is talking. Some providers put the token in the *path* instead (`/secure/<token>/stream/<token>/playlist.m3u8`); any path segment that looks machine-generated is replaced with `<redacted>` too. Ordinary names like `chunklist.m3u8` or `index_1080p` are kept, though a very long CamelCase name can occasionally be redacted — deliberately, since a hidden name costs less than a leaked token. The candidate URLs shown on the dashboard and returned by `/api/status` are **not** redacted: you typed them, and the advanced header fields are keyed by them. PVArr has no authentication, so treat port 8999 as trusted-LAN-only regardless.
 
 **A recording says `finished on schedule`.** It reached the end of its window (or the `PVARR_MAX_HOURS` backstop) while still capturing, and stopped cleanly — the file is complete and was remuxed and announced as normal. If instead it says `completed partial`, the window closed while every candidate was down, so the file stops where the stream did.
 

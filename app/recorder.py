@@ -348,6 +348,16 @@ def output_ts_offset_flags(offset: Optional[float]) -> List[str]:
     return ["-output_ts_offset", f"{value:.6f}"]
 
 
+def url_for_log(url: Optional[str], limit: int = 70) -> str:
+    """A URL shortened for a log line, redacted *before* it is cut.
+
+    _log() redacts every line at the sink, but by then the URL may already
+    have been truncated -- and a path token cut short enough no longer looks
+    like a token, so its first characters passed straight through.
+    """
+    return redact_url_secrets(url or "")[:limit]
+
+
 class _TailBuffer:
     """The last ~256KB of one FFmpeg invocation's output, kept for its PTS.
 
@@ -719,7 +729,7 @@ class StreamFailoverRecorder:
 
     def _probe_candidate(self, candidate: CandidateStream) -> bool:
         """Try the built-in probe. Returns False so the caller can fall through."""
-        self._log(f"Probing {candidate.name}: {candidate.url[:70]}...")
+        self._log(f"Probing {candidate.name}: {url_for_log(candidate.url)}...")
         try:
             result = probe_stream(
                 candidate.url,
@@ -839,6 +849,14 @@ class StreamFailoverRecorder:
         """Start local hls-proxy instance for candidate stream (Fallback Mode)."""
         if not self.hls_proxy_path or not os.path.exists(self.hls_proxy_path):
             return candidate.m3u8_url
+        if self._proxy_process is not None:
+            # stop_proxy() keeps hold of a proxy it could not kill. Starting a
+            # second would overwrite the only reference to the first -- the
+            # forgetting that keeping hold of it exists to prevent -- and could
+            # try to bind the port it is still holding. Go direct instead.
+            self._log("Not starting hls-proxy: this session's previous proxy "
+                      "has not exited.", "ERROR")
+            return candidate.m3u8_url
 
         # Modulo keeps a session inside the block reserved for it even if it
         # somehow carries more candidates than the stride allows.
@@ -932,23 +950,48 @@ class StreamFailoverRecorder:
         finally:
             self._proxy_conf_file = None
 
+    @property
+    def holds_proxy_port(self) -> bool:
+        """True while an hls-proxy this session started may still be bound."""
+        return self._proxy_process is not None
+
     def stop_proxy(self):
-        """Terminate active hls-proxy subprocess."""
-        if self._proxy_process:
+        """Terminate active hls-proxy subprocess.
+
+        The reference is dropped only once the proxy is confirmed reaped. It
+        used to be dropped unconditionally, so a proxy that survived both
+        terminate() and kill() was forgotten while still bound, and its port
+        was reported free to the next session.
+
+        Works on a local reference: an operator stop now runs in a worker
+        thread, concurrently with the recorder thread's own teardown.
+        """
+        proc = self._proxy_process
+        if proc:
+            exited = False
             try:
-                self._proxy_process.terminate()
-                self._proxy_process.wait(timeout=2)
+                proc.terminate()
+                proc.wait(timeout=2)
+                exited = True
             except Exception:
                 try:
-                    self._proxy_process.kill()
+                    proc.kill()
                     # kill() only delivers SIGKILL. Without the wait() the
                     # dead child stays in the process table as a zombie, and a
                     # long session that fails over repeatedly accumulates one
                     # per switch. Same defect _reap_ffmpeg() documents.
-                    self._proxy_process.wait(timeout=2)
+                    proc.wait(timeout=2)
+                    exited = True
                 except Exception:
                     pass
-            self._proxy_process = None
+            if exited:
+                if self._proxy_process is proc:
+                    self._proxy_process = None
+            else:
+                self._log(
+                    f"hls-proxy (pid {getattr(proc, 'pid', '?')}) did not exit "
+                    "after SIGKILL. Keeping its port block reserved rather than "
+                    "handing it to another session.", "ERROR")
         self._remove_proxy_conf()
 
     def logs_since(self, seq: int) -> Tuple[List[str], int]:
@@ -1646,7 +1689,7 @@ class StreamFailoverRecorder:
             self.detect_candidate_headers(candidate)
 
             # 2. Attempt Direct Mode (Direct FFmpeg with -headers)
-            self._log(f"[Direct Mode] Connecting FFmpeg directly to {candidate.m3u8_url[:70]}...")
+            self._log(f"[Direct Mode] Connecting FFmpeg directly to {url_for_log(candidate.m3u8_url)}...")
             direct_cmd = self._build_ffmpeg_cmd(
                 candidate.m3u8_url, candidate.referer, candidate.user_agent, candidate.cookie
             )

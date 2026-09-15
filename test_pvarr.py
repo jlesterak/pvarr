@@ -2977,6 +2977,29 @@ class TestRecordingRoutes(ServerTestCase):
         self.assertEqual(r.status_code, 200)
         rec.stop.assert_called_once()
 
+    def test_stop_runs_off_the_event_loop(self):
+        """stop() waits up to ~7s for FFmpeg and hls-proxy to exit. Called
+        inline it froze every other request -- dashboard, log streams, the Plex
+        tuner -- for that long."""
+        import asyncio
+        from unittest.mock import MagicMock
+        seen = {}
+
+        def fake_stop(reason):
+            try:
+                asyncio.get_running_loop()
+                seen["on_loop"] = True
+            except RuntimeError:
+                seen["on_loop"] = False
+            seen["reason"] = reason
+
+        rec = MagicMock()
+        rec.stop.side_effect = fake_stop
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/stop")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen, {"on_loop": False, "reason": "operator"})
+
     def test_start_registers_session_without_spawning_ffmpeg(self):
         from unittest.mock import patch, MagicMock
         fake = MagicMock()
@@ -3271,6 +3294,7 @@ class TestSessionRetention(ServerTestCase):
         rec.is_running = running
         rec.stop_time = stop_time
         rec.base_port = base_port
+        rec.holds_proxy_port = False
         self.server.active_recorders[rid] = rec
         return rec
 
@@ -3307,6 +3331,15 @@ class TestSessionRetention(ServerTestCase):
         self._session("a", running=True, base_port=8090)
         self._session("b", running=True, base_port=8094)
         self.assertEqual(self.server._allocate_proxy_port(), 8098)
+
+    def test_a_stopped_session_still_holding_its_proxy_keeps_its_ports(self):
+        """stop() clears is_running before the proxy has exited. With the stop
+        in a worker thread, a start in that window was handed a block a live
+        proxy was still bound to -- and a proxy that never dies, forever."""
+        from app.server import PROXY_PORT_STRIDE
+        rec = self._session("a", running=False, base_port=8090)
+        rec.holds_proxy_port = True
+        self.assertEqual(self.server._allocate_proxy_port(), 8090 + PROXY_PORT_STRIDE)
 
     def test_allocator_leaves_room_for_every_candidate(self):
         # start_proxy() binds base_port + candidate_index, so a three-candidate
@@ -3996,6 +4029,44 @@ class TestProxyConfNeverOutlivesTheSession(unittest.TestCase):
         rec.stop_proxy()
         self.assertEqual(self._confs(), [])
 
+    def test_a_proxy_that_will_not_die_is_not_forgotten(self):
+        """Dropping the reference regardless reported a still-bound port free."""
+        import subprocess
+        from unittest.mock import MagicMock
+        rec = self.rec
+        stuck = MagicMock()
+        stuck.wait.side_effect = subprocess.TimeoutExpired("hls-proxy", 2)
+        rec._proxy_process = stuck
+        rec.stop_proxy()
+        stuck.kill.assert_called_once()
+        self.assertIs(rec._proxy_process, stuck)
+        self.assertTrue(rec.holds_proxy_port)
+        self.assertTrue(any("did not exit" in line for line in rec.log_history))
+
+    def test_a_proxy_that_exits_is_released(self):
+        from unittest.mock import MagicMock
+        rec = self.rec
+        rec._proxy_process = MagicMock()
+        rec.stop_proxy()
+        self.assertIsNone(rec._proxy_process)
+        self.assertFalse(rec.holds_proxy_port)
+
+    def test_a_stuck_proxy_is_not_replaced_by_a_new_one(self):
+        """Starting another would overwrite the only reference to the stuck one."""
+        from unittest.mock import MagicMock
+        from app import recorder as recorder_mod
+        rec = self.rec
+        stuck = MagicMock()
+        rec._proxy_process = stuck
+        cand = rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.slug = "cand_0"
+        spawned = recorder_mod.subprocess.Popen.call_count
+        self.assertEqual(rec.start_proxy(cand), cand.m3u8_url)
+        self.assertEqual(recorder_mod.subprocess.Popen.call_count, spawned)
+        self.assertIs(rec._proxy_process, stuck)
+        self.assertEqual(self._confs(), [], "no tokenised conf for a proxy never started")
+
 
 
 class TestRecordingDeadline(unittest.TestCase):
@@ -4271,6 +4342,53 @@ class TestUrlSecretRedaction(unittest.TestCase):
     def test_non_string_input_does_not_raise(self):
         self.assertEqual(redact_url_secrets(None), None)
         self.assertIn("cdn.example", redact_url_secrets(Path("https://cdn.example/a?k=v")))
+
+    def test_a_token_carried_in_the_path_goes(self):
+        """strmd.st's shape: the credential is path segments, not a query.
+
+        A query-only scrub passed this URL to Discord with both tokens intact.
+        """
+        url = ("https://lb7.strmd.st/secure/PDWbrzK7fQx2LmN9aB3cYe/rtmp/stream/"
+               "nyU-8dK2pQ7rT5vW1xZ3hJ/playlist.m3u8")
+        out = redact_url_secrets(f"Connecting to {url} now")
+        self.assertNotIn("PDWbrz", out)
+        self.assertNotIn("nyU-8dK2", out)
+        self.assertIn("https://lb7.strmd.st/secure/<redacted>/rtmp/stream/"
+                      "<redacted>/playlist.m3u8 now", out)
+
+    def test_a_hex_digest_in_the_path_goes(self):
+        """nginx secure_link style: /s/<md5>/<expiry>/segment."""
+        out = redact_url_secrets(
+            "https://cdn.example/s/5d41402abc4b2a76b9719d911017c592/1693526400/seg.ts")
+        self.assertNotIn("5d41402abc", out)
+        self.assertIn("/<redacted>/1693526400/seg.ts", out)
+
+    def test_short_tokens_with_separators_and_short_hex_go(self):
+        """Measured misses before this: 40% of random 16-char base64url tokens
+        (only letters and digits were counted towards the length, so '-' and
+        '_' pushed them under it) and ~7% of 20-char hex."""
+        for token in ("aB3-xY7_kP9qLm2Z", "5d41402abc4b2a76b971"):
+            out = redact_url_secrets(f"https://cdn.example/live/{token}/playlist.m3u8")
+            self.assertNotIn(token, out)
+
+    def test_ordinary_path_names_survive(self):
+        """The path is the diagnostic value of the line; names must be kept."""
+        for url in (
+            "https://cdn.example/hls/media_w1234567_b2596000_12345.ts",
+            "https://cdn.example/live/index_1080p.m3u8",
+            "https://tnt-usa.biz/Tnt-42/Em1/604.html",
+            "https://cdn13.zohanayaan.com:1686/hls/mchicagocubs/chunklist.m3u8",
+        ):
+            self.assertEqual(redact_url_secrets(url), url)
+
+    def test_a_path_token_cut_by_log_truncation_still_goes(self):
+        """Truncating before redacting left a stub too short to look like a token."""
+        from app.recorder import url_for_log
+        url = ("https://cdn.example.com/aaaa/bbbb/cccc/dddd/eeee/ffff/gggg/"
+               "Zq8Xw2Lp9Rt4Km7Nv3Bc/x.m3u8")
+        # The premise: cut first, and the sink no longer recognises the stub.
+        self.assertIn("Zq8X", redact_url_secrets(url[:70]))
+        self.assertNotIn("Zq8X", url_for_log(url))
 
 
 class TestRecorderLogsCarryNoTokens(unittest.TestCase):

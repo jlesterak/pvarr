@@ -748,13 +748,34 @@
           try { return new URL(url).host; } catch (e) { return url; }
         },
 
+        // Same rule as _looks_like_token() in app/logging_config.py -- keep the
+        // two in step. Some providers carry the token as a path segment, so a
+        // query-only scrub still put it on the clipboard via Copy trace.
+        pathLooksLikeToken(seg) {
+          if (!/^[A-Za-z0-9_\-.~+=%]+$/.test(seg)) return false;
+          const stem = seg.replace(/\.[A-Za-z0-9]{1,5}$/, '');
+          if (stem.length < 16) return false;
+          const alnum = stem.replace(/[^A-Za-z0-9]/g, '');
+          if (alnum.length < 8) return false;
+          if (/^[0-9a-fA-F]+$/.test(alnum) && /[0-9]/.test(alnum)
+              && /[a-fA-F]/.test(alnum)) return true;
+          const cls = c => /[0-9]/.test(c) ? 0 : (/[a-z]/.test(c) ? 1 : 2);
+          let runs = 1;
+          for (let i = 1; i < alnum.length; i++) {
+            if (cls(alnum[i]) !== cls(alnum[i - 1])) runs++;
+          }
+          return alnum.length / runs <= 3.0;
+        },
+
         shortUrl(url) {
           if (!url) return '';
+          const scrub = p => p.split('/')
+            .map(s => this.pathLooksLikeToken(s) ? '<redacted>' : s).join('/');
           try {
             const u = new URL(url);
-            // The query string is where the token lives -- never render it.
-            return u.host + u.pathname;
-          } catch (e) { return String(url).split('?')[0]; }
+            // The query string is where the token usually lives -- never render it.
+            return u.host + scrub(u.pathname);
+          } catch (e) { return scrub(String(url).split('?')[0]); }
         },
 
         async copyTrace(key) {

@@ -2326,7 +2326,7 @@ stream, so it survives any domain rotation.
 the **path**. `redact_url_secrets()` strips the query string and keeps the path,
 so a URL of this shape still reaches Discord/Telegram with the token intact.
 Same leak class as the one fixed in 0.4.0, different URL shape. Fix generically,
-not by matching this layout.
+not by matching this layout. **[FIXED in Phase 19]**
 
 ### Not yet built -- needs sponsor go-ahead
 New loopback listener + change to the recorder's core path. Escalation
@@ -2581,13 +2581,13 @@ not the live recorder.
   returns `game_1.ts` and leaves the `.mp4` byte-identical.
 
 ### Known, not fixed here (separate commits)
-- `server.py` calls `recorder.stop()` synchronously on the event loop, blocking
+- **[FIXED in Phase 19]** `server.py` calls `recorder.stop()` synchronously on the event loop, blocking
   the FastAPI thread for up to ~7s (`proc.wait(timeout=5)` + `wait(timeout=2)`)
   -- the dashboard freezes while a recording stops. The obvious fix
   (`asyncio.to_thread`) opens a port-reuse race, because `recorder.stop()` sets
   `is_running = False` *before* `stop_proxy()`, and `_allocate_proxy_port`
   excludes only running recorders. The two must move together.
-- `stop_proxy()` sets `self._proxy_process = None` even when both `terminate()`
+- **[FIXED in Phase 19]** `stop_proxy()` sets `self._proxy_process = None` even when both `terminate()`
   and `kill()` throw, so a proxy that refuses to die is forgotten and its port
   is reported free.
 - On an `aborted_no_space` finish, `_on_complete` still remuxes unconditionally.
@@ -2766,3 +2766,68 @@ upgrade window, and now stated in the README.
 ### Verified
 - 569 tests, CI-style (`python test_pvarr.py`) and via `-m unittest`, both green
   and both reporting the same count.
+
+## Phase 19: Path tokens, the stop freeze, and a proxy that would not die (2026-09-14) [COMPLETED]
+
+Two items carried since Phase 15 and one since the `strmd.st` investigation.
+Sponsor-approved as one unit because two of them share a race.
+
+### 1. Tokens carried in the URL *path* reached Discord
+`redact_url_secrets()` dropped the query string and kept the path. `strmd.st`
+puts its credential in the path (`/secure/<token>/rtmp/stream/<token>/...`), so
+that URL reached the log history, stdout and chat notifications intact.
+
+Fixed without matching any provider's layout: a path segment is redacted when
+it *looks generated*, measured by how often its characters change class
+(digit / lower / upper). Tokens switch every one or two characters; names like
+`media_w1234567_b2596000_12345` stay in one class for long runs. Hex mixing
+digits and letters is caught outright. Errs towards redacting: a long CamelCase
+name (`NFL_Green_Bay_Packers`) can be hidden, and that is accepted.
+
+Measured over 20,000 random tokens per length, after one correction to my own
+first draft -- which counted only letters and digits towards the 16-character
+minimum, so `-`/`_` let **40%** of 16-char base64url tokens through, and whose
+run test missed ~7% of 20-char hex:
+
+| length | base64url missed | hex missed |
+|---|---|---|
+| 16 | 0.65% | 0.04% |
+| 20 | 0.33% | 0.04% |
+| 32 | 0.05% | 0.00% |
+
+Tokens under 16 characters are not caught. Of 20 realistic path names, only the
+two CamelCase team names were wrongly redacted.
+
+**Copy trace** had the same leak in the browser: `shortUrl()` in `index.html`
+kept `host + pathname`. It now applies the same rule. Checked for parity by
+running the extracted JS under node against Python's output on 3,008 URLs: 0
+mismatches. There is no JS test harness, so that check is not in the suite --
+the two copies must be kept in step by hand (comment at both sites).
+
+Also found while fixing it: two call sites cut URLs to 70 characters *before*
+the sink redacted them, which can shorten a path token below the length that
+looks like one and leak its first characters. `url_for_log()` redacts first.
+
+### 2. Stopping a recording froze the whole server for up to ~7s
+`POST /stop` called `recorder.stop()` on the event loop, and stop() waits on
+FFmpeg (5s) and hls-proxy (2s). Now `asyncio.to_thread`. The race Phase 15
+warned about is real: stop() clears `is_running` before the proxy exits, and
+`_allocate_proxy_port()` counted only running sessions, so a start in that
+window could be handed a still-bound port. The allocator now also counts
+`holds_proxy_port`.
+
+### 3. A proxy that survived SIGKILL was forgotten
+`stop_proxy()` dropped its reference unconditionally, so its port read as free.
+It now keeps the reference unless the child was confirmed reaped, logs an
+ERROR, and `start_proxy()` refuses to overwrite a held proxy (goes direct
+instead). stop_proxy() works on a local reference, since an operator stop and
+the recorder thread's own teardown can now run concurrently.
+
+### Verified
+- 10 new regression tests. The first 9 fail against the previous code (source
+  files stashed, tests run, restored) and pass against the fix; the 10th pins
+  the 16-char/short-hex correction above.
+- 579 tests green via `python test_pvarr.py`.
+
+### Still open from Phase 15
+The `aborted_no_space` remux leaving a partial `.mp4` on a full volume.
