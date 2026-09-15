@@ -2866,15 +2866,20 @@ reach its threshold.
 ### Candidate causes (not yet distinguished -- needs the session log)
 1. **Segment fetch errors, never retried.** `-seg_max_retry` defaults to 0: one
    403/timeout on a segment and FFmpeg moves on. Browsers (hls.js) retry.
-   The option exists in the local 6.1; the shipped image is Debian bookworm's
-   FFmpeg 5.1, so it must be probed from the binary the way
-   `hls_extension_flags()` already does, not assumed.
+   The option exists in the local 6.1 but **not in the shipped image**:
+   checked inside the running container, Debian bookworm's FFmpeg 5.1.9 lists
+   no `seg_max_retry` at all. Using it means a newer FFmpeg in the image -- an
+   image-size and dependency decision for the sponsor, not a flag change.
 2. **Falling behind a short live window** so segments expire before they are
    fetched -- would fit the regular get-two-lose-one pattern.
 3. **Variant choice.** `probe.py` descends to `variants[0]` for its segment
    check and `ytdlp._pick_format()` claims FFmpeg "can switch down
    mid-recording" -- FFmpeg's HLS demuxer does no adaptive switching, so that
    docstring is wrong. Needs the master playlist to know what was on offer.
+   Live session c7ef5f46 (2026-09-14, local container): probe reported
+   `media, headers Referer` -- the pasted URL is a single variant playlist,
+   not a master, so FFmpeg is locked to it (1280x720 again) and no variant
+   logic in PVArr could have chosen better.
 
 ### Proposed next steps -- need sponsor go-ahead (changes FFmpeg execution)
 1. Raise FFmpeg to `-loglevel warning` (stderr is already drained to a bounded
@@ -2886,3 +2891,37 @@ reach its threshold.
    pattern before choosing the fix.
 4. Ask the sponsor for this recording's session log (Direct vs Fallback mode,
    failovers, time of the last 5 clean minutes) -- to be pasted, not fetched.
+
+### Live test, 2026-09-14 (local container, session c7ef5f46) -- stream was clean
+Sponsor ran a real recording on the dev machine (container `pvarr`, image
+v0.5.0) so it could be observed live. Remote-host rules respected: nothing
+touched icebox; the one outside connection (a diagnostic FFmpeg against the
+stream CDN) had explicit sponsor approval.
+
+- Source `edgestream1.pro`, direct mode, single 720p variant (~1.8 Mbit/s),
+  4s segments, **15-segment (60s) live window**.
+- Hole detector on the growing `.ts` (reads only appended bytes, pipes to
+  ffprobe): **0 video and 0 audio holes over 20+ minutes**.
+- A parallel FFmpeg with the same argv at `-loglevel verbose`: ~23 minutes, every
+  segment number exactly +360000 (4s at 90kHz) after the last, **no warnings,
+  no skips, no failed opens**. One 7s playlist delay was absorbed without loss.
+- mpv playing the growing `.ts` from 30s behind the write edge for 8 minutes:
+  no buffering, no EOF, no jumps in its log. **mpv neither damages a growing
+  file nor stutters on one**, ruling it out for the 2026-09-13 report.
+- Sponsor heard audio drop at ~9:50 for ~20s. Measured: 27.0s of AAC silence
+  (577-604s), packets continuous, 1,267 tiny (<30 B) packets = exactly 27s at
+  46.9 packets/s -- encoded digital silence *sent by the source*. Frames show
+  "END OF 1st QTR" going to break: the restreamer mutes the break transition.
+  Not a PVArr fault; potentially a useful break marker for comskip.
+
+**Conclusion:** the 2026-09-13 loss (81 segment holes, ~20%) is not reproducible
+on a healthy source and most likely belonged to that stream (link no longer
+available). Sponsor agrees. The ~60s window here would tolerate a ~48s stall,
+which cannot produce that recording's 4s-every-8s pattern -- consistent with a
+different, worse upstream.
+
+**Still recommended (unchanged, needs go-ahead):** step 1 above -- surface FFmpeg
+segment warnings and a skipped-segment count, so the next bad source is
+diagnosed on the night instead of from the finished file. Retries remain
+blocked on a newer FFmpeg in the image, with no evidence yet that they would
+have helped.
