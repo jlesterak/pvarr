@@ -2831,3 +2831,58 @@ the recorder thread's own teardown can now run concurrently.
 
 ### Still open from Phase 15
 The `aborted_no_space` remux leaving a partial `.mp4` on a full volume.
+
+## Phase 20: Recordings lose whole HLS segments (2026-09-14) [PENDING]
+
+### The report
+Sponsor: the recording is lower quality than the same stream in Firefox/Chrome,
+and in mpv the video freezes for seconds to minutes while the audio carries on,
+then jumps and runs fast until it catches up.
+
+### Measured, on `recordings/2026-09-13_NFL_Green_Bay_Packers_vs_Minnesota_Viking_1080p.mp4`
+Per-packet timestamps via ffprobe (35 min, remuxed .mp4):
+- **81 holes, 414.7s of 2107.6s missing (~20%)**. Hole sizes are exactly 4.0s
+  (59) or 8.0s (22) -- one or two whole segments of a ~4s-segment stream.
+- **Audio has the same 81 holes at the same timestamps.** Audio is not
+  actually continuous; mpv plays audio straight across a gap but cannot do the
+  same for video, so it holds the last frame and then races to resync. The
+  "video-only freeze" is how the player presents a hole in both.
+- No compressed/fast-forward timestamps in the file and no non-monotonic DTS:
+  the file is not mis-timed, it is missing data.
+- Pattern is very regular early on: often 8s delivered, 4s lost, repeating --
+  "get two segments, lose one" -- and **no holes at all in the last 5 min**.
+- **It is 1280x720 at ~1.19 Mbit/s**, despite `1080p` in the filename (that
+  token comes from the naming form, not from the stream). Only the scale of
+  the "lower quality" report is explained by this; which variant the browser
+  was actually getting is unknown.
+
+### Why nobody saw it
+FFmpeg runs with `-loglevel error`. The HLS demuxer reports both likely causes
+-- "Failed to open segment" and "skipping N segments ahead, expired from
+playlists" -- at *warning* level, so PVArr's log carries no trace of a loss
+this large. The freeze detector watches output bytes, and 4-8s holes never
+reach its threshold.
+
+### Candidate causes (not yet distinguished -- needs the session log)
+1. **Segment fetch errors, never retried.** `-seg_max_retry` defaults to 0: one
+   403/timeout on a segment and FFmpeg moves on. Browsers (hls.js) retry.
+   The option exists in the local 6.1; the shipped image is Debian bookworm's
+   FFmpeg 5.1, so it must be probed from the binary the way
+   `hls_extension_flags()` already does, not assumed.
+2. **Falling behind a short live window** so segments expire before they are
+   fetched -- would fit the regular get-two-lose-one pattern.
+3. **Variant choice.** `probe.py` descends to `variants[0]` for its segment
+   check and `ytdlp._pick_format()` claims FFmpeg "can switch down
+   mid-recording" -- FFmpeg's HLS demuxer does no adaptive switching, so that
+   docstring is wrong. Needs the master playlist to know what was on offer.
+
+### Proposed next steps -- need sponsor go-ahead (changes FFmpeg execution)
+1. Raise FFmpeg to `-loglevel warning` (stderr is already drained to a bounded
+   tail, so no pipe-fill risk), count skipped/failed segments, and show the
+   count on the dashboard and in the completion notification.
+2. Add `-seg_max_retry` where the binary supports it.
+3. Reproduce locally against a served live playlist with injected segment
+   failures and a short window, to prove which of 1/2 produces this exact
+   pattern before choosing the fix.
+4. Ask the sponsor for this recording's session log (Direct vs Fallback mode,
+   failovers, time of the last 5 clean minutes) -- to be pasted, not fetched.
