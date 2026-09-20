@@ -585,6 +585,36 @@ nothing is recording is a bug — please report it.
 
 **A recording stopped with `aborted_no_space`.** The volume fell below the free-space floor. PVArr deliberately does *not* fail over here: the problem is local, so another stream would not help. Free some space, or lower `PVARR_MIN_FREE_GB` if the floor is too conservative for your setup.
 
+### Watching a host during a recording
+
+If you want to know what a capture actually costs a machine — or you suspect a
+host is the problem rather than the stream — run `scripts/watch-host.sh` **on
+that host** while it records. It samples system metrics into a CSV and prints a
+summary when it stops:
+
+```bash
+# sample every 10s until Ctrl-C
+scripts/watch-host.sh
+
+# unattended for a long capture
+nohup scripts/watch-host.sh --duration 5h --out ~/game-watch >/dev/null 2>&1 &
+```
+
+Each sample records load, CPU idle, available memory, free space on the
+recordings volume, read/write throughput and busy time for the device that
+volume sits on, the number of FFmpeg processes and their CPU and memory, and
+how many MB PVArr reports captured across running sessions. That last pair
+comes from `/api/status` and needs `curl` and `python3`; without them those
+columns read `NA` and everything else still works. Nothing but system metrics
+is recorded — it never reads the video.
+
+The FFmpeg process count is the one to watch for a lifecycle problem: it should
+be one per running recording, briefly two during a failover, and back to zero
+when everything stops. A count that only climbs means processes are being
+orphaned. `--out` sets the file prefix, `--interval` the sampling period,
+`--duration` an automatic stop (`300s`, `90m`, `4h`), and `PVARR_WATCH_DIR`
+overrides the recordings path if it is not `./recordings` or `/recordings`.
+
 ---
 
 ## Development

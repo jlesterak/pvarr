@@ -3120,3 +3120,46 @@ spends the budget, which is precisely the case that used to be thrown away.
   boundaries -- grace removed restores the old loss, and a generous grace must
   not delay a mid-stream stall (asserted under 2s against a 5s grace).
 - Full suite: **598 tests, OK.**
+
+## Phase 16: Host Instrumentation
+
+- [x] **`scripts/watch-host.sh` — measure a recording host instead of guessing.**
+      The sponsor's question before a live capture was whether the target host
+      could take the disk I/O and general load. There was no way to answer it
+      from the workspace: PVArr reports what *it* thinks it captured, and
+      nothing recorded what the machine underneath was doing. The script
+      samples load, CPU idle, available memory, free space on the recordings
+      volume, per-device read/write KB/s and I/O busy time from
+      `/proc/diskstats`, FFmpeg process count / CPU / RSS, and captured MB from
+      `/api/status`, into a CSV plus a summary on exit.
+
+      Runs on the host being measured, unattended if wanted
+      (`--duration 5h`). Dependencies are coreutils and `/proc`; the
+      `/api/status` columns need `curl` + `python3` and degrade to `NA`
+      without them. System metrics only — it never reads the video and never
+      takes a frame grab.
+
+      Device resolution handles the awkward cases: a partition with no
+      `/proc/diskstats` row of its own falls back to the parent whole disk,
+      and `/dev/mapper` LVM/crypt paths resolve through `readlink -f` to their
+      `dm-N` name. Verified against a live recording on the workstation
+      (`dm-1`, an LVM volume): four samples, plausible throughput, FFmpeg
+      correctly counted at one process.
+
+      **Expected shape for a 1080p sports HLS capture**, for comparison when
+      reading a real run: FFmpeg is `-c copy`, so there is no transcode — CPU
+      should sit near idle, and a few percent is already suspicious. Writes are
+      a sequential append flushed per 64KB chunk to the page cache, never
+      `fsync`ed, so the kernel batches them; sustained write rate is simply the
+      stream bitrate (~5 Mbps ≈ 625 KB/s ≈ 2.2 GB/hour). Disk busy time should
+      be low single-digit percent on anything that is not a heavily contended
+      spindle. The floor that stops a capture is `PVARR_MIN_FREE_GB`, default
+      5.0 GB, re-checked every 15s during recording
+      (`Recorder.DISK_CHECK_INTERVAL_SEC`), and it aborts rather than failing
+      over — a local problem is not fixed by another stream.
+
+### Not done, and why
+- **Remote monitoring of the test host.** Out of bounds by Directive 6 and
+  architecturally wrong anyway: the measurement has to run on the host being
+  measured, not be pulled across a network by a process that is not awake when
+  the capture is.
