@@ -2994,3 +2994,73 @@ Verified accepted by 5.1.9 and 6.1; with buffered reads the extra lines cost
 - End-to-end on the final code (buffered reads, `repeat` flag) against the lab
   source: `segments_lost=3 failed=1 expired=2`, empty `last_error`, one log line
   plus one summary -- identical on host FFmpeg 6.1 and the image's 5.1.9.
+
+## Phase 21: Live test 2026-09-20 -- a stale container reopened the timeline bug [DIAGNOSED]
+
+Sponsor reported, mid-game, on the live Jaguars/Broncos recording (local
+container, session `176086e4`): playback "speeding up and slowing down", and
+mpv refusing to seek anywhere past roughly 5 minutes into the growing `.ts`.
+Asked whether it was a laptop hardware limit. Nothing touched icebox; every
+measurement below is from the workspace and the local container.
+
+### What was measured
+- `ffprobe` on the growing `.ts` (944 MB at the time): `duration=492.689`,
+  `bit_rate=15290901`. Both nonsense -- 8 minutes of declared runtime for
+  ~80 minutes of captured football, and a "15 Mbit/s" figure that is only
+  file size divided by the bogus duration.
+- Sampling the first video PTS at twelve byte offsets across the file: the
+  timeline climbs cleanly 1.5s -> 2824s over the first 60% of the bytes, then
+  **resets to 407s at ~70%, and again to 75s at ~90%**. FFmpeg later confirmed
+  it on the remux: four `timestamp discontinuity` corrections.
+- The resets line up exactly with the failover storm at 21:54--21:56 UTC that
+  the sponsor triggered by hand, which cycled 1 -> 2 -> 3 -> 1 -> 2 before
+  settling on Candidate 2 in direct mode.
+- Seek probe, `mpv --no-config --vo=null --ao=null --start=N --frames=2`:
+  300s succeeds, 2700s returns "got EOF with no data before it". lavf seeks
+  MPEG-TS by estimating a byte offset from the declared duration, so every
+  target past ~492s estimates past EOF. `--demuxer-lavf-o=fflags=+genpts`
+  changes nothing; the duration is wrong before genpts ever runs.
+
+### Not a hardware limit
+Recording FFmpeg was at **0.4% CPU** -- it is a stream copy, it never decodes.
+Load average 2.25 was Firefox (27%) and the compositor. Source is 1280x720p30
+at ~1.6 Mbit/s despite the `1080p` in the filename, which a laptop decodes
+without noticing. The "speeding up and slowing down" is the four PTS resets:
+at each splice the presentation clock jumps backwards by tens of minutes and
+mpv's A/V sync chases it, dropping or rushing frames until it recovers.
+
+### Root cause: the container is a release behind
+`GET /api/status` reports **0.5.0**. The local `ghcr.io/jlesterak/pvarr:latest`
+image was **built 2026-08-31**; `segments_lost` is absent from its status
+payload, confirming pre-v0.5.1 code. The fix that prevents exactly this --
+`fb25395 fix: continue the timeline across a failover instead of restarting it`,
+which introduced `_timeline_offset` / `_advance_timeline` (Phase 14, above) --
+landed 2026-09-05 and ships in **v0.5.1**. GHCR has `0.5.1` and a current
+`latest` (both HTTP 200, anonymous pull token), so the image on this host is
+simply stale; watchtower has not replaced it.
+
+**No code change is warranted.** The bug is fixed in `main` and in the released
+image. The action is to pull.
+
+### Recovery recipe (verified on the live file, does not disturb the recording)
+Remuxing to MP4 makes FFmpeg normalise the splices and write a real index:
+
+    ffmpeg -i <growing>.ts -c copy -bsf:a aac_adtstoasc \
+           -map 0:v:0 -map 0:a:0 <out>.mp4
+
+12 seconds for 975 MB, output 925 MB, `duration=4704.80` (1h18m, matching the
+capture minus failover dead air) and `bit_rate=1573871` (sane). Seeks verified
+at 300 / 1800 / 2700 / 3600 / 4500s, all OK. Reading the file is safe while
+FFmpeg appends to it; **rewriting the `.ts` in place is not**, and was not
+attempted.
+
+### Open, for the sponsor
+- **Disk.** `/` is at 97%, 6.5 GB free after the remux, against a 5.0 GB
+  `min_free_disk_gb` floor. At the measured ~230 KB/s the live recording hits
+  that floor and auto-aborts in roughly 1.9 hours, with 4.5 hours still on its
+  schedule. Freeing space is the only thing that keeps the capture alive.
+- **Every failover attempt froze at exactly 15s.** Six consecutive candidate
+  attempts in the 21:54--21:56 storm, direct and proxy alike, each tripped
+  "No data received for 15s" on the dot before recovering on the seventh. Worth
+  checking whether the freeze watchdog starts counting before the HLS demuxer
+  has had time to fill its first buffer on a cold connect. Not investigated.
