@@ -87,7 +87,7 @@ Rolling back is then a one-line edit. Unset it to follow `latest` again.
 ### Requirements
 
 - **FFmpeg** — required. Does the actual recording.
-- **Python 3.8+** and the packages in `requirements.txt` (FastAPI, uvicorn, requests, jinja2).
+- **Python 3.10+** and the packages in `requirements.txt` (FastAPI, uvicorn, yt-dlp and others). yt-dlp is what sets the floor: its current releases need 3.10. The container image uses 3.12.
 - **yt-dlp** + **curl_cffi** — installed from `requirements.txt`, ~16 MB together. Resolves pages whose player fetches its manifest over XHR, which PVArr's own scraper cannot see, and lets it present a real browser's TLS fingerprint. Optional at runtime: if `yt-dlp` is not on `PATH`, that step is skipped and everything else works.
 - **[hls-restream-proxy](https://github.com/jlesterak/hls-restream-proxy)** — *optional*. Two fallbacks live here. `hls-proxy` bridges a stream when a direct FFmpeg connection fails despite correct headers, usually because the token needs continuous refreshing. `detect-headers` tries harder than the built-in probe at following redirect and iframe chains — it is **not** a browser (see [When the probe can't work it out](#when-the-probe-cant-work-it-out)).
 

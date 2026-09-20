@@ -3160,6 +3160,16 @@ The probe reads the start of the file. A recording that failed over from a
   keeps its name; a failed remux leaves no placeholder.
 - 609 tests green via `python test_pvarr.py`.
 
+## Phase 24: CI `tests` red on every push since 2026-08-31 (2026-09-20) [COMPLETED]
+
+Found while checking the v0.6.0 release. The `publish` workflow (Python 3.12)
+was green and the image shipped, but the `tests` workflow had failed on every
+push to `main` since `df9fc2f` (2026-08-31). Only the Python 3.9 job failed,
+at "Install dependencies", before any test ran; 3.11, 3.12 and the image job
+passed. Cause: `yt-dlp>=2026.8.19` declares `requires_python >=3.10` (checked
+on PyPI). Released images were never affected (3.12). The matrix is now 3.10 /
+3.11 / 3.12, and README's stale "Python 3.8+" now says 3.10+.
+
 ## Phase 16: Host Instrumentation
 
 - [x] **`scripts/watch-host.sh` — measure a recording host instead of guessing.**
