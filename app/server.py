@@ -33,7 +33,6 @@ from app.naming import (
     StorageManager,
     generate_sports_filename,
     media_type_for,
-    probe_video_resolution,
 )
 from app.cleanup import register_signal_handlers, stop_all
 from app.tuner import (

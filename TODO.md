@@ -3121,6 +3121,45 @@ spends the budget, which is precisely the case that used to be thrown away.
   not delay a mid-stream stall (asserted under 2s against a 5s grace).
 - Full suite: **598 tests, OK.**
 
+## Phase 23: The filename's resolution tag was never checked (2026-09-20) [COMPLETED]
+
+### The problem
+The `_1080p` in a recording's name came straight from the Add Recording form's
+**Resolution Tag** dropdown, which defaults to 1080p, and nothing ever compared
+it with the video. Found in Phase 20 and again in Phase 21: both recordings
+were named `_1080p` and were 1280x720 throughout. `naming.probe_video_resolution`
+already existed but was imported by `server.py` and never called -- and on any
+failure it answered "1080p", the very guess it was meant to replace.
+
+### The fix
+- `probe_video_resolution` returns `None` when it cannot measure, instead of
+  "1080p", and reads only the first line of ffprobe's output (an MPEG-TS can
+  list the stream once per program).
+- `naming.retag_resolution(path, tag)` swaps the trailing tag, anchored to the
+  end of the stem so a team name containing "720p" is never touched. It drops
+  the old `_N` collision counter; operator-renamed files (no tag) are untouched.
+- `remux_recording` probes the `.ts` before remuxing and writes the finished
+  file under the measured tag. The new name is claimed with
+  `reserve_output_path`, because the `.ts` only reserved the *old* name and the
+  remux runs `ffmpeg -y` -- without this a finished `_720p.mp4` of the same
+  fixture would be overwritten. A failed remux releases the claimed name.
+  Covers both `_on_complete` and `_finalise_orphan`, since both call it.
+- The live `.ts` keeps the form's tag: there is no video to measure at start,
+  and renaming a file FFmpeg is appending to is not worth the risk.
+- Cost: one ffprobe (reads the file's first few MB, 5s timeout) per finished
+  recording, on the recorder thread that already runs the remux.
+
+### Known limit
+The probe reads the start of the file. A recording that failed over from a
+1080p candidate to a 720p one is tagged by whichever came first.
+
+### Verified
+- 11 new tests (`TestResolutionRetag`), including real FFmpeg round trips: a
+  1280x720 `.ts` named `_1080p` finishes as `_720p.mp4`; an existing
+  `_720p.mp4` is not overwritten (new file gets `_720p_1.mp4`); a correct tag
+  keeps its name; a failed remux leaves no placeholder.
+- 609 tests green via `python test_pvarr.py`.
+
 ## Phase 16: Host Instrumentation
 
 - [x] **`scripts/watch-host.sh` — measure a recording host instead of guessing.**

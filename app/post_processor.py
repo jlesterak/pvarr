@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from app.check_deps import find_executable
+from app.naming import probe_video_resolution, reserve_output_path, retag_resolution
 
 logger = logging.getLogger("PVArrPostProcessor")
 
@@ -34,6 +35,27 @@ def remux_recording(
         target_format = "mp4"
 
     dest_path = source_path.with_suffix(f".{target_format}")
+    # Name the finished file after what was recorded, not after the form's
+    # Resolution Tag. Only when the probe actually measured something: a
+    # failed probe leaves the name alone rather than guessing again.
+    reserved = False
+    measured = probe_video_resolution(str(source_path))
+    if measured:
+        retagged = retag_resolution(dest_path, measured)
+        if retagged != dest_path:
+            try:
+                # The new name was never reserved -- the .ts holds the old
+                # one -- so claim it the same way a new recording does, or a
+                # finished recording already under that name would be
+                # overwritten by `ffmpeg -y`.
+                dest_path = reserve_output_path(retagged)
+                reserved = True
+                logger.info(
+                    f"Resolution tag corrected: recorded {measured}, "
+                    f"finishing as {dest_path.name}"
+                )
+            except OSError as e:
+                logger.warning(f"Could not reserve {retagged.name}, keeping the original tag: {e}")
     ffmpeg_cmd = find_executable("ffmpeg") or "ffmpeg"
 
     cmd = [
@@ -69,7 +91,23 @@ def remux_recording(
             }
         else:
             logger.error(f"Remux failed: {res.stderr}")
+            _discard_reservation(dest_path, reserved)
             return {"status": "failed", "error": res.stderr}
     except Exception as e:
         logger.error(f"Remux error for {source_path.name}: {e}")
+        _discard_reservation(dest_path, reserved)
         return {"status": "failed", "error": str(e)}
+
+
+def _discard_reservation(dest_path: Path, reserved: bool) -> None:
+    """Remove a name this remux claimed and failed to fill.
+
+    The .ts survives a failed remux under its original name, so the retagged
+    placeholder -- or FFmpeg's partial output in it -- belongs to nothing and
+    would hold the name against the next attempt.
+    """
+    if reserved:
+        try:
+            dest_path.unlink(missing_ok=True)
+        except OSError:
+            pass

@@ -40,11 +40,17 @@ def sanitize_token(text: str, fallback: str = "Unknown") -> str:
     return cleaned if cleaned else fallback
 
 
-def probe_video_resolution(filepath: str) -> str:
-    """Use ffprobe to inspect video stream height and return formatted resolution (e.g., 1080p, 720p)."""
+def probe_video_resolution(filepath: str) -> Optional[str]:
+    """Measure the first video stream's height and return its tag (1080p, 720p, 4K).
+
+    None when it cannot be measured. This used to answer "1080p" on any
+    failure, which is exactly the guess it exists to replace: a caller that
+    renames a file on the strength of the answer must be able to tell "this is
+    1080p" from "I could not look".
+    """
     ffprobe_cmd = find_executable("ffprobe")
     if not ffprobe_cmd or not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-        return "1080p"  # Default assumption
+        return None
 
     cmd = [
         ffprobe_cmd,
@@ -57,27 +63,56 @@ def probe_video_resolution(filepath: str) -> str:
 
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if res.returncode == 0 and res.stdout.strip():
-            # Output like: 1920x1080
-            dim = res.stdout.strip().split("x")
-            if len(dim) >= 2 and dim[1].isdigit():
-                height = int(dim[1])
-                if height >= 2160:
-                    return "4K"
-                elif height >= 1440:
-                    return "1440p"
-                elif height >= 1080:
-                    return "1080p"
-                elif height >= 720:
-                    return "720p"
-                elif height >= 480:
-                    return "480p"
-                else:
-                    return f"{height}p"
     except Exception:
-        pass
+        return None
+    lines = res.stdout.strip().splitlines() if res.returncode == 0 else []
+    # Output like: 1920x1080. An MPEG-TS can list the stream once per program,
+    # so only the first line counts.
+    dim = lines[0].strip().split("x") if lines else []
+    if len(dim) < 2 or not dim[1].isdigit() or int(dim[1]) == 0:
+        return None
+    height = int(dim[1])
+    if height >= 2160:
+        return "4K"
+    if height >= 1440:
+        return "1440p"
+    if height >= 1080:
+        return "1080p"
+    if height >= 720:
+        return "720p"
+    if height >= 480:
+        return "480p"
+    return f"{height}p"
 
-    return "1080p"
+
+# The tag generate_sports_filename() puts last in the stem, plus the "_N"
+# reserve_output_path() adds on a collision. Anchored to the end so a team
+# name that happens to contain "720p" is never touched.
+_RESOLUTION_TAG = re.compile(r"^(?P<prefix>.+)_(?:4K|\d{3,4}p)(?:_\d+)?$", re.IGNORECASE)
+
+
+def retag_resolution(path: Path, resolution: str) -> Path:
+    """`path` with its resolution tag replaced by `resolution`.
+
+    The tag in a new recording's name is whatever the Add Recording form said,
+    which is a guess made before a single frame arrived. The 2026-09-13 Packers
+    recording was named `_1080p` and was 1280x720 throughout. This lets the
+    finished file carry what was actually recorded.
+
+    Returns `path` unchanged when there is no tag to replace (a file the
+    operator renamed) or the tag is already right. Any collision counter is
+    dropped, because it belonged to the old name; the caller reserves the new
+    one and gets a fresh counter if that name is taken.
+    """
+    match = _RESOLUTION_TAG.match(path.stem)
+    tag = sanitize_token(resolution, "")
+    if not match or not tag:
+        return path
+    retagged = path.with_name(f"{match.group('prefix')}_{tag}{path.suffix}")
+    current = path.stem[len(match.group("prefix")) + 1:].split("_")[0]
+    if current.lower() == tag.lower():
+        return path
+    return retagged
 
 
 def generate_sports_filename(

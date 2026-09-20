@@ -31,7 +31,9 @@ from app import check_deps, tuner
 from app.naming import (
     StorageManager,
     generate_sports_filename,
+    probe_video_resolution,
     reserve_output_path,
+    retag_resolution,
     sanitize_token,
 )
 from app.post_processor import remux_recording
@@ -792,6 +794,113 @@ class TestPostProcessor(unittest.TestCase):
         res = remux_recording(str(src), target_format="mkv", delete_source=True)
         self.assertEqual(res["status"], "success", res.get("error"))
         self.assertFalse(src.exists())
+
+
+class TestResolutionRetag(unittest.TestCase):
+    """The finished file is named for what was recorded, not the form's guess.
+
+    The 2026-09-13 Packers recording was named `_1080p` and was 1280x720
+    throughout: the tag came from the Add Recording dropdown and nothing ever
+    checked it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-retag-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ts(self, name, size="320x240"):
+        import subprocess
+        src = Path(self.tmp) / name
+        subprocess.run(
+            [check_deps.find_executable("ffmpeg"), "-y", "-v", "error",
+             "-f", "lavfi", "-i", f"color=c=black:s={size}:d=1",
+             "-t", "1", "-c:v", "libx264", "-f", "mpegts", str(src)],
+            check=True, capture_output=True, timeout=60,
+        )
+        return src
+
+    def test_retag_replaces_the_trailing_tag(self):
+        p = Path("/r/2026-09-13_NFL_Packers_vs_Vikings_1080p.mp4")
+        self.assertEqual(retag_resolution(p, "720p").name,
+                         "2026-09-13_NFL_Packers_vs_Vikings_720p.mp4")
+
+    def test_retag_drops_the_old_collision_counter(self):
+        # The counter belonged to the old name; the new name is reserved afresh.
+        p = Path("/r/2026-09-13_NFL_A_vs_B_1080p_2.mp4")
+        self.assertEqual(retag_resolution(p, "720p").name, "2026-09-13_NFL_A_vs_B_720p.mp4")
+
+    def test_retag_leaves_a_correct_tag_alone(self):
+        for name in ("X_A_vs_B_720p.mp4", "X_A_vs_B_720p_1.mp4", "X_A_vs_B_4k.mp4"):
+            p = Path("/r") / name
+            tag = "4K" if "4k" in name else "720p"
+            self.assertEqual(retag_resolution(p, tag), p, name)
+
+    def test_retag_leaves_an_untagged_name_alone(self):
+        # An operator-renamed file has no tag to correct.
+        for name in ("highlights.mp4", "1080p.mp4", "final_cut.mp4"):
+            p = Path("/r") / name
+            self.assertEqual(retag_resolution(p, "720p"), p, name)
+
+    def test_retag_only_touches_the_end_of_the_name(self):
+        p = Path("/r/2026-01-01_Misc_Team_720p_vs_B_1080p.mp4")
+        self.assertEqual(retag_resolution(p, "480p").name,
+                         "2026-01-01_Misc_Team_720p_vs_B_480p.mp4")
+
+    def test_probe_answers_none_rather_than_guessing(self):
+        # It used to answer "1080p" on any failure -- the very guess it exists
+        # to replace.
+        junk = Path(self.tmp) / "junk.ts"
+        junk.write_bytes(b"not a transport stream")
+        empty = Path(self.tmp) / "empty.ts"
+        empty.touch()
+        self.assertIsNone(probe_video_resolution(str(junk)))
+        self.assertIsNone(probe_video_resolution(str(empty)))
+        self.assertIsNone(probe_video_resolution(str(Path(self.tmp) / "ghost.ts")))
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_probe_measures_real_video(self):
+        self.assertEqual(probe_video_resolution(str(self._ts("a.ts", "1280x720"))), "720p")
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_remux_names_the_file_for_what_was_recorded(self):
+        src = self._ts("2026-09-13_NFL_A_vs_B_1080p.ts", "1280x720")
+        res = remux_recording(str(src), target_format="mp4", delete_source=True)
+        self.assertEqual(res["status"], "success", res.get("error"))
+        self.assertEqual(res["output_filename"], "2026-09-13_NFL_A_vs_B_720p.mp4")
+        self.assertTrue(Path(res["output_filepath"]).stat().st_size > 0)
+        self.assertFalse(src.exists())
+        self.assertFalse((Path(self.tmp) / "2026-09-13_NFL_A_vs_B_1080p.mp4").exists())
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_remux_does_not_overwrite_a_recording_under_the_new_name(self):
+        # The corrected name was never reserved; a finished recording may
+        # already hold it, and the remux runs `ffmpeg -y`.
+        existing = Path(self.tmp) / "2026-09-13_NFL_A_vs_B_720p.mp4"
+        existing.write_bytes(b"earlier recording")
+        src = self._ts("2026-09-13_NFL_A_vs_B_1080p.ts", "1280x720")
+        res = remux_recording(str(src), target_format="mp4", delete_source=True)
+        self.assertEqual(res["status"], "success", res.get("error"))
+        self.assertEqual(res["output_filename"], "2026-09-13_NFL_A_vs_B_720p_1.mp4")
+        self.assertEqual(existing.read_bytes(), b"earlier recording")
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_correct_tag_keeps_its_name(self):
+        src = self._ts("2026-09-13_NFL_A_vs_B_240p.ts", "320x240")
+        res = remux_recording(str(src), target_format="mp4", delete_source=True)
+        self.assertEqual(res["output_filename"], "2026-09-13_NFL_A_vs_B_240p.mp4")
+
+    def test_failed_remux_releases_the_new_name(self):
+        from unittest.mock import patch
+        junk = Path(self.tmp) / "2026-09-13_NFL_A_vs_B_1080p.ts"
+        junk.write_bytes(b"not a transport stream")
+        with patch("app.post_processor.probe_video_resolution", return_value="720p"):
+            res = remux_recording(str(junk), delete_source=True)
+        self.assertEqual(res["status"], "failed")
+        self.assertTrue(junk.exists())
+        self.assertFalse((Path(self.tmp) / "2026-09-13_NFL_A_vs_B_720p.mp4").exists(),
+                         "placeholder left holding the corrected name")
 
 
 # --------------------------------------------------------------------------
