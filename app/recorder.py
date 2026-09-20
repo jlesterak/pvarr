@@ -561,6 +561,24 @@ class StreamFailoverRecorder:
     READ_POLL_SEC = 0.5
     # Read whatever has arrived, up to this much. Never wait for a full buffer.
     READ_CHUNK_BYTES = 65536
+    # How long an attempt may go before its FIRST byte, as opposed to how long
+    # it may go quiet once bytes are flowing. FFmpeg emits nothing until it has
+    # spawned, opened TLS to the edge, fetched the playlist, pulled enough
+    # segments to probe the streams, and muxed the first packets -- on a cold
+    # connect to a live HLS source that is routinely longer than the freeze
+    # timeout, and the freeze clock used to cover it. A perfectly healthy
+    # candidate was therefore abandoned for the crime of being slow to warm up,
+    # and with three candidates and three laps a flaky edge could cost every
+    # attempt in a row. Measured on 2026-09-20: six consecutive attempts, direct
+    # and proxy alike, each abandoned at exactly 15.0s; the seventh connected in
+    # under 15s and then ran for an hour. Nothing was wrong with the streams.
+    #
+    # This is a bound, not a wait. A candidate that is genuinely dead makes
+    # FFmpeg exit non-zero within a second or two and is caught by poll() long
+    # before this expires, and every individual socket read is already capped by
+    # FFmpeg's own -rw_timeout. Only a candidate that is connected but slow ever
+    # spends this budget.
+    STARTUP_GRACE_SEC = 30
     # Tail of FFmpeg's stderr kept for diagnostics when an attempt fails.
     STDERR_TAIL_LINES = 15
     SEGMENT_LOSS_LOG_INTERVAL_SEC = 60
@@ -1515,7 +1533,6 @@ class StreamFailoverRecorder:
     ) -> "StreamOutcome":
         """Stream FFmpeg stdout to the output file and report how the attempt ended."""
         written_for_this_session = 0
-        last_write_time = time.time()
 
         with self._open_sink() as out_f:
             self._ffmpeg_process = subprocess.Popen(
@@ -1527,6 +1544,10 @@ class StreamFailoverRecorder:
             stdout_fd = self._ffmpeg_process.stdout.fileno()
             stderr_tail = self._drain_stderr(self._ffmpeg_process, ffmpeg=True)
             at_eof = False
+            # Started here, not before Popen: spawning the process is this
+            # recorder's own overhead and has no business inside a budget that
+            # exists to judge the source.
+            last_write_time = time.time()
 
             def finish(outcome: "StreamOutcome") -> "StreamOutcome":
                 """Attach FFmpeg's own words to a failed attempt."""
@@ -1608,11 +1629,26 @@ class StreamFailoverRecorder:
                     candidate.fail_count += 1
                     return finish(StreamOutcome.INTERRUPTED)
 
-                if (time.time() - last_write_time) > self.freeze_timeout_sec:
-                    self._log(f"Stream freeze detected! No data received for {self.freeze_timeout_sec}s", "ERROR")
+                # Two different failures share this one check. Before the first
+                # byte the question is "did this source ever start?", which is
+                # allowed the startup grace; after it, "has this source gone
+                # quiet?", which is the freeze timeout the operator configured.
+                # The grace never applies to a stream that has already
+                # delivered, so a mid-recording stall is still caught as fast as
+                # it always was.
+                started = written_for_this_session > 0
+                idle_budget = (
+                    self.freeze_timeout_sec if started
+                    else max(self.freeze_timeout_sec, self.STARTUP_GRACE_SEC)
+                )
+                if (time.time() - last_write_time) > idle_budget:
                     candidate.fail_count += 1
-                    if written_for_this_session == 0:
+                    if not started:
+                        self._log(
+                            f"No data from {candidate.name} in the first "
+                            f"{idle_budget}s; giving up on this attempt", "ERROR")
                         return finish(StreamOutcome.FAILED)
+                    self._log(f"Stream freeze detected! No data received for {idle_budget}s", "ERROR")
                     return finish(StreamOutcome.INTERRUPTED)
 
                 if at_eof:

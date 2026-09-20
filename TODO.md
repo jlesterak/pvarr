@@ -3059,8 +3059,64 @@ attempted.
   `min_free_disk_gb` floor. At the measured ~230 KB/s the live recording hits
   that floor and auto-aborts in roughly 1.9 hours, with 4.5 hours still on its
   schedule. Freeing space is the only thing that keeps the capture alive.
-- **Every failover attempt froze at exactly 15s.** Six consecutive candidate
-  attempts in the 21:54--21:56 storm, direct and proxy alike, each tripped
-  "No data received for 15s" on the dot before recovering on the seventh. Worth
-  checking whether the freeze watchdog starts counting before the HLS demuxer
-  has had time to fill its first buffer on a cold connect. Not investigated.
+- **Disk, resolved the same day.** `docker builder prune -a` reclaimed 4.55 GB
+  of build cache with `ACTIVE=0` -- no recording touched, nothing user-facing
+  deleted. 6.5 GB -> 9.4 GB free, then 8.4 GB after pulling the current image,
+  which puts the live capture comfortably clear of the floor for its remaining
+  window. Ten stale `pvarr` image tags (0.1.0 through 0.4.0 plus four local
+  build tags, ~3.6 GB reclaimable) were **not** removed: the sandbox refused
+  the `docker rmi`. Left for the sponsor.
+- **Image pulled, container deliberately not restarted.** `:latest` is now
+  `sha256:c275df55` (built 2026-09-06 = v0.5.1). The running container still
+  references the old `sha256:cf6fa05b` and is mid-game. Restarting it is the
+  sponsor's call and should wait for the final whistle. Note `pvarr` carries
+  `com.centurylinklabs.watchtower.enable=false`, so watchtower (04:00 daily,
+  `WATCHTOWER_CLEANUP=true`) will never do this on its own -- correct for a
+  recorder, but it means the image only moves when someone moves it. **That is
+  the whole reason a fix released on 2026-09-05 was still absent on 2026-09-20.**
+
+## Phase 22: The freeze watchdog counted a cold connect as a freeze [COMPLETED]
+
+Chased down from the Phase 21 observation, and it was a real defect rather than
+tuning. `last_write_time` was set *before* `subprocess.Popen`, and the single
+`freeze_timeout_sec` budget then had to cover process spawn, TLS to the edge,
+the playlist fetch, enough segment downloads for FFmpeg to probe the streams,
+and the first mux output -- none of which is a freeze. On a cold connect to a
+live HLS source that routinely exceeds 15s, so a perfectly good candidate was
+abandoned for warming up slowly, and with three candidates over three laps a
+briefly-sluggish edge burned every attempt in the list.
+
+### The fix (`app/recorder.py`)
+- New `STARTUP_GRACE_SEC = 30` class constant. The idle budget is now chosen per
+  iteration: `freeze_timeout_sec` once `written_for_this_session > 0`, otherwise
+  `max(freeze_timeout_sec, STARTUP_GRACE_SEC)`. The grace can never apply to a
+  stream that has already delivered, so a mid-recording stall is caught exactly
+  as fast as before -- that is asserted, not assumed.
+- `last_write_time` moved to after `Popen` and `_drain_stderr`. Spawning the
+  process is PVArr's own overhead and has no business inside a budget that
+  exists to judge the source.
+- The two failures now log differently. "No data from <candidate> in the first
+  Ns" for one that never started; "Stream freeze detected!" only for one that
+  went quiet after delivering. Previously both said the latter, which is what
+  made the 2026-09-20 storm read as six dying streams.
+- **No new user-facing knob.** The dashboard field, the API parameter and the
+  session record are untouched, so nothing needs migrating and **Record again**
+  keeps working on sessions recorded before this.
+
+### Why 30s is not a failover penalty
+A candidate that is genuinely dead makes FFmpeg exit non-zero within a second
+or two and is caught by the existing `poll()` branch long before the grace
+expires; every individual socket read is already capped by the argv's
+`-rw_timeout 15000000`. Only a candidate that is *connected but slow* ever
+spends the budget, which is precisely the case that used to be thrown away.
+
+### Proven
+- 5 new tests in `TestFreezeDetection`. `_FakeProc` gained `delay_before`,
+  feeding the pipe from a thread and withholding the exit status until the data
+  lands, so the capture loop really sits in `select()` through a slow start.
+- 3 of the 5 fail against the pre-fix `recorder.py` (checked in a scratch copy
+  with `git show HEAD:app/recorder.py`): the slow first byte is abandoned, the
+  log wording is wrong, and the constant does not exist. The other two pin the
+  boundaries -- grace removed restores the old loss, and a generous grace must
+  not delay a mid-stream stall (asserted under 2s against a 5s grace).
+- Full suite: **598 tests, OK.**

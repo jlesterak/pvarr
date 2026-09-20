@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tempfile
 import unittest
@@ -1940,19 +1941,40 @@ class _FakeProc:
     """
 
     def __init__(self, chunks, returncode=None, close_stdout=False,
-                 stderr_lines=()):
+                 stderr_lines=(), delay_before=0.0):
         read_fd, write_fd = os.pipe()
-        for chunk in chunks:
-            os.write(write_fd, chunk)   # total stays well under the 64KB pipe
-        if close_stdout:
-            os.close(write_fd)
-            self._write_fd = None
-        else:
-            self._write_fd = write_fd
+
+        def _feed():
+            for chunk in chunks:
+                os.write(write_fd, chunk)  # total stays under the 64KB pipe
+            if close_stdout:
+                os.close(write_fd)
+
+        self._write_fd = None if close_stdout else write_fd
+        self._feeder = None
+        if not delay_before:
+            _feed()
         self.stdout = os.fdopen(read_fd, "rb", buffering=0)
         # readline() walks these then hits EOF, so the drain thread exits.
         self.stderr = io.BytesIO(b"".join(l + b"\n" for l in stderr_lines))
         self._rc = returncode
+
+        if delay_before:
+            # A source that connects but takes its time before its first byte:
+            # the startup case, which must not read as a freeze. Fed from a
+            # thread so the capture loop is genuinely sitting in select(), and
+            # the exit status is withheld until the data lands -- FFmpeg has
+            # not exited while it is still warming up, and a poll() that
+            # answered early would end the attempt before the test began.
+            self._rc = None
+
+            def _late():
+                time.sleep(delay_before)
+                _feed()
+                self._rc = returncode
+
+            self._feeder = threading.Thread(target=_late, daemon=True)
+            self._feeder.start()
 
     def close(self):
         try:
@@ -1988,7 +2010,8 @@ class TestFreezeDetection(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def drive(self, chunks, returncode=None, freeze_timeout=0,
-              close_stdout=False, stderr_lines=()):
+              close_stdout=False, stderr_lines=(), startup_grace=0,
+              delay_before=0.0):
         from unittest.mock import patch
         rec = StreamFailoverRecorder(
             "test-id", ["http://a/1.m3u8"], self.out,
@@ -1997,8 +2020,11 @@ class TestFreezeDetection(unittest.TestCase):
         )
         # Shrink the select() wait so tests do not sit through the real 0.5s.
         rec.READ_POLL_SEC = 0.01
+        # Default 0 so the tests that are about the freeze path keep tripping
+        # instantly; the startup-grace tests set it deliberately.
+        rec.STARTUP_GRACE_SEC = startup_grace
         proc = _FakeProc(chunks, returncode, close_stdout=close_stdout,
-                         stderr_lines=stderr_lines)
+                         stderr_lines=stderr_lines, delay_before=delay_before)
         try:
             with patch("app.recorder.subprocess.Popen", return_value=proc):
                 result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
@@ -2010,6 +2036,61 @@ class TestFreezeDetection(unittest.TestCase):
         rec, result = self.drive([])
         self.assertIs(result, StreamOutcome.FAILED)
         self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    # -- startup grace -----------------------------------------------------
+    # A source is allowed longer to produce its FIRST byte than it is allowed
+    # to go quiet afterwards. Without this, six healthy candidates in a row
+    # were abandoned at exactly the freeze timeout on 2026-09-20 purely
+    # because the CDN was slow to warm up.
+
+    def test_a_slow_first_byte_is_not_mistaken_for_a_freeze(self):
+        # Freeze timeout 0: under the old single-budget check this attempt was
+        # dead before the source ever spoke.
+        rec, result = self.drive([b"x" * 2048], returncode=0, close_stdout=True,
+                                 freeze_timeout=0, startup_grace=5,
+                                 delay_before=0.2)
+        self.assertIs(result, StreamOutcome.COMPLETED,
+                      "a source that took 0.2s to start was abandoned")
+        self.assertEqual(rec.bytes_written, 2048)
+        self.assertEqual(rec.candidates[0].fail_count, 0)
+
+    def test_without_the_grace_the_same_slow_start_is_abandoned(self):
+        # The regression this pins: same source, grace removed, attempt lost.
+        rec, result = self.drive([b"x" * 2048], freeze_timeout=0,
+                                 startup_grace=0, delay_before=0.2)
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertEqual(rec.bytes_written, 0)
+
+    def test_the_grace_does_not_leak_into_the_freeze_timeout(self):
+        # Once bytes have arrived the operator's freeze timeout governs again.
+        # A generous grace must not keep a stalled recording on the air: this
+        # would take the full 5s if the budget were still the startup one.
+        started = time.time()
+        rec, result = self.drive([b"x" * 1024], freeze_timeout=0,
+                                 startup_grace=5)
+        elapsed = time.time() - started
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertLess(elapsed, 2.0,
+                        f"mid-stream stall waited {elapsed:.1f}s on the startup budget")
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    def test_a_failed_start_and_a_freeze_read_differently_in_the_log(self):
+        # The dashboard is the only place the sponsor sees this, so "never
+        # started" and "went quiet" must not both say "Stream freeze detected".
+        never, _ = self.drive([], freeze_timeout=0, startup_grace=0)
+        froze, _ = self.drive([b"x" * 1024], freeze_timeout=0, startup_grace=0)
+        self.assertTrue(any("in the first" in l for l in never.log_history),
+                        never.log_history)
+        self.assertFalse(any("Stream freeze detected" in l for l in never.log_history),
+                         never.log_history)
+        self.assertTrue(any("Stream freeze detected" in l for l in froze.log_history),
+                        froze.log_history)
+
+    def test_the_shipped_grace_is_longer_than_the_default_freeze_timeout(self):
+        # The whole point is that they differ; a grace at or below the freeze
+        # timeout silently restores the old behaviour.
+        rec = StreamFailoverRecorder("g", ["http://a/1.m3u8"], self.out, min_free_gb=0)
+        self.assertGreater(rec.STARTUP_GRACE_SEC, rec.freeze_timeout_sec)
 
     def test_bytes_written_is_tracked(self):
         rec, _ = self.drive([b"x" * 4096])
