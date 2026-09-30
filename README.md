@@ -576,7 +576,7 @@ scripts/score-comskip.py truth recordings/GAME.mp4 --logo-box 160:40:1100:12 > t
 scripts/score-comskip.py score truth.csv run-a/GAME.edl run-b/GAME.edl --exclude 6356-6984
 ```
 
-`--logo-box` is `W:H:X:Y` around the logo; `--exclude` leaves out spans like halftime that drop the logo without being ads. It reports the share of ad time caught, what was missed, and how much of the game was marked as an ad — the number to watch before turning on `cut`. On a 3h44m NBC game the shipped defaults caught 73% of ad time and marked no real play as an ad.
+`--logo-box` is `W:H:X:Y` around the logo; `--exclude` leaves out spans like halftime that drop the logo without being ads. It reports the share of ad time caught, what was missed, and how much of the game was marked as an ad — the number to watch before turning on `cut`. On a 3h44m NBC game the shipped defaults caught 73% of ad time and marked no real play as an ad. On that same game, a `comskip.ini` containing `detect_method=111` (scene changes as cut points in place of closed captions) raised that to 80% for six extra seconds of game marked as an ad, at no extra CPU. It is not the default yet because it has only been measured on one broadcaster; do not combine it with `max_commercialbreak=900`, which cancelled the gain.
 
 **A `.proxy_conf` folder in your recordings directory.** When a candidate
 falls back to the bundled proxy, PVArr writes that proxy a small config file

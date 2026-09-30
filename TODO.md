@@ -2166,6 +2166,51 @@ this game.** Recall is the weakness: three whole breaks missed (0:06:32 200 s,
       EDL -> score) is small and should live in `scripts/` so any tuning claim
       is a number, not an impression. Do not ship a tuned ini as the default
       until it beats 73% recall without raising game-marked-as-ad time.
+      **Harness built** (`scripts/score-comskip.py`, 84fd96b). Sweep below.
+
+### comskip tuning sweep on the same game (2026-09-30)
+Scored with `scripts/score-comskip.py` (its key: 25 breaks; halftime
+6356-6984 excluded, hence 72% not 73% for the baseline). 14 runs, one
+setting varied at a time where it mattered; comskip is deterministic
+(baseline and its verbose twin, and `111` and its verbose twin, agree to the
+second).
+
+comskip's real defaults, read from the verbose log: `detect_method=123`
+(black, logo, resolution, closed captions, aspect, silence),
+`max_commercialbreak=600`, `max_commercial_size=120`,
+`min_show_segment_length=120`, `logo_threshold=0.8`.
+
+| ini on top of defaults | recall | game as ad | whole breaks missed |
+|---|---|---|---|
+| none (shipped) | 72% | 1.3 min | 4 |
+| `detect_method=107` (drop CC) | 72% | 1.3 | 4 |
+| `detect_method=111` (CC -> **scene change**) | **80%** | 1.4 | **2** |
+| `detect_method=255` (everything) | 80% | 1.4 | 2 |
+| 111 + `max_commercial_size=180` or `240` | 80% | 1.4 | 2 |
+| 111 + `min_commercialbreak=20` | 80% | 1.4 | 2 |
+| 111 + `logo_threshold=0.75` | 80% | 1.4 | 2 |
+| 111 + `max_commercialbreak=900` | 72% | 1.3 | 4 |
+| `logo_threshold=0.70`, longer limits, 107+longer limits | 72% | 1.3 | 4 |
+
+- **Scene change is the one lever.** It recovers two whole breaks the
+  default drops (1:27:28 152 s, 2:34:44 140 s), ~5 min of ads, for +6 s of
+  game-as-ad and no measurable CPU cost (same wall time as the default).
+- **`max_commercialbreak=900` cancels it**, reproducibly. Not investigated
+  further; do not combine the two.
+- **Still missed under every setting:** 0:06:32 (204 s). comskip sees logo
+  0.00 across a 131 s block and keeps it as show anyway, flagged `E`
+  ("exceeds"). Raising `max_commercial_size` does not change that, so the cap
+  it exceeds is something else. Also two 36 s breaks and 30-48 s slivers at
+  the edges of four more.
+- An earlier explanation in this session -- "back-to-back ads with no black
+  frame between exceed the 120 s single-ad cap" -- was **wrong**: raising the
+  cap changed nothing. Recorded so it is not repeated.
+
+- [ ] **Validate `detect_method=111` on a second recording, ideally another
+      network (CBS/FOX), before making it the default ini.** One game is one
+      broadcaster's ad-insertion habits; a setting that helps here can split
+      show blocks elsewhere. Until then it is a documented tip, not a default.
+      Cost to validate: ~30 s for the key + one comskip run (~18 min alone).
 
 ## Integration candidates — decided (2026-08-31)
 
