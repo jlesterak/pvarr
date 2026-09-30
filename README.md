@@ -569,6 +569,15 @@ orphan is not recoverable.
 
 **Commercial detection found nothing, or marked the wrong things.** comskip was built for broadcast TV: it leans on station logos vanishing, black frames at boundaries, aspect-ratio changes and audio silence. A rebroadcast OTA channel gives it all of those and it does well. A stream that fills its breaks with an animated "commercial break in progress" card gives it almost none — that card is not black, not silent, and not a frozen frame — so expect misses there. Point `PVARR_COMSKIP_INI` at a tuned `comskip.ini` for your source; that is where the real gains are.
 
+To tell whether a tuned ini is actually better rather than guessing, score it. `scripts/score-comskip.py` builds an answer key for one recording from the channel's corner logo (on every programme frame, on no ad), then rates any number of comskip `.edl` files against it:
+
+```bash
+scripts/score-comskip.py truth recordings/GAME.mp4 --logo-box 160:40:1100:12 > truth.csv
+scripts/score-comskip.py score truth.csv run-a/GAME.edl run-b/GAME.edl --exclude 6356-6984
+```
+
+`--logo-box` is `W:H:X:Y` around the logo; `--exclude` leaves out spans like halftime that drop the logo without being ads. It reports the share of ad time caught, what was missed, and how much of the game was marked as an ad — the number to watch before turning on `cut`. On a 3h44m NBC game the shipped defaults caught 73% of ad time and marked no real play as an ad.
+
 **A `.proxy_conf` folder in your recordings directory.** When a candidate
 falls back to the bundled proxy, PVArr writes that proxy a small config file
 there. It contains the stream URL *with its access token*, so treat it as a

@@ -6687,5 +6687,67 @@ class TestShutdownBudgetFitsTheGracePeriod(unittest.TestCase):
         self.assertIn('=~ ^[0-9]+$', (self.ROOT / "start.sh").read_text())
 
 
+def _load_score_comskip():
+    import importlib.util
+    path = Path(__file__).resolve().parent / "scripts" / "score-comskip.py"
+    spec = importlib.util.spec_from_file_location("score_comskip", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestComskipScoring(unittest.TestCase):
+    """scripts/score-comskip.py decides which comskip settings ship.
+
+    A scorer that miscounts would quietly bless a worse ini, so the arithmetic
+    is pinned here rather than trusted.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sc = _load_score_comskip()
+
+    def track(self, pattern, step=4.0):
+        """'1' = logo visible on that keyframe, '0' = not."""
+        return [(i * step, float(c)) for i, c in enumerate(pattern)]
+
+    def test_logo_absent_runs_become_breaks(self):
+        breaks = self.sc.breaks_from_track(self.track("1111000000011110000000"), 20)
+        self.assertEqual(breaks, [(16.0, 44.0), (60.0, 88.0)])
+
+    def test_short_absences_are_not_breaks(self):
+        # 12 s without the logo is a replay or a graphic, not an ad break.
+        self.assertEqual(self.sc.breaks_from_track(self.track("11110001111"), 20), [])
+
+    def test_one_keyframe_blip_does_not_split_a_break(self):
+        breaks = self.sc.breaks_from_track(self.track("1110000010000000111"), 20)
+        self.assertEqual(breaks, [(12.0, 64.0)])
+
+    def test_break_running_to_the_end_is_kept(self):
+        breaks = self.sc.breaks_from_track(self.track("1111100000000"), 20)
+        self.assertEqual(breaks, [(20.0, 52.0)])
+
+    def test_score_counts_caught_missed_and_game_marked_as_ad(self):
+        truth = [(100.0, 200.0), (500.0, 600.0)]
+        detected = [(90.0, 180.0)]          # 10 s early, stops 20 s short
+        r = self.sc.score(truth, detected, [])
+        self.assertEqual((r["caught"], r["missed"], r["false_pos"]), (80, 120, 10))
+        self.assertEqual(r["whole_breaks_missed"], 1)
+        self.assertAlmostEqual(r["recall"], 0.4)
+
+    def test_excluded_span_is_not_scored(self):
+        truth = [(100.0, 200.0)]
+        r = self.sc.score(truth, [(300.0, 400.0)], [(300.0, 400.0)])
+        self.assertEqual((r["caught"], r["missed"], r["false_pos"]), (0, 100, 0))
+
+    def test_edl_keeps_only_cut_actions(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".edl", delete=False) as fh:
+            fh.write("0.00\t10.50\t0\n20.00\t30.00\t3\nbad line\n40.0\t50.0\t0\n")
+        try:
+            self.assertEqual(self.sc.parse_edl(fh.name), [(0.0, 10.5), (40.0, 50.0)])
+        finally:
+            os.unlink(fh.name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
