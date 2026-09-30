@@ -1984,7 +1984,10 @@ and available in the venv.
 
 452 tests (was 434).
 
-### Decided, not yet built: comskip  [PENDING]
+### comskip  [COMPLETED -- built in 04c6a8d (chapters) and ae98ad1 (verified cut)]
+The plan below is kept for its reasoning; the freezedetect half was dropped
+(see "The sponsor corrected me twice" further down). Measured results are under
+"comskip defaults, measured on a real game".
 Sponsor decision: **comchap (chapter marks) as the default, comcut (actual
 removal) as an option.** Non-destructive by default is the right call next to
 everything else this project does to avoid losing footage -- a false positive
@@ -2118,8 +2121,51 @@ Real comskip, real ffmpeg, on a real MP4:
       detector from my guess about what these cards look like would repeat the
       `-allowed_extensions ALL` mistake exactly. A 60-second clip spanning one
       break would settle it.
-- [ ] Whether comskip's defaults are any good on the sponsor's OTA
-      rebroadcasts, or whether a tuned ini is needed.
+- [x] Whether comskip's defaults are any good on the sponsor's OTA
+      rebroadcasts -- measured 2026-09-30, see below. **Tuned ini: open.**
+
+### comskip defaults, measured on a real game (2026-09-30)
+Sample: `recordings/2026-09-28_NFL_Los_Angeles_Rams_vs_Denver_Broncos_1080p.mp4`
+-- NBC Sunday Night Football, 3h44m, 1280x720 (named 1080p by 0.5.1; the
+0.6.0 retag fix postdates this recording). **This source carries real
+broadcast ads, not a break card**, so it is comskip's home turf. It says
+nothing about the animated-card case above.
+
+Ground truth, built without comskip: the NBC "SNF" corner logo is on every
+broadcast frame and on no ad. A per-pixel median over keyframe crops gives the
+logo template; per keyframe (every 4 s) the fraction of logo pixels lit is
+bimodal (2397 frames at 1.0, 869 at 0.0, ~100 between). Absent runs >= 20 s:
+**27 breaks, 65.1 min**. Spot-checked by eye: all ads, sponsor bumpers, or the
+halftime studio show (1:46:40-1:56:24, excluded from scoring as a judgement
+call).
+
+Bitrate and keyframes carry no signal on this source: the provider re-encodes
+at ~1.5 Mb/s constant (p10 1422, p90 1535 kb/s per 30 s) with a fixed 4.000 s
+GOP. So the "low bitrate of a simple loop" idea for break cards cannot be
+relied on either, at least from this provider.
+
+comskip 0.82.011 from the 0.5.1 image, PVArr's shipped minimal ini
+(`output_edl=1`, `output_ffmeta=1`), one core niced: **17m54s**.
+
+| | |
+|---|---|
+| breaks detected | 21 (46.8 min) |
+| ad time caught | 40.1 of 55.3 min -- **73%** |
+| ad time missed | 15.2 min |
+| game marked as ad | 1.8 min (4% of what it flagged) |
+
+Every "game marked as ad" span is 10-36 s and sits *between* two true breaks
+or at a break edge -- almost certainly bumpers carrying the logo, i.e. the
+answer key being strict, not comskip eating plays. **Precision is effectively
+fine for chapters, and good enough that `cut` would not have cost a play on
+this game.** Recall is the weakness: three whole breaks missed (0:06:32 200 s,
+1:27:28 152 s, 2:34:44 140 s), plus partial misses on six more.
+
+- [ ] **Tune a sports ini against this answer key.** Each run is ~18 min on
+      one core; several can run in parallel. The harness (logo track -> truth,
+      EDL -> score) is small and should live in `scripts/` so any tuning claim
+      is a number, not an impression. Do not ship a tuned ini as the default
+      until it beats 73% recall without raising game-marked-as-ad time.
 
 ## Integration candidates — decided (2026-08-31)
 
