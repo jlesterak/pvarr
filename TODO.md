@@ -2217,8 +2217,34 @@ comskip's real defaults, read from the verbose log: `detect_method=123`
       light and dark parts of the logo are scored separately (both must
       match). Result: scores go bimodal (0.0 / 0.9+), that ad break reads as
       ad end to end. Without `--ref` the NBC key is unchanged.
-- [ ] **Validate `detect_method=111` on a second recording, ideally another
-      network (CBS/FOX), before making it the default ini.** One game is one
+### Second network: NHL on TNT (2026-10-01)
+Sample: `recordings/2026-10-01_NHL_Los_Angeles_Kings_vs_Colorado_Avalanche_720p.mp4`,
+3h03m, 1280x720, TNT Sports. Starts with the tail of the previous game
+(Penguins-Flyers) and a studio show. Key: `truth --logo-box 70:60:24:40 --ref
+2400 --min-break 100` (the TNT logo inside the scorebug). `--min-break 100`
+because the scorebug also drops for 20-48 s during replays and goal
+celebrations; at the default 20 s those counted as ~20 phantom "breaks".
+Excluded as studio/judgement calls: pre-game 796-1340, 1st intermission
+3812-4924, 2nd intermission 7360-8472, post-game 10772-end. 10 in-game
+breaks, 128-148 s each. Each comskip run ~38 min on one core (3 h file).
+
+| ini | recall | game as ad | whole breaks missed |
+|---|---|---|---|
+| none (shipped) | 66% | 0.1 min | 0 of 10 |
+| `detect_method=111` | 66% | 0.1 min | 0 of 10 |
+
+- **Every break found, every break trimmed the same way:** comskip starts
+  ~10 s late and stops **35-50 s early**, so ~90 s of each ~140 s break.
+  Hypothesis, not checked: TNT ends breaks with in-house promos carrying the
+  top-right "TNT Sports" bug, and comskip's logo learner picked that bug.
+- **`111` is neutral here**: no gain, and no extra game marked as ad. With
+  +8 points on NBC and nothing lost on TNT, the evidence now supports making it
+  the default (sponsor's call; small change to `_DEFAULT_INI` + README).
+- [ ] **Sponsor decision: ship `detect_method=111` in the default ini?**
+- [ ] Investigate the TNT tail miss: which logo comskip learned (verbose
+      log / `.logo.txt`), and whether pinning the logo area fixes the ends.
+- [x] **Validate `detect_method=111` on a second recording, ideally another
+      network (CBS/FOX), before making it the default ini.** **Done 2026-10-01 on TNT, above.** One game is one
       broadcaster's ad-insertion habits; a setting that helps here can split
       show blocks elsewhere. Until then it is a documented tip, not a default.
       Cost to validate: ~30 s for the key + one comskip run (~18 min alone).
