@@ -18,6 +18,9 @@ Usage:
   scripts/score-comskip.py truth GAME.mp4 --logo-box 160:40:1100:12 > truth.csv
   scripts/score-comskip.py score truth.csv GAME.edl [--exclude 6400-6984 ...]
 
+--ref SECONDS (optional): a moment where the logo is on screen. Use it when the logo is
+off screen for much of the file (a doubleheader, a long studio show).
+
 --logo-box is ffmpeg's crop order, W:H:X:Y in pixels of the recording. Find it
 by grabbing one frame (`ffmpeg -ss 600 -i GAME.mp4 -frames:v 1 f.png`) and
 boxing the logo tightly; some background around it is fine.
@@ -55,7 +58,7 @@ def _logo_crops(video: str, box: str) -> Tuple[List[float], List[bytes]]:
     return times, frames
 
 
-def logo_track(video: str, box: str) -> List[Tuple[float, float]]:
+def logo_track(video: str, box: str, ref: float = None) -> List[Tuple[float, float]]:
     """(time, fraction of the logo visible) per keyframe.
 
     The template is the per-pixel median over a sample of frames: the logo
@@ -66,13 +69,27 @@ def logo_track(video: str, box: str) -> List[Tuple[float, float]]:
     """
     times, frames = _logo_crops(video, box)
     sample = frames[::max(1, len(frames) // 400)]
+    if ref is not None:
+        # Template from the 4 min around a moment known to show the logo. Needed when the logo
+        # is off screen for much of the file (doubleheaders, long studio shows): across the
+        # whole file its light pixels then fail the stability test and only the plate is left.
+        sample = [f for t, f in zip(times, frames) if abs(t - ref) <= 120]
+        if len(sample) < 5:
+            sys.exit(f"--ref {ref}: too few keyframes within 2 min of it")
     n = len(frames[0])
     template = [statistics.median(f[p] for f in sample) for p in range(n)]
     mask = [p for p in range(n)
             if sum(abs(f[p] - template[p]) <= 20 for f in sample) >= 0.6 * len(sample)]
     if len(mask) < 0.02 * n:
         sys.exit("no stable logo found in that box -- check --logo-box")
-    return [(t, sum(abs(f[p] - template[p]) <= 30 for p in mask) / len(mask))
+    # A logo on its own plate (TNT: white letters on a black square) is mostly plate, so a
+    # plain match fraction says "logo present" for any ad with a dark corner (2026-10-01,
+    # NHL on TNT). Score the light and dark parts separately and take the weaker, so both
+    # must match. A logo with no plate (NBC's) has one part only and scores as before.
+    light = [p for p in mask if template[p] >= 128]
+    dark = [p for p in mask if template[p] < 128]
+    parts = [g for g in (light, dark) if len(g) >= 0.1 * len(mask)] or [mask]
+    return [(t, min(sum(abs(f[p] - template[p]) <= 30 for p in g) / len(g) for g in parts))
             for t, f in zip(times, frames)]
 
 
@@ -157,6 +174,9 @@ def main() -> None:
     tr = sub.add_parser("truth", help="build an answer key from the corner logo")
     tr.add_argument("video")
     tr.add_argument("--logo-box", required=True, help="W:H:X:Y, ffmpeg crop order")
+    tr.add_argument("--ref", type=float, default=None,
+                    help="seconds into the file where the logo is on screen; builds the logo "
+                         "template from the 4 min around it instead of the whole file")
     tr.add_argument("--min-break", type=float, default=20.0,
                     help="shortest logo-absent run counted as a break (s)")
     sc = sub.add_parser("score", help="score a comskip .edl against an answer key")
@@ -168,7 +188,7 @@ def main() -> None:
 
     if args.cmd == "truth":
         writer = csv.writer(sys.stdout)
-        for start, end in breaks_from_track(logo_track(args.video, args.logo_box),
+        for start, end in breaks_from_track(logo_track(args.video, args.logo_box, args.ref),
                                             args.min_break):
             writer.writerow([f"{start:.3f}", f"{end:.3f}"])
         return

@@ -2206,6 +2206,17 @@ comskip's real defaults, read from the verbose log: `detect_method=123`
   frame between exceed the 120 s single-ad cap" -- was **wrong**: raising the
   cap changed nothing. Recorded so it is not repeated.
 
+- [x] **Scorer fixed for logos on a plate (2026-10-01).** On the first
+      TNT recording (NHL, a doubleheader tail + studio shows) the answer key
+      said only 30.6 min of ads and had the logo "present" through a plainly
+      visible 3.5 min ad break. Cause: across the whole file the TNT logo's
+      white letters were on screen too rarely to pass the stability test, so
+      the template was only the black square behind them, and any ad with a
+      dark top-left corner matched. Fix: `truth --ref SECONDS` builds the
+      template from the 4 min around a moment known to show the logo, and the
+      light and dark parts of the logo are scored separately (both must
+      match). Result: scores go bimodal (0.0 / 0.9+), that ad break reads as
+      ad end to end. Without `--ref` the NBC key is unchanged.
 - [ ] **Validate `detect_method=111` on a second recording, ideally another
       network (CBS/FOX), before making it the default ini.** One game is one
       broadcaster's ad-insertion habits; a setting that helps here can split
