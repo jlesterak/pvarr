@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest a change to PVArr
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        PVArr is a small, self-hosted HLS recorder. Requests that keep it small are most likely to be accepted.
+
+        **No site-specific support.** Requests for support for a particular streaming site will be closed.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the problem first, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like PVArr to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today, or what else did you consider?
+      description: For example Plex, Sonarr, cron plus curl against the API, or an external script.

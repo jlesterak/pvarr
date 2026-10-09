@@ -1,0 +1,47 @@
+{
+ "sports": [
+  {
+   "leagues": [
+    {
+     "abbreviation": "NHL",
+     "name": "National Hockey League",
+     "teams": [
+      {
+       "team": {
+        "id": "17",
+        "abbreviation": "COL",
+        "displayName": "Colorado Avalanche",
+        "shortDisplayName": "Avalanche",
+        "name": "Avalanche",
+        "nickname": "Colorado",
+        "location": "Colorado"
+       }
+      },
+      {
+       "team": {
+        "id": "10",
+        "abbreviation": "MTL",
+        "displayName": "Montreal Canadiens",
+        "shortDisplayName": "Canadiens",
+        "name": "Canadiens",
+        "nickname": "Montreal",
+        "location": "Montreal"
+       }
+      },
+      {
+       "team": {
+        "id": "28",
+        "abbreviation": "WPG",
+        "displayName": "Winnipeg Jets",
+        "shortDisplayName": "Jets",
+        "name": "Jets",
+        "nickname": "Winnipeg",
+        "location": "Winnipeg"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

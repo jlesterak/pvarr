@@ -1,0 +1,13 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+requests>=2.28.0
+jinja2>=3.1.2
+python-multipart>=0.0.6
+yt-dlp>=2026.8.19
+# Gives yt-dlp and the probe a browser-compatible TLS client. 13 MB prebuilt
+# wheel, no compiler needed. Some origins answer every other HTTP client with
+# an identical 403.
+curl_cffi>=0.7
+# One interface to 100+ notification services, replacing hand-rolled Discord
+# and Telegram senders. 1.8 MB.
+apprise>=1.9

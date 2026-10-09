@@ -1,0 +1,8174 @@
+#!/usr/bin/env python3
+"""
+PVArr unit test suite.
+
+Stdlib-only (unittest) so the tests run with no extra dependencies beyond
+what requirements.txt already installs. Tests that genuinely need FFmpeg on
+the host are skipped rather than failed when it is absent.
+
+Run:
+    python3 test_pvarr.py
+    python3 -m unittest discover -v
+"""
+
+import io
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from app import check_deps, tuner
+from app.naming import (
+    StorageManager,
+    generate_sports_filename,
+    probe_video_resolution,
+    reserve_output_path,
+    retag_resolution,
+    sanitize_token,
+)
+from app.post_processor import remux_recording
+from app import commercials, notifications, probe, ringbuffer, sessions, ytdlp
+from app.logging_config import redact_url_secrets
+from app.recorder import (
+    DEFAULT_MAX_HOURS,
+    MAX_TIMELINE_OFFSET_SECONDS,
+    PTS_WRAP_SECONDS,
+    TS_PACKET_SIZE,
+    CandidateStream,
+    StreamFailoverRecorder,
+    StreamOutcome,
+    _TailBuffer,
+    advance_timeline_position,
+    last_timeline_position,
+    output_ts_offset_flags,
+    safe_stream_url,
+    tail_timeline_position,
+)
+
+# The modules log at INFO on import; silence it so test output stays readable.
+logging.disable(logging.CRITICAL)
+
+HAS_FFMPEG = bool(check_deps.find_executable("ffmpeg"))
+
+
+# --------------------------------------------------------------------------
+# naming.sanitize_token
+# --------------------------------------------------------------------------
+class TestSanitizeToken(unittest.TestCase):
+    def test_spaces_become_underscores(self):
+        self.assertEqual(sanitize_token("Kansas City Chiefs"), "Kansas_City_Chiefs")
+
+    def test_path_separators_are_stripped(self):
+        # Critical: these values land in a filename, so a token that survives
+        # with a "/" in it would let a caller escape the recordings directory.
+        self.assertEqual(sanitize_token("../../etc/passwd"), "etc_passwd")
+        self.assertNotIn("/", sanitize_token("a/b/c"))
+        self.assertNotIn("\\", sanitize_token("a\\b\\c"))
+
+    def test_empty_and_whitespace_use_fallback(self):
+        self.assertEqual(sanitize_token("", "Fallback"), "Fallback")
+        self.assertEqual(sanitize_token("   ", "Fallback"), "Fallback")
+
+    def test_all_punctuation_uses_fallback(self):
+        self.assertEqual(sanitize_token("!!!", "Fallback"), "Fallback")
+
+    def test_leading_trailing_underscores_trimmed(self):
+        self.assertEqual(sanitize_token("  Lakers  "), "Lakers")
+
+    def test_accents_from_team_suggestions_are_folded_not_dropped(self):
+        self.assertEqual(sanitize_token("CF Montréal"), "CF_Montreal")
+        self.assertEqual(sanitize_token("Borussia Mönchengladbach"), "Borussia_Monchengladbach")
+
+    def test_alphanumeric_preserved(self):
+        self.assertEqual(sanitize_token("49ers"), "49ers")
+        self.assertEqual(sanitize_token("Team-A_1"), "Team-A_1")
+
+
+# --------------------------------------------------------------------------
+# naming.generate_sports_filename
+# --------------------------------------------------------------------------
+class TestGenerateSportsFilename(unittest.TestCase):
+    def test_standard_format(self):
+        name = generate_sports_filename(
+            "NFL", "Chiefs", "Bills", "1080p", date_str="2026-01-15"
+        )
+        self.assertEqual(name, "2026-01-15_NFL_Chiefs_vs_Bills_1080p.ts")
+
+    def test_extension_normalised(self):
+        # A caller passing ".mkv" must not produce a double dot.
+        name = generate_sports_filename(
+            "NFL", "A", "B", "720p", date_str="2026-01-15", ext=".mkv"
+        )
+        self.assertTrue(name.endswith("_720p.mkv"))
+        self.assertNotIn("..", name)
+
+    def test_missing_teams_fall_back(self):
+        name = generate_sports_filename("", "", "", date_str="2026-01-15")
+        self.assertEqual(name, "2026-01-15_Sports_TeamA_vs_TeamB_1080p.ts")
+
+    def test_date_defaults_to_today(self):
+        name = generate_sports_filename("NFL", "A", "B")
+        # YYYY-MM-DD prefix
+        self.assertRegex(name, r"^\d{4}-\d{2}-\d{2}_NFL_A_vs_B_1080p\.ts$")
+
+    def test_date_follows_the_container_timezone(self):
+        """The date comes from local time, so TZ decides it. The image runs on
+        UTC unless TZ is set, which dated a 7 pm Mountain event the next day;
+        docker-compose.yml now passes TZ through. 02:00 UTC on 2026-10-08 is
+        still the 7th in Denver."""
+        import time
+        from datetime import datetime as real_datetime
+        from unittest.mock import patch
+        import app.naming as naming_mod
+
+        class Fixed(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime.fromtimestamp(1791424800, tz)  # 2026-10-08T02:00Z
+
+        old = os.environ.get("TZ")
+
+        def restore():
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+        self.addCleanup(restore)
+        with patch.object(naming_mod, "datetime", Fixed):
+            os.environ["TZ"] = "America/Denver"
+            time.tzset()
+            self.assertTrue(generate_sports_filename("NHL", "A", "B").startswith("2026-10-07_"))
+            os.environ["TZ"] = "UTC"
+            time.tzset()
+            self.assertTrue(generate_sports_filename("NHL", "A", "B").startswith("2026-10-08_"))
+
+    def test_dirty_input_yields_safe_filename(self):
+        name = generate_sports_filename(
+            "NFL/../", "A B", "C:D", date_str="2026-01-15"
+        )
+        self.assertNotIn("/", name)
+        self.assertNotIn(":", name)
+
+
+# --------------------------------------------------------------------------
+# naming.StorageManager
+# --------------------------------------------------------------------------
+class TestStorageManager(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.mgr = StorageManager(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_creates_directory(self):
+        self.assertTrue(Path(self.tmp).is_dir())
+
+    def test_output_path_inside_record_dir(self):
+        path = self.mgr.get_output_path("NFL", "A", "B")
+        self.assertEqual(path.parent, Path(self.tmp).resolve())
+
+    def test_collision_avoidance(self):
+        first = self.mgr.get_output_path("NFL", "A", "B")
+        first.touch()
+        second = self.mgr.get_output_path("NFL", "A", "B")
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.stem.endswith("_1"))
+
+        second.touch()
+        third = self.mgr.get_output_path("NFL", "A", "B")
+        self.assertNotIn(third, (first, second))
+
+    def test_list_recordings_covers_every_container(self):
+        # This used to glob "*.ts" only, which hid every FINISHED recording:
+        # post-processing remuxes to .mp4 and deletes the .ts, so the library
+        # emptied itself the moment a capture succeeded.
+        (Path(self.tmp) / "a.ts").write_bytes(b"x" * 2048)
+        (Path(self.tmp) / "b.mkv").write_bytes(b"x" * 2048)
+        (Path(self.tmp) / "c.mp4").write_bytes(b"x" * 2048)
+        (Path(self.tmp) / "d.txt").write_text("not a recording")
+
+        names = sorted(r["filename"] for r in self.mgr.list_recordings())
+        self.assertEqual(names, ["a.ts", "b.mkv", "c.mp4"])
+
+    def test_list_recordings_ignores_directories(self):
+        # .proxy_conf and similar live alongside the recordings.
+        (Path(self.tmp) / "a.ts").write_bytes(b"x")
+        (Path(self.tmp) / "weird.mp4").mkdir()
+        names = [r["filename"] for r in self.mgr.list_recordings()]
+        self.assertEqual(names, ["a.ts"])
+
+    def test_list_recordings_metadata(self):
+        (Path(self.tmp) / "a.ts").write_bytes(b"x" * (1024 * 1024))
+        rec = self.mgr.list_recordings()[0]
+        for key in ("filename", "filepath", "size_mb", "created_at", "modified_timestamp"):
+            self.assertIn(key, rec)
+        self.assertAlmostEqual(rec["size_mb"], 1.0, places=1)
+
+    def test_list_recordings_missing_dir_is_empty(self):
+        self.assertEqual(self.mgr.list_recordings("/nonexistent/pvarr/path"), [])
+
+    def test_rename_inherits_the_existing_extension(self):
+        (Path(self.tmp) / "old.ts").write_bytes(b"x")
+        self.assertTrue(self.mgr.rename_recording("old.ts", "new"))
+        self.assertTrue((Path(self.tmp) / "new.ts").exists())
+
+    def test_rename_inherits_mp4_not_ts(self):
+        # ".ts" used to be forced onto every rename, so renaming a finished
+        # recording gave it a name that lied about its contents.
+        (Path(self.tmp) / "old.mp4").write_bytes(b"x")
+        self.assertTrue(self.mgr.rename_recording("old.mp4", "highlights"))
+        self.assertTrue((Path(self.tmp) / "highlights.mp4").exists())
+        self.assertFalse((Path(self.tmp) / "highlights.ts").exists())
+
+    def test_rename_keeps_an_explicit_mp4_extension(self):
+        (Path(self.tmp) / "old.mp4").write_bytes(b"x")
+        self.assertTrue(self.mgr.rename_recording("old.mp4", "highlights.mp4"))
+        self.assertTrue((Path(self.tmp) / "highlights.mp4").exists())
+        self.assertFalse((Path(self.tmp) / "highlights.mp4.ts").exists(),
+                         "rename produced a double extension")
+
+    def test_renamed_file_is_still_listed(self):
+        # The rename bug also made the file vanish from the library, since the
+        # result was neither a real .ts nor a listed container.
+        (Path(self.tmp) / "old.mp4").write_bytes(b"x")
+        self.mgr.rename_recording("old.mp4", "highlights")
+        names = [r["filename"] for r in self.mgr.list_recordings()]
+        self.assertEqual(names, ["highlights.mp4"])
+
+    def test_rename_refuses_to_clobber(self):
+        (Path(self.tmp) / "old.ts").write_bytes(b"old")
+        (Path(self.tmp) / "new.ts").write_bytes(b"new")
+        self.assertFalse(self.mgr.rename_recording("old.ts", "new.ts"))
+        # Both survive, and the existing file is untouched.
+        self.assertEqual((Path(self.tmp) / "new.ts").read_bytes(), b"new")
+
+    def test_rename_missing_source_returns_false(self):
+        self.assertFalse(self.mgr.rename_recording("ghost.ts", "new.ts"))
+
+    def test_delete(self):
+        (Path(self.tmp) / "a.ts").write_bytes(b"x")
+        self.assertTrue(self.mgr.delete_recording("a.ts"))
+        self.assertFalse((Path(self.tmp) / "a.ts").exists())
+
+    def test_delete_a_remuxed_recording(self):
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x")
+        self.assertTrue(self.mgr.delete_recording("game.mp4"))
+        self.assertFalse((Path(self.tmp) / "game.mp4").exists())
+
+    def test_media_type_by_extension(self):
+        from app.naming import media_type_for
+        self.assertEqual(media_type_for("a.ts"), "video/mp2t")
+        self.assertEqual(media_type_for("a.mp4"), "video/mp4")
+        self.assertEqual(media_type_for("a.MP4"), "video/mp4")
+        self.assertEqual(media_type_for("a.mkv"), "video/x-matroska")
+        self.assertEqual(media_type_for("a.weird"), "application/octet-stream")
+
+    def test_delete_missing_returns_false(self):
+        self.assertFalse(self.mgr.delete_recording("ghost.ts"))
+
+
+# --------------------------------------------------------------------------
+# tuner
+# --------------------------------------------------------------------------
+class TestGuideNaming(unittest.TestCase):
+    """The guide has to say what is being recorded and where it is coming from.
+
+    Before this, every programme's description was "PVArr live recording
+    <uuid>", which told the sponsor nothing they could not already see.
+    """
+
+    def session(self, **over):
+        s = {
+            "id": "rec1",
+            "is_running": True,
+            "output_filename": "Bears vs Packers.ts",
+            "started_at": 1756600000.0,
+            "current_candidate": 2,
+            "total_candidates": 3,
+            "candidates": [{"name": "Primary"}, {"name": "Backup 1"},
+                           {"name": "Backup 2"}],
+        }
+        s.update(over)
+        return s
+
+    def test_remuxed_container_is_stripped_from_the_title(self):
+        # current_filepath follows the remux, so a finished session would have
+        # been advertised as "Bears vs Packers.mp4".
+        out = tuner.generate_m3u_playlist(
+            [self.session(output_filename="Bears vs Packers.mp4")], "http://h:8999")
+        self.assertIn("Bears vs Packers", out)
+        self.assertNotIn(".mp4", out)
+
+    def test_guide_names_the_stream_in_use(self):
+        xml = tuner.generate_xmltv_epg([self.session()])
+        self.assertIn("<sub-title lang=\"en\">Backup 1</sub-title>", xml)
+
+    def test_guide_description_carries_the_filename(self):
+        xml = tuner.generate_xmltv_epg([self.session()])
+        self.assertIn("Recording to Bears vs Packers.ts", xml)
+
+    def test_guide_description_reports_failover_position(self):
+        xml = tuner.generate_xmltv_epg([self.session()])
+        self.assertIn("Backup 1 (2 of 3, failover armed)", xml)
+
+    def test_single_url_session_does_not_claim_failover(self):
+        xml = tuner.generate_xmltv_epg([self.session(
+            current_candidate=1, total_candidates=1,
+            candidates=[{"name": "Primary"}])])
+        self.assertIn("Source: Primary", xml)
+        self.assertNotIn("failover armed", xml)
+
+    def test_unnamed_candidate_falls_back_to_its_number(self):
+        xml = tuner.generate_xmltv_epg([self.session(candidates=[{}, {}, {}])])
+        self.assertIn("Stream 2", xml)
+
+    def test_missing_candidate_data_does_not_break_the_guide(self):
+        # An older session dict, or one captured mid-teardown.
+        xml = tuner.generate_xmltv_epg([{
+            "id": "rec1", "is_running": True, "output_filename": "x.ts"}])
+        self.assertIn("<programme", xml)
+        self.assertIn("</tv>", xml)
+
+    def test_description_holds_no_live_counters(self):
+        # Plex caches the XMLTV. A byte count or elapsed time baked in here is
+        # stale seconds after it is fetched, which reads as a bug to the user.
+        xml = tuner.generate_xmltv_epg([self.session(
+            filesize_mb=1234.5, elapsed_seconds=4321.0)])
+        self.assertNotIn("1234", xml)
+        self.assertNotIn("4321", xml)
+
+
+class TestTuner(unittest.TestCase):
+    def setUp(self):
+        self.sessions = [
+            {"id": "rec1", "output_filename": "game1.ts", "is_running": True},
+            {"id": "rec2", "output_filename": "game2.ts", "is_running": False},
+            {"id": "rec3", "output_filename": "game3.ts", "is_running": True},
+        ]
+
+    def test_playlist_header(self):
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        self.assertTrue(out.startswith("#EXTM3U"))
+
+    def test_playlist_excludes_stopped_sessions(self):
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        self.assertIn("game1", out)
+        self.assertIn("game3", out)
+        self.assertNotIn("game2", out)
+
+    def test_channel_titles_drop_the_ts_extension(self):
+        # Plex shows this string in the guide; ".ts" is noise there.
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        self.assertNotIn(".ts", out)
+
+    def test_playlist_points_at_the_stream_endpoint(self):
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        self.assertIn("/api/recordings/rec1/stream", out)
+
+    def test_quotes_in_filename_do_not_break_attributes(self):
+        sessions = [{"id": "r1", "output_filename": 'a "quoted" game.ts',
+                     "is_running": True}]
+        out = tuner.generate_m3u_playlist(sessions, "http://host:8999")
+        extinf = [l for l in out.splitlines() if l.startswith("#EXTINF")][0]
+        # Attribute values must stay balanced.
+        self.assertEqual(extinf.count("tvg-name="), 1)
+        self.assertIn("group-title=", extinf)
+
+    def test_epg_excludes_stopped_sessions(self):
+        # The guide must match the playlist. Advertising a channel here that
+        # the M3U omits leaves Plex with guide entries it cannot tune.
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        ids = {c.attrib["id"] for c in ET.fromstring(body).findall("channel")}
+        self.assertEqual(ids, {"rec1", "rec3"})
+        self.assertNotIn("rec2", ids)
+
+    def test_epg_escapes_xml_special_characters(self):
+        # An unescaped & or < in a filename produced invalid XML that Plex
+        # would reject outright.
+        import xml.etree.ElementTree as ET
+        sessions = [{"id": "r1", "output_filename": "Fish & Chips <live>.ts",
+                     "is_running": True, "started_at": 1756000000.0}]
+        xml = tuner.generate_xmltv_epg(sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        root = ET.fromstring(body)  # raises if escaping is wrong
+        self.assertEqual(root.find("channel/display-name").text,
+                         "Fish & Chips <live>")
+
+    def test_epg_includes_a_programme_per_channel(self):
+        # Plex will not display a channel with no programme in the guide.
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        root = ET.fromstring(body)
+        programmes = root.findall("programme")
+        self.assertEqual(len(programmes), 2)  # running only
+        for prog in programmes:
+            self.assertIn("start", prog.attrib)
+            self.assertIn("stop", prog.attrib)
+            self.assertIn("channel", prog.attrib)
+            self.assertTrue(prog.find("title").text)
+
+    def test_programme_times_are_xmltv_format(self):
+        import re, xml.etree.ElementTree as ET
+        sessions = [{"id": "r1", "output_filename": "g.ts", "is_running": True,
+                     "started_at": 1756000000.0}]
+        xml = tuner.generate_xmltv_epg(sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        prog = ET.fromstring(body).find("programme")
+        for attr in ("start", "stop"):
+            self.assertRegex(prog.attrib[attr], r"^\d{14} \+0000$")
+
+    def test_epg_channel_ids_match_playlist_tvg_ids(self):
+        # Plex maps guide to channel by this id; a mismatch means no guide.
+        m3u = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        epg_ids = {c.attrib["id"] for c in ET.fromstring(body).findall("channel")}
+        for cid in epg_ids:
+            self.assertIn(f'tvg-id="{cid}"', m3u)
+
+    def test_playlist_stream_urls(self):
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999")
+        self.assertIn("http://host:8999/api/recordings/rec1/stream", out)
+
+    def test_playlist_strips_trailing_slash(self):
+        out = tuner.generate_m3u_playlist(self.sessions, "http://host:8999/")
+        self.assertIn("http://host:8999/api/recordings/rec1/stream", out)
+        self.assertNotIn("8999//api", out)
+
+    def test_empty_playlist_still_valid(self):
+        self.assertEqual(tuner.generate_m3u_playlist([], "http://host:8999"), "#EXTM3U")
+
+    def test_epg_is_wellformed_xml(self):
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        # Strip the DOCTYPE, which ElementTree will not parse.
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        root = ET.fromstring(body)
+        self.assertEqual(root.tag, "tv")
+        self.assertEqual(len(root.findall("channel")), 2)  # running only
+
+    def test_channel_numbers_are_stable_across_calls(self):
+        # Plex remembers a channel by its number; renumbering live channels on
+        # a rescan shuffles the guide underneath it.
+        first = tuner.assign_channel_numbers(self.sessions)
+        second = tuner.assign_channel_numbers(self.sessions)
+        self.assertEqual(first, second)
+
+    def test_channel_numbers_cover_running_sessions_only(self):
+        numbers = tuner.assign_channel_numbers(self.sessions)
+        self.assertEqual(set(numbers), {"rec1", "rec3"})
+
+    def test_channel_numbers_are_released_when_a_session_stops(self):
+        # Otherwise the registry grows for the life of the process.
+        tuner.assign_channel_numbers(self.sessions)
+        numbers = tuner.assign_channel_numbers(
+            [{"id": "rec9", "output_filename": "g.ts", "is_running": True}]
+        )
+        self.assertEqual(numbers, {"rec9": tuner.FIRST_CHANNEL_NUMBER})
+
+    def test_lineup_guide_numbers_appear_in_the_epg(self):
+        # This is how Plex maps XMLTV guide data onto a HDHomeRun lineup.
+        import xml.etree.ElementTree as ET
+        lineup = tuner.generate_lineup(self.sessions, "http://host:8999")
+        xml = tuner.generate_xmltv_epg(self.sessions)
+        body = "\n".join(l for l in xml.splitlines()
+                         if not l.startswith("<!DOCTYPE"))
+        names = {n.text for n in ET.fromstring(body).iter("display-name")}
+        for entry in lineup:
+            self.assertIn(entry["GuideNumber"], names)
+
+    def test_lineup_excludes_stopped_sessions(self):
+        names = {e["GuideName"] for e in
+                 tuner.generate_lineup(self.sessions, "http://host:8999")}
+        self.assertEqual(names, {"game1", "game3"})
+
+    def test_discover_lineup_url_matches_the_base(self):
+        d = tuner.generate_discover("http://host:8999/live/")
+        self.assertEqual(d["LineupURL"], "http://host:8999/live/lineup.json")
+        self.assertEqual(d["BaseURL"], "http://host:8999/live")
+
+    def test_device_id_override(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_DEVICE_ID": "abc123"}):
+            self.assertEqual(tuner.device_id(), "00ABC123")
+
+    def test_tuner_count_falls_back_on_junk(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_TUNER_COUNT": "lots"}):
+            self.assertEqual(tuner.tuner_count(), 4)
+
+    def test_epg_empty_is_wellformed(self):
+        import xml.etree.ElementTree as ET
+        xml = tuner.generate_xmltv_epg([])
+        body = "\n".join(l for l in xml.splitlines() if not l.startswith("<!DOCTYPE"))
+        self.assertEqual(ET.fromstring(body).tag, "tv")
+
+
+# --------------------------------------------------------------------------
+# check_deps
+# --------------------------------------------------------------------------
+class TestCheckDeps(unittest.TestCase):
+    def test_finds_binary_on_path(self):
+        self.assertTrue(check_deps.find_executable("sh"))
+
+    def test_missing_returns_empty_string(self):
+        self.assertEqual(
+            check_deps.find_executable("pvarr-definitely-not-a-real-binary-xyz"), ""
+        )
+
+    def test_alt_names_are_tried(self):
+        self.assertTrue(check_deps.find_executable("pvarr-nope-xyz", ["sh"]))
+
+    def test_check_dependencies_shape(self):
+        res = check_deps.check_dependencies(verbose=False)
+        self.assertIn("status", res)
+        self.assertIn("dependencies", res)
+        for tool in ("ffmpeg", "ffprobe", "hls-proxy", "detect-headers"):
+            self.assertIn(tool, res["dependencies"])
+
+    def test_optional_tools_do_not_affect_status(self):
+        # status must reflect only ffmpeg/ffprobe; hls-proxy is optional.
+        res = check_deps.check_dependencies(verbose=False)
+        expected = bool(res["dependencies"]["ffmpeg"]) and bool(res["dependencies"]["ffprobe"])
+        self.assertEqual(res["status"], expected)
+
+
+# --------------------------------------------------------------------------
+# recorder.CandidateStream
+# --------------------------------------------------------------------------
+class TestCandidateStream(unittest.TestCase):
+    def test_url_is_stripped(self):
+        self.assertEqual(CandidateStream("  http://x/s.m3u8  ").url, "http://x/s.m3u8")
+
+    def test_defaults(self):
+        c = CandidateStream("http://x/s.m3u8")
+        self.assertFalse(c.detected)
+        self.assertFalse(c.used_proxy)
+        self.assertEqual(c.fail_count, 0)
+        self.assertTrue(c.user_agent)
+
+    def test_to_dict_keys(self):
+        d = CandidateStream("http://x/s.m3u8", name="Primary").to_dict()
+        for key in ("url", "name", "m3u8_url", "referer", "user_agent",
+                    "detected", "used_proxy", "fail_count", "last_error"):
+            self.assertIn(key, d)
+        self.assertEqual(d["name"], "Primary")
+
+
+# --------------------------------------------------------------------------
+# recorder.StreamFailoverRecorder  (construction / command building only —
+# no subprocesses are spawned by these tests)
+# --------------------------------------------------------------------------
+class TestRecorderConstruction(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.out = str(Path(self.tmp) / "out.ts")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rec(self, candidates):
+        return StreamFailoverRecorder("test-id", candidates, self.out)
+
+    def test_three_stage_failover_candidates(self):
+        rec = self._rec(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"])
+        self.assertEqual(len(rec.candidates), 3)
+        self.assertEqual(rec.candidates[0].name, "Candidate 1")
+        self.assertEqual(rec.candidates[2].name, "Candidate 3")
+
+    def test_blank_candidates_are_dropped(self):
+        # The dashboard submits two backup fields whether or not they are
+        # filled in, so empty strings must not become real candidates.
+        rec = self._rec(["http://a/1.m3u8", "", "   ", None])
+        self.assertEqual(len(rec.candidates), 1)
+
+    def test_initial_state(self):
+        rec = self._rec(["http://a/1.m3u8"])
+        self.assertFalse(rec.is_running)
+        self.assertEqual(rec.status, "initialized")
+        self.assertEqual(rec.current_candidate_index, 0)
+        self.assertIsNone(rec.start_time)
+
+    def test_output_dir_not_created_until_start(self):
+        nested = str(Path(self.tmp) / "sub" / "out.ts")
+        StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], nested)
+        self.assertFalse((Path(self.tmp) / "sub").exists())
+
+    def test_status_summary_shape(self):
+        rec = self._rec(["http://a/1.m3u8", "http://b/2.m3u8"])
+        s = rec.get_status_summary()
+        for key in ("id", "status", "is_running", "output_file", "output_filename",
+                    "filesize_mb", "bytes_written", "elapsed_seconds",
+                    "current_candidate", "total_candidates", "candidates", "logs"):
+            self.assertIn(key, s)
+        self.assertEqual(s["total_candidates"], 2)
+        self.assertEqual(s["current_candidate"], 1)  # 1-indexed for display
+
+    def test_elapsed_is_zero_before_start(self):
+        self.assertEqual(self._rec(["http://a/1.m3u8"]).get_elapsed_seconds(), 0.0)
+
+    def test_filesize_follows_the_post_processed_file(self):
+        # After remux the .ts is deleted; reading the old path reported 0 MB
+        # next to a perfectly good .mp4.
+        rec = self._rec(["http://a/1.m3u8"])
+        ts = Path(self.out)
+        ts.write_bytes(b"x" * 2048)
+        mp4 = ts.with_suffix(".mp4")
+        mp4.write_bytes(b"x" * (2 * 1024 * 1024))
+        ts.unlink()
+
+        self.assertEqual(rec.get_filesize_mb(), 0.0)  # .ts is gone
+        rec.final_filepath = mp4
+        self.assertAlmostEqual(rec.get_filesize_mb(), 2.0, places=1)
+
+    def test_status_summary_reports_the_post_processed_file(self):
+        rec = self._rec(["http://a/1.m3u8"])
+        mp4 = Path(self.out).with_suffix(".mp4")
+        mp4.write_bytes(b"x")
+        rec.final_filepath = mp4
+        summary = rec.get_status_summary()
+        self.assertTrue(summary["output_filename"].endswith(".mp4"))
+        self.assertEqual(summary["output_file"], str(mp4))
+
+    def test_filesize_zero_when_absent(self):
+        self.assertEqual(self._rec(["http://a/1.m3u8"]).get_filesize_mb(), 0.0)
+
+    def test_log_history_is_capped(self):
+        rec = self._rec(["http://a/1.m3u8"])
+        for i in range(600):
+            rec._log(f"line {i}")
+        self.assertLessEqual(len(rec.log_history), 500)
+        self.assertIn("line 599", rec.log_history[-1])
+
+    def test_status_summary_truncates_logs(self):
+        rec = self._rec(["http://a/1.m3u8"])
+        for i in range(100):
+            rec._log(f"line {i}")
+        self.assertLessEqual(len(rec.get_status_summary()["logs"]), 30)
+
+
+class TestDetectHeadersInvocation(unittest.TestCase):
+    """The detector may be a .py or a .sh; each needs the right interpreter."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        # auto_probe off: this case is specifically the external-script
+        # fallback, and leaving the probe on would put a real network call in
+        # front of every assertion.
+        self.rec = StreamFailoverRecorder(
+            "test-id", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"),
+            auto_probe=False,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _captured_cmd(self, detector_name):
+        from unittest.mock import patch, MagicMock
+        detector = Path(self.tmp) / detector_name
+        detector.write_text("#!/bin/sh\necho {}\n")
+        detector.chmod(0o755)
+        self.rec.detect_headers_path = str(detector)
+        result = MagicMock(returncode=0, stdout="{}")
+        with patch("app.recorder.subprocess.run", return_value=result) as run:
+            self.rec.detect_candidate_headers(self.rec.candidates[0])
+        return run.call_args[0][0]
+
+    def test_python_detector_runs_under_interpreter(self):
+        cmd = self._captured_cmd("detect-headers-py.py")
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertTrue(cmd[1].endswith(".py"))
+
+    def test_shell_detector_runs_directly(self):
+        # Upstream ships only detect-headers.sh; running it under python3
+        # made every detection fail silently.
+        cmd = self._captured_cmd("detect-headers.sh")
+        self.assertNotEqual(cmd[0], sys.executable)
+        self.assertTrue(cmd[0].endswith(".sh"))
+
+    def test_json_flag_always_passed(self):
+        for name in ("detect-headers-py.py", "detect-headers.sh"):
+            with self.subTest(detector=name):
+                self.assertIn("--json", self._captured_cmd(name))
+
+
+class TestFFmpegCommand(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        # auto_probe off: this case is specifically the external-script
+        # fallback, and leaving the probe on would put a real network call in
+        # front of every assertion.
+        self.rec = StreamFailoverRecorder(
+            "test-id", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"),
+            auto_probe=False,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_remux_not_transcode(self):
+        # "-c copy" is the whole point: PVArr must never re-encode.
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertIn("-c", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+
+    def test_input_url_follows_dash_i(self):
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertEqual(cmd[cmd.index("-i") + 1], "http://a/1.m3u8")
+
+    def test_reconnect_flags_present(self):
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        for flag in ("-reconnect", "-reconnect_streamed", "-reconnect_delay_max"):
+            self.assertIn(flag, cmd)
+
+    def test_headers_omitted_when_not_supplied(self):
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertNotIn("-headers", cmd)
+
+    def test_referer_and_user_agent_injected(self):
+        cmd = self.rec._build_ffmpeg_cmd(
+            "http://a/1.m3u8", referer="http://site/", user_agent="UA/1.0"
+        )
+        self.assertIn("-headers", cmd)
+        headers = cmd[cmd.index("-headers") + 1]
+        self.assertIn("Referer: http://site/", headers)
+        self.assertIn("User-Agent: UA/1.0", headers)
+        self.assertTrue(headers.endswith("\r\n"))
+
+    def test_referer_only(self):
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8", referer="http://site/")
+        headers = cmd[cmd.index("-headers") + 1]
+        self.assertIn("Referer:", headers)
+        self.assertNotIn("User-Agent:", headers)
+
+    def test_origin_sent_with_the_referer_the_probe_verified(self):
+        # The probe proves a stream with Referer *and* Origin; FFmpeg must send
+        # the same pair or it asks for segments with less than was verified.
+        cmd = self.rec._build_ffmpeg_cmd(
+            "http://a/1.m3u8", referer="https://player.example/p.php?x=1")
+        headers = cmd[cmd.index("-headers") + 1]
+        self.assertIn("Origin: https://player.example\r\n", headers)
+
+    def test_command_is_argv_list_not_shell_string(self):
+        # Guards against reintroducing shell interpolation of scraped URLs.
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8?token=a&b=c")
+        self.assertIsInstance(cmd, list)
+        self.assertTrue(all(isinstance(part, str) for part in cmd))
+        self.assertIn("http://a/1.m3u8?token=a&b=c", cmd)
+
+
+# --------------------------------------------------------------------------
+# post_processor
+# --------------------------------------------------------------------------
+class TestPostProcessor(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_source_fails_cleanly(self):
+        res = remux_recording(str(Path(self.tmp) / "ghost.ts"))
+        self.assertEqual(res["status"], "failed")
+        self.assertIn("error", res)
+
+    def test_empty_source_fails_cleanly(self):
+        empty = Path(self.tmp) / "empty.ts"
+        empty.touch()
+        res = remux_recording(str(empty))
+        self.assertEqual(res["status"], "failed")
+        # An empty file must never be deleted as if it had been converted.
+        self.assertTrue(empty.exists())
+
+    def test_garbage_source_does_not_delete_original(self):
+        junk = Path(self.tmp) / "junk.ts"
+        junk.write_bytes(b"not a transport stream")
+        res = remux_recording(str(junk), delete_source=True)
+        self.assertEqual(res["status"], "failed")
+        self.assertTrue(junk.exists(), "source deleted despite failed remux")
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_real_remux_roundtrip(self):
+        import subprocess
+        src = Path(self.tmp) / "sample.ts"
+        # 1 second of black video + silence, encoded to MPEG-TS.
+        subprocess.run(
+            [check_deps.find_executable("ffmpeg"), "-y", "-v", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1",
+             "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+             "-t", "1", "-c:v", "libx264", "-c:a", "aac",
+             "-f", "mpegts", str(src)],
+            check=True, capture_output=True, timeout=60,
+        )
+        self.assertTrue(src.exists() and src.stat().st_size > 0)
+
+        res = remux_recording(str(src), target_format="mkv", delete_source=False)
+        self.assertEqual(res["status"], "success", res.get("error"))
+        self.assertTrue(Path(res["output_filepath"]).exists())
+        self.assertTrue(res["output_filename"].endswith(".mkv"))
+        self.assertTrue(src.exists(), "delete_source=False must keep the source")
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_delete_source_removes_original_on_success(self):
+        import subprocess
+        src = Path(self.tmp) / "sample2.ts"
+        subprocess.run(
+            [check_deps.find_executable("ffmpeg"), "-y", "-v", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=320x240:d=1",
+             "-t", "1", "-c:v", "libx264",
+             "-f", "mpegts", str(src)],
+            check=True, capture_output=True, timeout=60,
+        )
+        res = remux_recording(str(src), target_format="mkv", delete_source=True)
+        self.assertEqual(res["status"], "success", res.get("error"))
+        self.assertFalse(src.exists())
+
+
+class TestResolutionRetag(unittest.TestCase):
+    """The finished file is named for what was recorded, not the form's guess.
+
+    The 2026-09-13 Packers recording was named `_1080p` and was 1280x720
+    throughout: the tag came from the Add Recording dropdown and nothing ever
+    checked it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-retag-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ts(self, name, size="320x240"):
+        import subprocess
+        src = Path(self.tmp) / name
+        subprocess.run(
+            [check_deps.find_executable("ffmpeg"), "-y", "-v", "error",
+             "-f", "lavfi", "-i", f"color=c=black:s={size}:d=1",
+             "-t", "1", "-c:v", "libx264", "-f", "mpegts", str(src)],
+            check=True, capture_output=True, timeout=60,
+        )
+        return src
+
+    def test_retag_replaces_the_trailing_tag(self):
+        p = Path("/r/2026-01-15_NFL_Chiefs_vs_Bills_1080p.mp4")
+        self.assertEqual(retag_resolution(p, "720p").name,
+                         "2026-01-15_NFL_Chiefs_vs_Bills_720p.mp4")
+
+    def test_retag_drops_the_old_collision_counter(self):
+        # The counter belonged to the old name; the new name is reserved afresh.
+        p = Path("/r/2026-09-13_NFL_A_vs_B_1080p_2.mp4")
+        self.assertEqual(retag_resolution(p, "720p").name, "2026-09-13_NFL_A_vs_B_720p.mp4")
+
+    def test_retag_leaves_a_correct_tag_alone(self):
+        for name in ("X_A_vs_B_720p.mp4", "X_A_vs_B_720p_1.mp4", "X_A_vs_B_4k.mp4"):
+            p = Path("/r") / name
+            tag = "4K" if "4k" in name else "720p"
+            self.assertEqual(retag_resolution(p, tag), p, name)
+
+    def test_retag_leaves_an_untagged_name_alone(self):
+        # An operator-renamed file has no tag to correct.
+        for name in ("highlights.mp4", "1080p.mp4", "final_cut.mp4"):
+            p = Path("/r") / name
+            self.assertEqual(retag_resolution(p, "720p"), p, name)
+
+    def test_retag_only_touches_the_end_of_the_name(self):
+        p = Path("/r/2026-01-01_Misc_Team_720p_vs_B_1080p.mp4")
+        self.assertEqual(retag_resolution(p, "480p").name,
+                         "2026-01-01_Misc_Team_720p_vs_B_480p.mp4")
+
+    def test_probe_answers_none_rather_than_guessing(self):
+        # It used to answer "1080p" on any failure -- the very guess it exists
+        # to replace.
+        junk = Path(self.tmp) / "junk.ts"
+        junk.write_bytes(b"not a transport stream")
+        empty = Path(self.tmp) / "empty.ts"
+        empty.touch()
+        self.assertIsNone(probe_video_resolution(str(junk)))
+        self.assertIsNone(probe_video_resolution(str(empty)))
+        self.assertIsNone(probe_video_resolution(str(Path(self.tmp) / "ghost.ts")))
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_probe_measures_real_video(self):
+        self.assertEqual(probe_video_resolution(str(self._ts("a.ts", "1280x720"))), "720p")
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_remux_names_the_file_for_what_was_recorded(self):
+        src = self._ts("2026-09-13_NFL_A_vs_B_1080p.ts", "1280x720")
+        res = remux_recording(str(src), target_format="mp4", delete_source=True)
+        self.assertEqual(res["status"], "success", res.get("error"))
+        self.assertEqual(res["output_filename"], "2026-09-13_NFL_A_vs_B_720p.mp4")
+        self.assertTrue(Path(res["output_filepath"]).stat().st_size > 0)
+        self.assertFalse(src.exists())
+        self.assertFalse((Path(self.tmp) / "2026-09-13_NFL_A_vs_B_1080p.mp4").exists())
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_remux_does_not_overwrite_a_recording_under_the_new_name(self):
+        # The corrected name was never reserved; a finished recording may
+        # already hold it, and the remux runs `ffmpeg -y`.
+        existing = Path(self.tmp) / "2026-09-13_NFL_A_vs_B_720p.mp4"
+        existing.write_bytes(b"earlier recording")
+        src = self._ts("2026-09-13_NFL_A_vs_B_1080p.ts", "1280x720")
+        res = remux_recording(str(src), target_format="mp4", delete_source=True)
+        self.assertEqual(res["status"], "success", res.get("error"))
+        self.assertEqual(res["output_filename"], "2026-09-13_NFL_A_vs_B_720p_1.mp4")
+        self.assertEqual(existing.read_bytes(), b"earlier recording")
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_correct_tag_keeps_its_name(self):
+        src = self._ts("2026-09-13_NFL_A_vs_B_240p.ts", "320x240")
+        res = remux_recording(str(src), target_format="mp4", delete_source=True)
+        self.assertEqual(res["output_filename"], "2026-09-13_NFL_A_vs_B_240p.mp4")
+
+    def test_failed_remux_releases_the_new_name(self):
+        from unittest.mock import patch
+        junk = Path(self.tmp) / "2026-09-13_NFL_A_vs_B_1080p.ts"
+        junk.write_bytes(b"not a transport stream")
+        with patch("app.post_processor.probe_video_resolution", return_value="720p"):
+            res = remux_recording(str(junk), delete_source=True)
+        self.assertEqual(res["status"], "failed")
+        self.assertTrue(junk.exists())
+        self.assertFalse((Path(self.tmp) / "2026-09-13_NFL_A_vs_B_720p.mp4").exists(),
+                         "placeholder left holding the corrected name")
+
+
+# --------------------------------------------------------------------------
+# recorder disk guard
+#
+# Free space is stubbed throughout: a test that reads the real filesystem
+# passes or fails according to how full the developer's disk is, which is not
+# a property of the code under test.
+# --------------------------------------------------------------------------
+class TestDiskGuard(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-disk-")
+        self.out = str(Path(self.tmp) / "out.ts")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, free_gb, min_free_gb=5.0):
+        rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out,
+                                     min_free_gb=min_free_gb)
+        rec.free_bytes = lambda: None if free_gb is None else int(free_gb * 1024 ** 3)
+        return rec
+
+    def test_ample_space_is_fine(self):
+        rec = self.make(free_gb=100)
+        self.assertTrue(rec._disk_space_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_below_the_floor_aborts(self):
+        rec = self.make(free_gb=1)
+        self.assertFalse(rec._disk_space_ok())
+        self.assertTrue(rec._stop_event.is_set())
+        self.assertEqual(rec.status, "aborted_no_space")
+
+    def test_exactly_at_the_floor_is_allowed(self):
+        rec = self.make(free_gb=5.0, min_free_gb=5.0)
+        self.assertTrue(rec._disk_space_ok())
+
+    def test_zero_floor_disables_the_guard(self):
+        rec = self.make(free_gb=0.001, min_free_gb=0)
+        self.assertTrue(rec._disk_space_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_unreadable_volume_does_not_kill_a_recording(self):
+        # If free space cannot be determined, that is not a reason to throw
+        # away a capture in progress.
+        rec = self.make(free_gb=None)
+        self.assertTrue(rec._disk_space_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_check_is_rate_limited(self):
+        calls = []
+        rec = self.make(free_gb=100)
+        rec.free_bytes = lambda: calls.append(1) or 100 * 1024 ** 3
+        for _ in range(50):
+            rec._disk_space_ok()
+        self.assertEqual(len(calls), 1,
+                         "statvfs called per write instead of on an interval")
+
+    def test_abort_status_survives_the_completion_block(self):
+        # "aborted_no_space" must not be overwritten with "completed", which
+        # would hide why the recording is short.
+        rec = self.make(free_gb=1)
+        rec._disk_space_ok()                     # sets the status and stop_event
+        # stop_event is set, so the loop falls straight through to the
+        # completion block -- which is the code that must not clobber it.
+        rec._recording_loop()
+        self.assertEqual(rec.status, "aborted_no_space")
+        self.assertFalse(rec.is_running)
+
+    def test_status_summary_reports_headroom(self):
+        rec = self.make(free_gb=42, min_free_gb=5)
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["free_disk_gb"], 42.0)
+        self.assertEqual(summary["min_free_disk_gb"], 5.0)
+
+
+# --------------------------------------------------------------------------
+# recorder._recording_loop  —  failover state machine
+#
+# These drive the real loop with the subprocess boundary replaced by a script.
+# The fake mirrors one piece of real logic deliberately: the check of
+# _force_failover_flag on entry, because that check is loop-control, not
+# subprocess behaviour, and a bug living there must stay reachable.
+# --------------------------------------------------------------------------
+class FailoverLoopTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.out = str(Path(self.tmp) / "out.ts")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, urls, outcomes, **kwargs):
+        """Build a recorder whose stream attempts follow a scripted list.
+
+        Each entry is consumed by one _stream_ffmpeg_process call. Note that a
+        single candidate can consume two entries: direct mode, then the proxy
+        fallback. Entries may be callables taking (recorder, candidate).
+        """
+        # Disable the disk guard unless a test is specifically about it.
+        # Left live, these tests pass or fail according to how full the
+        # developer's disk happens to be, which is not a property of the code.
+        kwargs.setdefault("min_free_gb", 0)
+        rec = StreamFailoverRecorder("test-id", urls, self.out, **kwargs)
+        # Cycling means an unscripted run keeps going; the default budget of 3
+        # laps is what makes these tests terminate.
+        script = list(outcomes)
+        rec.attempts = []
+        rec.proxy_starts = []
+
+        def fake_stream(cmd, candidate):
+            rec.attempts.append(candidate.name)
+            if rec._force_failover_flag:
+                return StreamOutcome.INTERRUPTED  # mirrors the real check
+            outcome = script.pop(0) if script else StreamOutcome.FAILED
+            if callable(outcome):
+                outcome = outcome(rec, candidate)
+            # True/False remain shorthand for the two unambiguous outcomes.
+            if outcome is True:
+                return StreamOutcome.COMPLETED
+            if outcome is False:
+                return StreamOutcome.FAILED
+            return outcome
+
+        def fake_detect(candidate):
+            candidate.m3u8_url = candidate.url
+            candidate.detected = True
+            return True
+
+        def fake_start_proxy(candidate):
+            rec.proxy_starts.append(candidate.name)
+            return "http://127.0.0.1:8090/channel/x"
+
+        rec._stream_ffmpeg_process = fake_stream
+        rec.detect_candidate_headers = fake_detect
+        rec.start_proxy = fake_start_proxy
+        rec.stop_proxy = lambda: None
+        return rec
+
+    def run_loop(self, rec):
+        # Zero the inter-failover delay so tests stay fast. This stubs the
+        # delay itself rather than time.sleep: the loop waits on _stop_event
+        # so that a shutdown interrupts the backoff, and patching sleep would
+        # no longer make these tests fast -- it would silently make them take
+        # the real backoff, up to 60s each.
+        rec._failover_delay = lambda wrapped: 0.0
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+
+
+class TestRebroadcastRecorder(unittest.TestCase):
+    """A channel captures like a recording but keeps nothing."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-rb-"))
+        self.ring = ringbuffer.RingBuffer(
+            self.tmp / "chan.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+
+    def tearDown(self):
+        self.ring.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, ring=None):
+        return StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(self.tmp / "unused.ts"),
+            ring=ring, channel_name="Bears vs Packers")
+
+    def test_a_recording_is_not_a_rebroadcast(self):
+        self.assertFalse(self.make().is_rebroadcast)
+
+    def test_a_ring_makes_it_a_rebroadcast(self):
+        self.assertTrue(self.make(self.ring).is_rebroadcast)
+
+    def test_bytes_go_to_the_ring_and_no_file_is_created(self):
+        rec = self.make(self.ring)
+        with rec._open_sink() as sink:
+            sink.write(b"payload")
+            sink.flush()
+        self.assertEqual(self.ring.read(0)[0], b"payload")
+        self.assertFalse((self.tmp / "unused.ts").exists())
+
+    def test_a_recording_still_writes_its_file(self):
+        rec = self.make()
+        with rec._open_sink() as sink:
+            sink.write(b"payload")
+        self.assertEqual((self.tmp / "unused.ts").read_bytes(), b"payload")
+
+    def test_filesize_is_zero_because_nothing_is_kept(self):
+        # The ring's backing file is a fixed size no matter how much has
+        # flowed through it; reporting it would show a constant "recording"
+        # that never grows.
+        rec = self.make(self.ring)
+        self.ring.write(b"x" * 5000)
+        self.assertEqual(rec.get_filesize_mb(), 0.0)
+
+    def test_status_says_it_is_a_rebroadcast_and_names_the_channel(self):
+        summary = self.make(self.ring).get_status_summary()
+        self.assertTrue(summary["is_rebroadcast"])
+        self.assertEqual(summary["channel_name"], "Bears vs Packers")
+        self.assertEqual(summary["output_filename"], "")
+
+    def test_guide_uses_the_channel_name_when_there_is_no_file(self):
+        summary = self.make(self.ring).get_status_summary()
+        summary["is_running"] = True
+        self.assertIn("Bears vs Packers", tuner.generate_m3u_playlist(
+            [summary], "http://h:8999"))
+
+    def test_guide_does_not_claim_to_be_recording(self):
+        # Saying "Recording to ..." on a channel that keeps nothing would be a
+        # promise PVArr is not making.
+        summary = self.make(self.ring).get_status_summary()
+        summary["is_running"] = True
+        xml = tuner.generate_xmltv_epg([summary])
+        self.assertIn("not being recorded", xml)
+        self.assertNotIn("Recording to", xml)
+
+
+class TestRebroadcastResumePolicy(unittest.TestCase):
+    """A channel is meant to be permanent; a recording is an event."""
+
+    def record(self, **over):
+        r = sessions.build_record(
+            recording_id="chan1", candidates=["http://a/1.m3u8"],
+            output_filepath="/nonexistent/chan1.buf", started_at=1000.0,
+            rebroadcast=True, channel_name="News")
+        r.update(over)
+        return r
+
+    def test_channel_resumes_even_though_its_buffer_is_gone(self):
+        # The buffer is deleted at shutdown by design, so the file check that
+        # governs recordings would discard every channel on every restart.
+        self.assertEqual(sessions.resume_decision(self.record()), "resume")
+
+    def test_channel_is_not_subject_to_the_attempt_limit(self):
+        # A channel whose upstream is genuinely dead ends itself via
+        # max_cycles, so there is no restart loop to guard against.
+        r = self.record(resume_attempts=99)
+        self.assertEqual(sessions.resume_decision(r), "resume")
+
+    def test_a_recording_with_no_file_is_still_discarded(self):
+        r = self.record(rebroadcast=False)
+        self.assertEqual(sessions.resume_decision(r), "discard")
+
+    def test_the_channel_name_is_persisted(self):
+        self.assertEqual(self.record()["channel_name"], "News")
+        self.assertTrue(self.record()["rebroadcast"])
+
+
+class TestRingBuffer(unittest.TestCase):
+    """The bounded buffer rebroadcast fans out from.
+
+    Correctness here is load-bearing: everything a viewer sees comes through
+    it, and a subtle wrap bug shows up as corrupted video rather than an error.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-ring-"))
+        self.path = self.tmp / "chan.buf"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def ring(self, capacity=None):
+        return ringbuffer.RingBuffer(self.path, capacity=capacity)
+
+    # -- shape ---------------------------------------------------------
+
+    def test_capacity_is_whole_packets(self):
+        r = self.ring(capacity=1000)
+        self.assertEqual(r.capacity % ringbuffer.TS_PACKET_SIZE, 0)
+        self.assertLessEqual(r.capacity, 1000)
+
+    def test_file_is_created_at_full_size(self):
+        # Readers pread anywhere; a short file would return b"" and look like
+        # a stalled stream rather than an empty ring.
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 10)
+        self.assertEqual(self.path.stat().st_size, r.capacity)
+
+    def test_file_never_grows(self):
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        for _ in range(50):
+            r.write(b"x" * cap)
+        self.assertEqual(self.path.stat().st_size, cap)
+
+    # -- reading -------------------------------------------------------
+
+    def test_roundtrip(self):
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        r.write(b"hello world")
+        data, offset = r.read(0)
+        self.assertEqual(data, b"hello world")
+        self.assertEqual(offset, 11)
+
+    def test_reader_that_is_current_gets_nothing_not_an_error(self):
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        r.write(b"abc")
+        _, offset = r.read(0)
+        self.assertEqual(r.read(offset), (b"", offset))
+
+    def test_a_keeping_up_reader_sees_every_byte_across_many_wraps(self):
+        # The real property: whatever went in comes out, in order, unchanged.
+        import random
+        rng = random.Random(1234)
+        cap = ringbuffer.TS_PACKET_SIZE * 50
+        r = self.ring(capacity=cap)
+        written = bytearray()
+        read = bytearray()
+        offset = 0
+        for _ in range(400):
+            chunk = bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 600)))
+            r.write(chunk)
+            written += chunk
+            while True:
+                data, offset = r.read(offset, max_bytes=4096)
+                if not data:
+                    break
+                read += data
+        self.assertEqual(bytes(read), bytes(written))
+
+    def test_writes_larger_than_the_ring_keep_the_tail(self):
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        payload = bytes(range(256)) * 100
+        r.write(payload)
+        data, _ = r.read(r.oldest_offset())
+        self.assertEqual(data, payload[-cap:])
+
+    # -- lapping -------------------------------------------------------
+
+    def test_a_lapped_reader_is_skipped_forward_not_fed_garbage(self):
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        r.write(b"A" * cap)          # reader is at 0 and still current
+        r.write(b"B" * cap * 3)      # now long gone
+        data, offset = r.read(0)
+        self.assertGreaterEqual(offset, r.oldest_offset())
+        self.assertNotIn(b"A", data)
+
+    def test_resync_lands_on_a_packet_boundary(self):
+        # Off-boundary on purpose: 7 is not a multiple of 188.
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        r.write(b"x" * (cap * 4 + 7))
+        _, offset = r.read(0)
+        self.assertEqual(offset % ringbuffer.TS_PACKET_SIZE, 0)
+
+    def test_alignment_survives_wrapping(self):
+        # offset % 188 is preserved across wraps only because capacity is a
+        # whole number of packets. This is the invariant the whole design
+        # rests on, so assert it directly.
+        cap = ringbuffer.TS_PACKET_SIZE * 7
+        r = self.ring(capacity=cap)
+        for _ in range(200):
+            r.write(b"y" * ringbuffer.TS_PACKET_SIZE)
+        self.assertEqual(r.live_offset() % ringbuffer.TS_PACKET_SIZE, 0)
+        self.assertEqual(r.oldest_offset() % ringbuffer.TS_PACKET_SIZE, 0)
+
+    def test_live_offset_joins_at_the_edge_not_the_history(self):
+        # Plex is tuning a live channel. Replaying the buffer would put every
+        # viewer a minute behind, and further behind on every reconnect.
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        r.write(b"z" * 5000)
+        self.assertGreater(r.live_offset(), 4000)
+        self.assertEqual(r.live_offset() % ringbuffer.TS_PACKET_SIZE, 0)
+        # It points at the START of the newest packet, so at most one
+        # part-arrived packet is still ahead of it -- never a backlog.
+        pending, _ = r.read(r.live_offset())
+        self.assertLess(len(pending), ringbuffer.TS_PACKET_SIZE)
+
+    # -- writer independence -------------------------------------------
+
+    def test_the_writer_never_blocks_on_a_stalled_reader(self):
+        # The capture thread must keep pace with the upstream stream no matter
+        # what a client does. This is why an unread ring overwrites instead of
+        # applying backpressure.
+        cap = ringbuffer.TS_PACKET_SIZE * 10
+        r = self.ring(capacity=cap)
+        t0 = time.time()
+        for _ in range(2000):
+            r.write(b"q" * 512)
+        self.assertLess(time.time() - t0, 5.0)
+        self.assertEqual(r.write_offset, 2000 * 512)
+
+    # -- lifecycle -----------------------------------------------------
+
+    def test_close_removes_the_file(self):
+        # A rebroadcast buffer is not a recording; leaving it would fill the
+        # volume with footage nobody asked to keep.
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 10)
+        r.write(b"data")
+        r.close()
+        self.assertFalse(self.path.exists())
+
+    def test_operations_after_close_are_inert(self):
+        r = self.ring(capacity=ringbuffer.TS_PACKET_SIZE * 10)
+        r.close()
+        self.assertEqual(r.write(b"x"), 0)
+        self.assertEqual(r.read(0), (b"", 0))
+        r.close()  # idempotent
+
+    def test_capacity_from_environment(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_BUFFER_MB": "4"}):
+            self.assertEqual(ringbuffer.default_capacity(),
+                             4 * 1024 * 1024 // 188 * 188)
+        with patch.dict(os.environ, {"PVARR_BUFFER_MB": "nonsense"}):
+            self.assertEqual(ringbuffer.default_capacity(),
+                             ringbuffer.DEFAULT_CAPACITY_BYTES)
+
+
+class TestSessionStore(unittest.TestCase):
+    """One JSON per live session, so a restart does not lose the recording."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-store-"))
+        self.store = sessions.SessionStore(self.tmp / "sessions")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def record(self, **over):
+        r = sessions.build_record(
+            recording_id="rec1",
+            candidates=["http://a/1.m3u8", "http://b/2.m3u8"],
+            output_filepath=str(self.tmp / "game.ts"),
+            started_at=1756600000.0,
+            header_overrides={"http://a/1.m3u8": {"cookie": "SESSIONID=secret"}},
+        )
+        r.update(over)
+        return r
+
+    def test_roundtrip(self):
+        self.store.save(self.record())
+        loaded = self.store.load_all()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["id"], "rec1")
+        self.assertEqual(loaded[0]["candidates"][1], "http://b/2.m3u8")
+
+    def test_cookie_survives_because_a_resume_needs_it(self):
+        # A session-gated stream cannot be reattached without its cookie.
+        self.store.save(self.record())
+        loaded = self.store.load_all()[0]
+        self.assertEqual(
+            loaded["header_overrides"]["http://a/1.m3u8"]["cookie"],
+            "SESSIONID=secret")
+
+    def test_state_files_are_not_world_readable(self):
+        # They hold stream URLs and a live session cookie.
+        self.store.save(self.record())
+        path = next((self.tmp / "sessions").glob("*.json"))
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((self.tmp / "sessions").stat().st_mode & 0o777), "0o700")
+
+    def test_no_progress_counters_are_persisted(self):
+        # They disagree with reality the moment the process dies, which is
+        # exactly when they get read. Progress comes from stat() at resume.
+        r = self.record()
+        for key in ("bytes_written", "elapsed_seconds", "filesize_mb", "status"):
+            self.assertNotIn(key, r)
+
+    def test_save_leaves_no_temp_files_behind(self):
+        self.store.save(self.record())
+        leftovers = list((self.tmp / "sessions").glob(".tmp-*"))
+        self.assertEqual(leftovers, [])
+
+    def test_remove(self):
+        self.store.save(self.record())
+        self.store.remove("rec1")
+        self.assertEqual(self.store.load_all(), [])
+
+    def test_unknown_schema_is_ignored_not_guessed_at(self):
+        self.store.save(self.record())
+        path = next((self.tmp / "sessions").glob("*.json"))
+        data = json.loads(path.read_text())
+        data["schema"] = sessions.SCHEMA_VERSION + 99
+        path.write_text(json.dumps(data))
+        self.assertEqual(self.store.load_all(), [])
+
+    def test_corrupt_file_does_not_take_out_the_others(self):
+        self.store.save(self.record())
+        self.store.save(self.record(id="rec2"))
+        (self.tmp / "sessions" / "broken.json").write_text("{not json")
+        self.assertEqual(len(self.store.load_all()), 2)
+
+    def test_unwritable_directory_disables_rather_than_raises(self):
+        # The dev box has a root-owned config/; a running recording must not
+        # die because its state file cannot be written.
+        store = sessions.SessionStore(Path("/proc/nonexistent/sessions"))
+        self.assertFalse(store.enabled)
+        self.assertFalse(store.save(self.record()))
+        self.assertEqual(store.load_all(), [])
+        self.assertFalse(store.remove("rec1"))
+
+
+class TestResumeDecision(unittest.TestCase):
+    """What to do with a session found on disk at boot."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-resume-"))
+        self.ts = self.tmp / "game.ts"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def record(self, **over):
+        r = sessions.build_record(
+            recording_id="rec1", candidates=["http://a/1.m3u8"],
+            output_filepath=str(self.ts), started_at=1000.0)
+        r.update(over)
+        return r
+
+    def write(self, size=1024, age=0.0):
+        self.ts.write_bytes(b"x" * size)
+        if age:
+            past = time.time() - age
+            os.utime(self.ts, (past, past))
+
+    def test_missing_file_is_discarded(self):
+        self.assertEqual(sessions.resume_decision(self.record()), "discard")
+
+    def test_empty_file_is_discarded(self):
+        self.write(size=0)
+        self.assertEqual(sessions.resume_decision(self.record()), "discard")
+
+    def test_recently_written_file_resumes(self):
+        self.write(age=5)
+        self.assertEqual(sessions.resume_decision(self.record()), "resume")
+
+    def test_long_dead_file_is_finalised_not_resumed(self):
+        self.write(age=3600)
+        self.assertEqual(sessions.resume_decision(self.record()), "finalise")
+
+    def test_gap_is_measured_from_the_file_not_the_last_transition(self):
+        # The trap: state is written on transitions only, so a healthy
+        # three-hour recording's last transition is at t=0. Measuring the gap
+        # from that would finalise exactly the recordings worth saving.
+        self.write(age=5)
+        old = self.record(started_at=time.time() - 10800)
+        self.assertEqual(sessions.resume_decision(old), "resume")
+
+    def test_repeated_failures_stop_the_restart_loop(self):
+        self.write(age=5)
+        r = self.record(resume_attempts=sessions.DEFAULT_MAX_RESUME_ATTEMPTS)
+        self.assertEqual(sessions.resume_decision(r), "finalise")
+
+    def test_limits_are_configurable(self):
+        self.write(age=100)
+        self.assertEqual(
+            sessions.resume_decision(self.record(), gap_limit=50), "finalise")
+        self.assertEqual(
+            sessions.resume_decision(self.record(), gap_limit=500), "resume")
+
+
+class TestSegmentLossReporting(unittest.TestCase):
+    """Losses are counted exactly but logged sparingly: a source dropping one
+    segment in three would otherwise write a line every few seconds for hours."""
+
+    def make(self):
+        return StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts", min_free_gb=0)
+
+    @staticmethod
+    def _loss_lines(rec):
+        return [l for l in rec.log_history if "segments lost" in l.lower()]
+
+    def test_first_loss_is_logged_then_at_most_once_a_minute(self):
+        from unittest.mock import patch
+        rec = self.make()
+        clock = [1000.0]
+        with patch("app.recorder.time.time", side_effect=lambda: clock[0]):
+            rec._note_segment_loss(failed=1)
+            for _ in range(20):
+                clock[0] += 2
+                rec._note_segment_loss(expired=1)
+            self.assertEqual(len(self._loss_lines(rec)), 1, self._loss_lines(rec))
+            clock[0] += 60
+            rec._note_segment_loss(failed=1)
+        lines = self._loss_lines(rec)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("21 more", lines[-1])
+        self.assertEqual(rec.segments_lost, 22)
+
+    def test_losses_held_back_are_flushed(self):
+        rec = self.make()
+        rec._note_segment_loss(failed=1)
+        rec._note_segment_loss(expired=3)
+        rec._flush_segment_loss()
+        self.assertIn("3 more", rec.log_history[-1])
+        rec._flush_segment_loss()  # nothing pending: no new line
+        self.assertEqual(len(self._loss_lines(rec)), 2)
+
+    def _account(self, rec, line):
+        import collections
+        rec._account_ffmpeg_warning(line, collections.OrderedDict())
+
+    def test_source_text_in_another_warning_cannot_inflate_the_count(self):
+        """Only the hls demuxer's own line counts. An HTTP reason phrase or a
+        playlist URI quoted in some other warning is source-controlled text."""
+        rec = self.make()
+        self._account(rec, "[http @ 0x1] [warning] HTTP error 404 skipping 999999 "
+                           "segments ahead, expired from playlists")
+        self._account(rec, "[hls @ 0x1] [warning] Opening x: skipping 999999 segments "
+                           "ahead, expired from playlists")
+        self._account(rec, "[https @ 0x2] [warning] Failed to open segment 1 of playlist 0")
+        self.assertEqual(rec.segments_lost, 0)
+        # The genuine lines, including 6.1's input-prefixed context, still count.
+        self._account(rec, "[hls @ 0x59cc51483000] [warning] Failed to open segment 8 of playlist 0")
+        self._account(rec, "[in#0/hls @ 0x5e] [warning] skipping 2 segments ahead, "
+                           "expired from playlists")
+        self.assertEqual((rec.segments_failed, rec.segments_expired), (1, 2))
+
+    def test_an_absurd_expiry_count_is_capped(self):
+        from app.recorder import _MAX_EXPIRED_PER_LINE
+        rec = self.make()
+        self._account(rec, "[hls @ 0x1] [warning] skipping 999999999999 segments "
+                           "ahead, expired from playlists")
+        self.assertEqual(rec.segments_expired, _MAX_EXPIRED_PER_LINE)
+
+    def test_nested_contexts_are_still_recognised_as_warnings(self):
+        """FFmpeg prints two context prefixes for nested components; a pattern
+        allowing only one let those warnings into the failure tail."""
+        from app.recorder import _FFMPEG_LEVEL_RE
+        m = _FFMPEG_LEVEL_RE.match("[hls @ 0x1] [https @ 0x2] [warning] Packet corrupt")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "warning")
+
+    def test_the_status_summary_reports_them(self):
+        rec = self.make()
+        rec._note_segment_loss(failed=2, expired=5)
+        s = rec.get_status_summary()
+        self.assertEqual(
+            (s["segments_lost"], s["segments_failed"], s["segments_expired"]), (7, 2, 5))
+
+
+class TestStopReason(unittest.TestCase):
+    """Operator stop and process-going-away are not the same event.
+
+    stop() used to set status='completed' unconditionally. Persisting that
+    meant a restart read 'completed' and nothing ever resumed.
+    """
+
+    def make(self):
+        rec = StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts")
+        rec._reap_ffmpeg = lambda: None
+        rec.stop_proxy = lambda: None
+        return rec
+
+    def test_operator_stop_completes(self):
+        rec = self.make()
+        rec.stop()
+        self.assertEqual(rec.status, "completed")
+        self.assertEqual(rec.stop_reason, "operator")
+
+    def test_shutdown_stop_is_interrupted_not_completed(self):
+        rec = self.make()
+        rec.stop(reason="shutdown")
+        self.assertEqual(rec.status, "interrupted")
+
+    def test_completion_block_does_not_overwrite_interrupted(self):
+        rec = self.make()
+        rec.stop(reason="shutdown")
+        rec._recording_loop()
+        self.assertEqual(rec.status, "interrupted")
+
+
+class TestLogSequence(unittest.TestCase):
+    """The live log view froze silently once a session passed 500 lines.
+
+    log_history is trimmed to its newest LOG_HISTORY_LIMIT entries, but the
+    SSE endpoint tracked a plain index into it. Once trimming began the length
+    stopped growing, "is there anything new" was never true again, and the
+    dashboard log pane sat dead for the rest of the recording with no error.
+    """
+
+    def make(self):
+        return StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts")
+
+    def test_new_lines_still_arrive_after_the_buffer_wraps(self):
+        rec = self.make()
+        for i in range(rec.LOG_HISTORY_LIMIT + 50):
+            rec._log(f"line {i}")
+        _, seq = rec.logs_since(0)
+        rec._log("after the wrap")
+        lines, _ = rec.logs_since(seq)
+        self.assertEqual([l.split("] ", 3)[-1] for l in lines], ["after the wrap"])
+
+    def test_history_is_capped(self):
+        rec = self.make()
+        for i in range(rec.LOG_HISTORY_LIMIT + 200):
+            rec._log(f"line {i}")
+        self.assertEqual(len(rec.log_history), rec.LOG_HISTORY_LIMIT)
+
+    def test_reader_further_behind_than_the_buffer_gets_what_is_left(self):
+        rec = self.make()
+        for i in range(rec.LOG_HISTORY_LIMIT * 2):
+            rec._log(f"line {i}")
+        lines, seq = rec.logs_since(0)
+        self.assertEqual(len(lines), rec.LOG_HISTORY_LIMIT)
+        self.assertEqual(seq, rec.LOG_HISTORY_LIMIT * 2)
+
+    def test_nothing_new_returns_nothing(self):
+        rec = self.make()
+        rec._log("one")
+        _, seq = rec.logs_since(0)
+        self.assertEqual(rec.logs_since(seq), ([], seq))
+
+
+class TestStreamUrlSchemes(unittest.TestCase):
+    """FFmpeg opens far more than HTTP, and PVArr streams captured bytes back."""
+
+    def test_http_and_https_are_accepted(self):
+        for url in ("http://a/1.m3u8", "https://a/1.m3u8", "  https://a/1.m3u8  "):
+            self.assertTrue(safe_stream_url(url).startswith("http"))
+
+    def test_local_file_read_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("file:///etc/passwd")
+
+    def test_concat_splicing_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("concat:/etc/passwd|/etc/shadow")
+
+    def test_raw_socket_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("tcp://169.254.169.254:80")
+
+    def test_empty_is_refused(self):
+        with self.assertRaises(ValueError):
+            safe_stream_url("   ")
+
+    def test_ffmpeg_command_pins_the_protocol_whitelist(self):
+        rec = StreamFailoverRecorder("s1", ["http://a/1.m3u8"], "/tmp/x.ts")
+        cmd = rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertIn("-protocol_whitelist", cmd)
+        allowed = cmd[cmd.index("-protocol_whitelist") + 1]
+        self.assertNotIn("file", allowed.split(","))
+
+
+class TestBackoffIsInterruptible(FailoverLoopTestCase):
+    """A stop must not have to wait out the failover backoff.
+
+    The backoff climbs to 60s after a fruitless lap. It used to be a plain
+    time.sleep, so a container stop landing in one blew through the 20s
+    shutdown budget and the 30s stop_grace_period, and Docker SIGKILLed the
+    app mid-shutdown -- losing the remux the shutdown fix exists to protect.
+    """
+
+    def test_stop_during_backoff_returns_promptly(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [False, False])
+        rec._failover_delay = lambda wrapped: 30.0
+        rec._stop_event.set()
+        t0 = time.time()
+        rec._recording_loop()
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 5.0,
+                        f"stop waited out the backoff ({elapsed:.1f}s)")
+
+
+class TestFailoverHappyPath(FailoverLoopTestCase):
+    def test_first_candidate_succeeds_no_failover(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [True])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts, ["Candidate 1"])
+        self.assertEqual(rec.current_candidate_index, 0)
+        self.assertEqual(rec.status, "completed")
+
+    def test_completion_callback_fires_on_success(self):
+        seen = []
+        rec = self.make(["http://a/1.m3u8"], [True],
+                        on_completion_callback=seen.append)
+        self.run_loop(rec)
+        self.assertEqual(seen, [str(Path(self.out).resolve())])
+
+    def test_is_running_cleared_when_loop_exits(self):
+        rec = self.make(["http://a/1.m3u8"], [True])
+        rec.is_running = True
+        self.run_loop(rec)
+        self.assertFalse(rec.is_running)
+        self.assertIsNotNone(rec.stop_time)
+
+
+class TestFailoverAdvance(FailoverLoopTestCase):
+    def test_proxy_fallback_tried_before_advancing(self):
+        # Candidate 1 fails direct -> proxy fallback on the SAME candidate,
+        # and only then do we move on. This is the documented "direct-first
+        # with proxy fallback" design.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [False, False, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts,
+                         ["Candidate 1", "Candidate 1", "Candidate 2"])
+        self.assertEqual(rec.proxy_starts, ["Candidate 1"])
+        self.assertEqual(rec.current_candidate_index, 1)
+        self.assertEqual(rec.status, "completed")
+
+    def test_failover_callback_names_next_candidate(self):
+        seen = []
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [False, False, True],
+                        on_failover_callback=lambda rid, name: seen.append((rid, name)))
+        self.run_loop(rec)
+        self.assertEqual(seen, [("test-id", "Candidate 2")])
+
+    def test_exhaustion_takes_max_cycles_laps_not_one_pass(self):
+        # The list cycles now, so one bad pass is no longer the end: a token
+        # blip that touches all three sources must not kill a recording that
+        # still has hours to run. Giving up takes max_cycles fruitless laps.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        [], max_cycles=3)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "failed")
+        self.assertEqual(rec.cycles_without_data, 3)
+        # Three laps x three candidates x (direct + proxy).
+        self.assertEqual(rec.attempts.count("Candidate 1"), 6)
+        self.assertEqual(rec.attempts.count("Candidate 3"), 6)
+
+    def test_one_bad_lap_does_not_end_the_recording(self):
+        # Everything fails once, then candidate 1 comes back on the second lap.
+        script = [False] * 6 + [True]
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        script, max_cycles=3)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed",
+                         "a single failed lap ended the recording")
+        self.assertEqual(rec.current_candidate_index, 0,
+                         "did not cycle back round to candidate 1")
+
+    def test_data_resets_the_fruitless_lap_budget(self):
+        # A long capture that fails over occasionally must never exhaust its
+        # budget: any bytes at all put the counter back to zero.
+        def deliver(rec, candidate):
+            rec.bytes_written += 4096
+            return StreamOutcome.INTERRUPTED
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [False, False, deliver, deliver, deliver, deliver, True],
+                        max_cycles=2)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed")
+        self.assertEqual(rec.cycles_without_data, 0)
+
+    def test_backoff_grows_between_fruitless_laps(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertEqual(rec._failover_delay(wrapped=False), 1.0)
+        rec.cycles_without_data = 1
+        self.assertEqual(rec._failover_delay(wrapped=True), 5.0)
+        rec.cycles_without_data = 2
+        self.assertEqual(rec._failover_delay(wrapped=True), 10.0)
+        rec.cycles_without_data = 99
+        self.assertEqual(rec._failover_delay(wrapped=True), 60.0)
+
+    def test_completion_callback_not_fired_when_all_fail(self):
+        seen = []
+        rec = self.make(["http://a/1.m3u8"], [False, False],
+                        on_completion_callback=seen.append)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "failed")
+        self.assertEqual(seen, [], "completion callback fired on total failure")
+
+    def test_callback_exception_does_not_kill_recording(self):
+        def boom(*a):
+            raise RuntimeError("notification service down")
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [False, False, True], on_failover_callback=boom)
+        self.run_loop(rec)  # must not raise
+        self.assertEqual(rec.status, "completed")
+
+
+class TestInterruptedFailover(FailoverLoopTestCase):
+    def test_interrupted_advances_to_next_candidate(self):
+        # One scripted entry per candidate: with a backup on hand an
+        # interrupted candidate is no longer retried through the proxy.
+        rec = self.make(
+            ["http://a/1.m3u8", "http://b/2.m3u8"],
+            [StreamOutcome.INTERRUPTED, True],
+        )
+        self.run_loop(rec)
+        self.assertEqual(rec.current_candidate_index, 1)
+        self.assertEqual(rec.status, "completed")
+
+    def test_completed_does_not_advance(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [StreamOutcome.COMPLETED])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts, ["Candidate 1"])
+
+    def test_exhaustion_after_real_footage_is_partial_not_failed(self):
+        # A 3-hour recording whose stream dies near the end must not be thrown
+        # away: post-processing still needs to run on what was captured.
+        def wrote_then_died(rec, candidate):
+            rec.bytes_written += 500_000_000
+            return StreamOutcome.INTERRUPTED
+
+        seen = []
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [wrote_then_died] * 4,
+                        on_completion_callback=seen.append)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed_partial")
+        self.assertEqual(len(seen), 1, "post-processing skipped for partial recording")
+
+    def test_exhaustion_with_no_footage_is_failed(self):
+        seen = []
+        rec = self.make(["http://a/1.m3u8"], [StreamOutcome.FAILED] * 2,
+                        on_completion_callback=seen.append)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "failed")
+        self.assertEqual(seen, [])
+
+    def test_proxy_retried_on_interrupted_when_no_backup_exists(self):
+        # With a single URL there is nowhere else to go, so the proxy retry
+        # on the stalled stream is still better than nothing.
+        rec = self.make(["http://a/1.m3u8"], [StreamOutcome.INTERRUPTED, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, ["Candidate 1"])
+
+    def test_mid_recording_stall_fails_over_without_the_proxy(self):
+        # 2026-10-07 NHL: the primary's edge froze, PVArr spent ~17s asking
+        # the same dead edge again through hls-proxy, and only then moved to
+        # the healthy backup -- ~30-45s of game lost instead of ~20.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [StreamOutcome.INTERRUPTED, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, [],
+                         "retried a stream that just died via the proxy "
+                         "while a backup was waiting")
+        self.assertEqual(rec.attempts, ["Candidate 1", "Candidate 2"])
+        self.assertEqual(rec.current_candidate_index, 1)
+        self.assertTrue(any("skipping the hls-proxy retry" in l
+                            for l in rec.log_history), rec.log_history)
+
+    def test_a_backup_that_never_connects_still_gets_the_proxy(self):
+        # The skip is for a stream that died mid-recording. A candidate that
+        # never delivered direct keeps its proxy retry even with a backup:
+        # that is the non-video-extension / header case the fallback exists for.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [StreamOutcome.INTERRUPTED, False, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, ["Candidate 2"])
+        self.assertEqual(rec.attempts,
+                         ["Candidate 1", "Candidate 2", "Candidate 2"])
+        self.assertEqual(rec.status, "completed")
+
+
+class TestFreezeFailover(FailoverLoopTestCase):
+    """The 2026-10-07 failover gap, end to end through the real capture loop.
+
+    FailoverLoopTestCase.make() scripts outcomes and so cannot show that a
+    real freeze -- bytes, then silence on an open pipe -- is what triggers
+    the move. Here only Popen is faked: each call hands back the next
+    _FakeProc, and its argv records which URL FFmpeg was pointed at.
+    """
+
+    def drive(self, urls, procs):
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder("test-id", urls, self.out,
+                                     freeze_timeout_sec=0, min_free_gb=0)
+        rec.READ_POLL_SEC = 0.01
+        rec.STARTUP_GRACE_SEC = 0
+        rec._failover_delay = lambda wrapped: 0.0
+        rec.proxy_starts = []
+
+        def fake_detect(candidate):
+            candidate.m3u8_url = candidate.url
+            candidate.detected = True
+            return True
+
+        def fake_start_proxy(candidate):
+            rec.proxy_starts.append(candidate.name)
+            return "http://127.0.0.1:8090/channel/cand_0"
+
+        rec.detect_candidate_headers = fake_detect
+        rec.start_proxy = fake_start_proxy
+        rec.stop_proxy = lambda: None
+        inputs = []
+        queue = list(procs)
+
+        def fake_popen(cmd, **kwargs):
+            inputs.append(cmd[cmd.index("-i") + 1])
+            return queue.pop(0) if queue else _FakeProc([], returncode=1)
+
+        try:
+            with patch("app.recorder.subprocess.Popen", side_effect=fake_popen):
+                rec._recording_loop()
+        finally:
+            for proc in procs:
+                proc.close()
+        return rec, inputs
+
+    def test_a_freeze_moves_straight_to_the_backup(self):
+        frozen = _FakeProc([b"x" * 4096])                      # delivers, then silence
+        backup = _FakeProc([b"y" * 4096], returncode=0, close_stdout=True)
+        rec, inputs = self.drive(["http://a/1.m3u8", "http://b/2.m3u8"],
+                                 [frozen, backup])
+        self.assertTrue(any("Stream freeze detected" in l for l in rec.log_history))
+        self.assertEqual(rec.proxy_starts, [])
+        self.assertEqual(inputs, ["http://a/1.m3u8", "http://b/2.m3u8"],
+                         "FFmpeg was not pointed at the backup next")
+        self.assertEqual(rec.current_candidate_index, 1)
+        self.assertEqual(rec.bytes_written, 8192)
+        self.assertEqual(rec.status, "completed")
+
+    def test_a_freeze_with_no_backup_still_tries_the_proxy(self):
+        frozen = _FakeProc([b"x" * 4096])
+        via_proxy = _FakeProc([b"y" * 4096], returncode=0, close_stdout=True)
+        rec, inputs = self.drive(["http://a/1.m3u8"], [frozen, via_proxy])
+        self.assertEqual(rec.proxy_starts, ["Candidate 1"])
+        self.assertEqual(inputs, ["http://a/1.m3u8",
+                                  "http://127.0.0.1:8090/channel/cand_0"])
+        self.assertEqual(rec.status, "completed")
+
+
+class TestStopDuringRecording(FailoverLoopTestCase):
+    def test_stop_event_halts_before_next_candidate(self):
+        def stop_it(rec, candidate):
+            rec._stop_event.set()
+            return False
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [stop_it])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts, ["Candidate 1"])
+        self.assertNotIn("Candidate 2", rec.attempts)
+
+    def test_stop_skips_proxy_fallback(self):
+        def stop_it(rec, candidate):
+            rec._stop_event.set()
+            return False
+        rec = self.make(["http://a/1.m3u8"], [stop_it])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, [])
+
+
+class TestForceFailover(FailoverLoopTestCase):
+    def test_force_failover_advances_one_candidate(self):
+        def force_then_die(rec, candidate):
+            rec.force_failover()
+            return False
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [force_then_die, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.current_candidate_index, 1)
+
+    def test_force_failover_skips_proxy_fallback(self):
+        # An explicit "move on" must not spend time on the proxy bridge for
+        # the candidate the user just abandoned.
+        def force_then_die(rec, candidate):
+            rec.force_failover()
+            return False
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [force_then_die, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, [])
+
+    def test_force_failover_does_not_burn_remaining_candidates(self):
+        # Pressing the dashboard failover button once must switch to the next
+        # stream and keep recording -- not cascade through every remaining
+        # candidate and kill the recording.
+        def force_then_die(rec, candidate):
+            rec.force_failover()
+            return False
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        [force_then_die, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed",
+                         "one manual failover killed the whole recording")
+        self.assertEqual(rec.current_candidate_index, 1)
+        self.assertEqual(rec.attempts, ["Candidate 1", "Candidate 2"])
+
+    def test_flag_cleared_after_being_consumed(self):
+        def force_then_die(rec, candidate):
+            rec.force_failover()
+            return False
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [force_then_die, True])
+        self.run_loop(rec)
+        self.assertFalse(rec._force_failover_flag,
+                         "force-failover flag left set after being handled")
+
+    def test_force_failover_refused_when_no_backup_remains(self):
+        # With a single URL there is nothing to switch to, and advancing past
+        # the last candidate ends the recording. The button used to do exactly
+        # that -- killing a live capture -- while the API answered "success".
+        calls = []
+
+        def try_force_then_finish(rec, candidate):
+            calls.append(rec.force_failover())
+            return True
+
+        rec = self.make(["http://a/1.m3u8"], [try_force_then_finish])
+        self.run_loop(rec)
+        self.assertEqual(calls, [False], "force_failover claimed it switched")
+        self.assertFalse(rec._force_failover_flag,
+                         "a refused failover must not latch the flag")
+        self.assertEqual(rec.current_candidate_index, 0)
+        self.assertEqual(rec.status, "completed",
+                         "a refused failover ended the recording anyway")
+
+    def test_force_failover_from_the_last_candidate_wraps(self):
+        # Was refused when the walk was one-way, because advancing past the end
+        # ended the recording. Now the list cycles, so the last candidate has
+        # somewhere to go: back to the first.
+        calls = []
+
+        def die(rec, candidate):
+            return False
+
+        def try_force(rec, candidate):
+            calls.append(rec.force_failover())
+            return True
+
+        # Candidate 1 fails direct, then via the proxy, so we land on the last.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [die, die, try_force, True])
+        self.run_loop(rec)
+        self.assertEqual(calls, [True], "force-failover refused despite cycling")
+        self.assertEqual(rec.current_candidate_index, 0)
+
+    def test_has_next_candidate_holds_at_the_end_of_the_list(self):
+        # Cycling means the last candidate still has a next one -- the first.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertTrue(rec.has_next_candidate)
+        rec.current_candidate_index = 1
+        self.assertTrue(rec.has_next_candidate)
+
+    def test_switch_jumps_straight_to_a_chosen_candidate(self):
+        def jump(rec, candidate):
+            rec.switch_to_candidate(2)      # 0-based -> Candidate 3
+            return False
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        [jump, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts, ["Candidate 1", "Candidate 3"],
+                         "switch did not skip straight to the chosen candidate")
+        self.assertEqual(rec.current_candidate_index, 2)
+
+    def test_switch_back_to_the_primary(self):
+        # The story this whole change exists for: the primary's token expires,
+        # the recorder moves to a backup, the primary recovers, and there was
+        # previously no route back to it.
+        def to_first(rec, candidate):
+            rec.switch_to_candidate(0)
+            return False
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        [False, False, to_first, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.attempts,
+                         ["Candidate 1", "Candidate 1", "Candidate 2", "Candidate 1"])
+        self.assertEqual(rec.current_candidate_index, 0)
+        self.assertEqual(rec.status, "completed")
+
+    def test_switch_skips_the_proxy_retry_on_the_stream_being_left(self):
+        def jump(rec, candidate):
+            rec.switch_to_candidate(1)
+            return False
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [jump, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.proxy_starts, [],
+                         "spent time on the proxy for a stream the operator left")
+
+    def test_switch_rejects_an_index_out_of_range(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertFalse(rec.switch_to_candidate(-1))
+        self.assertFalse(rec.switch_to_candidate(2))
+        self.assertFalse(rec._force_failover_flag,
+                         "a rejected switch must not latch the failover flag")
+
+    def test_switch_to_the_current_candidate_is_a_no_op(self):
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        self.assertFalse(rec.switch_to_candidate(0))
+        self.assertFalse(rec._force_failover_flag)
+
+    def test_single_candidate_still_has_nowhere_to_go(self):
+        # The protection that matters stays: forcing a failover on a one-URL
+        # session would end the recording, so it is still refused.
+        rec = self.make(["http://a/1.m3u8"], [])
+        self.assertFalse(rec.has_next_candidate)
+        self.assertFalse(rec.force_failover())
+
+    def test_force_failover_marks_status_immediately(self):
+        # The loop only reaches its own "failing_over" assignment once the
+        # current attempt unwinds, and holds it for about a second. Against a
+        # 3s dashboard poll the operator saw nothing change at all.
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
+        rec.is_running = True
+        rec.status = "recording"
+        self.assertTrue(rec.force_failover())
+        self.assertEqual(rec.status, "failing_over")
+
+    def test_two_forced_failovers_traverse_two_candidates(self):
+        def force_then_die(rec, candidate):
+            rec.force_failover()
+            return False
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+                        [force_then_die, force_then_die, True])
+        self.run_loop(rec)
+        self.assertEqual(rec.current_candidate_index, 2)
+        self.assertEqual(rec.status, "completed")
+
+
+class TestStatusReporting(FailoverLoopTestCase):
+    def test_current_candidate_never_exceeds_total(self):
+        # The index runs one past the end once the list is exhausted, which the
+        # dashboard rendered literally as "Stream 2 of 1".
+        rec = self.make(["http://a/1.m3u8"], [False, False])
+        self.run_loop(rec)
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["total_candidates"], 1)
+        self.assertEqual(summary["current_candidate"], 1,
+                         "status summary reported a candidate that does not exist")
+
+    def test_status_returns_to_recording_after_failover(self):
+        # While candidate 2 is happily recording the dashboard must not still
+        # be showing "failing_over".
+        observed = []
+
+        def watch(rec, candidate):
+            observed.append(rec.status)
+            return True
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [False, False, watch])
+        self.run_loop(rec)
+        self.assertEqual(observed, ["recording"],
+                         f"status was {observed} while actively recording")
+
+
+# --------------------------------------------------------------------------
+# recorder._stream_ffmpeg_process  —  freeze detection
+#
+# Drives the real method against a fake Popen so the stall path is reachable
+# without spawning FFmpeg or waiting out a real timeout.
+# --------------------------------------------------------------------------
+class _FakeProc:
+    """Stands in for FFmpeg, over a real OS pipe.
+
+    The capture loop selects on the stdout file descriptor, so a fake with a
+    plain read() method would not exercise the code under test. Chunks are
+    written into the pipe up front; leaving the write end OPEN models the case
+    that matters most -- a source that has gone quiet without dropping the
+    connection, which is exactly what the freeze timeout exists to catch.
+    """
+
+    def __init__(self, chunks, returncode=None, close_stdout=False,
+                 stderr_lines=(), delay_before=0.0):
+        read_fd, write_fd = os.pipe()
+
+        def _feed():
+            for chunk in chunks:
+                os.write(write_fd, chunk)  # total stays under the 64KB pipe
+            if close_stdout:
+                os.close(write_fd)
+
+        self._write_fd = None if close_stdout else write_fd
+        self._feeder = None
+        if not delay_before:
+            _feed()
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        # readline() walks these then hits EOF, so the drain thread exits.
+        self.stderr = io.BytesIO(b"".join(l + b"\n" for l in stderr_lines))
+        self._rc = returncode
+
+        if delay_before:
+            # A source that connects but takes its time before its first byte:
+            # the startup case, which must not read as a freeze. Fed from a
+            # thread so the capture loop is genuinely sitting in select(), and
+            # the exit status is withheld until the data lands -- FFmpeg has
+            # not exited while it is still warming up, and a poll() that
+            # answered early would end the attempt before the test began.
+            self._rc = None
+
+            def _late():
+                time.sleep(delay_before)
+                _feed()
+                self._rc = returncode
+
+            self._feeder = threading.Thread(target=_late, daemon=True)
+            self._feeder.start()
+
+    def close(self):
+        try:
+            self.stdout.close()
+        except Exception:
+            pass
+        if self._write_fd is not None:
+            try:
+                os.close(self._write_fd)
+            except Exception:
+                pass
+            self._write_fd = None
+
+    def poll(self):
+        return self._rc
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self._rc
+
+
+class TestFreezeDetection(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.out = str(Path(self.tmp) / "out.ts")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def drive(self, chunks, returncode=None, freeze_timeout=0,
+              close_stdout=False, stderr_lines=(), startup_grace=0,
+              delay_before=0.0):
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder(
+            "test-id", ["http://a/1.m3u8"], self.out,
+            freeze_timeout_sec=freeze_timeout,
+            min_free_gb=0,   # not what these tests are about; see make() above
+        )
+        # Shrink the select() wait so tests do not sit through the real 0.5s.
+        rec.READ_POLL_SEC = 0.01
+        # Default 0 so the tests that are about the freeze path keep tripping
+        # instantly; the startup-grace tests set it deliberately.
+        rec.STARTUP_GRACE_SEC = startup_grace
+        proc = _FakeProc(chunks, returncode, close_stdout=close_stdout,
+                         stderr_lines=stderr_lines, delay_before=delay_before)
+        try:
+            with patch("app.recorder.subprocess.Popen", return_value=proc):
+                result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
+        finally:
+            proc.close()
+        return rec, result
+
+    def test_stall_before_any_data_is_a_failure(self):
+        rec, result = self.drive([])
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    # -- startup grace -----------------------------------------------------
+    # A source is allowed longer to produce its FIRST byte than it is allowed
+    # to go quiet afterwards. Without this, six healthy candidates in a row
+    # were abandoned at exactly the freeze timeout on 2026-09-20 purely
+    # because the CDN was slow to warm up.
+
+    def test_a_slow_first_byte_is_not_mistaken_for_a_freeze(self):
+        # Freeze timeout 0: under the old single-budget check this attempt was
+        # dead before the source ever spoke.
+        rec, result = self.drive([b"x" * 2048], returncode=0, close_stdout=True,
+                                 freeze_timeout=0, startup_grace=5,
+                                 delay_before=0.2)
+        self.assertIs(result, StreamOutcome.COMPLETED,
+                      "a source that took 0.2s to start was abandoned")
+        self.assertEqual(rec.bytes_written, 2048)
+        self.assertEqual(rec.candidates[0].fail_count, 0)
+
+    def test_without_the_grace_the_same_slow_start_is_abandoned(self):
+        # The regression this pins: same source, grace removed, attempt lost.
+        rec, result = self.drive([b"x" * 2048], freeze_timeout=0,
+                                 startup_grace=0, delay_before=0.2)
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertEqual(rec.bytes_written, 0)
+
+    def test_the_grace_does_not_leak_into_the_freeze_timeout(self):
+        # Once bytes have arrived the operator's freeze timeout governs again.
+        # A generous grace must not keep a stalled recording on the air: this
+        # would take the full 5s if the budget were still the startup one.
+        started = time.time()
+        rec, result = self.drive([b"x" * 1024], freeze_timeout=0,
+                                 startup_grace=5)
+        elapsed = time.time() - started
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertLess(elapsed, 2.0,
+                        f"mid-stream stall waited {elapsed:.1f}s on the startup budget")
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    def test_a_failed_start_and_a_freeze_read_differently_in_the_log(self):
+        # The dashboard is the only place the sponsor sees this, so "never
+        # started" and "went quiet" must not both say "Stream freeze detected".
+        never, _ = self.drive([], freeze_timeout=0, startup_grace=0)
+        froze, _ = self.drive([b"x" * 1024], freeze_timeout=0, startup_grace=0)
+        self.assertTrue(any("in the first" in l for l in never.log_history),
+                        never.log_history)
+        self.assertFalse(any("Stream freeze detected" in l for l in never.log_history),
+                         never.log_history)
+        self.assertTrue(any("Stream freeze detected" in l for l in froze.log_history),
+                        froze.log_history)
+
+    def test_the_shipped_grace_is_longer_than_the_default_freeze_timeout(self):
+        # The whole point is that they differ; a grace at or below the freeze
+        # timeout silently restores the old behaviour.
+        rec = StreamFailoverRecorder("g", ["http://a/1.m3u8"], self.out, min_free_gb=0)
+        self.assertGreater(rec.STARTUP_GRACE_SEC, rec.freeze_timeout_sec)
+
+    def test_bytes_written_is_tracked(self):
+        rec, _ = self.drive([b"x" * 4096])
+        self.assertEqual(rec.bytes_written, 4096)
+        self.assertEqual(Path(self.out).stat().st_size, 4096)
+
+    def test_clean_exit_after_data_is_success(self):
+        # FFmpeg exited 0 with data on disk: the stream genuinely ended.
+        rec, result = self.drive([b"x" * 1024], returncode=0)
+        self.assertIs(result, StreamOutcome.COMPLETED)
+
+    def test_immediate_nonzero_exit_is_a_failure(self):
+        rec, result = self.drive([], returncode=1)
+        self.assertIs(result, StreamOutcome.FAILED)
+
+    def test_stop_event_returns_without_writing(self):
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out,
+                                     min_free_gb=0)
+        rec._stop_event.set()
+        proc = _FakeProc([b"x" * 100])
+        try:
+            with patch("app.recorder.subprocess.Popen", return_value=proc):
+                result = rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
+        finally:
+            proc.close()
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertEqual(rec.bytes_written, 0)
+
+    def test_ffmpeg_stderr_explains_a_failure(self):
+        # FFmpeg's last words are usually the only account of why a stream
+        # would not play. They used to go into an undrained pipe and vanish.
+        rec, result = self.drive(
+            [], returncode=1,
+            stderr_lines=[b"[https] HTTP error 403 Forbidden",
+                          b"http://x/y.m3u8: Server returned 403 Forbidden"],
+        )
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertIn("403", rec.candidates[0].last_error)
+
+    def test_stderr_is_not_attached_to_a_clean_finish(self):
+        rec, result = self.drive([b"x" * 512], returncode=0, close_stdout=True,
+                                 stderr_lines=[b"some benign warning"])
+        self.assertIs(result, StreamOutcome.COMPLETED)
+        self.assertEqual(rec.candidates[0].last_error, "")
+
+    def test_ffmpeg_argv_suppresses_the_stats_spam(self):
+        # The progress line is ~124 B/s on a 64KB pipe that is only read on
+        # failure: at the default log level it filled in under ten minutes and
+        # FFmpeg then blocked, stopping video output entirely.
+        rec = StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], self.out)
+        cmd = rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertIn("-nostats", cmd)
+        # Warning, with each line's level tagged: lost segments are only ever
+        # warnings, and at "error" 20% of a recording vanished without a line.
+        self.assertEqual(cmd[cmd.index("-loglevel") + 1], "repeat+level+warning")
+
+    # Real FFmpeg output, captured 2026-09-14 from the shipped image's 5.1.9
+    # and from 6.1, against a local live source that 404s segment 8 and stalls
+    # segment 14 past the playlist window.
+    FFMPEG_5_1_LOSS = [
+        b"[http @ 0x568bc844f340] [warning] HTTP error 404 Not Found",
+        b"[hls @ 0x568bc8448a40] [warning] Failed to open segment 8 of playlist 0",
+        b"[mpegts @ 0x568bc844f740] [warning] Packet corrupt (stream = 0, dts = 1563000).",
+        b"[warning] http://127.0.0.1:18999/live.m3u8: corrupt input packet in stream 0",
+        b"[hls @ 0x568bc8448a40] [warning] skipping 2 segments ahead, expired from playlists",
+    ]
+    FFMPEG_6_1_LOSS = [
+        b"[http @ 0x7e3708003100] [warning] HTTP error 404 Not Found",
+        b"[hls @ 0x59cc51483000] [warning] Failed to open segment 8 of playlist 0",
+        b"[hls @ 0x59cc51483000] [warning] Segment 8 of playlist 0 failed too many times, skipping",
+        b"[hls @ 0x59cc51483000] [warning] skipping 2 segments ahead, expired from playlists",
+        b"[mpegts @ 0x59cc51488b40] [warning] Packet corrupt (stream = 0, dts = 2823000).",
+        b"[in#0/hls @ 0x59cc51482f00] [warning] corrupt input packet in stream 0",
+    ]
+
+    def _wait_for(self, predicate, timeout=2.0):
+        """The stderr pump is its own thread; give it a moment to catch up."""
+        import time as _time
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if predicate():
+                return True
+            _time.sleep(0.01)
+        return predicate()
+
+    def test_lost_segments_are_counted_from_real_ffmpeg_output(self):
+        rec, _ = self.drive([b"x" * 1024], returncode=0, close_stdout=True,
+                            stderr_lines=self.FFMPEG_5_1_LOSS)
+        self.assertTrue(self._wait_for(lambda: rec.segments_lost == 3), rec.segments_lost)
+        self.assertEqual((rec.segments_failed, rec.segments_expired), (1, 2))
+        self.assertTrue(any("Stream segments lost" in l for l in rec.log_history))
+
+    def test_a_retried_segment_counts_once(self):
+        """6.1 repeats "Failed to open segment" per retry; one hole is one loss."""
+        lines = (self.FFMPEG_6_1_LOSS[:2] + [self.FFMPEG_6_1_LOSS[1]]
+                 + self.FFMPEG_6_1_LOSS[2:])
+        rec, _ = self.drive([b"x" * 1024], returncode=0, close_stdout=True,
+                            stderr_lines=lines)
+        # Counts pass through 1, 1, 3 when deduplicated and 1, 2, 4 when not,
+        # so waiting for exactly 3 cannot pass on the broken version.
+        self.assertTrue(self._wait_for(lambda: rec.segments_lost == 3), rec.segments_lost)
+        self.assertEqual(rec.segments_failed, 1)
+
+    def test_warnings_stay_out_of_the_failure_explanation(self):
+        """A burst of warnings must not push the line that explains a failure
+        out of the 15-line tail -- it holds what it held at "error"."""
+        lines = self.FFMPEG_5_1_LOSS * 4 + [
+            b"[https @ 0x1] [error] http://x/y.m3u8: Server returned 403 Forbidden (access denied)"]
+        rec, result = self.drive([], returncode=1, stderr_lines=lines)
+        self.assertIs(result, StreamOutcome.FAILED)
+        self.assertIn("403", rec.candidates[0].last_error)
+        self.assertNotIn("Packet corrupt", rec.candidates[0].last_error)
+
+    def test_counting_can_never_stop_the_pipe_draining(self):
+        """Accounting that raised out of the pump would end the drain, and FFmpeg
+        would then block on a full pipe -- a hang, not a stream fault."""
+        from unittest.mock import patch
+        lines = [self.FFMPEG_5_1_LOSS[1],
+                 b"[https @ 0x1] [error] Server returned 403 Forbidden"]
+        with patch.object(StreamFailoverRecorder, "_account_ffmpeg_warning",
+                          side_effect=RuntimeError("boom")):
+            rec, _ = self.drive([], returncode=1, stderr_lines=lines)
+        self.assertIn("403", rec.candidates[0].last_error)
+
+    def test_the_failure_explanation_is_redacted_before_it_is_cut(self):
+        """last_error is served by /api/status and logged; cut first, a path
+        token could be shortened until it no longer looked like one."""
+        token_line = (b"[https @ 0x1] [error] https://cdn.example/secure/"
+                      b"Qx7RmT2kLp9VbN4cWe8YzA/playlist.m3u8: Server returned 403 Forbidden")
+        rec, _ = self.drive([], returncode=1, stderr_lines=[token_line])
+        self.assertIn("403", rec.candidates[0].last_error)
+        self.assertNotIn("Qx7RmT", rec.candidates[0].last_error)
+
+    def test_stderr_is_read_buffered(self):
+        """bufsize=0 hands the pump a raw FileIO, whose readline() is a system
+        call per byte -- 86 us a line, measured, against 1 us buffered."""
+        import types
+        reads = [0]
+
+        class CountingFileIO(io.FileIO):
+            def read(self, n=-1):
+                reads[0] += 1
+                return super().read(n)
+
+            def readinto(self, b):
+                reads[0] += 1
+                return super().readinto(b)
+
+        r, w = os.pipe()
+        line = b"[mpegts @ 0x1] [warning] Packet corrupt (stream = 0, dts = 1563000)." + b"x" * 40
+        os.write(w, (line + b"\n") * 50 + b"[https @ 0x1] [error] the last line\n")
+        os.close(w)
+        rec = StreamFailoverRecorder("t", ["http://a/1.m3u8"], self.out, min_free_gb=0)
+        tail = rec._drain_stderr(types.SimpleNamespace(stderr=CountingFileIO(r, "rb")),
+                                 ffmpeg=True)
+        self.assertTrue(self._wait_for(lambda: "the last line" in " ".join(tail)))
+        # ~6,000 reads unbuffered; a handful buffered.
+        self.assertLess(reads[0], 20, reads[0])
+
+    def test_freeze_fires_while_the_pipe_is_still_open(self):
+        # The regression that mattered: a source that stalls mid-buffer without
+        # closing the connection. The old loop sat inside a blocking
+        # read(32768) waiting for a full 32KB, so this check was unreachable --
+        # measured at 20s of nothing against a 5s timeout. The write end of the
+        # pipe is deliberately left open here.
+        import time as _time
+        start = _time.time()
+        rec, result = self.drive([b"x" * 1024], freeze_timeout=0.2)
+        elapsed = _time.time() - start
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertLess(elapsed, 5.0,
+                        "freeze detection did not fire on a stalled-but-open pipe")
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    def test_partial_chunk_is_written_without_waiting_for_a_full_buffer(self):
+        # bytes_written used to advance only in 32KB steps, so the dashboard
+        # showed 0.00 MB for the first seconds of a low-bitrate stream.
+        rec, _ = self.drive([b"x" * 100], freeze_timeout=0.2)
+        self.assertEqual(rec.bytes_written, 100)
+        self.assertEqual(Path(self.out).stat().st_size, 100)
+
+    def test_eof_with_clean_exit_completes(self):
+        rec, result = self.drive([b"x" * 512], returncode=0, close_stdout=True)
+        self.assertIs(result, StreamOutcome.COMPLETED)
+        self.assertEqual(rec.bytes_written, 512)
+
+    def test_mid_stream_freeze_after_data_is_interrupted(self):
+        # A stall after data is NOT a clean finish. Reporting it as success is
+        # what used to truncate a recording at the point of the stall instead
+        # of failing over to a backup.
+        rec, result = self.drive([b"x" * 2048])
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+    def test_nonzero_exit_after_data_is_interrupted(self):
+        # FFmpeg dying partway through a recording. Same class of bug as the
+        # stall: bytes had arrived, so it read as "completed naturally".
+        rec, result = self.drive([b"x" * 4096], returncode=1)
+        self.assertIs(result, StreamOutcome.INTERRUPTED)
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
+
+# --------------------------------------------------------------------------
+# app.server  —  route integration tests
+#
+# Needs httpx (fastapi.testclient). Install with:
+#     pip install -r requirements-dev.txt
+# The whole group skips cleanly when it is absent so the core suite still runs.
+# --------------------------------------------------------------------------
+try:
+    from fastapi.testclient import TestClient
+    HAS_TESTCLIENT = True
+except Exception:
+    HAS_TESTCLIENT = False
+
+
+@unittest.skipUnless(HAS_TESTCLIENT, "httpx not installed (see requirements-dev.txt)")
+class ServerTestCase(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        from app import server
+        from app.naming import StorageManager
+
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.server = server
+        # Point the module-level storage at a scratch dir so tests never touch
+        # the developer's real recordings/.
+        self._storage_patch = patch.object(
+            server, "storage", StorageManager(self.tmp)
+        )
+        self._storage_patch.start()
+        self._recorders_patch = patch.object(server, "active_recorders", {})
+        self._recorders_patch.start()
+        self._dir_patch = patch.object(server, "RECORDINGS_DIR", Path(self.tmp))
+        self._dir_patch.start()
+        # Disable the free-space floor by default. Left live, every start test
+        # passes or fails according to how full the developer's disk is; tests
+        # that are about the guard set it explicitly.
+        self._disk_patch = patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "0"})
+        self._disk_patch.start()
+        self.client = TestClient(server.app)
+
+    def tearDown(self):
+        self._storage_patch.stop()
+        self._recorders_patch.stop()
+        self._dir_patch.stop()
+        self._disk_patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class TestStaticRoutes(ServerTestCase):
+    def test_dashboard_renders(self):
+        r = self.client.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/html", r.headers["content-type"])
+
+    def test_favicon(self):
+        r = self.client.get("/favicon.ico")
+        self.assertIn(r.status_code, (200, 204))
+
+    def test_openapi_docs_available(self):
+        self.assertEqual(self.client.get("/openapi.json").status_code, 200)
+
+
+class TestPostProcessingStatus(FailoverLoopTestCase):
+    """"Completed" must not be shown while the remux is still running.
+
+    The sponsor stopped a recording and saw status "completed" beside a green
+    pulsing dot for two and a half minutes. Both were half right: the capture
+    had finished, but the recorder thread was still remuxing 263 MB and no
+    .mp4 existed in the library yet.
+    """
+
+    def test_status_is_post_processing_during_the_callback(self):
+        seen = {}
+
+        def on_complete(path):
+            seen["status"] = rec.status
+            seen["is_running"] = rec.is_running
+
+        rec = self.make(["http://a/1.m3u8"], [True], on_completion_callback=on_complete)
+        # run_loop drives _recording_loop directly, so mirror the one thing
+        # start_recording() sets that the loop itself does not.
+        rec.is_running = True
+        self.run_loop(rec)
+
+        self.assertEqual(seen["status"], "post_processing")
+        self.assertTrue(seen["is_running"],
+                        "the thread is still working, so the dot stays lit")
+
+    def test_final_status_is_restored_afterwards(self):
+        rec = self.make(["http://a/1.m3u8"], [True],
+                        on_completion_callback=lambda p: None)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed")
+        self.assertFalse(rec.is_running)
+
+    def test_a_failing_callback_still_restores_the_status(self):
+        """Post-processing blowing up must not strand the session."""
+        def boom(path):
+            raise RuntimeError("remux exploded")
+
+        rec = self.make(["http://a/1.m3u8"], [True], on_completion_callback=boom)
+        self.run_loop(rec)
+        self.assertEqual(rec.status, "completed")
+        self.assertFalse(rec.is_running)
+
+    def test_an_aborted_status_survives_post_processing(self):
+        """aborted_no_space must not come back as "completed"."""
+        seen = {}
+
+        def on_complete(path):
+            seen["during"] = rec.status
+
+        def abort(recorder, candidate):
+            recorder.status = "aborted_no_space"
+            return StreamOutcome.COMPLETED
+
+        rec = self.make(["http://a/1.m3u8"], [abort], on_completion_callback=on_complete)
+        self.run_loop(rec)
+        self.assertEqual(seen["during"], "post_processing")
+        self.assertEqual(rec.status, "aborted_no_space")
+
+
+class TestDashboardSurfacesCapturedBytes(ServerTestCase):
+    """bytes_written must be on screen, not just in the API.
+
+    It was in /api/status the whole time and the dashboard rendered only
+    filesize_mb, so when the two disagreed -- a recording writing into a
+    deleted file -- there was nothing on screen to show it. Four minutes of
+    footage were lost to a discrepancy the page already had the data to show.
+    """
+
+    def test_status_summary_still_carries_both_numbers(self):
+        rec = StreamFailoverRecorder("s1", ["http://a/1.m3u8"],
+                                     str(Path(self.tmp) / "a.ts"))
+        rec.bytes_written = 4096
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["bytes_written"], 4096)
+        self.assertIn("filesize_mb", summary)
+
+    def test_dashboard_renders_the_captured_counter(self):
+        body = self.client.get("/").text
+        self.assertIn("bytes_written", body)
+        self.assertIn("Captured", body)
+
+    def test_dashboard_separates_live_from_finished(self):
+        body = self.client.get("/").text
+        self.assertIn("liveSessions", body)
+        self.assertIn("finishedSessions", body)
+        self.assertIn("Recently Finished", body)
+
+    def test_the_live_dot_is_not_driven_by_session_count(self):
+        """It used to pulse green whenever any session existed, finished ones
+        included, which is why a stopped recording kept blinking."""
+        body = self.client.get("/").text
+        self.assertNotIn("activeSessions.length > 0 ? 'bg-emerald-400", body)
+
+    def test_divergence_warning_is_scoped_to_active_capture(self):
+        """It must not fire during post_processing.
+
+        The remux deletes the .ts, so on-disk is legitimately 0 against a large
+        captured count. Warning there would cry wolf on every successful
+        recording and train the operator to ignore the one case that matters.
+        Asserted against the template because the suite cannot run the page's
+        JavaScript; the logic itself was exercised directly in node.
+        """
+        body = self.client.get("/").text
+        self.assertIn("s.status !== 'recording'", body)
+
+    def test_finished_sessions_keep_their_logs(self):
+        """Collapsed, not discarded -- the log history is the evidence."""
+        body = self.client.get("/").text
+        self.assertIn("expandedFinished", body)
+        self.assertIn("toggleFinished", body)
+
+
+class TestProxyChannelMode(unittest.TestCase):
+    """hls-proxy must be told the URL is a playlist, not a page to scrape.
+
+    The mode was keyed off the referer, which decides nothing of the sort. A
+    stream needing no Referer got mode="direct", so the proxy fetched our
+    already-resolved playlist, hunted for an <iframe> in MPEG-TS playlist text,
+    found none, and answered "Channel not found or scrape failed". That 404 is
+    what the fallback died on every time -- on a stream that was healthy, with
+    valid tokens, whose headers had been detected correctly.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-mode-")
+        self.rec = StreamFailoverRecorder(
+            "m1", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"), min_free_gb=0)
+        # Any real file will do; Popen and the settle sleep are stubbed.
+        self.rec.hls_proxy_path = str(Path(self.tmp) / "fake-proxy.py")
+        Path(self.rec.hls_proxy_path).write_text("# stub\n")
+        self._popen = patch("app.recorder.subprocess.Popen")
+        proc = self._popen.start()
+        proc.return_value.poll.return_value = None
+        self._sleep = patch("app.recorder.time.sleep")
+        self._sleep.start()
+        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p, **k: [])
+        self._drain.start()
+
+    def tearDown(self):
+        self._popen.stop(); self._sleep.stop(); self._drain.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _mode_for(self, m3u8_url, referer=""):
+        cand = self.rec.candidates[0]
+        cand.m3u8_url = m3u8_url
+        cand.referer = referer
+        cand.slug = "cand_0"
+        self.rec.start_proxy(cand)
+        conf = list((Path(self.tmp) / ".proxy_conf").glob("*.conf"))[0]
+        return conf.read_text().strip().split("|")[6]
+
+    def test_a_playlist_without_a_referer_is_literal(self):
+        """The exact regression: this used to write "direct" and 404."""
+        self.assertEqual(self._mode_for("https://x.example/live.m3u8"), "literal")
+
+    def test_a_playlist_with_a_referer_is_still_literal(self):
+        self.assertEqual(
+            self._mode_for("https://x.example/live.m3u8", "https://x.example/"), "literal")
+
+    def test_a_playlist_with_a_query_string_is_literal(self):
+        """Tokenised playlists are the normal case, not the exception."""
+        self.assertEqual(
+            self._mode_for("https://x.example/secure/a.m3u8?st=tok&e=123"), "literal")
+
+    def test_a_page_url_is_still_scraped(self):
+        """A URL we could not resolve is where scraping is the right answer."""
+        self.assertEqual(self._mode_for("https://x.example/watch/game"), "direct")
+
+    def test_the_referer_is_still_written_to_its_own_field(self):
+        cand = self.rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.referer = "https://x.example/"
+        cand.slug = "cand_0"
+        self.rec.start_proxy(cand)
+        conf = list((Path(self.tmp) / ".proxy_conf").glob("*.conf"))[0]
+        self.assertEqual(conf.read_text().strip().split("|")[7], "https://x.example/")
+
+
+class TestHlsExtensionFlags(unittest.TestCase):
+    """Only send options the FFmpeg on this machine actually has.
+
+    Measured in the shipped image (Debian ffmpeg 5.1.9) against a real segment
+    served as ".image": -allowed_extensions ALL is refused,
+    -allowed_segment_extensions ALL is refused a step later, and only
+    -extension_picky 0 lets it through. That option does not exist on upstream
+    6.1, and passing an option a build does not know is fatal -- so the build
+    is asked rather than guessed at from a version number.
+    """
+
+    def setUp(self):
+        from app import recorder
+        recorder._HLS_EXT_FLAGS_CACHE.clear()
+
+    def _flags_for(self, help_text):
+        from unittest.mock import patch, MagicMock
+        from app.recorder import hls_extension_flags
+        result = MagicMock(stdout=help_text, stderr="")
+        with patch("app.recorder.subprocess.run", return_value=result):
+            return hls_extension_flags("/usr/bin/ffmpeg-fake")
+
+    def test_debian_build_gets_extension_picky(self):
+        flags = self._flags_for(
+            "  -allowed_extensions <string> ...\n"
+            "  -allowed_segment_extensions <string> ...\n"
+            "  -extension_picky   <boolean> ...\n")
+        self.assertEqual(flags, ["-allowed_extensions", "ALL",
+                                 "-allowed_segment_extensions", "ALL",
+                                 "-extension_picky", "0"])
+
+    def test_upstream_build_gets_only_what_it_has(self):
+        """ffmpeg 6.1 has no extension_picky; sending it would be fatal."""
+        flags = self._flags_for("  -allowed_extensions <string> ...\n")
+        self.assertEqual(flags, ["-allowed_extensions", "ALL"])
+        self.assertNotIn("-extension_picky", flags)
+
+    def test_a_build_with_none_of_them_gets_nothing(self):
+        self.assertEqual(self._flags_for("  -live_start_index <int> ...\n"), [])
+
+    def test_a_broken_ffmpeg_does_not_raise(self):
+        from unittest.mock import patch
+        from app.recorder import hls_extension_flags
+        with patch("app.recorder.subprocess.run", side_effect=OSError("no such file")):
+            self.assertEqual(hls_extension_flags("/nope"), [])
+
+    def test_the_probe_is_cached(self):
+        from unittest.mock import patch, MagicMock
+        from app.recorder import hls_extension_flags
+        result = MagicMock(stdout="  -extension_picky   <boolean> ...\n", stderr="")
+        with patch("app.recorder.subprocess.run", return_value=result) as run:
+            hls_extension_flags("/usr/bin/ff")
+            hls_extension_flags("/usr/bin/ff")
+            self.assertEqual(run.call_count, 1, "shelling out once is enough")
+
+
+class TestFfmpegExtensionScope(unittest.TestCase):
+    """Relaxing the extension check is scoped to our own local proxy."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-scope-")
+        self.rec = StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(Path(self.tmp) / "o.ts"), min_free_gb=0)
+        from app import recorder
+        recorder._HLS_EXT_FLAGS_CACHE[self.rec.ffmpeg_path or "ffmpeg"] = [
+            "-extension_picky", "0"]
+
+    def tearDown(self):
+        from app import recorder
+        recorder._HLS_EXT_FLAGS_CACHE.clear()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_direct_mode_keeps_ffmpegs_strict_default(self):
+        cmd = self.rec._build_ffmpeg_cmd("https://remote.example/live.m3u8")
+        self.assertNotIn("-extension_picky", cmd)
+
+    def test_the_proxy_path_relaxes_it(self):
+        cmd = self.rec._build_ffmpeg_cmd(
+            "http://127.0.0.1:8090/channel/cand_0", local_proxy=True)
+        self.assertIn("-extension_picky", cmd)
+        self.assertEqual(cmd[cmd.index("-extension_picky") + 1], "0")
+
+    def test_the_protocol_whitelist_still_applies_on_the_proxy_path(self):
+        """The protocol list, not the extension list, is what stops file://."""
+        cmd = self.rec._build_ffmpeg_cmd("http://127.0.0.1:8090/channel/x",
+                                         local_proxy=True)
+        self.assertIn("-protocol_whitelist", cmd)
+        whitelist = cmd[cmd.index("-protocol_whitelist") + 1]
+        self.assertNotIn("file", whitelist)
+
+
+class TestFileSink(unittest.TestCase):
+    """The sink must know when its file has been taken away.
+
+    Reproduces the live incident: a DELETE against the library removed the .ts
+    of a running recording, PVArr answered 200 OK, and the capture loop wrote
+    four minutes of hockey into an unnamed inode. NFS showed it as a
+    .nfsXXXXXXXX file; on a local filesystem there is nothing to see at all.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-sink-")
+        self.path = Path(self.tmp) / "game.ts"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_intact_while_the_file_is_there(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"data")
+            sink.flush()
+            self.assertTrue(sink.is_intact())
+
+    def test_not_intact_after_the_file_is_deleted(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"data")
+            sink.flush()
+            self.path.unlink()
+            self.assertFalse(sink.is_intact())
+
+    def test_not_intact_when_the_path_is_a_different_file(self):
+        """The silly-rename case, and why st_nlink is the wrong test.
+
+        NFS answers a delete-with-open-handle by *renaming* the file, so its
+        link count stays 1. A link-count check passes happily here; only an
+        inode comparison catches it.
+        """
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"data")
+            sink.flush()
+            os.rename(self.path, Path(self.tmp) / ".nfs00000000deadbeef")
+            self.path.write_bytes(b"a different file entirely")
+            self.assertEqual(os.fstat(sink._fh.fileno()).st_nlink, 1)
+            self.assertFalse(sink.is_intact())
+
+    def test_writes_still_succeed_into_a_deleted_file(self):
+        """The property that makes this bug silent. Documented, not desired."""
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.path.unlink()
+            sink.write(b"goes nowhere")   # no exception, no error
+            sink.flush()
+            self.assertFalse(self.path.exists())
+
+    def test_reopen_recreates_the_file(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            sink.write(b"first")
+            sink.flush()
+            self.path.unlink()
+            sink.reopen()
+            sink.write(b"second")
+            sink.flush()
+            self.assertTrue(sink.is_intact())
+            self.assertEqual(self.path.read_bytes(), b"second")
+
+
+class TestOutputVanishGuard(unittest.TestCase):
+    """_output_ok: recreate the file, and give up if it keeps disappearing."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-vanish-")
+        self.path = Path(self.tmp) / "game.ts"
+        self.rec = StreamFailoverRecorder(
+            recording_id="v1",
+            candidates=["http://a/1.m3u8"],
+            output_filepath=str(self.path),
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_intact_file_passes(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.assertTrue(self.rec._output_ok(sink))
+            self.assertEqual(self.rec._output_reopens, 0)
+
+    def test_deleted_file_is_recreated_and_recording_continues(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.path.unlink()
+            self.assertTrue(self.rec._output_ok(sink))
+            self.assertTrue(self.path.exists())
+            self.assertEqual(self.rec._output_reopens, 1)
+        joined = " ".join(self.rec.log_history)
+        self.assertIn("vanished", joined)
+
+    def test_repeated_deletion_aborts_rather_than_looping(self):
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            for _ in range(self.rec.MAX_OUTPUT_REOPENS):
+                self.rec._last_output_check = 0.0
+                self.path.unlink()
+                self.assertTrue(self.rec._output_ok(sink))
+            self.rec._last_output_check = 0.0
+            self.path.unlink()
+            self.assertFalse(self.rec._output_ok(sink))
+        self.assertEqual(self.rec.status, "aborted_output_lost")
+
+    def test_check_is_rate_limited(self):
+        """Two stats every 15s, not two stats per chunk."""
+        from app.recorder import _FileSink
+        with _FileSink(self.path) as sink:
+            self.rec._output_ok(sink)
+            self.path.unlink()
+            # Inside the interval, so the deletion is not noticed yet.
+            self.assertTrue(self.rec._output_ok(sink))
+            self.assertEqual(self.rec._output_reopens, 0)
+
+    def test_a_broken_sink_never_kills_a_recording(self):
+        class Exploding:
+            def is_intact(self):
+                raise RuntimeError("stat blew up")
+        self.assertTrue(self.rec._output_ok(Exploding()))
+
+    def test_rebroadcast_ring_is_always_intact(self):
+        from app.recorder import _RingSink
+        from app import ringbuffer
+        ring = ringbuffer.RingBuffer(Path(self.tmp) / "buf.bin", capacity=188 * 100)
+        try:
+            sink = _RingSink(ring)
+            self.assertTrue(sink.is_intact())
+            self.assertTrue(self.rec._output_ok(sink))
+        finally:
+            ring.close()
+
+
+class TestLibraryRefusesLiveFiles(ServerTestCase):
+    """A DELETE that returned 200 OK cost a live recording. Never again."""
+
+    def _live_recorder(self, path, rebroadcast=False):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.is_rebroadcast = rebroadcast
+        rec.output_filepath = Path(path)
+        rec.current_filepath = Path(path)
+        rec.final_filepath = None
+        return rec
+
+    def test_delete_of_a_recording_in_progress_is_refused(self):
+        target = Path(self.tmp) / "live.ts"
+        target.write_bytes(b"footage")
+        self.server.active_recorders["r1"] = self._live_recorder(target)
+
+        r = self.client.delete("/api/library/live.ts")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("r1", r.json()["detail"])
+        self.assertTrue(target.exists(), "the file must survive the refusal")
+
+    def test_rename_of_a_recording_in_progress_is_refused(self):
+        target = Path(self.tmp) / "live.ts"
+        target.write_bytes(b"footage")
+        self.server.active_recorders["r1"] = self._live_recorder(target)
+
+        r = self.client.post("/api/library/rename", data={
+            "old_name": "live.ts", "new_name": "renamed.ts",
+        })
+        self.assertEqual(r.status_code, 409)
+        self.assertTrue(target.exists())
+
+    def test_an_idle_file_is_still_deletable(self):
+        """The guard must not turn the library read-only."""
+        target = Path(self.tmp) / "old.ts"
+        target.write_bytes(b"done")
+        self.server.active_recorders["r1"] = self._live_recorder(
+            Path(self.tmp) / "live.ts"
+        )
+        r = self.client.delete("/api/library/old.ts")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(target.exists())
+
+    def test_a_stopped_recorders_file_is_deletable(self):
+        target = Path(self.tmp) / "finished.ts"
+        target.write_bytes(b"done")
+        rec = self._live_recorder(target)
+        rec.is_running = False
+        self.server.active_recorders["r1"] = rec
+        self.assertEqual(self.client.delete("/api/library/finished.ts").status_code, 200)
+
+    def test_the_remuxed_final_path_is_protected_too(self):
+        """A session switches to the .mp4 at completion; both must be safe."""
+        ts = Path(self.tmp) / "live.ts"
+        mp4 = Path(self.tmp) / "live.mp4"
+        mp4.write_bytes(b"remuxed")
+        rec = self._live_recorder(ts)
+        rec.final_filepath = mp4
+        rec.current_filepath = mp4
+        self.server.active_recorders["r1"] = rec
+        self.assertEqual(self.client.delete("/api/library/live.mp4").status_code, 409)
+
+    def test_a_rebroadcast_channel_blocks_nothing(self):
+        """A channel keeps no file, so it has no library entry to protect."""
+        target = Path(self.tmp) / "unrelated.ts"
+        target.write_bytes(b"data")
+        self.server.active_recorders["r1"] = self._live_recorder(
+            target, rebroadcast=True
+        )
+        self.assertEqual(self.client.delete("/api/library/unrelated.ts").status_code, 200)
+
+
+class TestVersionReporting(ServerTestCase):
+    """The version a user can see must be the version they are running.
+
+    The dashboard badge was the literal "v1.0.0" from the first commit and was
+    never wired to __version__, so it disagreed with every shipped release of
+    the 0.1.x series. The sponsor hit this on the test server: the page said 1.0.0 while
+    the container was 0.2.0, which is indistinguishable from "the pull did not
+    take" -- exactly the wrong thing to be unsure about when testing a build.
+    """
+
+    def test_dashboard_badge_shows_the_real_version(self):
+        from app import __version__
+        body = self.client.get("/").text
+        self.assertIn(f"v{__version__}", body)
+
+    def test_dashboard_does_not_show_a_stale_hardcoded_version(self):
+        from app import __version__
+        body = self.client.get("/").text
+        if __version__ != "1.0.0":
+            self.assertNotIn("v1.0.0", body)
+
+    def test_no_template_hardcodes_a_version_literal(self):
+        """The guard that would have caught the original bug.
+
+        A version baked into markup cannot be bumped by the release script, so
+        it silently rots. Templates must render pvarr_version instead.
+        """
+        import re
+        from app import server
+
+        pattern = re.compile(r"v\d+\.\d+\.\d+")
+        offenders = []
+        for path in Path(server.TEMPLATES_DIR).rglob("*.html"):
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                if pattern.search(line):
+                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        self.assertEqual(
+            offenders, [],
+            "Hardcoded version literal in a template; use "
+            "{{ pvarr_version }} so the release bump reaches the UI:\n"
+            + "\n".join(offenders),
+        )
+
+    def test_status_endpoint_reports_the_version(self):
+        from app import __version__
+        data = self.client.get("/api/status").json()
+        self.assertEqual(data["version"], __version__)
+
+    def test_openapi_reports_the_version(self):
+        from app import __version__
+        data = self.client.get("/openapi.json").json()
+        self.assertEqual(data["info"]["version"], __version__)
+
+
+class TestVersionConsistency(unittest.TestCase):
+    """__version__ is the single source of truth the release flow bumps."""
+
+    def test_version_is_semver(self):
+        import re
+        from app import __version__
+        self.assertRegex(__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_version_file_is_what_the_publish_script_parses(self):
+        """scripts/publish.sh and the CI tag guard both sed this exact line.
+
+        If the assignment is ever reformatted, the release script silently
+        fails to bump and CI's tag-vs-code check reads an empty string.
+        """
+        import re
+        from app import __version__
+        text = Path("app/__init__.py").read_text()
+        found = re.findall(r'^__version__ = "(.*)"$', text, re.MULTILINE)
+        self.assertEqual(found, [__version__])
+
+
+class TestTunerRoutes(ServerTestCase):
+    def test_m3u_both_extensions(self):
+        for path in ("/live/playlist.m3u", "/live/playlist.m3u8"):
+            with self.subTest(path=path):
+                r = self.client.get(path)
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.headers["content-type"], "application/x-mpegurl")
+                self.assertTrue(r.text.startswith("#EXTM3U"))
+
+    def test_epg_is_xml(self):
+        r = self.client.get("/live/epg.xml")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "application/xml")
+        self.assertIn("<tv", r.text)
+
+
+class TestHDHomeRunRoutes(ServerTestCase):
+    """Plex's Live TV setup probes a device address for these files before it
+    will add a tuner. They 404'd, so the whole add-device flow failed."""
+
+    def _add_session(self, rid="rec1", name="Game 1.ts"):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.is_rebroadcast = False
+        rec.ring = None
+        rec.get_status_summary.return_value = {
+            "id": rid, "output_filename": name, "is_running": True,
+            "started_at": 1756000000.0,
+        }
+        self.server.active_recorders[rid] = rec
+        return rec
+
+    def test_probe_paths_answer_at_both_mounts(self):
+        # Plex appends these to whatever address the user typed, so the root
+        # and the /live prefix both have to serve them.
+        for prefix in ("", "/live"):
+            for name in ("discover.json", "lineup_status.json", "lineup.json"):
+                with self.subTest(path=f"{prefix}/{name}"):
+                    r = self.client.get(f"{prefix}/{name}")
+                    self.assertEqual(r.status_code, 200)
+
+    def test_discover_advertises_a_reachable_lineup_url(self):
+        r = self.client.get("/live/discover.json").json()
+        self.assertTrue(r["LineupURL"].endswith("/live/lineup.json"))
+        follow = self.client.get(r["LineupURL"].replace("http://testserver", ""))
+        self.assertEqual(follow.status_code, 200)
+
+    def test_discover_device_id_is_stable(self):
+        first = self.client.get("/discover.json").json()["DeviceID"]
+        second = self.client.get("/discover.json").json()["DeviceID"]
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"^[0-9A-F]{8}$")
+
+    def test_lineup_lists_running_recordings(self):
+        self._add_session()
+        entry = self.client.get("/lineup.json").json()[0]
+        self.assertEqual(entry["GuideName"], "Game 1")
+        self.assertEqual(entry["URL"],
+                         "http://testserver/api/recordings/rec1/stream")
+
+    def test_lineup_urls_are_routable(self):
+        # The same regression as the M3U: a lineup pointing at a 404 gives
+        # Plex channels that will not tune.
+        path = Path(self.tmp) / "live.ts"
+        path.write_bytes(b"\x47data")
+        rec = self._add_session()
+        rec.output_filepath = path
+        url = self.client.get("/lineup.json").json()[0]["URL"]
+        # Fetch it as a finished recording: a running one tails the file and
+        # the request would never return.
+        rec.is_running = False
+        r = self.client.get(url.replace("http://testserver", ""))
+        self.assertEqual(r.status_code, 200, f"lineup URL {url} is not routable")
+
+    def test_empty_lineup_is_still_a_json_array(self):
+        self.assertEqual(self.client.get("/lineup.json").json(), [])
+
+    def test_lineup_status_reports_no_scan_running(self):
+        self.assertEqual(
+            self.client.get("/lineup_status.json").json()["ScanInProgress"], 0
+        )
+
+    def test_lineup_post_scan_trigger_succeeds(self):
+        for method in (self.client.get, self.client.post):
+            with self.subTest(method=method):
+                self.assertEqual(method("/lineup.post").status_code, 200)
+
+    def test_device_xml_is_wellformed(self):
+        import xml.etree.ElementTree as ET
+        r = self.client.get("/device.xml")
+        self.assertEqual(r.headers["content-type"], "application/xml")
+        ET.fromstring(r.text)
+
+
+class TestRebroadcastRoutes(ServerTestCase):
+    """Starting a channel through the API."""
+
+    def start(self, **extra):
+        from unittest.mock import MagicMock, patch
+        data = {"url_primary": "https://example.com/live.m3u8",
+                "sport": "Sports", "team_a": "Bears", "team_b": "Packers"}
+        data.update(extra)
+        made = {}
+
+        def build(**kw):
+            rec = MagicMock()
+            rec.get_status_summary.return_value = {"id": "x", "is_running": True}
+            made.update(kw)
+            return rec
+
+        with patch.object(self.server, "StreamFailoverRecorder", side_effect=build), \
+             patch.object(self.server, "notifier", MagicMock()):
+            resp = self.client.post("/api/recordings/start", data=data)
+        return resp, made
+
+    def test_a_normal_start_gets_no_ring(self):
+        resp, made = self.start()
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(made.get("ring"))
+
+    def test_rebroadcast_start_gets_a_ring(self):
+        resp, made = self.start(rebroadcast="true")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNotNone(made.get("ring"))
+        made["ring"].close()
+
+    def test_rebroadcast_writes_no_recording_file(self):
+        # The output path must not land in the library tree.
+        resp, made = self.start(rebroadcast="true")
+        self.assertNotIn(str(self.server.RECORDINGS_DIR / "Sports"),
+                         made["output_filepath"])
+        made["ring"].close()
+
+    def test_channel_name_defaults_to_the_teams(self):
+        resp, made = self.start(rebroadcast="true")
+        self.assertEqual(made.get("channel_name"), "Bears vs Packers")
+        made["ring"].close()
+
+    def test_explicit_channel_name_wins(self):
+        resp, made = self.start(rebroadcast="true", channel_name="RedZone")
+        self.assertEqual(made.get("channel_name"), "RedZone")
+        made["ring"].close()
+
+    def test_url_scheme_is_still_validated_for_a_channel(self):
+        resp, _ = self.start(rebroadcast="true", url_primary="file:///etc/passwd")
+        self.assertEqual(resp.status_code, 400)
+
+
+class TestRecordingRoutes(ServerTestCase):
+    def test_start_requires_a_url(self):
+        r = self.client.post("/api/recordings/start", data={"sport": "NFL"})
+        self.assertEqual(r.status_code, 422)  # missing required form field
+
+    def test_start_rejects_blank_url(self):
+        r = self.client.post("/api/recordings/start", data={"url_primary": "   "})
+        self.assertEqual(r.status_code, 400)
+
+    def test_freeze_timeout_bounds_enforced(self):
+        for bad in (0, -5, 9999):
+            with self.subTest(freeze_timeout=bad):
+                r = self.client.post("/api/recordings/start", data={
+                    "url_primary": "http://a/1.m3u8",
+                    "freeze_timeout": bad,
+                })
+                self.assertEqual(r.status_code, 400)
+
+    def test_notifications_do_not_block_the_response(self):
+        # The notifier must be deferred to a background task; called inline it
+        # can stall the event loop for up to 15s on slow webhooks.
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        notifier = MagicMock()
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", notifier):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        # TestClient runs background tasks before returning, so it has fired --
+        # what matters is that it was scheduled, not awaited inline.
+        notifier.notify_recording_started.assert_called_once()
+
+    def test_stop_unknown_session_404s(self):
+        r = self.client.post("/api/recordings/nope/stop")
+        self.assertEqual(r.status_code, 404)
+
+    def test_failover_unknown_session_404s(self):
+        r = self.client.post("/api/recordings/nope/failover")
+        self.assertEqual(r.status_code, 404)
+
+    def test_logs_unknown_session_404s(self):
+        r = self.client.get("/api/recordings/nope/logs")
+        self.assertEqual(r.status_code, 404)
+
+    def test_failover_on_stopped_session_400s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = False
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/failover")
+        self.assertEqual(r.status_code, 400)
+        rec.force_failover.assert_not_called()
+
+    def test_failover_on_running_session_calls_recorder(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.has_next_candidate = True
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/failover")
+        self.assertEqual(r.status_code, 200)
+        rec.force_failover.assert_called_once()
+
+    def test_start_refuses_when_the_volume_is_nearly_full(self):
+        # Fail fast rather than starting a capture the guard aborts moments
+        # later -- and rather than being the thing that fills the volume.
+        from unittest.mock import patch
+        import collections
+        usage = collections.namedtuple("usage", "total used free")
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "5"}), \
+             patch.object(self.server.shutil, "disk_usage",
+                          return_value=usage(100, 99, int(0.5 * 1024 ** 3))):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 507)
+        self.assertIn("PVARR_MIN_FREE_GB", r.json()["detail"])
+        self.assertEqual(self.server.active_recorders, {},
+                         "a refused start still registered a session")
+
+    def test_start_allowed_when_space_is_ample(self):
+        from unittest.mock import patch, MagicMock
+        import collections
+        usage = collections.namedtuple("usage", "total used free")
+        fake = MagicMock(); fake.get_status_summary.return_value = {}
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "5"}), \
+             patch.object(self.server.shutil, "disk_usage",
+                          return_value=usage(100, 1, int(50 * 1024 ** 3))), \
+             patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_invalid_min_free_gb_falls_back_to_the_default(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "not-a-number"}):
+            self.assertEqual(self.server._min_free_gb(),
+                             self.server.DEFAULT_MIN_FREE_GB)
+
+    def test_min_free_gb_is_read_from_the_environment(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "12.5"}):
+            self.assertEqual(self.server._min_free_gb(), 12.5)
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "-4"}):
+            self.assertEqual(self.server._min_free_gb(), 0.0)
+
+    def test_switch_unknown_session_404s(self):
+        r = self.client.post("/api/recordings/nope/switch", data={"candidate": 1})
+        self.assertEqual(r.status_code, 404)
+
+    def test_switch_on_stopped_session_400s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = False
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/switch", data={"candidate": 1})
+        self.assertEqual(r.status_code, 400)
+        rec.switch_to_candidate.assert_not_called()
+
+    def test_switch_rejects_out_of_range_candidate(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = True
+        rec.candidates = ["a", "b"]
+        self.server.active_recorders["abc"] = rec
+        for bad in (0, -1, 3):
+            with self.subTest(candidate=bad):
+                r = self.client.post("/api/recordings/abc/switch",
+                                     data={"candidate": bad})
+                self.assertEqual(r.status_code, 400)
+        rec.switch_to_candidate.assert_not_called()
+
+    def test_switch_passes_zero_based_index_to_the_recorder(self):
+        # The API is 1-based because that is what the dashboard shows; the
+        # recorder indexes from 0. Getting this wrong switches to the wrong
+        # stream, which is silent and hard to spot.
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = True
+        rec.candidates = ["a", "b", "c"]
+        rec.switch_to_candidate.return_value = True
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/switch", data={"candidate": 3})
+        self.assertEqual(r.status_code, 200)
+        rec.switch_to_candidate.assert_called_once_with(2)
+
+    def test_switch_to_the_current_candidate_400s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock(); rec.is_running = True
+        rec.candidates = ["a", "b"]
+        rec.switch_to_candidate.return_value = False
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/switch", data={"candidate": 1})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("already", r.json()["detail"].lower())
+
+    def test_failover_refused_when_no_backup_configured(self):
+        # A single-URL session has nothing to fail over to. Honouring the
+        # request advanced past the last candidate and ended the recording,
+        # and the caller still got a 200 "success".
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.has_next_candidate = False
+        rec.candidates = ["http://a/1.m3u8"]
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/failover")
+        self.assertEqual(r.status_code, 400)
+        rec.force_failover.assert_not_called()
+        self.assertIn("backup", r.json()["detail"].lower())
+
+    def test_stop_calls_recorder_stop(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/stop")
+        self.assertEqual(r.status_code, 200)
+        rec.stop.assert_called_once()
+
+    def test_stop_runs_off_the_event_loop(self):
+        """stop() waits up to ~7s for FFmpeg and hls-proxy to exit. Called
+        inline it froze every other request -- dashboard, log streams, the Plex
+        tuner -- for that long."""
+        import asyncio
+        from unittest.mock import MagicMock
+        seen = {}
+
+        def fake_stop(reason):
+            try:
+                asyncio.get_running_loop()
+                seen["on_loop"] = True
+            except RuntimeError:
+                seen["on_loop"] = False
+            seen["reason"] = reason
+
+        rec = MagicMock()
+        rec.stop.side_effect = fake_stop
+        self.server.active_recorders["abc"] = rec
+        r = self.client.post("/api/recordings/abc/stop")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(seen, {"on_loop": False, "reason": "operator"})
+
+    def test_start_registers_session_without_spawning_ffmpeg(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {"id": "x"}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        fake.start_recording.assert_called_once()
+        self.assertEqual(len(self.server.active_recorders), 1)
+
+    def test_start_passes_all_three_candidates_in_order(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor, \
+             patch.object(self.server, "notifier", MagicMock()):
+            self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8",
+                "url_backup1": "",                       # blank middle field
+                "url_backup2": "http://c/3.m3u8",
+            })
+        candidates = ctor.call_args.kwargs["candidates"]
+        self.assertEqual(candidates, ["http://a/1.m3u8", "http://c/3.m3u8"])
+
+
+class TestCompletionOrdering(ServerTestCase):
+    """Post-process first, announce second.
+
+    notify_recording_finished triggers a Plex/Emby library scan. It used to run
+    before the remux, so the media server scanned while only the .ts existed
+    and the .mp4 did not -- indexing a file the remux was about to delete, and
+    never seeing the finished recording until its next scheduled scan. The
+    webhook text also quoted the .ts name and its pre-remux size.
+    """
+
+    def _run_completion(self, remux_result, source_bytes=b"x" * 2048,
+                        final_bytes=b"y" * 1024):
+        from unittest.mock import patch, MagicMock
+
+        order = []
+        captured = {}
+
+        ts_path = Path(self.tmp) / "game.ts"
+        ts_path.write_bytes(source_bytes)
+        mp4_path = Path(self.tmp) / "game.mp4"
+
+        def fake_recorder(**kwargs):
+            captured["on_complete"] = kwargs["on_completion_callback"]
+            rec = MagicMock()
+            rec.get_status_summary.return_value = {}
+            rec.final_filepath = None  # a bare MagicMock attr is truthy
+            captured["recorder"] = rec
+            return rec
+
+        def fake_remux(path, **kwargs):
+            order.append("remux")
+            if remux_result.get("status") == "success":
+                mp4_path.write_bytes(final_bytes)
+                ts_path.unlink()
+            return remux_result
+
+        notifier = MagicMock()
+        notifier.notify_recording_finished.side_effect = (
+            lambda sid, name, size, **kw: (order.append(("notify", name, size)),
+                                           captured.setdefault("notify_kwargs", kw))
+        )
+
+        with patch.object(self.server, "StreamFailoverRecorder", fake_recorder), \
+             patch.object(self.server, "remux_recording", fake_remux), \
+             patch.object(self.server, "notifier", notifier):
+            r = self.client.post("/api/recordings/start",
+                                 data={"url_primary": "http://a/1.m3u8"})
+            self.assertEqual(r.status_code, 200)
+            captured["on_complete"](str(ts_path))
+
+        return order, captured
+
+    def test_remux_runs_before_the_library_scan(self):
+        order, _ = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        self.assertEqual(order[0], "remux",
+                         "the media server was told to scan before the mp4 existed")
+        self.assertEqual(order[1][0], "notify")
+
+    def test_notification_names_the_remuxed_file(self):
+        order, _ = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        _, name, size_mb = order[1]
+        self.assertEqual(name, "game.mp4",
+                         "notification quoted the .ts the remux just deleted")
+        self.assertEqual(size_mb, round(1024 / (1024 * 1024), 2))
+
+    def test_failed_remux_still_notifies_about_the_ts(self):
+        # If the remux fails the .ts is what is left on disk, so that is what
+        # the notification and the scan must refer to.
+        order, _ = self._run_completion({"status": "failed", "error": "boom"})
+        self.assertEqual(order[0], "remux")
+        _, name, size_mb = order[1]
+        self.assertEqual(name, "game.ts")
+        self.assertEqual(size_mb, round(2048 / (1024 * 1024), 2))
+
+    def test_session_points_at_the_remuxed_file(self):
+        _, captured = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        self.assertEqual(captured["recorder"].final_filepath,
+                         Path(self.tmp) / "game.mp4")
+
+    def test_notification_carries_the_segment_loss_count(self):
+        _, captured = self._run_completion(
+            {"status": "success", "output_filepath": str(Path(self.tmp) / "game.mp4")}
+        )
+        self.assertIs(captured["notify_kwargs"]["segments_lost"],
+                      captured["recorder"].segments_lost)
+
+
+class TestLibraryRoutes(ServerTestCase):
+    def test_library_lists_recordings(self):
+        (Path(self.tmp) / "game.ts").write_bytes(b"x" * 1024)
+        r = self.client.get("/api/library")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual([i["filename"] for i in r.json()["library"]], ["game.ts"])
+
+    def test_rename(self):
+        (Path(self.tmp) / "old.ts").write_bytes(b"x")
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": "old.ts", "new_name": "new.ts"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue((Path(self.tmp) / "new.ts").exists())
+
+    def test_rename_missing_file_400s(self):
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": "ghost.ts", "new_name": "new.ts"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_delete_remuxed_recording(self):
+        # The reported symptom: deleting a finished recording errored, because
+        # the library only ever showed (and the UI only ever offered) .ts.
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x")
+        r = self.client.request("DELETE", "/api/library/game.mp4")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse((Path(self.tmp) / "game.mp4").exists())
+
+    def test_library_lists_remuxed_recordings(self):
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x")
+        r = self.client.get("/api/library")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual([i["filename"] for i in r.json()["library"]], ["game.mp4"])
+
+    def test_download_uses_the_right_content_type(self):
+        (Path(self.tmp) / "game.mp4").write_bytes(b"x" * 16)
+        r = self.client.get("/api/library/download/game.mp4")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "video/mp4")
+
+    def test_delete(self):
+        (Path(self.tmp) / "game.ts").write_bytes(b"x")
+        r = self.client.request("DELETE", "/api/library/game.ts")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse((Path(self.tmp) / "game.ts").exists())
+
+    def test_delete_missing_404s(self):
+        self.assertEqual(
+            self.client.request("DELETE", "/api/library/ghost.ts").status_code, 404
+        )
+
+    def test_download_missing_404s(self):
+        self.assertEqual(
+            self.client.get("/api/library/download/ghost.ts").status_code, 404
+        )
+
+    def test_download_serves_file(self):
+        (Path(self.tmp) / "game.ts").write_bytes(b"payload")
+        r = self.client.get("/api/library/download/game.ts")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"payload")
+
+
+class TestMissingStatusRoute(ServerTestCase):
+    def test_api_status_is_registered(self):
+        # The dashboard polls /api/status on a timer to refresh active
+        # sessions. get_system_status() exists in server.py but has no route
+        # decorator, so the poll 404s and the UI never updates.
+        r = self.client.get("/api/status")
+        self.assertEqual(r.status_code, 200,
+                         "/api/status is not routed; dashboard polling is dead")
+        body = r.json()
+        for key in ("active_count", "total_sessions", "sessions"):
+            self.assertIn(key, body)
+
+
+class TestCookieRedaction(unittest.TestCase):
+    """A live session cookie must not be readable back out of the API.
+
+    PVArr is unauthenticated by design, so every field in /api/status is
+    effectively public to the LAN. The cookie is the sponsor's paid account.
+    """
+
+    def make(self):
+        from app.recorder import CandidateStream
+        c = CandidateStream("https://example.com/s.m3u8", "Primary")
+        c.cookie = "SESSIONID=super-secret-token"
+        return c
+
+    def test_to_dict_withholds_the_cookie_by_default(self):
+        data = self.make().to_dict()
+        self.assertNotIn("cookie", data)
+        self.assertNotIn("super-secret-token", json.dumps(data))
+
+    def test_to_dict_reports_that_a_cookie_exists(self):
+        # The UI still needs to show that auth is attached, just not what it is.
+        self.assertTrue(self.make().to_dict()["has_cookie"])
+        from app.recorder import CandidateStream
+        self.assertFalse(CandidateStream("https://example.com/s.m3u8").to_dict()["has_cookie"])
+
+    def test_opt_in_still_returns_the_value(self):
+        # Persistence and FFmpeg command building need the real thing.
+        self.assertEqual(self.make().to_dict(include_secrets=True)["cookie"],
+                         "SESSIONID=super-secret-token")
+
+    def test_status_payload_carries_no_cookie(self):
+        rec = StreamFailoverRecorder("s1", ["https://example.com/s.m3u8"], "/tmp/x.ts")
+        rec.candidates[0].cookie = "SESSIONID=super-secret-token"
+        self.assertNotIn("super-secret-token", json.dumps(rec.get_status_summary()))
+
+
+class TestTunerStream(ServerTestCase):
+    """The endpoint the tuner playlist advertises. It did not exist before, so
+    every channel Plex saw resolved to a 404."""
+
+    def _fake_recorder(self, data=b"", running=False):
+        from unittest.mock import MagicMock
+        path = Path(self.tmp) / "live.ts"
+        path.write_bytes(data)
+        rec = MagicMock()
+        rec.output_filepath = path
+        rec.is_running = running
+        # Explicit: on a MagicMock every attribute is truthy, so without this
+        # the endpoint takes the rebroadcast branch and tails a ring that does
+        # not exist.
+        rec.is_rebroadcast = False
+        rec.ring = None
+        return rec
+
+    def test_unknown_session_404s(self):
+        self.assertEqual(
+            self.client.get("/api/recordings/nope/stream").status_code, 404
+        )
+
+    def test_streams_the_recorded_bytes(self):
+        self.server.active_recorders["abc"] = self._fake_recorder(b"\x47" + b"payload")
+        r = self.client.get("/api/recordings/abc/stream")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "video/mp2t")
+        self.assertEqual(r.content, b"\x47" + b"payload")
+
+    def test_live_mode_starts_at_the_write_head(self):
+        # ?live=true joins at the current position instead of replaying.
+        self.server.active_recorders["abc"] = self._fake_recorder(b"old data here")
+        r = self.client.get("/api/recordings/abc/stream?live=true")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"")
+
+    def test_missing_file_on_stopped_recorder_404s(self):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.output_filepath = Path(self.tmp) / "never-written.ts"
+        rec.is_running = False
+        rec.is_rebroadcast = False
+        rec.ring = None
+        self.server.active_recorders["abc"] = rec
+        self.assertEqual(
+            self.client.get("/api/recordings/abc/stream").status_code, 404
+        )
+
+    def test_playlist_url_resolves_to_a_real_route(self):
+        # Guards the exact regression: tuner advertising an unrouted path.
+        from app.tuner import generate_m3u_playlist
+        self.server.active_recorders["abc"] = self._fake_recorder(b"data")
+        m3u = generate_m3u_playlist(
+            [{"id": "abc", "output_filename": "g.ts", "is_running": True}],
+            "http://testserver",
+        )
+        url = [l for l in m3u.splitlines() if l.startswith("http")][0]
+        r = self.client.get(url.replace("http://testserver", ""))
+        self.assertEqual(r.status_code, 200, f"tuner URL {url} is not routable")
+
+
+class TestSessionRetention(ServerTestCase):
+    """Nothing used to remove finished sessions, so the dict grew for the life
+    of the process and the proxy port climbed with it."""
+
+    def _session(self, rid, running, stop_time=0.0, base_port=8090):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = running
+        rec.stop_time = stop_time
+        rec.base_port = base_port
+        rec.holds_proxy_port = False
+        self.server.active_recorders[rid] = rec
+        return rec
+
+    def test_finished_sessions_are_capped(self):
+        for i in range(self.server.MAX_FINISHED_SESSIONS + 10):
+            self._session(f"old{i}", running=False, stop_time=float(i))
+        self.server._prune_finished_sessions()
+        self.assertEqual(len(self.server.active_recorders),
+                         self.server.MAX_FINISHED_SESSIONS)
+
+    def test_pruning_drops_the_oldest_first(self):
+        for i in range(self.server.MAX_FINISHED_SESSIONS + 3):
+            self._session(f"s{i}", running=False, stop_time=float(i))
+        self.server._prune_finished_sessions()
+        remaining = set(self.server.active_recorders)
+        self.assertNotIn("s0", remaining)
+        self.assertIn(f"s{self.server.MAX_FINISHED_SESSIONS + 2}", remaining)
+
+    def test_running_sessions_are_never_pruned(self):
+        for i in range(self.server.MAX_FINISHED_SESSIONS + 5):
+            self._session(f"done{i}", running=False, stop_time=float(i))
+        self._session("live", running=True)
+        self.server._prune_finished_sessions()
+        self.assertIn("live", self.server.active_recorders)
+
+    def test_proxy_port_reuses_freed_slots(self):
+        # Derived from the total count, this climbed forever and eventually
+        # ran past the valid port range. A stopped session's block is free.
+        self._session("a", running=True, base_port=8090)
+        self._session("b", running=False, base_port=8094)
+        self.assertEqual(self.server._allocate_proxy_port(), 8094)
+
+    def test_proxy_ports_do_not_collide_between_running_sessions(self):
+        self._session("a", running=True, base_port=8090)
+        self._session("b", running=True, base_port=8094)
+        self.assertEqual(self.server._allocate_proxy_port(), 8098)
+
+    def test_a_stopped_session_still_holding_its_proxy_keeps_its_ports(self):
+        """stop() clears is_running before the proxy has exited. With the stop
+        in a worker thread, a start in that window was handed a block a live
+        proxy was still bound to -- and a proxy that never dies, forever."""
+        from app.server import PROXY_PORT_STRIDE
+        rec = self._session("a", running=False, base_port=8090)
+        rec.holds_proxy_port = True
+        self.assertEqual(self.server._allocate_proxy_port(), 8090 + PROXY_PORT_STRIDE)
+
+    def test_allocator_leaves_room_for_every_candidate(self):
+        # start_proxy() binds base_port + candidate_index, so a three-candidate
+        # session occupies base .. base+2. The allocator used to step by 2, so
+        # session A failing over to its third candidate bound 8092 -- which had
+        # already been handed to session B as a base, and B's proxy then could
+        # not start. The gap must exceed the candidates a session can hold.
+        from app.server import PROXY_PORT_STRIDE
+        self._session("a", running=True, base_port=8090)
+        second = self.server._allocate_proxy_port()
+        self.assertGreaterEqual(second - 8090, 3,
+                                "next base port lands inside session a's block")
+        self.assertEqual(second, 8090 + PROXY_PORT_STRIDE)
+
+    def test_candidate_index_cannot_escape_its_reserved_block(self):
+        from app.recorder import PROXY_PORT_STRIDE, StreamFailoverRecorder
+        rec = StreamFailoverRecorder(
+            "x", ["u1", "u2", "u3"], "/tmp/x.ts", base_port=8090)
+        for index in range(6):
+            rec.current_candidate_index = index
+            port = rec.base_port + (rec.current_candidate_index % PROXY_PORT_STRIDE)
+            self.assertLess(port, 8090 + PROXY_PORT_STRIDE)
+
+
+class TestShutdown(ServerTestCase):
+    def test_lifespan_shutdown_stops_active_recorders(self):
+        # docker stop / Ctrl-C must not orphan FFmpeg and hls-proxy children.
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        with TestClient(self.server.app) as client:
+            self.server.active_recorders["abc"] = rec
+            client.get("/live/epg.xml")
+        rec.stop.assert_called_once()
+
+    def test_shutdown_survives_a_failing_recorder(self):
+        from unittest.mock import MagicMock
+        bad = MagicMock()
+        bad.stop.side_effect = RuntimeError("already dead")
+        good = MagicMock()
+        with TestClient(self.server.app) as client:
+            self.server.active_recorders["bad"] = bad
+            self.server.active_recorders["good"] = good
+            client.get("/live/epg.xml")
+        good.stop.assert_called_once()
+
+
+class TestPathHandling(ServerTestCase):
+    """Directory-escape guards.
+
+    None of these endpoints are authenticated, so an unconstrained dir_path
+    turned the library API into arbitrary file read and delete for anyone who
+    could reach the port. All three of these failed before the fix.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.outside = tempfile.mkdtemp(prefix="pvarr-outside-")
+        self.secret = Path(self.outside) / "secret.txt"
+        self.secret.write_bytes(b"SENSITIVE")
+
+    def tearDown(self):
+        shutil.rmtree(self.outside, ignore_errors=True)
+        super().tearDown()
+
+    def test_start_refuses_output_dir_outside_allowlist(self):
+        # output_dir gets mkdir'd and written to, so an unconstrained value is
+        # arbitrary directory creation plus arbitrary file write.
+        r = self.client.post("/api/recordings/start", data={
+            "url_primary": "http://a/1.m3u8",
+            "output_dir": str(Path(self.outside) / "escaped"),
+        })
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse((Path(self.outside) / "escaped").exists(),
+                         "directory created outside the allowlist")
+
+    def test_start_accepts_output_dir_inside_allowlist(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        inside = str(Path(self.tmp) / "sub")
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8",
+                "output_dir": inside,
+            })
+        self.assertEqual(r.status_code, 200)
+
+    def test_download_refuses_dir_path_outside_allowlist(self):
+        r = self.client.get(
+            f"/api/library/download/secret.txt?dir_path={self.outside}"
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertNotIn(b"SENSITIVE", r.content)
+
+    def test_delete_refuses_dir_path_outside_allowlist(self):
+        r = self.client.request(
+            "DELETE", f"/api/library/secret.txt?dir_path={self.outside}"
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(self.secret.exists(), "file outside allowlist was deleted")
+
+    def test_list_refuses_dir_path_outside_allowlist(self):
+        self.assertEqual(
+            self.client.get(f"/api/library?dir_path={self.outside}").status_code, 403
+        )
+
+    def test_rename_refuses_filename_with_directory_component(self):
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": "../x.ts", "new_name": "y.ts"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_allowlist_env_var_permits_extra_dirs(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_ALLOWED_DIRS": self.outside}):
+            r = self.client.get(
+                f"/api/library/download/secret.txt?dir_path={self.outside}"
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"SENSITIVE")
+
+    def test_download_rejects_dotdot_traversal(self):
+        r = self.client.get("/api/library/download/..%2F..%2Fetc%2Fpasswd")
+        self.assertNotEqual(r.status_code, 200, "path traversal via %2F succeeded")
+
+
+# ---------------------------------------------------------------------------
+# Stream probe: paste a URL, get back a playlist plus the headers it needs.
+# Every test here drives a scripted fake HTTP layer -- no network.
+# ---------------------------------------------------------------------------
+
+MEDIA_PLAYLIST = b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg1.ts\n#EXTINF:6.0,\nseg2.ts\n"
+MASTER_PLAYLIST = (
+    b"#EXTM3U\n"
+    b'#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080\n720/index.m3u8\n'
+    b'#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1280x720\n480/index.m3u8\n'
+)
+
+
+class FakeResponse:
+    def __init__(self, url, status=200, body=b"", headers=None):
+        self.url = url
+        self.status_code = status
+        self._body = body
+        self.headers = headers or {}
+
+    @property
+    def ok(self):
+        return 200 <= self.status_code < 400
+
+    def iter_content(self, chunk_size):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+class FakeSession:
+    """Serves a handler(url, headers) -> FakeResponse and records every call."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.cookies = []
+        self.calls = []
+
+    def get(self, url, headers=None, timeout=None, stream=False, allow_redirects=True):
+        headers = dict(headers or {})
+        self.calls.append((url, headers))
+        return self.handler(url, headers)
+
+
+class ProbeTestCase(unittest.TestCase):
+    # handler(url, headers) for requests made with the browser TLS profile.
+    # None means curl_cffi is unavailable, so no test ever touches the network.
+    browser_tls_handler = None
+
+    def probe(self, handler, url, **kwargs):
+        from unittest.mock import patch
+        import app.probe as probe_mod
+        self.session = FakeSession(handler)
+        self.browser_tls = (FakeSession(self.browser_tls_handler)
+                             if self.browser_tls_handler else None)
+        # Placeholder hosts must not reach DNS; IP literals still classify.
+        with patch.object(probe_mod.requests, "Session", return_value=self.session), \
+                patch.object(probe_mod, "_browser_tls_session",
+                             return_value=self.browser_tls), \
+                patch.object(probe_mod.socket, "getaddrinfo",
+                             side_effect=OSError("no DNS in tests")):
+            return probe_mod.probe_stream(url, **kwargs)
+
+
+class TestProbeUrlCleaning(unittest.TestCase):
+    def test_strips_quotes_and_whitespace(self):
+        from app.probe import clean_url
+        self.assertEqual(
+            clean_url("  'https://a.example/x.m3u8'  "), "https://a.example/x.m3u8"
+        )
+
+    def test_protocol_relative_gets_scheme(self):
+        from app.probe import clean_url
+        self.assertEqual(clean_url("//a.example/x.m3u8"), "https://a.example/x.m3u8")
+
+    def test_rejects_non_http_scheme(self):
+        from app.probe import clean_url, ProbeError
+        # file:// would turn the probe endpoint into a local file reader.
+        for bad in ("file:///etc/passwd", "ftp://a/x.m3u8", "notaurl"):
+            with self.subTest(url=bad), self.assertRaises(ProbeError):
+                clean_url(bad)
+
+
+class TestProbeDirectPlaylist(ProbeTestCase):
+    def test_open_stream_needs_no_headers(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://cdn.example/hls/stream.m3u8",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["referer"], "")
+        self.assertEqual(result["headers_required"], [])
+        self.assertEqual(result["kind"], "media")
+
+    def test_bare_attempt_comes_first(self):
+        # Sending an invented Referer to a stream that does not want one is
+        # occasionally worse than sending none, so try clean first.
+        self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://cdn.example/hls/stream.m3u8",
+        )
+        self.assertNotIn("Referer", self.session.calls[0][1])
+
+    def test_referer_discovered_when_403_without_it(self):
+        def handler(url, headers):
+            if headers.get("Referer") != "https://cdn.example/":
+                return FakeResponse(url, 403, b"denied")
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+
+        result = self.probe(handler, "https://cdn.example/hls/stream.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["referer"], "https://cdn.example/")
+        self.assertIn("Referer", result["headers_required"])
+
+    def test_referer_taken_from_query_string(self):
+        def handler(url, headers):
+            if headers.get("Referer") != "https://player.example/embed":
+                return FakeResponse(url, 403, b"denied")
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+
+        result = self.probe(
+            handler,
+            "https://cdn.example/x.m3u8?referer=https://player.example/embed",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["referer"], "https://player.example/embed")
+
+    def test_caller_referer_is_tried_first(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://cdn.example/x.m3u8",
+            referer="https://mysite.example/game",
+        )
+        self.assertEqual(self.session.calls[0][1]["Referer"], "https://mysite.example/game")
+        self.assertEqual(result["referer"], "https://mysite.example/game")
+
+    def test_all_rejected_reports_403(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 403, b"denied"),
+            "https://cdn.example/x.m3u8",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("403", result["message"])
+
+    def test_expired_token_reads_as_404(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 404, b""),
+            "https://cdn.example/x.m3u8?token=old",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("expired", result["message"])
+
+    def test_non_playlist_body_is_not_accepted(self):
+        # A 200 that is actually an HTML error page must not pass as a stream.
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, b"<html>nope</html>"),
+            "https://cdn.example/x.m3u8",
+        )
+        self.assertFalse(result["ok"])
+
+
+class TestProbeMasterPlaylist(ProbeTestCase):
+    def handler(self, url, headers):
+        if url.endswith("master.m3u8"):
+            return FakeResponse(url, 200, MASTER_PLAYLIST)
+        if url.endswith("index.m3u8"):
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+        return FakeResponse(url, 200, b"\x47" * 512)
+
+    def test_variants_parsed(self):
+        result = self.probe(self.handler, "https://cdn.example/master.m3u8")
+        self.assertEqual(result["kind"], "master")
+        self.assertEqual(len(result["variants"]), 2)
+        self.assertEqual(result["variants"][0]["resolution"], "1920x1080")
+        self.assertEqual(result["variants"][0]["bandwidth"], 5000000)
+
+    def test_variant_urls_absolutised(self):
+        result = self.probe(self.handler, "https://cdn.example/master.m3u8")
+        self.assertEqual(
+            result["variants"][0]["url"], "https://cdn.example/720/index.m3u8"
+        )
+
+    def test_segment_reached_through_variant(self):
+        result = self.probe(self.handler, "https://cdn.example/master.m3u8")
+        self.assertTrue(result["segment_ok"])
+
+
+class TestProbeSegmentCheck(ProbeTestCase):
+    def test_gated_segments_flagged(self):
+        # The manifest is public, the segments are not: this is the failure
+        # that would otherwise show up minutes into a recording.
+        def handler(url, headers):
+            if url.endswith(".m3u8"):
+                return FakeResponse(url, 200, MEDIA_PLAYLIST)
+            return FakeResponse(url, 403, b"")
+
+        result = self.probe(handler, "https://cdn.example/x.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["segment_ok"])
+        self.assertIn("segments rejected", result["message"])
+
+    def test_segment_request_is_ranged(self):
+        def handler(url, headers):
+            if url.endswith(".m3u8"):
+                return FakeResponse(url, 200, MEDIA_PLAYLIST)
+            return FakeResponse(url, 206, b"\x47" * 1024)
+
+        self.probe(handler, "https://cdn.example/x.m3u8")
+        seg_call = [c for c in self.session.calls if c[0].endswith(".ts")][0]
+        self.assertEqual(seg_call[1]["Range"], "bytes=0-2047")
+
+
+class TestProbeFollowsTheEmbedChain(ProbeTestCase):
+    """Phase 18: the pasted page holds no m3u8; the player is several embeds deep.
+
+    Modelled on the chain traced on 2026-09-01 (domains replaced): an iframe,
+    then an external script that document.write()s the next iframe using a
+    variable the parent set, then a player that builds the playlist URL from a
+    character array. The CDN accepts only the innermost document as Referer.
+    """
+
+    PLAYER = "https://player.example/p1.php?ch=chan1"
+    PLAYLIST = "https://cdn.example:8443/hls/chan1.m3u8"
+
+    def handler(self, url, headers):
+        pages = {
+            "https://front.example/watch/event.html":
+                b'<html><iframe src="https://embed.example/fetch.php?hd=604"></iframe></html>',
+            "https://embed.example/fetch.php?hd=604":
+                b'<script>window.fid="chan1";</script>'
+                b'<script src="https://player.example/p1.js"></script>',
+            "https://player.example/p1.js":
+                b"document.write('<iframe src=\"https:\\/\\/player.example/p1.php"
+                b"?ch='+fid+'\" width=100%></iframe>');",
+            self.PLAYER:
+                b'<script>var src = ["h","t","t","p","s",":","/","/","cdn.example",'
+                b'":8443","/hls/chan1",".m3u8"].join("");</script>',
+        }
+        if url in pages:
+            return FakeResponse(url, 200, pages[url])
+        if url == self.PLAYLIST:
+            if headers.get("Referer", "").startswith("https://player.example/"):
+                return FakeResponse(url, 200, MEDIA_PLAYLIST)
+            return FakeResponse(url, 403, b"denied")
+        if url.endswith(".ts"):
+            return FakeResponse(url, 200, b"\x47" * 512)
+        return FakeResponse(url, 404, b"")
+
+    def test_playlist_found_through_iframe_script_and_joined_array(self):
+        result = self.probe(self.handler, "https://front.example/watch/event.html",
+                            use_ytdlp=False)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertEqual(result["m3u8_url"], self.PLAYLIST)
+        # The innermost document is the Referer, not the pasted page.
+        self.assertEqual(result["page_url"], self.PLAYER)
+        self.assertTrue(result["referer"].startswith("https://player.example/"))
+        self.assertTrue(result["segment_ok"])
+
+    def test_iframe_is_fetched_with_its_parent_as_referer(self):
+        self.probe(self.handler, "https://front.example/watch/event.html", use_ytdlp=False)
+        sent = {url: h.get("Referer") for url, h in self.session.calls}
+        self.assertEqual(sent["https://embed.example/fetch.php?hd=604"], "https://front.example/")
+        self.assertEqual(sent[self.PLAYER], "https://embed.example/")
+
+
+class TestProbeRetriesWithABrowserTlsProfile(ProbeTestCase):
+    """Phase 18: an origin that serves its playlist only to a browser TLS
+    profile. Plain clients get 403 whatever the headers; segments need only
+    the Referer, which FFmpeg can send."""
+
+    PLAYLIST = "https://edge.example/live/playlist.m3u8"
+    PLAYLIST_BODY = b"#EXTM3U\n#EXTINF:6.0,\nhttps://media.example/s1.ts\n"
+
+    def plain(self, url, headers):
+        if url.endswith(".ts") and headers.get("Referer"):
+            return FakeResponse(url, 206, b"\x47" * 512)
+        return FakeResponse(url, 403, b"denied")
+
+    def chrome(self, url, headers):
+        if url == self.PLAYLIST and headers.get("Referer"):
+            return FakeResponse(url, 200, self.PLAYLIST_BODY)
+        return FakeResponse(url, 403, b"denied")
+
+    def test_playlist_found_as_chrome_and_flagged_for_the_relay(self):
+        self.browser_tls_handler = self.chrome
+        result = self.probe(self.plain, self.PLAYLIST, referer="https://player.example/")
+        self.assertTrue(result["ok"], result["message"])
+        self.assertTrue(result["impersonate"])
+        # Segments were proven with the plain client, as FFmpeg will fetch them.
+        self.assertTrue(result["segment_ok"])
+        self.assertTrue(any(url.endswith(".ts") for url, _ in self.session.calls))
+        self.assertFalse(any(url.endswith(".ts") for url, _ in self.browser_tls.calls))
+
+    def test_no_browser_tls_retry_when_plain_client_succeeds(self):
+        self.browser_tls_handler = self.chrome
+        result = self.probe(lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+                            self.PLAYLIST)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["impersonate"])
+        self.assertEqual(self.browser_tls.calls, [])
+
+
+class TestPlaylistSearchIsLinear(unittest.TestCase):
+    """Review 2026-10-05: the old m3u8 regex took 13.75s on a 60 KB base64
+    data URI, and the embed walk reads up to a dozen documents per probe --
+    on the failover path, that is a stalled recording."""
+
+    def test_a_long_base64_run_does_not_stall_the_search(self):
+        from app.probe import _extract_playlists
+        page = ("<img src='data:image/png;base64," + "QUJD" * 15000 + "'>"
+                "<script>var s = 'https://cdn.example/live/master.m3u8?t=1';</script>")
+        started = time.monotonic()
+        found = _extract_playlists(page, "https://site.example/")
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(found, ["https://cdn.example/live/master.m3u8?t=1"])
+
+
+class TestEmbedWalkStaysOffThePrivateNetwork(ProbeTestCase):
+    """Review 2026-10-05: a scraped page could point the embed walk at the
+    sponsor's LAN, the container's own API, or a cloud metadata address."""
+
+    PAGE = (b'<iframe src="http://127.0.0.1:8999/api/status"></iframe>'
+            b'<iframe src="http://169.254.169.254/latest/meta-data/"></iframe>'
+            b'<script>var s="http://192.168.1.10/live/index.m3u8";</script>')
+
+    def handler(self, url, headers):
+        return FakeResponse(url, 200, self.PAGE if "front" in url else b"")
+
+    def test_private_embeds_and_playlists_are_never_fetched(self):
+        result = self.probe(self.handler, "https://front.example/watch", use_ytdlp=False)
+        self.assertFalse(result["ok"])
+        fetched = [url for url, _ in self.session.calls]
+        self.assertEqual(fetched, ["https://front.example/watch"])
+        skipped = [a["url"] for a in result["attempts"] if a.get("stage") == "embed"]
+        self.assertEqual(len(skipped), 3)
+
+    def test_a_private_page_may_embed_private_documents(self):
+        def handler(url, headers):
+            if url.endswith("/watch"):
+                return FakeResponse(url, 200, b'<iframe src="http://10.0.0.2/p"></iframe>')
+            if url == "http://10.0.0.2/p":
+                return FakeResponse(url, 200, b'"http://10.0.0.2/live.m3u8"')
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+        result = self.probe(handler, "http://10.0.0.1/watch", use_ytdlp=False,
+                            check_segment=False)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertEqual(result["m3u8_url"], "http://10.0.0.2/live.m3u8")
+
+
+class TestRedirectsAndPlaylistsStayOffThePrivateNetwork(ProbeTestCase):
+    """Review 2026-10-06: the checks above covered URLs PVArr found, but not
+    where a 302 sent it, nor the segment URLs inside a playlist."""
+
+    PRIVATE = ("http://127.0.0.1:8999/api/status", "http://10.0.0.5/x.m3u8",
+               "http://192.168.1.10/x.m3u8", "http://169.254.169.254/latest/meta-data/",
+               "http://[::1]/x.m3u8")
+
+    def test_a_redirect_to_a_private_address_is_refused(self):
+        for private in self.PRIVATE:
+            with self.subTest(private=private):
+                def handler(url, headers):
+                    return FakeResponse(url, 302, b"", {"Location": private})
+                result = self.probe(handler, "https://cdn.example/live.m3u8",
+                                    use_ytdlp=False)
+                self.assertFalse(result["ok"])
+                self.assertNotIn(private, [u for u, _ in self.session.calls])
+                self.assertIn("private", result["message"])
+
+    def test_a_public_redirect_is_followed_without_the_cookie(self):
+        def handler(url, headers):
+            if url.startswith("https://cdn.example/"):
+                return FakeResponse(url, 302, b"", {"Location": "https://8.8.8.8/hls/live.m3u8"})
+            return FakeResponse(url, 200, MEDIA_PLAYLIST if url.endswith(".m3u8") else b"\x47")
+        result = self.probe(handler, "https://cdn.example/live.m3u8", cookie="sid=1",
+                            use_ytdlp=False)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertEqual(result["m3u8_url"], "https://8.8.8.8/hls/live.m3u8")
+        hop = next(h for u, h in self.session.calls if u.startswith("https://8.8.8.8/"))
+        self.assertNotIn("Cookie", hop)  # never handed to a different host
+
+    def test_a_public_playlist_naming_a_private_segment_is_refused(self):
+        playlist = b"#EXTM3U\n#EXTINF:6.0,\nhttp://192.168.1.10/seg1.ts\n"
+        result = self.probe(lambda url, h: FakeResponse(url, 200, playlist),
+                            "https://cdn.example/live.m3u8", use_ytdlp=False)
+        self.assertFalse(result["ok"])
+        self.assertIn("192.168.1.10", result["message"])
+        self.assertEqual([u for u, _ in self.session.calls], ["https://cdn.example/live.m3u8"])
+
+    def test_a_pasted_lan_source_still_works(self):
+        # Recording from a local IPTV box: the operator typed a LAN URL, so
+        # its redirects and segments may stay on the LAN.
+        def handler(url, headers):
+            if url == "http://192.168.1.5/live.m3u8":
+                return FakeResponse(url, 302, b"", {"Location": "http://192.168.1.6/live.m3u8"})
+            if url.endswith(".m3u8"):
+                return FakeResponse(url, 200, b"#EXTM3U\n#EXTINF:6.0,\nhttp://10.0.0.7/s1.ts\n")
+            return FakeResponse(url, 200, b"\x47" * 188)
+        result = self.probe(handler, "http://192.168.1.5/live.m3u8", use_ytdlp=False)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertTrue(result["segment_ok"])
+        self.assertIn("http://10.0.0.7/s1.ts", [u for u, _ in self.session.calls])
+
+
+class TestEmbedWalkIsBounded(ProbeTestCase):
+    """A page cannot make one probe fetch more than MAX_EMBED_FETCHES embeds."""
+
+    def test_twenty_iframes_cost_twelve_fetches(self):
+        from app.probe import MAX_EMBED_FETCHES
+        page = b"".join(b'<iframe src="https://f%d.example/"></iframe>' % i for i in range(20))
+        result = self.probe(lambda url, h: FakeResponse(url, 200, page),
+                            "https://front.example/watch", use_ytdlp=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(MAX_EMBED_FETCHES, 12)
+        self.assertEqual(len(self.session.calls), 1 + MAX_EMBED_FETCHES)
+
+
+class TestProbePageScraping(ProbeTestCase):
+    PAGE = (
+        b"<html><script>var src = 'https:\\/\\/cdn.example\\/hls\\/master.m3u8?t=9';"
+        b"</script></html>"
+    )
+
+    def handler(self, url, headers):
+        if url.endswith(".php"):
+            return FakeResponse(url, 200, self.PAGE)
+        if headers.get("Referer") != "https://site.example/watch.php":
+            return FakeResponse(url, 403, b"denied")
+        if ".m3u8" in url:
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+        return FakeResponse(url, 200, b"\x47" * 512)
+
+    def test_m3u8_extracted_from_page(self):
+        result = self.probe(self.handler, "https://site.example/watch.php")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["m3u8_url"], "https://cdn.example/hls/master.m3u8?t=9")
+
+    def test_page_becomes_the_referer(self):
+        result = self.probe(self.handler, "https://site.example/watch.php")
+        self.assertEqual(result["referer"], "https://site.example/watch.php")
+        self.assertEqual(result["page_url"], "https://site.example/watch.php")
+
+    def test_stream_url_behind_640kb_of_padding_is_found_whole(self):
+        # Shape of a shared embed player page (2026-10-07): ~640 KB of
+        # inline script, then the URL with its '&' written as &.
+        # The old 512 KB read stopped short of it, and the escape cut the
+        # token's expiry off the query.
+        class Chunked(FakeResponse):
+            def iter_content(self, chunk_size):
+                for i in range(0, len(self._body), chunk_size):
+                    yield self._body[i:i + chunk_size]
+
+        page = (b"<script>window['k']='" + b"A" * 640 * 1024 + b"';</script>"
+                b'<script>const streamUrl = "https://edge.example/hls/x.m3u8'
+                b'?st=tok\\u0026e=99";</script>')
+
+        def handler(url, headers):
+            if ".m3u8" in url:
+                return FakeResponse(url, 200, MEDIA_PLAYLIST)
+            if url.endswith("/watch"):
+                return Chunked(url, 200, page)
+            return FakeResponse(url, 200, b"\x47" * 512)
+
+        result = self.probe(handler, "https://site.example/watch", use_ytdlp=False)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertEqual(result["m3u8_url"], "https://edge.example/hls/x.m3u8?st=tok&e=99")
+
+    def test_base64_stream_url_is_decoded(self):
+        # Shape of a player page seen 2026-10-07: the m3u8 is a base64
+        # string the player passes to atob(), next to an unrelated large
+        # base64 blob that must not slow the scan down.
+        import base64, time
+        url = b"https://dash.example/live/event-1/index.m3u8"
+        page = (b"<script>var e=['" + b"d3d3" * 200_000 + b"'];"
+                b'const activeStream = "' + base64.b64encode(url) + b'";'
+                b"player.load(atob(activeStream));</script>")
+
+        def handler(u, headers):
+            if u.endswith("/watch"):
+                return FakeResponse(u, 200, page)
+            if ".m3u8" in u:
+                return FakeResponse(u, 200, MEDIA_PLAYLIST)
+            return FakeResponse(u, 200, b"\x47" * 512)
+
+        started = time.monotonic()
+        result = self.probe(handler, "https://site.example/watch", use_ytdlp=False)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertEqual(result["m3u8_url"], url.decode())
+
+    def test_page_with_no_playlist_says_so(self):
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, b"<html>nothing here</html>"),
+            "https://site.example/watch.php",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("No .m3u8", result["message"])
+
+    def test_url_serving_a_playlist_without_m3u8_suffix(self):
+        # Some hosts serve playlists from extensionless paths.
+        result = self.probe(
+            lambda url, h: FakeResponse(url, 200, MEDIA_PLAYLIST),
+            "https://site.example/live/channel1",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["kind"], "media")
+
+
+class TestProbeBodyCap(ProbeTestCase):
+    def test_oversized_body_is_truncated(self):
+        import app.probe as probe_mod
+        huge = b"#EXTM3U\n" + b"x" * (probe_mod.MAX_BYTES * 3)
+        result = self.probe(lambda url, h: FakeResponse(url, 200, huge),
+                            "https://cdn.example/x.m3u8")
+        # Accepted, but the probe must not have grown with the response.
+        self.assertTrue(result["ok"])
+
+
+class TestRecorderProbeIntegration(unittest.TestCase):
+    """The recorder probes at connect time, then falls back to the script."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rec(self, **kwargs):
+        return StreamFailoverRecorder(
+            "test-id", ["https://cdn.example/x.m3u8"],
+            str(Path(self.tmp) / "out.ts"), **kwargs
+        )
+
+    def test_probe_result_populates_candidate(self):
+        from unittest.mock import patch
+        rec = self._rec()
+        fake = {
+            "ok": True,
+            "m3u8_url": "https://cdn.example/real.m3u8",
+            "referer": "https://site.example/",
+            "user_agent": "UA/9",
+            "cookie": "sid=abc",
+            "kind": "media",
+            "headers_required": ["Referer", "Cookie"],
+            "message": "Media playlist, needs Referer + Cookie.",
+        }
+        with patch("app.recorder.probe_stream", return_value=fake):
+            rec.detect_candidate_headers(rec.candidates[0])
+        cand = rec.candidates[0]
+        self.assertEqual(cand.m3u8_url, "https://cdn.example/real.m3u8")
+        self.assertEqual(cand.referer, "https://site.example/")
+        self.assertEqual(cand.cookie, "sid=abc")
+        self.assertEqual(cand.user_agent, "UA/9")
+        self.assertEqual(cand.detect_source, "probe")
+
+    def test_failed_probe_falls_back_to_raw_url(self):
+        from unittest.mock import patch
+        rec = self._rec()
+        rec.detect_headers_path = ""
+        with patch("app.recorder.probe_stream", return_value={"ok": False, "message": "nope"}):
+            rec.detect_candidate_headers(rec.candidates[0])
+        # A failed probe must still leave a recordable URL: the stream may well
+        # work under FFmpeg even when the probe cannot confirm it.
+        self.assertEqual(rec.candidates[0].m3u8_url, "https://cdn.example/x.m3u8")
+        self.assertEqual(rec.candidates[0].detect_source, "raw")
+
+    def test_probe_exception_does_not_kill_recording(self):
+        from unittest.mock import patch
+        rec = self._rec()
+        rec.detect_headers_path = ""
+        with patch("app.recorder.probe_stream", side_effect=RuntimeError("boom")):
+            self.assertTrue(rec.detect_candidate_headers(rec.candidates[0]))
+        self.assertEqual(rec.candidates[0].detect_source, "raw")
+
+    def test_script_used_only_after_probe_fails(self):
+        from unittest.mock import patch, MagicMock
+        rec = self._rec()
+        detector = Path(self.tmp) / "detect-headers.sh"
+        detector.write_text("#!/bin/sh\necho {}\n")
+        detector.chmod(0o755)
+        rec.detect_headers_path = str(detector)
+        good = {"ok": True, "m3u8_url": "https://cdn.example/x.m3u8", "referer": "",
+                "user_agent": "UA", "cookie": "", "kind": "media",
+                "headers_required": [], "message": "ok"}
+        with patch("app.recorder.probe_stream", return_value=good):
+            with patch("app.recorder.subprocess.run") as run:
+                rec.detect_candidate_headers(rec.candidates[0])
+        run.assert_not_called()
+
+    def test_auto_probe_can_be_disabled(self):
+        from unittest.mock import patch
+        rec = self._rec(auto_probe=False)
+        rec.detect_headers_path = ""
+        with patch("app.recorder.probe_stream") as probe:
+            rec.detect_candidate_headers(rec.candidates[0])
+        probe.assert_not_called()
+
+    def test_header_overrides_seed_candidates_by_url(self):
+        rec = StreamFailoverRecorder(
+            "test-id",
+            ["https://a.example/1.m3u8", "https://b.example/2.m3u8"],
+            str(Path(self.tmp) / "out.ts"),
+            header_overrides={"https://b.example/2.m3u8": {"referer": "https://b.example/"}},
+        )
+        # Keyed by URL, so the override lands on the second candidate only.
+        self.assertEqual(rec.candidates[0].referer, "")
+        self.assertEqual(rec.candidates[1].referer, "https://b.example/")
+
+    def test_cookie_reaches_ffmpeg_headers(self):
+        rec = self._rec(auto_probe=False)
+        cmd = rec._build_ffmpeg_cmd(
+            "https://cdn.example/x.m3u8", referer="https://s/", cookie="sid=abc"
+        )
+        headers = cmd[cmd.index("-headers") + 1]
+        self.assertIn("Cookie: sid=abc", headers)
+
+
+class TestProbeRoute(ServerTestCase):
+    def test_probe_endpoint_returns_result(self):
+        from unittest.mock import patch
+        fake = {"ok": True, "m3u8_url": "https://cdn.example/x.m3u8", "message": "fine"}
+        with patch("app.server.probe_stream", return_value=fake):
+            r = self.client.post("/api/probe", data={"url": "https://cdn.example/x.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["ok"])
+
+    def test_probe_passes_referer_hint(self):
+        from unittest.mock import patch
+        with patch("app.server.probe_stream", return_value={"ok": False}) as probe:
+            self.client.post(
+                "/api/probe",
+                data={"url": "https://cdn.example/x.m3u8", "referer": "https://site/"},
+            )
+        self.assertEqual(probe.call_args.kwargs["referer"], "https://site/")
+
+    def test_probe_rejects_absurd_url(self):
+        r = self.client.post("/api/probe", data={"url": "https://a/" + "x" * 5000})
+        self.assertEqual(r.status_code, 400)
+
+    def test_start_accepts_stream_headers(self):
+        from unittest.mock import patch, MagicMock
+        import json as _json
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        payload = _json.dumps({"https://cdn.example/x.m3u8": {"referer": "https://site/"}})
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "https://cdn.example/x.m3u8",
+                "stream_headers": payload,
+            })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            ctor.call_args.kwargs["header_overrides"],
+            {"https://cdn.example/x.m3u8": {"referer": "https://site/"}},
+        )
+
+    def _start(self, **extra):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        data = {"url_primary": "https://cdn.example/x.m3u8"}
+        data.update(extra)
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            r = self.client.post("/api/recordings/start", data=data)
+        return r, ctor
+
+    def test_duration_minutes_becomes_an_absolute_end_time(self):
+        r, ctor = self._start(duration_minutes=90)
+        self.assertEqual(r.status_code, 200)
+        end = ctor.call_args.kwargs["end_time"]
+        self.assertAlmostEqual(end - time.time(), 90 * 60, delta=5)
+        # An explicit duration overrides the global backstop.
+        self.assertIsNone(ctor.call_args.kwargs["max_hours"])
+
+    def test_no_duration_falls_back_to_the_backstop(self):
+        r, ctor = self._start()
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(ctor.call_args.kwargs["end_time"])
+        self.assertEqual(ctor.call_args.kwargs["max_hours"], DEFAULT_MAX_HOURS)
+
+    def test_duration_zero_means_no_cap_at_all(self):
+        """Including the backstop -- that is what asking for 0 means."""
+        r, ctor = self._start(duration_minutes=0)
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(ctor.call_args.kwargs["end_time"])
+        self.assertIsNone(ctor.call_args.kwargs["max_hours"])
+
+    def test_an_absolute_end_time_is_passed_through(self):
+        end = time.time() + 1800
+        r, ctor = self._start(end_time=end)
+        self.assertEqual(r.status_code, 200)
+        self.assertAlmostEqual(ctor.call_args.kwargs["end_time"], end, places=2)
+
+    def test_an_end_time_in_the_past_is_refused(self):
+        r, _ = self._start(end_time=time.time() - 60)
+        self.assertEqual(r.status_code, 400)
+
+    def test_an_absurd_duration_is_refused(self):
+        r, _ = self._start(duration_minutes=60 * 48)
+        self.assertEqual(r.status_code, 400)
+
+    def test_a_negative_duration_is_refused(self):
+        r, _ = self._start(duration_minutes=-5)
+        self.assertEqual(r.status_code, 400)
+
+    def test_malformed_stream_headers_ignored(self):
+        # A bad hint must not cost the user their recording.
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "https://cdn.example/x.m3u8",
+                "stream_headers": "{not json",
+            })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(ctor.call_args.kwargs["header_overrides"], {})
+
+    def test_non_dict_header_entries_dropped(self):
+        from unittest.mock import patch, MagicMock
+        import json as _json
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake) as ctor:
+            self.client.post("/api/recordings/start", data={
+                "url_primary": "https://cdn.example/x.m3u8",
+                "stream_headers": _json.dumps({"https://cdn.example/x.m3u8": "nope"}),
+            })
+        self.assertEqual(ctor.call_args.kwargs["header_overrides"], {})
+
+
+class TestProxyConfNeverOutlivesTheSession(unittest.TestCase):
+    """channels.conf holds the fully tokenised stream URL.
+
+    It is written to the mounted recordings volume, where the sponsor -- and
+    anything else with read access to that share -- can see it. The teardown
+    that deletes it ran on the straight-line path only, so any exception during
+    a fallback attempt left the credential behind, together with an orphaned
+    proxy still holding its port. This is the guard for both.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-conf-")
+        self.rec = StreamFailoverRecorder(
+            "c1", ["http://a/1.m3u8"], str(Path(self.tmp) / "out.ts"), min_free_gb=0)
+        self.rec.hls_proxy_path = str(Path(self.tmp) / "fake-proxy.py")
+        Path(self.rec.hls_proxy_path).write_text("# stub\n")
+        self._popen = patch("app.recorder.subprocess.Popen")
+        proc = self._popen.start()
+        proc.return_value.poll.return_value = None
+        self._sleep = patch("app.recorder.time.sleep")
+        self._sleep.start()
+        self._drain = patch.object(StreamFailoverRecorder, "_drain_stderr", lambda s, p, **k: [])
+        self._drain.start()
+        # Patching Popen also breaks subprocess.run, which this probe uses to
+        # ask the ffmpeg binary what it supports. Not what is under test here.
+        self._flags = patch("app.recorder.hls_extension_flags", return_value=[])
+        self._flags.start()
+
+    def tearDown(self):
+        self._popen.stop(); self._sleep.stop(); self._drain.stop(); self._flags.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _confs(self):
+        return list((Path(self.tmp) / ".proxy_conf").glob("*.conf"))
+
+    def test_a_raising_fallback_still_deletes_the_conf(self):
+        """The regression: an exception mid-fallback used to strand the file."""
+        rec = self.rec
+
+        def fake_detect(candidate):
+            candidate.m3u8_url = candidate.url
+            return True
+
+        calls = []
+
+        def fake_stream(cmd, candidate):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return StreamOutcome.FAILED      # direct mode fails -> fall back
+            raise RuntimeError("capture blew up mid-fallback")
+
+        rec.detect_candidate_headers = fake_detect
+        rec._stream_ffmpeg_process = fake_stream
+        rec._failover_delay = lambda wrapped: 0.0
+
+        with self.assertRaises(RuntimeError):
+            rec._recording_loop()
+
+        # The proxy did start, so there was really something to clean up.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self._confs(), [], "tokenised channels.conf outlived the session")
+        self.assertIsNone(rec._proxy_process, "hls-proxy left running, still holding its port")
+
+    def test_the_conf_is_removable_even_if_start_proxy_dies_after_writing_it(self):
+        """_remove_proxy_conf can only delete what it was told about.
+
+        The bookkeeping used to happen several lines after the write, so a
+        failure in between orphaned the file with no reference left to it.
+        """
+        from unittest.mock import patch
+        rec = self.rec
+        cand = rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.slug = "cand_0"
+
+        # Fail immediately after the write, before the old assignment point.
+        with patch("app.recorder.os.environ.copy", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                rec.start_proxy(cand)
+
+        self.assertEqual(len(self._confs()), 1, "precondition: the file was written")
+        rec.stop_proxy()
+        self.assertEqual(self._confs(), [], "orphaned conf: nothing held a reference to it")
+
+    def test_a_clean_fallback_removes_it_too(self):
+        """The ordinary path must keep working -- this is not only about crashes."""
+        rec = self.rec
+        cand = rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.slug = "cand_0"
+        rec.start_proxy(cand)
+        self.assertEqual(len(self._confs()), 1)
+        rec.stop_proxy()
+        self.assertEqual(self._confs(), [])
+
+    def test_a_proxy_that_will_not_die_is_not_forgotten(self):
+        """Dropping the reference regardless reported a still-bound port free."""
+        import subprocess
+        from unittest.mock import MagicMock
+        rec = self.rec
+        stuck = MagicMock()
+        stuck.wait.side_effect = subprocess.TimeoutExpired("hls-proxy", 2)
+        rec._proxy_process = stuck
+        rec.stop_proxy()
+        stuck.kill.assert_called_once()
+        self.assertIs(rec._proxy_process, stuck)
+        self.assertTrue(rec.holds_proxy_port)
+        self.assertTrue(any("did not exit" in line for line in rec.log_history))
+
+    def test_a_proxy_that_exits_is_released(self):
+        from unittest.mock import MagicMock
+        rec = self.rec
+        rec._proxy_process = MagicMock()
+        rec.stop_proxy()
+        self.assertIsNone(rec._proxy_process)
+        self.assertFalse(rec.holds_proxy_port)
+
+    def test_a_stuck_proxy_is_not_replaced_by_a_new_one(self):
+        """Starting another would overwrite the only reference to the stuck one."""
+        from unittest.mock import MagicMock
+        from app import recorder as recorder_mod
+        rec = self.rec
+        stuck = MagicMock()
+        rec._proxy_process = stuck
+        cand = rec.candidates[0]
+        cand.m3u8_url = "https://x.example/live.m3u8"
+        cand.slug = "cand_0"
+        spawned = recorder_mod.subprocess.Popen.call_count
+        self.assertEqual(rec.start_proxy(cand), cand.m3u8_url)
+        self.assertEqual(recorder_mod.subprocess.Popen.call_count, spawned)
+        self.assertIs(rec._proxy_process, stuck)
+        self.assertEqual(self._confs(), [], "no tokenised conf for a proxy never started")
+
+
+
+class TestRecordingDeadline(unittest.TestCase):
+    """A recording may carry an end time; at the deadline it stops cleanly.
+
+    Absolute, never a duration. A duration restarts its clock on every resume,
+    so a recording that crashed twice would run well past the end that was
+    asked for -- and the global backstop would hand each restart a fresh six
+    hours, which is exactly what it exists to prevent.
+    """
+
+    def make(self, **kw):
+        tmp = tempfile.mkdtemp(prefix="pvarr-deadline-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return StreamFailoverRecorder(
+            "d1", ["http://a/1.m3u8"], str(Path(tmp) / "out.ts"),
+            min_free_gb=0, **kw)
+
+    def test_no_window_and_no_backstop_means_no_deadline(self):
+        rec = self.make()
+        rec.start_time = time.time()
+        self.assertIsNone(rec.deadline())
+        self.assertIsNone(rec.seconds_remaining())
+
+    def test_an_explicit_end_time_wins_over_the_backstop(self):
+        soon = time.time() + 600
+        rec = self.make(end_time=soon, max_hours=6)
+        rec.start_time = time.time()
+        self.assertEqual(rec.deadline(), soon)
+
+    def test_the_backstop_is_measured_from_the_original_start(self):
+        """The resume case. Six hours from *then*, not six more from now."""
+        started = time.time() - (5 * 3600)
+        rec = self.make(max_hours=6)
+        rec.start_time = started
+        self.assertAlmostEqual(rec.deadline(), started + 6 * 3600, places=3)
+        # One hour left, not six.
+        self.assertLess(rec.seconds_remaining(), 3601)
+        self.assertGreater(rec.seconds_remaining(), 3599)
+
+    def test_a_zero_backstop_disables_it(self):
+        rec = self.make(max_hours=0)
+        rec.start_time = time.time()
+        self.assertIsNone(rec.deadline())
+
+    def test_a_rebroadcast_is_not_capped_by_the_backstop(self):
+        """A live channel is meant to sit there. Capping it would kill every
+        channel at the six hour mark, silently."""
+        tmp = Path(tempfile.mkdtemp(prefix="pvarr-deadline-rb-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ring = ringbuffer.RingBuffer(
+            tmp / "chan.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        self.addCleanup(ring.close)
+        rec = StreamFailoverRecorder(
+            "d2", ["http://a/1.m3u8"], str(tmp / "out.ts"),
+            min_free_gb=0, ring=ring, max_hours=6)
+        rec.start_time = time.time() - (10 * 3600)
+        self.assertIsNone(rec.deadline())
+
+    def test_a_rebroadcast_still_honours_an_explicit_end_time(self):
+        tmp = Path(tempfile.mkdtemp(prefix="pvarr-deadline-rb2-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ring = ringbuffer.RingBuffer(
+            tmp / "chan2.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        self.addCleanup(ring.close)
+        soon = time.time() + 300
+        rec = StreamFailoverRecorder(
+            "d3", ["http://a/1.m3u8"], str(tmp / "out.ts"),
+            min_free_gb=0, ring=ring, end_time=soon, max_hours=6)
+        rec.start_time = time.time()
+        self.assertEqual(rec.deadline(), soon)
+
+    def test_passing_the_deadline_stops_the_recording(self):
+        rec = self.make(end_time=time.time() - 1)
+        rec.start_time = time.time() - 60
+        self.assertFalse(rec._deadline_ok())
+        self.assertEqual(rec.status, "completed_window")
+        self.assertTrue(rec._stop_event.is_set())
+
+    def test_before_the_deadline_nothing_happens(self):
+        rec = self.make(end_time=time.time() + 3600)
+        rec.start_time = time.time()
+        self.assertTrue(rec._deadline_ok())
+        self.assertFalse(rec._stop_event.is_set())
+
+    def test_the_status_survives_post_processing(self):
+        """completed_window must not be flattened to "completed" -- the whole
+        point is being able to tell a scheduled finish from a stream ending."""
+        rec = self.make(end_time=time.time() - 1)
+        rec.start_time = time.time() - 60
+        rec.is_running = True
+        rec.on_completion_callback = lambda path: None
+        rec._recording_loop()
+        self.assertEqual(rec.status, "completed_window")
+
+    def test_the_summary_carries_the_deadline(self):
+        soon = time.time() + 1800
+        rec = self.make(end_time=soon)
+        rec.start_time = time.time()
+        summary = rec.get_status_summary()
+        self.assertEqual(summary["ends_at"], soon)
+        self.assertGreater(summary["seconds_remaining"], 1700)
+
+    def test_the_summary_says_none_when_open_ended(self):
+        rec = self.make()
+        rec.start_time = time.time()
+        summary = rec.get_status_summary()
+        self.assertIsNone(summary["ends_at"])
+        self.assertIsNone(summary["seconds_remaining"])
+
+
+class TestWindowKeepsRetrying(unittest.TestCase):
+    """Sponsor decision: while a window is open, keep trying every candidate.
+
+    max_cycles is a guess at "these sources are dead". An explicit end time is
+    a statement that the event runs until then, and a stream that is down at
+    kick-off is often back a few minutes later.
+    """
+
+    def make(self, **kw):
+        tmp = tempfile.mkdtemp(prefix="pvarr-window-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        rec = StreamFailoverRecorder(
+            "w1", ["http://a/1.m3u8", "http://b/2.m3u8"],
+            str(Path(tmp) / "out.ts"), min_free_gb=0, max_cycles=2, **kw)
+        rec.detect_candidate_headers = lambda c: setattr(c, "m3u8_url", c.url) or True
+        rec._failover_delay = lambda wrapped: 0.0
+        return rec
+
+    def test_without_a_window_it_gives_up_after_max_cycles(self):
+        """The existing behaviour, asserted so the change below is visibly a
+        change and not an accident."""
+        rec = self.make()
+        rec.start_time = time.time()
+        rec._stream_ffmpeg_process = lambda cmd, cand: StreamOutcome.FAILED
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+        self.assertEqual(rec.status, "failed")
+
+    def test_with_an_open_window_it_keeps_trying_past_max_cycles(self):
+        rec = self.make(end_time=time.time() + 3600)
+        rec.start_time = time.time()
+        attempts = []
+
+        def fail_then_close_the_window(cmd, cand):
+            attempts.append(cand.name)
+            # Well past max_cycles=2 (two candidates, so 4 attempts a lap).
+            if len(attempts) >= 12:
+                rec.end_time = time.time() - 1   # window closes
+            return StreamOutcome.FAILED
+
+        rec._stream_ffmpeg_process = fail_then_close_the_window
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+
+        self.assertGreaterEqual(len(attempts), 12,
+                                "gave up while the window was still open")
+        # And once the window closed having captured nothing, it reports
+        # "failed" rather than "finished on schedule". Deliberate: the window
+        # lifts the give-up cap, it does not turn a recording that captured
+        # zero bytes into a success. completed_window is for a capture that
+        # was actually running when its deadline arrived.
+        self.assertEqual(rec.status, "failed")
+        self.assertEqual(rec.bytes_written, 0)
+
+    def test_footage_captured_before_the_window_closed_is_kept(self):
+        """The realistic failure: it recorded, then every source died."""
+        rec = self.make(end_time=time.time() + 3600)
+        rec.start_time = time.time()
+        attempts = []
+
+        def record_then_die(cmd, cand):
+            attempts.append(cand.name)
+            if len(attempts) == 1:
+                rec.bytes_written = 5_000_000
+                return StreamOutcome.INTERRUPTED
+            if len(attempts) >= 10:
+                rec.end_time = time.time() - 1
+            return StreamOutcome.FAILED
+
+        rec._stream_ffmpeg_process = record_then_die
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+        self.assertEqual(rec.status, "completed_partial")
+
+    def test_the_backstop_alone_does_not_grant_infinite_retries(self):
+        """Deliberately keyed off an explicit window, not the 6h default.
+
+        Retrying for six hours against three dead URLs is not what anyone
+        means by a safety backstop.
+        """
+        rec = self.make(max_hours=6)
+        rec.start_time = time.time()
+        rec._stream_ffmpeg_process = lambda cmd, cand: StreamOutcome.FAILED
+        from unittest.mock import patch
+        with patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+        self.assertEqual(rec.status, "failed")
+
+
+class TestDeadlineSurvivesRestart(unittest.TestCase):
+    """The window is what makes resume exact, rather than a gap heuristic."""
+
+    def test_build_record_carries_the_window(self):
+        end = time.time() + 900
+        record = sessions.build_record(
+            recording_id="r1", candidates=["http://a/1.m3u8"],
+            output_filepath="/tmp/x.ts", started_at=time.time(),
+            end_time=end, max_hours=6)
+        self.assertEqual(record["end_time"], end)
+        self.assertEqual(record["max_hours"], 6)
+
+    def test_a_closed_window_finalises_instead_of_resuming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.ts"
+            path.write_bytes(b"x" * 4096)
+            record = sessions.build_record(
+                recording_id="r2", candidates=["http://a/1.m3u8"],
+                output_filepath=str(path), started_at=time.time() - 7200,
+                end_time=time.time() - 60)
+            # Fresh mtime, so the gap heuristic alone would say "resume".
+            self.assertEqual(
+                sessions.resume_decision(record, gap_limit=99999), "finalise")
+
+    def test_an_open_window_still_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.ts"
+            path.write_bytes(b"x" * 4096)
+            record = sessions.build_record(
+                recording_id="r3", candidates=["http://a/1.m3u8"],
+                output_filepath=str(path), started_at=time.time() - 600,
+                end_time=time.time() + 3600)
+            self.assertEqual(
+                sessions.resume_decision(record, gap_limit=99999), "resume")
+
+
+
+class TestUrlSecretRedaction(unittest.TestCase):
+    """Query strings are where stream access tokens live."""
+
+    def test_the_query_string_goes(self):
+        out = redact_url_secrets(
+            "FFmpeg said: https://cdn.example/live/seg.ts?token=SECRET&x-expires=1 failed")
+        self.assertNotIn("SECRET", out)
+        self.assertNotIn("x-expires", out)
+        # The useful half survives: which host and path is what identifies the
+        # candidate, and is the entire diagnostic value of the line.
+        self.assertIn("https://cdn.example/live/seg.ts", out)
+        self.assertIn("failed", out)
+
+    def test_userinfo_credentials_go(self):
+        out = redact_url_secrets("Probe https://user:hunter2@cdn.example/a.m3u8")
+        self.assertNotIn("hunter2", out)
+        self.assertNotIn("user", out)
+
+    def test_a_clean_url_is_left_alone(self):
+        text = "Connecting to https://cdn.example/a/b.m3u8 now"
+        self.assertEqual(redact_url_secrets(text), text)
+
+    def test_several_urls_in_one_line(self):
+        out = redact_url_secrets("https://a.example/1?z=1 and https://b.example/2?y=2")
+        self.assertNotIn("z=1", out)
+        self.assertNotIn("y=2", out)
+
+    def test_a_truncated_url_is_still_redacted(self):
+        """Log lines cut URLs at 70 chars, which can land mid-token."""
+        out = redact_url_secrets("[Direct Mode] Connecting to https://cdn.example/x.m3u8?tok=abcd")
+        self.assertNotIn("abcd", out)
+
+    def test_non_string_input_does_not_raise(self):
+        self.assertEqual(redact_url_secrets(None), None)
+        self.assertIn("cdn.example", redact_url_secrets(Path("https://cdn.example/a?k=v")))
+
+    def test_a_token_carried_in_the_path_goes(self):
+        """A real provider.s shape (domain replaced): the credential is path segments, not a query.
+
+        A query-only scrub passed this URL to Discord with both tokens intact.
+        """
+        url = ("https://edge1.example/secure/Qx7RmT2kLp9VbN4cWe8YzA/rtmp/stream/"
+               "hG5-sJ3fK8dL2mP6qR9tVw/playlist.m3u8")
+        out = redact_url_secrets(f"Connecting to {url} now")
+        self.assertNotIn("Qx7RmT", out)
+        self.assertNotIn("hG5-sJ3f", out)
+        self.assertIn("https://edge1.example/secure/<redacted>/rtmp/stream/"
+                      "<redacted>/playlist.m3u8 now", out)
+
+    def test_a_hex_digest_in_the_path_goes(self):
+        """nginx secure_link style: /s/<md5>/<expiry>/segment."""
+        out = redact_url_secrets(
+            "https://cdn.example/s/5d41402abc4b2a76b9719d911017c592/1693526400/seg.ts")
+        self.assertNotIn("5d41402abc", out)
+        self.assertIn("/<redacted>/1693526400/seg.ts", out)
+
+    def test_short_tokens_with_separators_and_short_hex_go(self):
+        """Measured misses before this: 40% of random 16-char base64url tokens
+        (only letters and digits were counted towards the length, so '-' and
+        '_' pushed them under it) and ~7% of 20-char hex."""
+        for token in ("aB3-xY7_kP9qLm2Z", "5d41402abc4b2a76b971"):
+            out = redact_url_secrets(f"https://cdn.example/live/{token}/playlist.m3u8")
+            self.assertNotIn(token, out)
+
+    def test_ordinary_path_names_survive(self):
+        """The path is the diagnostic value of the line; names must be kept."""
+        for url in (
+            "https://cdn.example/hls/media_w1234567_b2596000_12345.ts",
+            "https://cdn.example/live/index_1080p.m3u8",
+            "https://front.example/Live-42/Hd1/604.html",
+            "https://cdn2.provider.example:8443/hls/mteamchannel/chunklist.m3u8",
+        ):
+            self.assertEqual(redact_url_secrets(url), url)
+
+    def test_a_path_token_cut_by_log_truncation_still_goes(self):
+        """Truncating before redacting left a stub too short to look like a token."""
+        from app.recorder import url_for_log
+        url = ("https://cdn.example.com/aaaa/bbbb/cccc/dddd/eeee/ffff/gggg/"
+               "Zq8Xw2Lp9Rt4Km7Nv3Bc/x.m3u8")
+        # The premise: cut first, and the sink no longer recognises the stub.
+        self.assertIn("Zq8X", redact_url_secrets(url[:70]))
+        self.assertNotIn("Zq8X", url_for_log(url))
+
+
+class TestRecorderLogsCarryNoTokens(unittest.TestCase):
+    """log_history is served by /api/status and the log endpoint, so a token
+    in a log line is readable by anything that can reach port 8999."""
+
+    def make(self):
+        tmp = tempfile.mkdtemp(prefix="pvarr-redact-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return StreamFailoverRecorder(
+            "r1", ["https://cdn.example/live.m3u8?token=SECRET"],
+            str(Path(tmp) / "out.ts"), min_free_gb=0)
+
+    def test_a_token_never_reaches_the_log_history(self):
+        rec = self.make()
+        rec._log("FFmpeg said: https://cdn.example/seg.ts?token=SECRET&sig=DEADBEEF broke")
+        joined = "\n".join(rec.log_history)
+        self.assertNotIn("SECRET", joined)
+        self.assertNotIn("DEADBEEF", joined)
+        self.assertIn("cdn.example/seg.ts", joined)
+
+    def test_the_log_lines_in_the_status_summary_are_redacted(self):
+        """Scoped to the logs deliberately.
+
+        `candidates[].url` in the same payload still carries the full
+        tokenised URL, and that is not an oversight: the operator typed it,
+        the dashboard shows it back to them, and the advanced header fields
+        are keyed by it. Changing that is an API contract decision, recorded
+        in TODO.md rather than made quietly here.
+        """
+        rec = self.make()
+        rec._log("connecting https://cdn.example/live.m3u8?token=SECRET")
+        summary = rec.get_status_summary()
+        self.assertNotIn("SECRET", json.dumps(summary["logs"]))
+
+
+class TestNotificationsShipNoTokens(ServerTestCase):
+    """A notification leaves the network for good.
+
+    There is no taking a message back out of a Discord channel, and no
+    expiring it -- so this is a worse leak than the same token in a local log.
+    """
+
+    def test_the_started_notification_is_given_a_name_not_a_url(self):
+        """The regression: notify_recording_started declares a candidate_name
+        and was handed candidates[0], the raw tokenised primary URL."""
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock()]
+        fake.candidates[0].name = "Candidate 1"
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake):
+            with patch.object(self.server.notifier, "notify_recording_started") as note:
+                r = self.client.post("/api/recordings/start", data={
+                    "url_primary": "https://cdn.example/live.m3u8?token=SECRET",
+                })
+        self.assertEqual(r.status_code, 200)
+        shipped = " ".join(str(a) for a in note.call_args.args)
+        self.assertNotIn("SECRET", shipped)
+        self.assertIn("Candidate 1", shipped)
+
+    def test_the_sink_redacts_a_url_handed_to_it_anyway(self):
+        """send() is the single choke point for outbound text, which is why
+        redaction lives there rather than in each notify_* method."""
+        from unittest.mock import patch
+        manager = notifications.NotificationManager()
+        manager.targets = ["json://example.com/hook"]
+        with patch("app.notifications.apprise.Apprise") as Apprise:
+            Apprise.return_value.add.return_value = True
+            Apprise.return_value.__len__ = lambda self: 1
+            manager.notify_recording_started(
+                "s1", "game.ts", "https://cdn.example/live.m3u8?token=SECRET")
+        sent = Apprise.return_value.notify.call_args.kwargs
+        self.assertNotIn("SECRET", sent["title"] + sent["body"])
+        self.assertIn("cdn.example", sent["body"])
+
+
+
+class TestSegmentExtension(unittest.TestCase):
+    """FFmpeg refuses segments by extension, so the extension is a diagnosis."""
+
+    def test_ordinary_segment(self):
+        self.assertEqual(probe.segment_extension("https://a/b/seg.ts"), ".ts")
+
+    def test_query_string_is_ignored(self):
+        self.assertEqual(probe.segment_extension("https://a/seg.image?tok=1"), ".image")
+
+    def test_no_extension(self):
+        self.assertEqual(probe.segment_extension("https://a/b/noext"), "")
+
+    def test_empty(self):
+        self.assertEqual(probe.segment_extension(""), "")
+
+
+class TestProbeTrace(unittest.TestCase):
+    """The probe records what it tried, so a failed detection is diagnosable.
+
+    All of this data existed already; the dashboard discarded it on failure,
+    which is why "could not detect headers" was a dead end for the operator.
+    """
+
+    def _fake_fetch(self, script):
+        """script: url-substring -> (status, body). Returns a _fetch stand-in."""
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            for needle, (status, body) in script.items():
+                if needle in url:
+                    resp = MagicMock()
+                    resp.status_code = status
+                    resp.ok = 200 <= status < 300
+                    resp.url = url
+                    return resp, body
+            raise AssertionError(f"unscripted URL: {url}")
+
+        return fetch
+
+    def test_every_header_attempt_is_recorded_with_its_status(self):
+        from unittest.mock import patch
+        script = {"gated.m3u8": (403, b"denied"), "://x.example/": (200, b"<html>hi</html>")}
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/gated.m3u8", check_segment=False)
+        self.assertFalse(result["ok"])
+        playlist = [a for a in result["attempts"] if a["stage"] == "playlist"]
+        for attempt in playlist:
+            self.assertEqual(attempt["status"], 403)
+        # More than one, because the point is showing *which* combinations were
+        # tried -- a bare request and then each guessed referer.
+        self.assertGreaterEqual(len(playlist), 2)
+
+    def test_a_non_video_segment_extension_is_named(self):
+        """The candidate 1 case: everything succeeds, and it still will not
+        record, for a reason no status code shows."""
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n#EXTINF:4.0,\nseg0.image?tok=abc\n"
+        script = {
+            "live.m3u8": (200, playlist),
+            "seg0.image": (200, b"\x47" + b"\x00" * 200),
+        }
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["segment_ok"])
+        segs = [a for a in result["attempts"] if a["stage"] == "segment"]
+        self.assertEqual(len(segs), 1)
+        self.assertIn(".image", segs[0]["note"])
+        self.assertIn("FFmpeg refuses", segs[0]["note"])
+
+    def test_an_ordinary_ts_segment_is_not_flagged(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n"
+        script = {
+            "live.m3u8": (200, playlist),
+            "seg0.ts": (200, b"\x47" + b"\x00" * 200),
+        }
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        segs = [a for a in result["attempts"] if a["stage"] == "segment"]
+        self.assertNotIn("refuses", segs[0]["note"])
+
+    def test_a_gated_segment_records_its_status(self):
+        """"Segments rejected" with no status is a shrug, not a diagnosis."""
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n#EXTINF:4.0,\nlocked.ts\n"
+        script = {
+            "open.m3u8": (200, playlist),
+            "locked.ts": (403, b"denied"),
+        }
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/open.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["segment_ok"])
+        segs = [a for a in result["attempts"] if a["stage"] == "segment"]
+        self.assertEqual(segs[0]["status"], 403)
+
+    def test_a_2xx_that_is_not_a_playlist_is_called_out(self):
+        from unittest.mock import patch
+        script = {"live.m3u8": (200, b"<html>are you a robot</html>"),
+                  "://x.example/": (200, b"<html>hi</html>")}
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8", check_segment=False)
+        self.assertFalse(result["ok"])
+        notes = [a.get("note", "") for a in result["attempts"]]
+        self.assertTrue(any("not a playlist" in n for n in notes), notes)
+
+    def test_a_rejected_status_is_not_also_called_not_a_playlist(self):
+        """A 403 body is obviously not a playlist. Saying so reads like a
+        second, unrelated problem."""
+        from unittest.mock import patch
+        script = {"live.m3u8": (403, b"denied"), "://x.example/": (200, b"<html>hi</html>")}
+        with patch("app.probe._fetch", self._fake_fetch(script)):
+            result = probe.probe_stream("https://x.example/live.m3u8", check_segment=False)
+        notes = [a.get("note", "") for a in result["attempts"] if a["stage"] == "playlist"]
+        self.assertFalse(any("not a playlist" in n for n in notes), notes)
+
+    def test_the_trace_reaches_the_api(self):
+        """The dashboard cannot show what the endpoint does not return."""
+        import app.server as server_mod
+        from unittest.mock import patch
+        client = TestClient(server_mod.app)
+        fake = {"ok": False, "message": "nope",
+                "attempts": [{"stage": "playlist", "status": 403, "referer": ""}]}
+        with patch("app.server.probe_stream", return_value=fake):
+            r = client.post("/api/probe", data={"url": "https://cdn.example/x.m3u8"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["attempts"][0]["status"], 403)
+
+
+
+class TestOriginRefusalIsNotAHeaderProblem(unittest.TestCase):
+    """Distinguish "needs a header we cannot guess" from "not talking to us".
+
+    A real case: the sponsor's stream 403'd from the dev box, from the test server, and
+    in a browser on their own network -- and PVArr answered all three by
+    telling them to copy headers out of DevTools. The link was simply dead. The
+    host was refusing its own front page too, which is the signal that no
+    header was ever going to help.
+    """
+
+    def _fake_fetch(self, script):
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            for needle, status in script.items():
+                if needle in url:
+                    resp = MagicMock()
+                    resp.status_code = status
+                    resp.ok = 200 <= status < 300
+                    resp.url = url
+                    return resp, b"denied" if status >= 400 else b"<html>hi</html>"
+            raise AssertionError(f"unscripted URL: {url}")
+
+        return fetch
+
+    def test_a_host_refusing_its_own_root_is_named_as_such(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 403})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertFalse(result["ok"])
+        self.assertIn("including its own front page", result["message"])
+        self.assertIn("will not help", result["message"])
+        # And it must NOT send the operator to DevTools on a dead link.
+        self.assertNotIn("copy them from DevTools", result["message"])
+
+    def test_a_host_that_answers_still_points_at_devtools(self):
+        """The genuinely header-gated case must keep its old advice."""
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 200})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertFalse(result["ok"])
+        self.assertIn("DevTools", result["message"])
+        self.assertIn("gating this stream specifically", result["message"])
+
+    def test_the_origin_check_is_in_the_trace(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 403})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        origins = [a for a in result["attempts"] if a["stage"] == "origin"]
+        self.assertEqual(len(origins), 1)
+        self.assertEqual(origins[0]["status"], 403)
+
+    def test_a_mismatched_status_is_not_treated_as_a_wall(self):
+        """404 on the playlist and 403 on the root are two different facts."""
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 404, "://x.example/": 403})):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertNotIn("front page", result["message"])
+        self.assertIn("404", result["message"])
+
+    def test_an_unreachable_origin_does_not_break_the_message(self):
+        from unittest.mock import patch
+        import requests as _requests
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            from unittest.mock import MagicMock
+            if url.rstrip("/").endswith("x.example"):
+                raise _requests.RequestException("no route")
+            resp = MagicMock(status_code=403, ok=False, url=url)
+            return resp, b"denied"
+
+        with patch("app.probe._fetch", fetch):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertIn("403", result["message"])
+        origins = [a for a in result["attempts"] if a["stage"] == "origin"]
+        self.assertIn("error", origins[0])
+
+    def test_a_successful_probe_costs_no_extra_request(self):
+        """The origin check runs only on total failure."""
+        from unittest.mock import patch, MagicMock
+        seen = []
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            seen.append(url)
+            resp = MagicMock(status_code=200, ok=True, url=url)
+            return resp, b"#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n"
+
+        with patch("app.probe._fetch", fetch):
+            result = probe.probe_stream("https://x.example/live.m3u8")
+        self.assertTrue(result["ok"])
+        self.assertFalse([a for a in result["attempts"] if a["stage"] == "origin"])
+
+
+
+class TestLooksTokenised(unittest.TestCase):
+    """Deciding whether a URL carries a per-session access token.
+
+    Only used to offer one extra sentence of advice, so a false positive is
+    cheap -- but a false positive on every ordinary URL would make the advice
+    noise, which is why the path heuristic needs randomness and not just length.
+    """
+
+    def test_a_token_in_the_query_string(self):
+        self.assertTrue(probe.looks_tokenised("https://c.example/live.m3u8?token=abc"))
+        self.assertTrue(probe.looks_tokenised("https://c.example/m.m3u8?hdnts=exp=1~hmac=aa"))
+
+    def test_a_token_baked_into_the_path(self):
+        """nginx secure_link, which is what the sponsor's provider used."""
+        self.assertTrue(probe.looks_tokenised(
+            "https://edge1.example/secure/WkR3nPq8ZtYb2HmLc7VxJd5GsFa9QeUo/stream/mono.m3u8"))
+
+    def test_a_long_hex_path_segment(self):
+        self.assertTrue(probe.looks_tokenised("https://c.example/hls/10ee824a533e34e1/mono.m3u8"))
+
+    def test_an_ordinary_slug_is_not_a_token(self):
+        """Length alone would flag this -- 26 characters of plain English."""
+        self.assertFalse(probe.looks_tokenised(
+            "https://s.example/2024-nfl-week-1-highlights/master.m3u8"))
+
+    def test_ordinary_urls_are_not_tokens(self):
+        for url in ("https://c.example/hls/master.m3u8",
+                    "https://s.example/watch/game-123",
+                    "https://s.example/channel.php?id=5",
+                    "https://c.example/live/manchester-united/index.m3u8"):
+            self.assertFalse(probe.looks_tokenised(url), url)
+
+
+class TestExpiredTokenAdvice(unittest.TestCase):
+    """The likeliest real cause of "could not detect headers".
+
+    These tokens are minted for one browser session and commonly last minutes,
+    so an m3u8 copied out of DevTools is often dead by the time it is pasted --
+    and PVArr answered that by suggesting more headers. Pasting the page URL
+    instead lets the recorder re-resolve it on every connect and failover, which
+    is the thing that actually survives a three-hour recording.
+    """
+
+    def _fake_fetch(self, script):
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            for needle, status in script.items():
+                if needle in url:
+                    resp = MagicMock()
+                    resp.status_code = status
+                    resp.ok = 200 <= status < 300
+                    resp.url = url
+                    return resp, b"denied" if status >= 400 else b"<html>hi</html>"
+            raise AssertionError(f"unscripted URL: {url}")
+
+        return fetch
+
+    def test_a_rejected_token_suggests_the_page_url(self):
+        from unittest.mock import patch
+        url = "https://x.example/secure/WkR3nPq8ZtYb2HmLc7VxJd5GsFa9QeUo/mono.m3u8"
+        with patch("app.probe._fetch", self._fake_fetch({"mono.m3u8": 403, "://x.example/": 200})):
+            result = probe.probe_stream(url)
+        self.assertIn("access token", result["message"])
+        self.assertIn("page URL", result["message"])
+        # And the next step if the page URL fails too, which is the loop the
+        # sponsor got stuck in: session cookie, not more referer guessing.
+        self.assertIn("Cookie", result["message"])
+        self.assertNotIn("copy them from DevTools", result["message"])
+
+    def test_an_untokenised_url_keeps_the_header_advice(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fake_fetch({"live.m3u8": 403, "://x.example/": 200})):
+            result = probe.probe_stream("https://x.example/hls/live.m3u8")
+        self.assertIn("DevTools", result["message"])
+        self.assertNotIn("access token", result["message"])
+
+    def test_a_wall_beats_the_token_advice(self):
+        """If the host refuses its own front page, "paste the page URL" is
+        wrong advice -- the page will be refused too."""
+        from unittest.mock import patch
+        url = "https://x.example/secure/WkR3nPq8ZtYb2HmLc7VxJd5GsFa9QeUo/mono.m3u8"
+        with patch("app.probe._fetch", self._fake_fetch({"mono.m3u8": 403, "://x.example/": 403})):
+            result = probe.probe_stream(url)
+        self.assertIn("front page", result["message"])
+        self.assertNotIn("page URL", result["message"])
+
+    def test_a_404_on_a_tokenised_url_says_expired(self):
+        from unittest.mock import patch
+        url = "https://x.example/hls/10ee824a533e34e1/mono.m3u8"
+        with patch("app.probe._fetch", self._fake_fetch({"mono.m3u8": 404, "://x.example/": 200})):
+            result = probe.probe_stream(url)
+        self.assertIn("expired", result["message"])
+        self.assertIn("page URL", result["message"])
+
+
+
+class TestYtdlpResolver(unittest.TestCase):
+    """yt-dlp resolves the case the probe structurally cannot.
+
+    A modern player fetches its manifest over XHR and hands it to hls.js, so
+    the URL is never in the document. The sponsor confirmed this across all
+    five of their providers. No amount of HTML scraping finds it.
+    """
+
+    def _run(self, stdout="", returncode=0, raises=None):
+        from unittest.mock import patch, MagicMock
+        if raises is not None:
+            return patch("app.ytdlp.subprocess.run", side_effect=raises)
+        return patch("app.ytdlp.subprocess.run",
+                     return_value=MagicMock(stdout=stdout, stderr="", returncode=returncode))
+
+    def test_missing_binary_is_not_an_error(self):
+        from unittest.mock import patch
+        with patch("app.ytdlp.shutil.which", return_value=None):
+            self.assertIsNone(ytdlp.resolve("https://site.example/watch"))
+
+    def test_it_extracts_the_url_and_the_headers(self):
+        """-J rather than -g precisely because the headers come with it.
+
+        Getting the URL without its Referer just moves the 403 one step later.
+        """
+        payload = json.dumps({
+            "extractor_key": "Generic", "title": "Game",
+            "formats": [{
+                "url": "https://cdn.example/live/master.m3u8",
+                "protocol": "m3u8_native", "tbr": 3000,
+                "http_headers": {"Referer": "https://site.example/",
+                                 "User-Agent": "Mozilla/5.0", "Cookie": "sid=1"},
+            }],
+        })
+        with self._run(stdout=payload):
+            got = ytdlp.resolve("https://site.example/watch", binary="/usr/bin/yt-dlp")
+        self.assertEqual(got["m3u8_url"], "https://cdn.example/live/master.m3u8")
+        self.assertEqual(got["referer"], "https://site.example/")
+        self.assertEqual(got["user_agent"], "Mozilla/5.0")
+        self.assertEqual(got["cookie"], "sid=1")
+
+    def test_the_highest_bandwidth_media_playlist_wins(self):
+        payload = json.dumps({"formats": [
+            {"url": "https://c/low.m3u8", "protocol": "m3u8_native",
+             "format_id": "480", "tbr": 800},
+            {"url": "https://c/high.m3u8", "protocol": "m3u8_native",
+             "format_id": "1080", "tbr": 5000},
+        ]})
+        with self._run(stdout=payload):
+            got = ytdlp.resolve("https://site.example/watch", binary="/usr/bin/yt-dlp")
+        self.assertEqual(got["m3u8_url"], "https://c/high.m3u8")
+
+    def test_non_hls_formats_are_ignored(self):
+        payload = json.dumps({"formats": [
+            {"url": "https://c/video.mp4", "protocol": "https", "tbr": 9000},
+        ]})
+        with self._run(stdout=payload):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_a_failed_run_returns_none(self):
+        with self._run(stdout="", returncode=1):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_unparseable_output_returns_none(self):
+        with self._run(stdout="not json at all"):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_a_timeout_returns_none_rather_than_raising(self):
+        """This runs on the failover path. It may never propagate."""
+        import subprocess as _sp
+        with self._run(raises=_sp.TimeoutExpired(cmd="yt-dlp", timeout=20)):
+            self.assertIsNone(ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp"))
+
+    def test_the_command_is_an_argv_list_never_a_shell_string(self):
+        """Project directive: every subprocess is an explicit list. These URLs
+        come from an unauthenticated caller."""
+        from unittest.mock import patch, MagicMock
+        with patch("app.ytdlp.impersonation_available", return_value=True), \
+             patch("app.ytdlp.subprocess.run",
+                   return_value=MagicMock(stdout="{}", stderr="", returncode=0)) as run:
+            ytdlp.resolve("https://s/w; rm -rf /", binary="/usr/bin/yt-dlp")
+        cmd = run.call_args.args[0]
+        self.assertIsInstance(cmd, list)
+        self.assertNotIn("shell", run.call_args.kwargs)
+        # The metacharacters survive intact as one argv element -- they are
+        # data, never parsed by a shell.
+        self.assertEqual(cmd[-1], "https://s/w; rm -rf /")
+        self.assertIn("--impersonate", cmd)
+        self.assertIn("-J", cmd)
+
+    def test_impersonate_is_omitted_when_the_build_cannot_do_it(self):
+        """A build without curl_cffi does not ignore --impersonate, it dies on
+        it -- exits with a traceback and resolves nothing."""
+        from unittest.mock import patch, MagicMock
+        with patch("app.ytdlp.impersonation_available", return_value=False), \
+             patch("app.ytdlp.subprocess.run",
+                   return_value=MagicMock(stdout="{}", stderr="", returncode=0)) as run:
+            ytdlp.resolve("https://s/w", binary="/usr/bin/yt-dlp")
+        self.assertNotIn("--impersonate", run.call_args.args[0])
+
+
+class TestImpersonationCapability(unittest.TestCase):
+    """Ask what the binary can do, not what its --help mentions.
+
+    Measured on yt-dlp 2024.04.09: --help names impersonate three times and
+    `--impersonate chrome` exits with a Python traceback, because every target
+    needs curl_cffi. A flag-name check would have turned every resolution on
+    that build into a hard failure.
+    """
+
+    def setUp(self):
+        ytdlp._IMPERSONATE_CACHE.clear()
+        self.addCleanup(ytdlp._IMPERSONATE_CACHE.clear)
+
+    def _targets(self, text):
+        from unittest.mock import patch, MagicMock
+        return patch("app.ytdlp.subprocess.run",
+                     return_value=MagicMock(stdout=text, stderr="", returncode=0))
+
+    def test_all_targets_unavailable_means_no(self):
+        listing = (
+            "[info] Available impersonate targets\n"
+            "Client   OS   Source\n"
+            "---------------------------------------\n"
+            "Chrome   -    curl_cffi (not available)\n"
+            "Edge     -    curl_cffi (not available)\n"
+        )
+        with self._targets(listing):
+            self.assertFalse(ytdlp.impersonation_available("/usr/bin/yt-dlp"))
+
+    def test_a_usable_target_means_yes(self):
+        listing = (
+            "[info] Available impersonate targets\n"
+            "Client          OS           Source\n"
+            "--------------------------------------\n"
+            "Chrome-133      Macos-15     curl_cffi\n"
+        )
+        with self._targets(listing):
+            self.assertTrue(ytdlp.impersonation_available("/usr/bin/yt-dlp"))
+
+    def test_the_answer_is_cached(self):
+        from unittest.mock import patch, MagicMock
+        with patch("app.ytdlp.subprocess.run",
+                   return_value=MagicMock(stdout="", stderr="", returncode=0)) as run:
+            ytdlp.impersonation_available("/usr/bin/yt-dlp")
+            ytdlp.impersonation_available("/usr/bin/yt-dlp")
+        self.assertEqual(run.call_count, 1)
+
+    def test_a_binary_that_cannot_run_is_not_fatal(self):
+        from unittest.mock import patch
+        with patch("app.ytdlp.subprocess.run", side_effect=OSError("nope")):
+            self.assertFalse(ytdlp.impersonation_available("/usr/bin/yt-dlp"))
+
+
+class TestRecorderUsesYtdlp(unittest.TestCase):
+    """Where yt-dlp sits in the resolution chain, and where it must not."""
+
+    def make(self, url):
+        tmp = tempfile.mkdtemp(prefix="pvarr-ytdlp-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return StreamFailoverRecorder(
+            "y1", [url], str(Path(tmp) / "out.ts"), min_free_gb=0, auto_probe=False)
+
+    def test_a_pasted_playlist_never_reaches_ytdlp(self):
+        """Up to 20s of stall on the failover path, to learn nothing.
+
+        The probe has already tried that exact URL with every header
+        combination it has; yt-dlp's generic extractor would do strictly less.
+        """
+        from unittest.mock import patch
+        rec = self.make("https://cdn.example/live/master.m3u8")
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve") as resolve:
+            self.assertFalse(rec._resolve_via_ytdlp(rec.candidates[0]))
+        resolve.assert_not_called()
+
+    def test_a_page_url_does_reach_ytdlp(self):
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        found = {"m3u8_url": "https://cdn.example/x.m3u8", "referer": "https://site.example/",
+                 "user_agent": "UA", "cookie": "", "extractor": "Generic"}
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve", return_value=found):
+            self.assertTrue(rec._resolve_via_ytdlp(rec.candidates[0]))
+        cand = rec.candidates[0]
+        self.assertEqual(cand.m3u8_url, "https://cdn.example/x.m3u8")
+        self.assertEqual(cand.referer, "https://site.example/")
+        self.assertEqual(cand.detect_source, "yt-dlp")
+
+    def test_it_does_not_blank_an_operator_supplied_header(self):
+        """A referer typed by hand outranks an empty one from an extractor."""
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        rec.candidates[0].referer = "https://typed-by-hand.example/"
+        found = {"m3u8_url": "https://cdn.example/x.m3u8", "referer": "",
+                 "user_agent": "", "cookie": "", "extractor": "Generic"}
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve", return_value=found):
+            rec._resolve_via_ytdlp(rec.candidates[0])
+        self.assertEqual(rec.candidates[0].referer, "https://typed-by-hand.example/")
+
+    def test_a_raising_resolver_does_not_kill_detection(self):
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.recorder.ytdlp.resolve", side_effect=RuntimeError("boom")):
+            self.assertFalse(rec._resolve_via_ytdlp(rec.candidates[0]))
+
+    def test_absent_ytdlp_is_normal(self):
+        from unittest.mock import patch
+        rec = self.make("https://site.example/watch/game")
+        with patch("app.recorder.ytdlp.ytdlp_path", return_value=None):
+            self.assertFalse(rec._resolve_via_ytdlp(rec.candidates[0]))
+
+
+
+class TestCommercialEdlParsing(unittest.TestCase):
+    """comskip's EDL is start<TAB>end<TAB>action, seconds as floats."""
+
+    def test_cut_ranges_are_read(self):
+        edl = "12.5\t42.0\t0\n900.25\t1020.5\t0\n"
+        self.assertEqual(commercials.parse_edl(edl),
+                         [(12.5, 42.0), (900.25, 1020.5)])
+
+    def test_non_cut_actions_are_ignored(self):
+        """Action 3 is a mute, not a commercial to skip."""
+        self.assertEqual(commercials.parse_edl("10\t20\t3\n"), [])
+
+    def test_malformed_lines_are_skipped_not_fatal(self):
+        """A detector must never be why a finished recording is lost."""
+        edl = "garbage\n\n5\n1.0\t2.0\t0\nx\ty\t0\n"
+        self.assertEqual(commercials.parse_edl(edl), [(1.0, 2.0)])
+
+    def test_a_zero_length_range_is_dropped(self):
+        self.assertEqual(commercials.parse_edl("10\t10\t0\n"), [])
+
+    def test_empty_input(self):
+        self.assertEqual(commercials.parse_edl(""), [])
+        self.assertEqual(commercials.parse_edl(None), [])
+
+
+class TestCommercialGating(unittest.TestCase):
+    """Off unless asked for, and safe by default."""
+
+    def test_off_by_default(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVARR_COMSKIP", None)
+            self.assertFalse(commercials.enabled())
+
+    def test_enabled_by_env(self):
+        from unittest.mock import patch
+        for value in ("1", "true", "yes", "on", "ON"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP": value}):
+                self.assertTrue(commercials.enabled(), value)
+
+    def test_mode_defaults_to_chapters(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVARR_COMSKIP_MODE", None)
+            self.assertEqual(commercials.mode(), "chapters")
+
+    def test_anything_unrecognised_means_chapters(self):
+        """Never guess your way into the destructive branch."""
+        from unittest.mock import patch
+        for value in ("", "CHAPTERS", "remove", "delete", "yes", "cuts"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP_MODE": value}):
+                self.assertEqual(commercials.mode(), "chapters", value)
+
+    def test_stray_whitespace_still_means_cut(self):
+        """A trailing space in a .env is a typo, not a request for a different
+        mode. Switching behaviour on an invisible character would be worse than
+        being forgiving here."""
+        from unittest.mock import patch
+        for value in ("cut ", " cut", "\tCut\n"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP_MODE": value}):
+                self.assertEqual(commercials.mode(), "cut", repr(value))
+
+    def test_cut_must_be_spelled_exactly(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP_MODE": "cut"}):
+            self.assertEqual(commercials.mode(), "cut")
+
+    def test_disabled_does_no_work_at_all(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "0"}), \
+             patch.object(commercials, "detect") as detect:
+            out = commercials.process("/tmp/whatever.mp4")
+        detect.assert_not_called()
+        self.assertFalse(out["ran"])
+
+    def test_missing_comskip_is_not_an_error(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
+             patch.object(commercials, "comskip_path", return_value=None), \
+             patch.object(commercials, "detect") as detect:
+            out = commercials.process("/tmp/whatever.mp4")
+        detect.assert_not_called()
+        self.assertFalse(out["ran"])
+
+
+class TestCommercialsNeverDamageARecording(unittest.TestCase):
+    """The whole point of chapters-by-default.
+
+    Everything else in this project is built so a capture is never silently
+    lost. A heuristic that edits recordings by default would undo that.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-com-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.video = self.tmp / "game.mp4"
+        self.video.write_bytes(b"original recording bytes")
+        self.meta = self.tmp / "game.ffmeta"
+        self.meta.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/100\nSTART=0\nEND=100\n")
+
+    def test_a_failed_chapter_write_leaves_the_original_untouched(self):
+        from unittest.mock import patch
+        from unittest.mock import MagicMock
+        with patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=1, stdout="", stderr="boom")):
+            ok = commercials.apply_chapters(str(self.video), str(self.meta))
+        self.assertFalse(ok)
+        self.assertEqual(self.video.read_bytes(), b"original recording bytes")
+        # And no debris left beside it.
+        self.assertEqual(list(self.tmp.glob(".*chapters*")), [])
+
+    def test_a_raising_ffmpeg_leaves_the_original_untouched(self):
+        from unittest.mock import patch
+        with patch("app.commercials.subprocess.run", side_effect=OSError("nope")):
+            self.assertFalse(commercials.apply_chapters(str(self.video), str(self.meta)))
+        self.assertEqual(self.video.read_bytes(), b"original recording bytes")
+
+    def test_a_missing_metadata_file_is_refused(self):
+        self.assertFalse(commercials.apply_chapters(str(self.video), str(self.tmp / "nope.ffmeta")))
+        self.assertEqual(self.video.read_bytes(), b"original recording bytes")
+
+    def test_cut_mode_does_not_silently_delete_anything_yet(self):
+        """Cut is accepted as a setting but not implemented. It must fall back
+        to chapters rather than half-doing the destructive thing."""
+        from unittest.mock import patch
+        scratch = Path(tempfile.mkdtemp(prefix="pvarr-com-scratch-"))
+        self.addCleanup(shutil.rmtree, scratch, True)
+        found = {"workdir": str(scratch), "ffmeta": str(self.meta),
+                 "edl": "", "breaks": [(10.0, 20.0)]}
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1", "PVARR_COMSKIP_MODE": "cut"}), \
+             patch.object(commercials, "comskip_path", return_value="/usr/bin/comskip"), \
+             patch.object(commercials, "detect", return_value=found), \
+             patch.object(commercials, "apply_chapters", return_value=True) as chapters:
+            out = commercials.process(str(self.video))
+        chapters.assert_called_once()
+        self.assertEqual(out["mode"], "cut")
+        self.assertTrue(self.video.exists())
+
+    def test_detection_failure_is_survivable(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
+             patch.object(commercials, "comskip_path", return_value="/usr/bin/comskip"), \
+             patch.object(commercials, "detect", return_value=None):
+            out = commercials.process(str(self.video))
+        self.assertFalse(out["ran"])
+        self.assertTrue(self.video.exists())
+
+    def test_the_argv_is_a_list_never_a_shell_string(self):
+        from unittest.mock import patch
+        from unittest.mock import MagicMock
+        with patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")) as run, \
+             patch.object(commercials, "comskip_path", return_value="/usr/bin/comskip"):
+            commercials.detect(str(self.video))
+        cmd = run.call_args.args[0]
+        self.assertIsInstance(cmd, list)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+
+
+class TestNotificationTargets(unittest.TestCase):
+    """Existing config must keep working across the Apprise change.
+
+    An upgrade that silently stops notifying is worse than one that never
+    started -- nobody checks a channel that has always been quiet.
+    """
+
+    def _manager(self, **env):
+        from unittest.mock import patch
+        clean = {k: "" for k in (
+            "DISCORD_WEBHOOK_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+            "PVARR_APPRISE_URLS", "PLEX_URL", "PLEX_TOKEN", "EMBY_URL", "EMBY_API_KEY")}
+        clean.update(env)
+        with patch.dict(os.environ, clean):
+            return notifications.NotificationManager()
+
+    def test_a_discord_webhook_is_translated(self):
+        m = self._manager(DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/123/abcXYZ-_1")
+        self.assertEqual(m.targets, ["discord://123/abcXYZ-_1"])
+
+    def test_the_old_discordapp_host_still_works(self):
+        m = self._manager(DISCORD_WEBHOOK_URL="https://discordapp.com/api/webhooks/9/tok")
+        self.assertEqual(m.targets, ["discord://9/tok"])
+
+    def test_a_nonsense_discord_url_is_dropped_not_passed_through(self):
+        """Passing it through would hand Apprise something it cannot use and
+        produce a confusing failure at send time instead of at startup."""
+        m = self._manager(DISCORD_WEBHOOK_URL="https://example.com/not-a-webhook")
+        self.assertEqual(m.targets, [])
+
+    def test_telegram_needs_both_halves(self):
+        self.assertEqual(self._manager(TELEGRAM_BOT_TOKEN="123:AA").targets, [])
+        self.assertEqual(self._manager(TELEGRAM_CHAT_ID="99").targets, [])
+        self.assertEqual(
+            self._manager(TELEGRAM_BOT_TOKEN="123:AA", TELEGRAM_CHAT_ID="99").targets,
+            ["tgram://123:AA/99"])
+
+    def test_arbitrary_apprise_urls_are_accepted(self):
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic, gotify://host/tok")
+        self.assertEqual(m.targets, ["ntfy://host/topic", "gotify://host/tok"])
+
+    def test_whitespace_separated_urls_too(self):
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://a/b\n  gotify://c/d")
+        self.assertEqual(m.targets, ["ntfy://a/b", "gotify://c/d"])
+
+    def test_legacy_and_new_config_combine(self):
+        m = self._manager(
+            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/1/t",
+            TELEGRAM_BOT_TOKEN="2:BB", TELEGRAM_CHAT_ID="3",
+            PVARR_APPRISE_URLS="ntfy://host/topic")
+        self.assertEqual(m.targets,
+                         ["discord://1/t", "tgram://2:BB/3", "ntfy://host/topic"])
+
+    def test_no_config_means_no_targets_and_no_send(self):
+        m = self._manager()
+        self.assertEqual(m.targets, [])
+        self.assertFalse(m.send("t", "b"))
+
+    def test_send_is_a_no_op_without_apprise_installed(self):
+        """apprise is optional at runtime; recording must not depend on it."""
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch.object(notifications, "APPRISE_AVAILABLE", False):
+            self.assertFalse(m.send("t", "b"))
+
+    def test_a_raising_apprise_does_not_propagate(self):
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch("app.notifications.apprise.Apprise") as Apprise:
+            Apprise.return_value.add.return_value = True
+            Apprise.return_value.__len__ = lambda self: 1
+            Apprise.return_value.notify.side_effect = RuntimeError("network down")
+            self.assertFalse(m.send("t", "b"))
+
+    def test_every_event_reaches_the_single_send_path(self):
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch.object(m, "send", return_value=True) as send, \
+             patch.object(m, "trigger_media_server_refresh"):
+            m.notify_recording_started("s", "f.ts", "Candidate 1")
+            m.notify_failover_triggered("s", "Candidate 2")
+            m.notify_recording_finished("s", "f.mp4", 12.5)
+        self.assertEqual(send.call_count, 3)
+
+    def test_a_finished_recording_with_gaps_says_so(self):
+        """A file with holes looks complete in the library; the message read
+        before deciding to watch is where that has to be said."""
+        from unittest.mock import patch
+        m = self._manager(PVARR_APPRISE_URLS="ntfy://host/topic")
+        with patch.object(m, "send", return_value=True) as send, \
+             patch.object(m, "trigger_media_server_refresh"):
+            m.notify_recording_finished("s", "f.mp4", 12.5, segments_lost=4)
+            m.notify_recording_finished("s", "f.mp4", 12.5)
+        with_gaps, clean = (c.args[1] for c in send.call_args_list)
+        self.assertIn("4 stream segment(s) lost", with_gaps)
+        self.assertNotIn("lost", clean)
+
+
+
+class TestProbeFallsBackToYtdlp(unittest.TestCase):
+    """The dashboard must give the same answer the recording will get.
+
+    yt-dlp was wired into the recorder but not into /api/probe, so an operator
+    testing a page from the dashboard was told to go to DevTools while the
+    recorder would have resolved it. The sponsor hit exactly that.
+    """
+
+    def _fetch(self, status, body):
+        from unittest.mock import MagicMock
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            resp = MagicMock(status_code=status, ok=200 <= status < 300, url=url)
+            return resp, body
+
+        return fetch
+
+    def test_a_page_with_no_m3u8_is_handed_to_ytdlp(self):
+        from unittest.mock import patch
+        found = {"m3u8_url": "https://cdn.example/live.m3u8",
+                 "referer": "https://site.example/", "user_agent": "UA",
+                 "cookie": "", "extractor": "Generic"}
+        with patch("app.probe._fetch", self._fetch(200, b"<html>no manifest here</html>")), \
+             patch("app.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.ytdlp.resolve", return_value=found):
+            result = probe.probe_stream("https://site.example/watch", check_segment=False)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["m3u8_url"], "https://cdn.example/live.m3u8")
+        self.assertEqual(result["referer"], "https://site.example/")
+        self.assertIn("Referer", result["headers_required"])
+        self.assertIn("yt-dlp", result["message"])
+
+    def test_the_attempt_shows_up_in_the_trace(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fetch(200, b"<html>nope</html>")), \
+             patch("app.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.ytdlp.resolve", return_value=None):
+            result = probe.probe_stream("https://site.example/watch", check_segment=False)
+        stages = [a["stage"] for a in result["attempts"]]
+        self.assertIn("yt-dlp", stages)
+        self.assertFalse(result["ok"])
+
+    def test_the_failure_message_no_longer_just_says_devtools(self):
+        """It should say yt-dlp also failed, and warn about the token clock."""
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fetch(200, b"<html>nope</html>")), \
+             patch("app.ytdlp.ytdlp_path", return_value="/usr/bin/yt-dlp"), \
+             patch("app.ytdlp.resolve", return_value=None):
+            result = probe.probe_stream("https://site.example/watch", check_segment=False)
+        self.assertIn("yt-dlp could not resolve", result["message"])
+        self.assertIn("token", result["message"])
+
+    def test_it_can_be_switched_off(self):
+        from unittest.mock import patch
+        with patch("app.probe._fetch", self._fetch(200, b"<html>nope</html>")), \
+             patch("app.ytdlp.resolve") as resolve:
+            probe.probe_stream("https://site.example/watch",
+                               check_segment=False, use_ytdlp=False)
+        resolve.assert_not_called()
+
+
+class TestKeepRanges(unittest.TestCase):
+    """Inverting commercial ranges into the parts worth keeping."""
+
+    def test_simple_case(self):
+        self.assertEqual(commercials.keep_ranges([(10, 20), (50, 60)], 100),
+                         [(0.0, 10), (20, 50), (60, 100)])
+
+    def test_overlapping_ranges_are_merged_first(self):
+        """comskip can emit these, and inverting them naively drops content."""
+        self.assertEqual(commercials.keep_ranges([(50, 60), (10, 25), (20, 30)], 100),
+                         [(0.0, 10), (30, 50), (60, 100)])
+
+    def test_a_break_at_the_start(self):
+        self.assertEqual(commercials.keep_ranges([(0, 10)], 100), [(10, 100)])
+
+    def test_a_break_at_the_end(self):
+        self.assertEqual(commercials.keep_ranges([(90, 100)], 100), [(0.0, 90)])
+
+    def test_everything_flagged_leaves_nothing(self):
+        self.assertEqual(commercials.keep_ranges([(0, 100)], 100), [])
+
+    def test_ranges_past_the_end_are_clamped(self):
+        self.assertEqual(commercials.keep_ranges([(90, 500)], 100), [(0.0, 90)])
+
+    def test_no_duration_means_no_keeps(self):
+        self.assertEqual(commercials.keep_ranges([(1, 2)], 0), [])
+
+
+class TestCutRefusesRatherThanGuesses(unittest.TestCase):
+    """The destructive path. It must refuse anything it cannot verify.
+
+    A stream-copy concat that silently produced a 30-second file from a
+    three-hour recording would otherwise replace the recording with wreckage,
+    and there is no re-recording a live game.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-cut-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.video = self.tmp / "game.mp4"
+        self.video.write_bytes(b"the original recording")
+
+    def test_it_refuses_when_the_duration_cannot_be_read(self):
+        from unittest.mock import patch
+        with patch.object(commercials, "media_duration", return_value=None):
+            self.assertFalse(commercials.cut_breaks(str(self.video), [(10, 20)]))
+        self.assertEqual(self.video.read_bytes(), b"the original recording")
+
+    def test_it_refuses_when_nothing_would_be_left(self):
+        from unittest.mock import patch
+        with patch.object(commercials, "media_duration", return_value=100.0):
+            self.assertFalse(commercials.cut_breaks(str(self.video), [(0, 100)]))
+        self.assertEqual(self.video.read_bytes(), b"the original recording")
+
+    def test_it_refuses_when_the_cut_is_the_wrong_length(self):
+        """The check that makes this safe to ship: expected 70s, got 12s."""
+        from unittest.mock import patch, MagicMock
+
+        # Keyed on the exact filename: the scratch directory is named
+        # "pvarr-comcut-…", so a bare "cut" substring test also matches the
+        # source path and quietly makes this assert nothing.
+        def durations(path):
+            return 12.0 if Path(path).name.startswith("cut") else 100.0
+
+        with patch.object(commercials, "media_duration", side_effect=durations), \
+             patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+             patch("app.commercials.Path.is_file", return_value=True), \
+             patch("app.commercials.Path.stat",
+                   return_value=MagicMock(st_size=1024)), \
+             patch("app.commercials.shutil.move") as move:
+            ok = commercials.cut_breaks(str(self.video), [(10, 40)])
+        self.assertFalse(ok)
+        move.assert_not_called()
+
+    def test_a_failed_segment_extraction_aborts(self):
+        from unittest.mock import patch, MagicMock
+        with patch.object(commercials, "media_duration", return_value=100.0), \
+             patch("app.commercials.subprocess.run",
+                   return_value=MagicMock(returncode=1, stdout="", stderr="boom")), \
+             patch("app.commercials.shutil.move") as move:
+            self.assertFalse(commercials.cut_breaks(str(self.video), [(10, 20)]))
+        move.assert_not_called()
+        self.assertEqual(self.video.read_bytes(), b"the original recording")
+
+    def test_no_breaks_means_no_work(self):
+        self.assertFalse(commercials.cut_breaks(str(self.video), []))
+
+    def test_keeping_the_original_is_the_default(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVARR_COMSKIP_KEEP_ORIGINAL", None)
+            self.assertTrue(commercials.keep_original())
+
+    def test_the_backup_can_be_turned_off(self):
+        from unittest.mock import patch
+        for value in ("0", "false", "no", "off"):
+            with patch.dict(os.environ, {"PVARR_COMSKIP_KEEP_ORIGINAL": value}):
+                self.assertFalse(commercials.keep_original(), value)
+
+
+# --------------------------------------------------------------------------
+# Failover timeline continuity
+#
+# Every failover starts a fresh FFmpeg, and FFmpeg normalises each input to its
+# own zero. Appending those bytes to one .ts used to walk the file's clock
+# backwards at every switch: ffprobe reported only the first segment's
+# duration, and mpv logged "Invalid audio PTS ... Reset playback due to audio
+# timestamp reset" and resynced mid-recording. These tests hold the timeline
+# rising.
+# --------------------------------------------------------------------------
+
+def _ts_packet(pid=0x0100, pts_seconds=None, stream_id=0xE0,
+               adaptation=b"", payload_start=True):
+    """One well-formed 188-byte TS packet, optionally carrying a PES PTS."""
+    afc = 0x3 if adaptation else 0x1
+    head = bytes([
+        0x47,
+        (0x40 if payload_start else 0x00) | ((pid >> 8) & 0x1F),
+        pid & 0xFF,
+        (afc << 4) | 0x1,
+    ])
+    body = bytes([len(adaptation)]) + adaptation if adaptation else b""
+    if pts_seconds is None:
+        payload = b"\xde\xad\xbe\xef"
+    else:
+        ticks = int(round(pts_seconds * 90000))
+        pts = bytes([
+            0x21 | ((ticks >> 29) & 0x0E),
+            (ticks >> 22) & 0xFF,
+            0x01 | ((ticks >> 14) & 0xFE),
+            (ticks >> 7) & 0xFF,
+            0x01 | ((ticks << 1) & 0xFE),
+        ])
+        payload = (b"\x00\x00\x01" + bytes([stream_id]) + b"\x00\x00"
+                   + b"\x80\x80\x05" + pts)
+    packet = head + body + payload
+    return packet + b"\xff" * (TS_PACKET_SIZE - len(packet))
+
+
+class TestTimelineParser(unittest.TestCase):
+    """Reading our own output back to find where a segment ended."""
+
+    def test_finds_the_highest_timestamp_not_the_last_one(self):
+        # Audio and video interleave and neither is reliably ahead. Taking
+        # whichever PES header came last would under-report the end of the
+        # segment, and an offset that is too small puts the backward jump
+        # straight back where it was.
+        buf = (_ts_packet(pts_seconds=10.0, stream_id=0xE0)
+               + _ts_packet(pts_seconds=12.0, stream_id=0xC0)
+               + _ts_packet(pts_seconds=11.0, stream_id=0xE0))
+        self.assertAlmostEqual(last_timeline_position(buf), 12.0, places=4)
+
+    def test_recovers_the_packet_grid_from_an_unaligned_buffer(self):
+        # The capture loop reads 64KB at a time, which is not a multiple of
+        # 188, so a tail sliced out of that stream almost never starts on a
+        # packet boundary.
+        buf = b"\x00" * 77 + b"".join(
+            _ts_packet(pts_seconds=t) for t in (1.0, 2.0, 3.0))
+        self.assertAlmostEqual(last_timeline_position(buf), 3.0, places=4)
+
+    def test_an_adaptation_field_is_skipped_to_reach_the_pes_header(self):
+        buf = _ts_packet(pts_seconds=7.5, adaptation=b"\x00" * 20) * 3
+        self.assertAlmostEqual(last_timeline_position(buf), 7.5, places=4)
+
+    def test_packets_without_a_timestamp_are_ignored(self):
+        self.assertIsNone(last_timeline_position(_ts_packet() * 4))
+
+    def test_padding_and_private_streams_do_not_count(self):
+        # Only audio (0xC0-0xDF) and video (0xE0-0xEF) carry the programme's
+        # own clock; a padding stream's timestamp is not the segment's end.
+        buf = _ts_packet(pts_seconds=99.0, stream_id=0xBE) * 3
+        self.assertIsNone(last_timeline_position(buf))
+
+    def test_no_input_survives_the_parser_by_raising(self):
+        # This runs on the capture thread. An unhandled IndexError here would
+        # end a recording that was otherwise perfectly healthy, so a malformed
+        # stream must yield None, never an exception.
+        hostile = [
+            b"", b"\x47", b"\x47" * 1000, b"\x00" * 5000,
+            os.urandom(4000),
+            # an adaptation field claiming to run past the end of the packet
+            bytes([0x47, 0x40, 0x00, 0x30, 0xFF]) + b"\x00" * 183,
+            # a truncated final packet, which the rolling tail produces
+            # routinely at its own boundary without any malice at all
+            (_ts_packet(pts_seconds=3.0) * 2)[:-40],
+        ]
+        for buf in hostile:
+            with self.subTest(sample=buf[:8]):
+                last_timeline_position(buf)  # must simply not raise
+
+    def test_a_truncated_tail_still_reads_the_packets_that_are_whole(self):
+        buf = (_ts_packet(pts_seconds=4.0) * 3)[:-40]
+        self.assertAlmostEqual(last_timeline_position(buf), 4.0, places=4)
+
+
+class TestTimelineAdvance(unittest.TestCase):
+    """Moving the running offset, including across the 33-bit PTS wrap."""
+
+    def test_a_normal_segment_moves_the_timeline_forward(self):
+        self.assertAlmostEqual(advance_timeline_position(0.0, 11.4), 11.4)
+        self.assertAlmostEqual(advance_timeline_position(11.4, 22.8), 22.8)
+
+    def test_the_wrap_does_not_send_the_timeline_backwards(self):
+        # A PTS is 33 bits at 90kHz, so it restarts every ~26.5 hours while our
+        # own offset keeps counting. Read at face value past the wrap, the
+        # timeline would leap backwards a day into a recording -- the original
+        # bug, merely delayed.
+        moved = advance_timeline_position(PTS_WRAP_SECONDS - 2.0, 3.0)
+        self.assertAlmostEqual(moved, PTS_WRAP_SECONDS + 3.0, places=3)
+        self.assertGreater(moved, PTS_WRAP_SECONDS - 2.0)
+
+    def test_a_reading_that_went_backwards_holds_the_timeline_still(self):
+        # Standing still costs a small forward gap at the splice. Moving
+        # backwards breaks playback, so that is the direction to refuse.
+        self.assertEqual(advance_timeline_position(500.0, 10.0), 500.0)
+
+
+class TestTimelineOffsetArgv(unittest.TestCase):
+    """The offset is derived from stream content, so it is hostile input."""
+
+    def test_a_sound_offset_becomes_a_fixed_point_argument(self):
+        self.assertEqual(output_ts_offset_flags(11.3382),
+                         ["-output_ts_offset", "11.338200"])
+
+    def test_the_first_segment_gets_no_offset(self):
+        self.assertEqual(output_ts_offset_flags(0.0), [])
+        self.assertEqual(output_ts_offset_flags(None), [])
+
+    def test_nothing_unparseable_can_reach_the_argv(self):
+        # str() of a float is not a safe serialisation for an FFmpeg argument:
+        # nan and inf render as words, and a large magnitude renders in
+        # exponent notation, which FFmpeg does not accept as a duration.
+        for bad in (float("nan"), float("inf"), float("-inf"), -5.0,
+                    1e21, MAX_TIMELINE_OFFSET_SECONDS * 2, "banana", None):
+            with self.subTest(value=bad):
+                self.assertEqual(output_ts_offset_flags(bad), [])
+
+    def test_a_long_channel_past_the_wrap_is_still_offset(self):
+        # The 26.5h wrap is not the ceiling; a rebroadcast channel can run
+        # past it and still needs its splices corrected.
+        self.assertTrue(output_ts_offset_flags(PTS_WRAP_SECONDS + 500))
+
+    def test_every_rendered_offset_parses_as_a_plain_number(self):
+        for value in (0.001, 1.5, 11.338222, 95000.0, 1e6):
+            flags = output_ts_offset_flags(value)
+            if flags:
+                float(flags[1])  # must not raise
+                self.assertNotIn("e", flags[1].lower())
+
+
+class TestTailBuffer(unittest.TestCase):
+    """A bounded tail that does not copy on the capture hot path."""
+
+    def test_it_keeps_the_recent_bytes_and_drops_the_old_ones(self):
+        tail = _TailBuffer(cap=1000)
+        for i in range(50):
+            tail.append(bytes([i]) * 400)
+        kept = tail.bytes()
+        self.assertLess(len(kept), 2000)
+        self.assertGreaterEqual(len(kept), 1000)
+        self.assertTrue(kept.endswith(bytes([49]) * 400))
+
+    def test_it_stores_chunks_rather_than_recopying_a_flat_buffer(self):
+        # The naive version reallocates and copies a quarter of a megabyte on
+        # every chunk, ten times a second per recording, to serve a value read
+        # once. Appending must not copy the chunk.
+        tail = _TailBuffer(cap=1000)
+        chunk = b"payload"
+        tail.append(chunk)
+        self.assertIs(tail._chunks[0], chunk)
+
+    def test_emptiness_reports_whether_the_attempt_got_any_data(self):
+        tail = _TailBuffer()
+        self.assertFalse(tail)
+        tail.append(b"x")
+        self.assertTrue(tail)
+
+
+class TestTimelineSurvivesEveryExitPath(unittest.TestCase):
+    """The offset must advance however the capture attempt ended.
+
+    `_stream_ffmpeg_process` returns from half a dozen places, and all but one
+    are followed by another FFmpeg appending to the same file. Advancing the
+    offset only where the body falls off the end would run it solely on the
+    operator-stop path -- the single case with no next segment -- so every
+    failover would still splice backwards.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-tl-"))
+        self.rec = StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(self.tmp / "out.ts"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, outcome):
+        from unittest.mock import patch
+        captured = _ts_packet(pts_seconds=42.0) * 4
+
+        def fake_capture(cmd, candidate, tail):
+            tail.append(captured)
+            return outcome
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", fake_capture):
+            self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        return self.rec._timeline_offset
+
+    def test_the_offset_advances_on_every_outcome(self):
+        for outcome in StreamOutcome:
+            with self.subTest(outcome=outcome):
+                self.rec._timeline_offset = 0.0
+                self.assertAlmostEqual(self._run(outcome), 42.0, places=3)
+
+    def test_it_advances_even_when_the_capture_raises(self):
+        from unittest.mock import patch
+
+        def exploding(cmd, candidate, tail):
+            tail.append(_ts_packet(pts_seconds=17.0) * 4)
+            raise RuntimeError("pipe died")
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", exploding):
+            with self.assertRaises(RuntimeError):
+                self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        self.assertAlmostEqual(self.rec._timeline_offset, 17.0, places=3)
+
+    def test_an_attempt_that_got_nothing_leaves_the_timeline_alone(self):
+        from unittest.mock import patch
+        self.rec._timeline_offset = 30.0
+
+        def no_data(cmd, candidate, tail):
+            return StreamOutcome.FAILED
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", no_data):
+            self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        # Nothing was appended, so there is nothing to move past -- and a
+        # stream that fails instantly can cycle candidates fast enough for the
+        # skipped scan to matter.
+        self.assertEqual(self.rec._timeline_offset, 30.0)
+
+    def test_unreadable_output_does_not_kill_the_recording(self):
+        from unittest.mock import patch
+
+        def garbage(cmd, candidate, tail):
+            tail.append(os.urandom(3000))
+            return StreamOutcome.INTERRUPTED
+
+        with patch.object(self.rec, "_capture_ffmpeg_output", garbage):
+            self.rec._stream_ffmpeg_process(["ffmpeg"], self.rec.candidates[0])
+        self.assertEqual(self.rec._timeline_offset, 0.0)
+
+
+class TestFailoverArgvCarriesTheOffset(unittest.TestCase):
+    """What the offset actually does to the FFmpeg command line."""
+
+    def setUp(self):
+        self.rec = StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], "/tmp/pvarr-argv.ts")
+
+    def test_the_first_segment_is_not_offset(self):
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertNotIn("-output_ts_offset", cmd)
+
+    def test_a_later_segment_continues_the_timeline(self):
+        self.rec._timeline_offset = 63.5
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertIn("-output_ts_offset", cmd)
+        self.assertEqual(cmd[cmd.index("-output_ts_offset") + 1], "63.500000")
+
+    def test_the_offset_applies_to_the_output_not_the_input(self):
+        # Placed after -i it shifts what is written; placed before -i it would
+        # shift what is read, which is a different operation entirely.
+        self.rec._timeline_offset = 10.0
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertGreater(cmd.index("-output_ts_offset"), cmd.index("-i"))
+
+    def test_the_proxy_fallback_is_offset_too(self):
+        # The proxy retry is a second FFmpeg appending to the same file, so it
+        # is a splice exactly like a candidate switch.
+        self.rec._timeline_offset = 5.0
+        cmd = self.rec._build_ffmpeg_cmd("http://127.0.0.1:9/p.m3u8",
+                                         local_proxy=True)
+        self.assertIn("-output_ts_offset", cmd)
+
+    def test_the_command_is_still_a_plain_argv_list(self):
+        self.rec._timeline_offset = 63.5
+        cmd = self.rec._build_ffmpeg_cmd("http://a/1.m3u8")
+        self.assertTrue(all(isinstance(part, str) for part in cmd))
+
+
+class TestResumePicksUpTheTimeline(unittest.TestCase):
+    """A resumed session appends to a file another process already wrote."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-resume-"))
+        self.out = self.tmp / "game.ts"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, ring=None):
+        return StreamFailoverRecorder(
+            "s1", ["http://a/1.m3u8"], str(self.out), ring=ring)
+
+    def test_it_continues_where_the_previous_process_stopped(self):
+        # Starting back at zero against a file whose timeline is already hours
+        # in would reintroduce the backward jump on every container restart.
+        self.out.write_bytes(_ts_packet(pts_seconds=1800.0) * 8)
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertAlmostEqual(rec._timeline_offset, 1800.0, places=2)
+
+    def test_a_fresh_recording_starts_at_zero(self):
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertEqual(rec._timeline_offset, 0.0)
+
+    def test_an_empty_file_starts_at_zero(self):
+        self.out.write_bytes(b"")
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertEqual(rec._timeline_offset, 0.0)
+
+    def test_an_unreadable_file_does_not_stop_the_recording(self):
+        self.out.write_bytes(b"not a transport stream at all")
+        rec = self.make()
+        rec._seed_timeline()
+        self.assertEqual(rec._timeline_offset, 0.0)
+
+    def test_seeding_happens_once(self):
+        self.out.write_bytes(_ts_packet(pts_seconds=100.0) * 8)
+        rec = self.make()
+        rec._seed_timeline()
+        rec._timeline_offset = 250.0
+        rec._seed_timeline()  # a second call must not rewind it
+        self.assertEqual(rec._timeline_offset, 250.0)
+
+    def test_a_rebroadcast_channel_has_no_prior_timeline_to_rejoin(self):
+        # A ring holds a moving window and is discarded with the process. Its
+        # failover splices are still corrected; only this seeding is skipped.
+        self.out.write_bytes(_ts_packet(pts_seconds=1800.0) * 8)
+        ring = ringbuffer.RingBuffer(
+            self.tmp / "chan.buf", capacity=ringbuffer.TS_PACKET_SIZE * 100)
+        try:
+            rec = self.make(ring=ring)
+            rec._seed_timeline()
+            self.assertEqual(rec._timeline_offset, 0.0)
+        finally:
+            ring.close()
+
+    def test_the_tail_of_a_long_file_is_enough_to_read_it(self):
+        padding = _ts_packet(pts_seconds=5.0) * 4000
+        self.out.write_bytes(padding + _ts_packet(pts_seconds=900.0) * 8)
+        self.assertAlmostEqual(
+            tail_timeline_position(self.out), 900.0, places=2)
+
+    def test_a_missing_file_reads_as_no_timeline(self):
+        self.assertIsNone(tail_timeline_position(self.tmp / "nope.ts"))
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+class TestRealFailoverSpliceIsMonotonic(unittest.TestCase):
+    """The whole thing, against real FFmpeg output.
+
+    Before this fix the same construction produced a file that ffprobe read as
+    10s of a 20s recording, with the timeline dropping back to ~1.4s at the
+    splice -- which is what made mpv reset playback mid-stream.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-splice-"))
+        self.ffmpeg = check_deps.find_executable("ffmpeg")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _source(self, name, freq):
+        path = self.tmp / name
+        subprocess.run(
+            [self.ffmpeg, "-hide_banner", "-v", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10:duration=4",
+             "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=4",
+             "-c:v", "libx264", "-preset", "ultrafast", "-g", "10",
+             "-c:a", "aac", "-f", "mpegts", str(path)], check=True)
+        return path
+
+    def _pts_series(self, path):
+        out = subprocess.run(
+            [check_deps.find_executable("ffprobe"), "-v", "error",
+             "-select_streams", "v", "-show_entries", "packet=pts_time",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True).stdout
+        return [float(line.rstrip(",")) for line in out.split() if line.strip()]
+
+    def test_three_appended_segments_never_walk_the_clock_backwards(self):
+        sources = [self._source("a.ts", 440), self._source("b.ts", 880),
+                   self._source("c.ts", 1320)]
+        out = self.tmp / "joined.ts"
+        out.write_bytes(b"")
+        offset = 0.0
+        for src in sources:
+            cmd = [self.ffmpeg, "-hide_banner", "-v", "error", "-i", str(src),
+                   "-c", "copy"]
+            cmd += output_ts_offset_flags(offset)
+            cmd += ["-f", "mpegts", "pipe:1"]
+            produced = subprocess.run(cmd, capture_output=True,
+                                      check=True).stdout
+            with open(out, "ab") as fh:
+                fh.write(produced)
+            observed = last_timeline_position(produced[-262144:])
+            self.assertIsNotNone(observed, "no timestamp found in real output")
+            offset = advance_timeline_position(offset, observed)
+
+        series = self._pts_series(out)
+        self.assertGreater(len(series), 60)
+        for earlier, later in zip(series, series[1:]):
+            self.assertGreaterEqual(
+                later, earlier,
+                f"timeline went backwards: {earlier} -> {later}")
+
+    def test_the_reported_duration_covers_every_segment(self):
+        # The symptom a user sees first: a 12s recording that claims to be 4s,
+        # because a duration probe reads the container timeline and everything
+        # after the first splice was invisible to it.
+        sources = [self._source("a.ts", 440), self._source("b.ts", 880),
+                   self._source("c.ts", 1320)]
+        out = self.tmp / "joined.ts"
+        out.write_bytes(b"")
+        offset = 0.0
+        for src in sources:
+            cmd = [self.ffmpeg, "-hide_banner", "-v", "error", "-i", str(src),
+                   "-c", "copy"] + output_ts_offset_flags(offset)
+            cmd += ["-f", "mpegts", "pipe:1"]
+            produced = subprocess.run(cmd, capture_output=True,
+                                      check=True).stdout
+            with open(out, "ab") as fh:
+                fh.write(produced)
+            offset = advance_timeline_position(
+                offset, last_timeline_position(produced[-262144:]))
+
+        duration = float(subprocess.run(
+            [check_deps.find_executable("ffprobe"), "-v", "error",
+             "-show_entries", "format=duration", "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True, check=True).stdout.strip())
+        self.assertGreater(duration, 11.0)
+
+
+
+class TestOutputPathReservation(unittest.TestCase):
+    """The naming layer must not hand two recordings the same file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-reserve-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_it_creates_the_file_it_returns(self):
+        # The reservation is the file. Returning a name without creating it is
+        # what let two starts claim the same one.
+        path = reserve_output_path(self.tmp / "game.ts")
+        self.assertTrue(path.exists())
+        self.assertEqual(path.stat().st_size, 0)
+
+    def test_a_finished_mp4_blocks_its_own_stem(self):
+        # The bug this exists for: capture writes .ts, the remux makes .mp4 and
+        # DELETES the .ts, so a .ts-only check saw a free name and ffmpeg -y
+        # then overwrote the finished recording.
+        (self.tmp / "game.mp4").write_bytes(b"a finished recording")
+        path = reserve_output_path(self.tmp / "game.ts")
+        self.assertEqual(path.name, "game_1.ts")
+        self.assertEqual((self.tmp / "game.mp4").read_bytes(), b"a finished recording")
+
+    def test_an_mkv_blocks_the_stem_too(self):
+        (self.tmp / "game.mkv").write_bytes(b"x")
+        self.assertEqual(reserve_output_path(self.tmp / "game.ts").name, "game_1.ts")
+
+    def test_repeated_reservations_never_collide(self):
+        # Two "Record again" clicks a second apart used to receive the same
+        # path and open it "ab" -- two FFmpegs interleaving into one file.
+        names = [reserve_output_path(self.tmp / "game.ts").name for _ in range(5)]
+        self.assertEqual(len(set(names)), 5)
+        self.assertEqual(names[0], "game.ts")
+        self.assertEqual(names[1], "game_1.ts")
+
+    def test_it_closes_the_descriptor_it_opens(self):
+        # Leaking one fd per start would exhaust the process over a long uptime.
+        before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+        if before is None:
+            self.skipTest("no /proc/self/fd on this platform")
+        for _ in range(20):
+            reserve_output_path(self.tmp / "game.ts")
+        self.assertLessEqual(len(os.listdir("/proc/self/fd")), before + 2)
+
+    def test_an_unwritable_directory_raises_rather_than_lying(self):
+        # Path.exists() answers False on OSError, so an unreadable or stale
+        # directory used to read as "this name is free" and the failure landed
+        # later, on the capture thread, after the API had returned 200.
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o500)
+        try:
+            with self.assertRaises(OSError):
+                reserve_output_path(locked / "game.ts")
+        finally:
+            os.chmod(locked, 0o700)
+
+    def test_storage_manager_uses_the_reservation(self):
+        storage = StorageManager(str(self.tmp))
+        first = storage.get_output_path("NFL", "A", "B", "1080p")
+        first.rename(first.with_suffix(".mp4"))          # simulate the remux
+        second = storage.get_output_path("NFL", "A", "B", "1080p")
+        self.assertNotEqual(first.stem, second.stem)
+        self.assertTrue(first.with_suffix(".mp4").exists())
+
+
+class TestRejectedStartLeavesNothingBehind(ServerTestCase):
+    """A refused start must give back the output name it reserved.
+
+    get_output_path() claims the name by creating the file, so two starts a
+    second apart cannot be handed the same one. Nothing rolled that back, so
+    every rejected attempt left a 0-byte .ts and burnt a slot: the same fixture
+    climbed _1, _2, ... and after 999 could not be recorded at all.
+    """
+
+    def _start(self, **extra):
+        data = {"url_primary": "http://a/1.m3u8", "sport": "NFL",
+                "team_a": "Bucs", "team_b": "Raiders", "resolution": "1080p"}
+        data.update(extra)
+        return self.client.post("/api/recordings/start", data=data)
+
+    def _files(self):
+        return sorted(p.name for p in Path(self.tmp).iterdir() if p.is_file())
+
+    def test_a_507_leaves_no_stub_behind(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "999999"}):
+            r = self._start()
+        self.assertEqual(r.status_code, 507)
+        self.assertEqual(self._files(), [])
+
+    def test_repeated_refusals_do_not_burn_slot_numbers(self):
+        from unittest.mock import patch, MagicMock
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "999999"}):
+            for _ in range(4):
+                self.assertEqual(self._start().status_code, 507)
+        self.assertEqual(self._files(), [])
+
+        # The next real start must get the plain name, not ..._4.
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock()]
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            self.assertEqual(self._start().status_code, 200)
+        self.assertEqual(len(self._files()), 1)
+        # Not "..._1080p_1.ts". Checking for "_1" alone would match the
+        # resolution in the middle of the name.
+        self.assertIsNone(re.search(r"_\d+\.ts$", self._files()[0]),
+                          f"slot number burnt by refused starts: {self._files()[0]}")
+
+    def test_a_launch_failure_also_gives_the_name_back(self):
+        from unittest.mock import patch
+        with patch.object(self.server, "_launch_session", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._start()
+        self.assertEqual(self._files(), [])
+
+    def test_a_successful_start_keeps_its_reserved_file(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock()]
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            self.assertEqual(self._start().status_code, 200)
+        self.assertEqual(len(self._files()), 1)
+
+    def test_a_non_empty_file_is_never_removed(self):
+        # If anything has been written the recorder owns it. Cleanup must not
+        # be able to delete footage on a late failure.
+        from unittest.mock import patch
+
+        def _write_then_fail(record, port):
+            Path(record["output_filepath"]).write_bytes(b"captured bytes")
+            raise RuntimeError("failed after the first write")
+
+        with patch.object(self.server, "_launch_session", side_effect=_write_then_fail):
+            with self.assertRaises(RuntimeError):
+                self._start()
+        self.assertEqual(len(self._files()), 1)
+        self.assertEqual((Path(self.tmp) / self._files()[0]).read_bytes(), b"captured bytes")
+
+
+class TestRecordAgainConfig(ServerTestCase):
+    """GET /api/recordings/{id}/config -- the settings behind a finished run."""
+
+    def _seed(self, **overrides):
+        from app.sessions import build_record
+        record = build_record(
+            recording_id="abc123",
+            candidates=["http://a/1.m3u8?st=tok", "http://b/2.m3u8"],
+            output_filepath=str(Path(self.tmp) / "old.ts"),
+            started_at=1000.0,
+            header_overrides={
+                "http://a/1.m3u8?st=tok": {
+                    "referer": "http://a/",
+                    "user_agent": "PVArr",
+                    "cookie": "session=supersecret",
+                },
+            },
+            freeze_timeout_sec=22,
+            channel_name="Test Channel",
+            end_time=1000.0 + 5400.0,
+            naming={
+                "sport": "NCAA-FBS", "team_a": "Wyoming", "team_b": "Colorado_State",
+                "resolution": "1080p", "output_dir": "",
+            },
+        )
+        record.update(overrides)
+        from unittest.mock import MagicMock
+        recorder = MagicMock()
+        recorder.session_record = record
+        self.server.active_recorders["abc123"] = recorder
+        return record
+
+    def test_unknown_session_404s(self):
+        r = self.client.get("/api/recordings/nope/config")
+        self.assertEqual(r.status_code, 404)
+
+    def test_it_returns_the_operators_original_inputs(self):
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["sport"], "NCAA-FBS")
+        self.assertEqual(cfg["team_a"], "Wyoming")
+        self.assertEqual(cfg["team_b"], "Colorado_State")
+        self.assertEqual(cfg["resolution"], "1080p")
+        self.assertEqual(cfg["freeze_timeout"], 22)
+        self.assertEqual(cfg["channel_name"], "Test Channel")
+        self.assertEqual(cfg["url_primary"], "http://a/1.m3u8?st=tok")
+        self.assertEqual(cfg["url_backup1"], "http://b/2.m3u8")
+        self.assertEqual(cfg["url_backup2"], "")
+
+    def test_it_never_returns_a_cookie(self):
+        # /api/status withholds the cookie on purpose: port 8999 has no
+        # authentication and a cookie is a live account credential that does
+        # not expire the way a stream token does. This endpoint must not be
+        # the way back out.
+        self._seed()
+        body = self.client.get("/api/recordings/abc123/config").text
+        self.assertNotIn("supersecret", body)
+        self.assertNotIn("cookie", json.loads(body)["config"]["stream_headers"]
+                         ["http://a/1.m3u8?st=tok"])
+
+    def test_it_flags_which_candidates_need_a_cookie_repasted(self):
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["cookie_required"], ["http://a/1.m3u8?st=tok"])
+
+    def test_referer_and_user_agent_do_come_back(self):
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["stream_headers"]["http://a/1.m3u8?st=tok"],
+                         {"referer": "http://a/", "user_agent": "PVArr"})
+
+    def test_an_absolute_end_time_becomes_a_duration(self):
+        # Replaying the old absolute epoch would be refused as "in the past".
+        # What the operator meant was "ninety minutes", so offer that.
+        self._seed()
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["duration_minutes"], 90.0)
+
+    def test_the_duration_is_clamped_to_what_start_accepts(self):
+        self._seed(end_time=1000.0 + (72 * 3600))
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertEqual(cfg["duration_minutes"], 1440)
+
+    def test_no_end_time_offers_no_duration(self):
+        self._seed(end_time=None)
+        cfg = self.client.get("/api/recordings/abc123/config").json()["config"]
+        self.assertIsNone(cfg["duration_minutes"])
+
+    def test_it_does_not_hand_out_the_live_record(self):
+        # _on_failover mutates and re-saves this dict; a caller must not be
+        # able to reach it.
+        record = self._seed()
+        self.client.get("/api/recordings/abc123/config")
+        self.assertEqual(record["candidates"], ["http://a/1.m3u8?st=tok", "http://b/2.m3u8"])
+        self.assertEqual(record["header_overrides"]["http://a/1.m3u8?st=tok"]["cookie"],
+                         "session=supersecret")
+
+    def test_a_started_recording_is_immediately_re_recordable(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        fake.candidates = [MagicMock(name="c1")]
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            started = self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8",
+                "sport": "NFL", "team_a": "Bucs", "team_b": "Raiders",
+                "resolution": "720p", "freeze_timeout": 30,
+            })
+        self.assertEqual(started.status_code, 200)
+        rid = next(iter(self.server.active_recorders))
+        cfg = self.client.get(f"/api/recordings/{rid}/config").json()["config"]
+        self.assertEqual(cfg["team_a"], "Bucs")
+        self.assertEqual(cfg["resolution"], "720p")
+        self.assertEqual(cfg["freeze_timeout"], 30)
+
+    def test_a_pruned_session_is_no_longer_offered(self):
+        # The record has the recorder's lifetime, so pruning one loses both and
+        # the endpoint 404s rather than serving a config for a dead session.
+        from unittest.mock import MagicMock
+        for n in range(self.server.MAX_FINISHED_SESSIONS + 3):
+            rec = MagicMock()
+            rec.is_running = False
+            rec.stop_time = float(n)
+            rec.session_record = {"id": f"s{n}"}
+            self.server.active_recorders[f"s{n}"] = rec
+        self.server._prune_finished_sessions()
+        self.assertEqual(len(self.server.active_recorders),
+                         self.server.MAX_FINISHED_SESSIONS)
+        self.assertEqual(self.client.get("/api/recordings/s0/config").status_code, 404)
+
+
+class TestResumeReattachesToTheWorkingCandidate(unittest.TestCase):
+    """_on_failover saves current_candidate_index -- _launch_session must use it.
+
+    It was written to the record and never read back, so every resume started
+    again from the primary that had already failed.
+    """
+
+    def _launch(self, **record_bits):
+        from unittest.mock import patch, MagicMock
+        from app import server
+        from app.sessions import build_record
+
+        record = build_record(
+            recording_id="rid",
+            candidates=["http://a/1.m3u8", "http://b/2.m3u8", "http://c/3.m3u8"],
+            output_filepath="/tmp/pvarr-resume-test.ts",
+            started_at=1000.0,
+        )
+        record.update(record_bits)
+
+        built = {}
+
+        def _capture(*args, **kwargs):
+            rec = MagicMock()
+            rec.candidates = [MagicMock() for _ in kwargs.get("candidates", [])]
+            rec.current_candidate_index = 0
+            built["recorder"] = rec
+            return rec
+
+        with patch.object(server, "StreamFailoverRecorder", side_effect=_capture), \
+             patch.object(server, "session_store", MagicMock()), \
+             patch.object(server, "active_recorders", {}):
+            server._launch_session(record, 8090)
+        return built["recorder"]
+
+    def test_it_resumes_on_the_candidate_that_was_working(self):
+        recorder = self._launch(current_candidate_index=1)
+        self.assertEqual(recorder.current_candidate_index, 1)
+
+    def test_a_fresh_start_still_begins_at_the_primary(self):
+        recorder = self._launch(current_candidate_index=0)
+        self.assertEqual(recorder.current_candidate_index, 0)
+
+    def test_an_index_past_the_candidate_list_is_clamped(self):
+        # The record is JSON on disk and the list can be shorter than it was.
+        recorder = self._launch(current_candidate_index=9)
+        self.assertEqual(recorder.current_candidate_index, 0)
+
+    def test_a_junk_index_does_not_crash_the_resume(self):
+        for junk in ("two", None, [1]):
+            with self.subTest(value=junk):
+                recorder = self._launch(current_candidate_index=junk)
+                self.assertEqual(recorder.current_candidate_index, 0)
+
+
+class TestRelayRoutesNestedPlaylistsByTag(unittest.TestCase):
+    """Review 2026-10-05: only URIs ending .m3u8 were relayed, so a variant
+    at `/live/720p` or a `.m3u` rendition went to FFmpeg direct and 403'd,
+    while the probe (which fetches variants with the browser TLS profile) said OK."""
+
+    MASTER = (b'#EXTM3U\n'
+              b'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",URI="audio/en.m3u"\n'
+              b'#EXT-X-STREAM-INF:BANDWIDTH=900000,AUDIO="a"\n'
+              b'/live/720p\n')
+    MEDIA = (b'#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+             b'#EXTINF:6.0,\nseg1.ts\n')
+
+    def setUp(self):
+        # Placeholder hosts must not reach DNS; IP literals still classify.
+        from unittest.mock import patch
+        from urllib.parse import urlsplit
+        from app.probe import is_private_url
+        def fake(u):
+            return False if (urlsplit(u).hostname or "").endswith(".example") else is_private_url(u)
+        # app.probe too: the relay's playlist check resolves through it.
+        for target in ("app.relay.is_private_url", "app.probe.is_private_url"):
+            dns = patch(target, side_effect=fake)
+            dns.start()
+            self.addCleanup(dns.stop)
+
+    def test_variants_and_renditions_go_through_the_relay(self):
+        from app.relay import PlaylistRelay
+        relay = PlaylistRelay("https://edge.example/hls/master",
+                              {}, fetch=lambda url, h, t: (200, self.MASTER, url))
+        local = relay.start()
+        try:
+            status, body = relay.serve(0)
+        finally:
+            relay.stop()
+        text = body.decode()
+        prefix = local.rsplit("/", 1)[0] + "/"
+        self.assertEqual(status, 200)
+        self.assertIn('URI="' + prefix + "1.m3u8", text)
+        self.assertIn("\n" + prefix + "2.m3u8\n", text)
+        self.assertNotIn("edge.example", text)
+
+    def test_a_private_nested_playlist_is_refused_without_fetching(self):
+        from app.relay import PlaylistRelay
+        master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttp://127.0.0.1:8999/x\n"
+        fetched = []
+
+        def fetch(url, headers, timeout):
+            fetched.append(url)
+            return 200, master, url
+
+        relay = PlaylistRelay("https://93.184.216.34/hls/master", {"Cookie": "sid=1"},
+                              fetch=fetch)
+        relay.start()
+        try:
+            master_status, _ = relay.serve(0)
+            status, _ = relay.serve(1)
+        finally:
+            relay.stop()
+        # The master itself is refused now, so the variant is never handed out.
+        self.assertEqual(master_status, 403)
+        self.assertIn(status, (403, 404))
+        self.assertEqual(fetched, ["https://93.184.216.34/hls/master"])
+
+    def test_a_public_playlist_naming_a_private_segment_is_refused(self):
+        from app.relay import PlaylistRelay
+        media = b"#EXTM3U\n#EXTINF:6.0,\nhttp://10.0.0.9/seg1.ts\n"
+        relay = PlaylistRelay("https://edge.example/hls/live", {},
+                              fetch=lambda url, h, t: (200, media, url))
+        relay.start()
+        try:
+            status, body = relay.serve(0)
+        finally:
+            relay.stop()
+        self.assertEqual((status, body), (403, b""))
+
+    def test_a_rewrite_racing_stop_does_not_crash(self):
+        # Review 2026-10-05: stop() cleared `_server` while a handler thread
+        # could still be in _local(), which read the port from it.
+        from app.relay import PlaylistRelay
+        relay = PlaylistRelay("https://edge.example/hls/master", {},
+                              fetch=lambda url, h, t: (200, self.MASTER, url))
+        local = relay.start()
+        relay.stop()
+        status, body = relay.serve(0)
+        self.assertEqual(status, 200)
+        self.assertIn(local.rsplit("/", 1)[0] + "/2.m3u8", body.decode())
+
+    def test_the_real_fetch_stops_reading_at_the_ceiling(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from app.relay import MAX_PLAYLIST_BYTES, browser_tls_fetch
+
+        class Huge(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    for _ in range(200):
+                        self.wfile.write(b"#" * 65536)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Huge)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            status, body, _ = browser_tls_fetch(
+                f"http://127.0.0.1:{server.server_address[1]}/p.m3u8", {}, 10)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(status, 200)
+        self.assertLess(len(body), MAX_PLAYLIST_BYTES + 65536 * 2)
+
+    def test_unlisted_paths_are_404(self):
+        # The not-an-open-proxy guarantee: only indexes it handed out exist.
+        import urllib.error
+        import urllib.request
+        from app.relay import PlaylistRelay
+        relay = PlaylistRelay("https://edge.example/hls/720p", {},
+                              fetch=lambda url, h, t: (200, self.MEDIA, url))
+        local = relay.start()
+        base = local.rsplit("/", 1)[0]
+        try:
+            for path in ("/1.m3u8", "/0", "/x.m3u8", "/https://evil.example/a.m3u8",
+                         "/../0.m3u8"):
+                with self.assertRaises(urllib.error.HTTPError, msg=path) as caught:
+                    urllib.request.urlopen(base + path, timeout=5)
+                self.assertEqual(caught.exception.code, 404, path)
+        finally:
+            relay.stop()
+
+    def test_segments_and_keys_stay_direct(self):
+        from app.relay import PlaylistRelay
+        relay = PlaylistRelay("https://edge.example/hls/720p",
+                              {}, fetch=lambda url, h, t: (200, self.MEDIA, url))
+        relay.start()
+        try:
+            _, body = relay.serve(0)
+        finally:
+            relay.stop()
+        text = body.decode()
+        self.assertIn('URI="https://edge.example/hls/key.bin"', text)
+        self.assertIn("\nhttps://edge.example/hls/seg1.ts\n", text)
+
+
+class TestPlaylistRelayRecordsAGatedStream(unittest.TestCase):
+    """Phase 18, end to end with real FFmpeg and real curl_cffi.
+
+    The origin refuses the playlists to anything but the relay (standing in
+    for the browser-TLS gate, which cannot be reproduced offline) and
+    serves segments to anyone. FFmpeg must record the stream through the
+    relay, fetching the segments itself from the origin.
+    """
+
+    def setUp(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-relay-"))
+        self.ffmpeg = check_deps.find_executable("ffmpeg")
+        subprocess.run(
+            [self.ffmpeg, "-hide_banner", "-v", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10:duration=4",
+             "-c:v", "libx264", "-preset", "ultrafast", "-g", "10",
+             "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+             "-hls_segment_filename", str(self.tmp / "seg%d.ts"),
+             str(self.tmp / "media.m3u8")],
+            check=True, timeout=60)
+        (self.tmp / "master.m3u8").write_text(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=200000\nmedia.m3u8\n")
+        root, requests_seen = self.tmp, []
+        self.requests_seen = requests_seen
+
+        class Origin(BaseHTTPRequestHandler):
+            def do_GET(self):
+                name = self.path.lstrip("/")
+                gated = name.endswith(".m3u8") and self.headers.get("X-Gate") != "open"
+                requests_seen.append((name, self.headers.get("User-Agent", "")))
+                path = root / name
+                if gated or not path.is_file():
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                body = path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+        threading.Thread(target=self.origin.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.origin.server_address[1]}/"
+
+    def tearDown(self):
+        self.origin.shutdown()
+        self.origin.server_close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ffmpeg_records_through_the_relay(self):
+        from app.relay import PlaylistRelay
+        relay = PlaylistRelay(self.base + "master.m3u8", {"X-Gate": "open"})
+        local = relay.start()
+        try:
+            out = self.tmp / "out.ts"
+            res = subprocess.run(
+                [self.ffmpeg, "-hide_banner", "-v", "error", "-y",
+                 "-headers", "User-Agent: pvarr-ffmpeg\r\n",
+                 "-i", local, "-c", "copy", "-f", "mpegts", str(out)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertGreater(out.stat().st_size, 10000)
+            # Segments came straight from the origin, fetched by FFmpeg.
+            self.assertIn(("seg0.ts", "pvarr-ffmpeg"), self.requests_seen)
+            # Not an open proxy: only playlists it has been handed are served.
+            import urllib.request, urllib.error
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(local.replace("/0.m3u8", "/9.m3u8"), timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+        finally:
+            relay.stop()
+
+    def test_ffmpeg_alone_is_refused(self):
+        # Proves the gate above is real: without the relay this stream fails.
+        res = subprocess.run(
+            [self.ffmpeg, "-hide_banner", "-v", "error", "-i", self.base + "master.m3u8",
+             "-c", "copy", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_the_relay_stops_when_ffmpeg_raises(self):
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+        import app.recorder as recorder_mod
+        rec = StreamFailoverRecorder("relay2", [self.base + "master.m3u8"],
+                                     str(self.tmp / "rec2.ts"))
+        started = []
+
+        class Tracked(recorder_mod.PlaylistRelay):
+            def start(self):
+                started.append(super().start())
+                return started[-1]
+
+        def detect(candidate):
+            candidate.m3u8_url = self.base + "master.m3u8"
+            candidate.needs_relay = True
+
+        with patch.object(recorder_mod, "PlaylistRelay", Tracked), \
+                patch.object(rec, "detect_candidate_headers", side_effect=detect), \
+                patch.object(rec, "_stream_ffmpeg_process",
+                             side_effect=RuntimeError("ffmpeg blew up")):
+            with self.assertRaises(RuntimeError):
+                rec._recording_loop()
+        self.assertEqual(len(started), 1)
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(started[0], timeout=2)
+
+    def test_recorder_routes_a_flagged_candidate_through_the_relay(self):
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder("relay1", [self.base + "master.m3u8"],
+                                     str(self.tmp / "rec.ts"))
+        seen = {}
+
+        def detect(candidate):
+            candidate.m3u8_url = self.base + "master.m3u8"
+            candidate.needs_relay = True
+            candidate.referer = "https://player.example/p.php"
+
+        def stream(cmd, candidate):
+            seen["url"] = cmd[cmd.index("-i") + 1]
+            # Live while FFmpeg runs: the origin's 403 (no X-Gate here) comes
+            # back through it.
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(seen["url"], timeout=5)
+            seen["status"] = caught.exception.code
+            return StreamOutcome.COMPLETED
+
+        with patch.object(rec, "detect_candidate_headers", side_effect=detect), \
+                patch.object(rec, "_stream_ffmpeg_process", side_effect=stream):
+            rec._recording_loop()
+
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:"))
+        self.assertEqual(seen["status"], 403)
+        self.assertIn(("master.m3u8", rec.candidates[0].user_agent), self.requests_seen)
+        # Torn down once FFmpeg is done.
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(seen["url"], timeout=2)
+
+
+class TestEveryTestInThisFileActuallyRuns(unittest.TestCase):
+    """The `__main__` entry point must be the last thing in this file.
+
+    CI runs `python test_pvarr.py`. `unittest.main()` reflects over __main__'s
+    globals at the moment it is called and then sys.exit()s, so any class
+    defined below it is never defined, never discovered and never run -- and
+    nothing fails, the count just quietly drops. Twenty-five tests were added
+    below that block and were invisible to CI while passing locally under
+    `-m unittest`, which imports the module and executes the whole file.
+
+    This guard is the reason that cannot happen again silently.
+    """
+
+    def test_no_test_class_is_defined_after_the_entry_point(self):
+        source = Path(__file__).resolve().read_text().splitlines()
+        entry = [i for i, line in enumerate(source)
+                 if line.startswith('if __name__ == "__main__"')]
+        self.assertEqual(len(entry), 1, "expected exactly one __main__ block")
+        stranded = [
+            f"line {i + 1}: {line}"
+            for i, line in enumerate(source)
+            if i > entry[0] and line.startswith("class ")
+        ]
+        self.assertEqual(
+            stranded, [],
+            "these classes sit below `if __name__ == \"__main__\"` and will "
+            "never run under `python test_pvarr.py`:\n  " + "\n  ".join(stranded),
+        )
+
+    def test_the_two_ways_of_running_the_suite_agree(self):
+        # `python test_pvarr.py` (CI) and `-m unittest test_pvarr` (local) must
+        # collect the same tests, or a green local run means nothing.
+        loader = unittest.TestLoader()
+        imported = loader.loadTestsFromModule(
+            __import__("test_pvarr") if __name__ == "__main__" else sys.modules[__name__]
+        )
+        as_main = loader.loadTestsFromModule(sys.modules[__name__])
+        self.assertEqual(imported.countTestCases(), as_main.countTestCases())
+
+
+class TestShutdownBudgetFitsTheGracePeriod(unittest.TestCase):
+    """The two shutdown phases run in sequence inside Docker's grace period.
+
+    Uvicorn drains open connections first, and only then runs the lifespan hook
+    that stops the recorders and marks their sessions for resume. The dashboard
+    holds a log-tailing EventSource open for as long as a browser tab is on it,
+    so before the drain was bounded a `docker stop` with the UI open waited on
+    that tab (measured at ~80s), Docker's stop_grace_period expired, and the
+    container was SIGKILLed before a single recorder had been told to stop --
+    no resume marker, FFmpeg killed mid-write. Exactly the situation resume
+    exists for.
+
+    If these numbers drift apart again, that failure comes back silently.
+    """
+
+    ROOT = Path(__file__).resolve().parent
+
+    def _graceful_default(self) -> int:
+        text = (self.ROOT / "start.sh").read_text()
+        match = re.search(r'GRACEFUL_TIMEOUT="\$\{PVARR_GRACEFUL_TIMEOUT:-(\d+)\}"', text)
+        self.assertIsNotNone(match, "start.sh no longer sets a graceful-shutdown default")
+        return int(match.group(1))
+
+    def _grace_period(self) -> int:
+        text = (self.ROOT / "docker-compose.yml").read_text()
+        match = re.search(r"stop_grace_period:\s*(\d+)s", text)
+        self.assertIsNotNone(match, "docker-compose.yml no longer sets stop_grace_period")
+        return int(match.group(1))
+
+    def test_uvicorn_is_launched_with_a_bounded_drain(self):
+        # Without this flag the drain is unlimited and a single open dashboard
+        # tab postpones the recorder shutdown indefinitely.
+        text = (self.ROOT / "start.sh").read_text()
+        self.assertIn("--timeout-graceful-shutdown", text)
+
+    def test_the_two_phases_fit_inside_the_grace_period(self):
+        from app.cleanup import DEFAULT_SHUTDOWN_TIMEOUT_SEC
+        total = self._graceful_default() + DEFAULT_SHUTDOWN_TIMEOUT_SEC
+        self.assertLess(
+            total, self._grace_period(),
+            f"drain ({self._graceful_default()}s) + reap/remux "
+            f"({DEFAULT_SHUTDOWN_TIMEOUT_SEC}s) = {total}s must fit inside "
+            f"stop_grace_period ({self._grace_period()}s), or Docker SIGKILLs "
+            "an in-flight recording before it is marked for resume.",
+        )
+
+    def test_an_invalid_graceful_timeout_falls_back_rather_than_failing_to_boot(self):
+        # start.sh runs under `set -euo pipefail`; an unvalidated value would
+        # reach uvicorn's argument parser and the container would crash-loop.
+        result = subprocess.run(
+            ["bash", "-n", str(self.ROOT / "start.sh")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('=~ ^[0-9]+$', (self.ROOT / "start.sh").read_text())
+
+
+def _load_score_comskip():
+    import importlib.util
+    path = Path(__file__).resolve().parent / "scripts" / "score-comskip.py"
+    spec = importlib.util.spec_from_file_location("score_comskip", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestComskipScoring(unittest.TestCase):
+    """scripts/score-comskip.py decides which comskip settings ship.
+
+    A scorer that miscounts would quietly bless a worse ini, so the arithmetic
+    is pinned here rather than trusted.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sc = _load_score_comskip()
+
+    def track(self, pattern, step=4.0):
+        """'1' = logo visible on that keyframe, '0' = not."""
+        return [(i * step, float(c)) for i, c in enumerate(pattern)]
+
+    def test_logo_absent_runs_become_breaks(self):
+        breaks = self.sc.breaks_from_track(self.track("1111000000011110000000"), 20)
+        self.assertEqual(breaks, [(16.0, 44.0), (60.0, 88.0)])
+
+    def test_short_absences_are_not_breaks(self):
+        # 12 s without the logo is a replay or a graphic, not an ad break.
+        self.assertEqual(self.sc.breaks_from_track(self.track("11110001111"), 20), [])
+
+    def test_one_keyframe_blip_does_not_split_a_break(self):
+        breaks = self.sc.breaks_from_track(self.track("1110000010000000111"), 20)
+        self.assertEqual(breaks, [(12.0, 64.0)])
+
+    def test_break_running_to_the_end_is_kept(self):
+        breaks = self.sc.breaks_from_track(self.track("1111100000000"), 20)
+        self.assertEqual(breaks, [(20.0, 52.0)])
+
+    def test_score_counts_caught_missed_and_game_marked_as_ad(self):
+        truth = [(100.0, 200.0), (500.0, 600.0)]
+        detected = [(90.0, 180.0)]          # 10 s early, stops 20 s short
+        r = self.sc.score(truth, detected, [])
+        self.assertEqual((r["caught"], r["missed"], r["false_pos"]), (80, 120, 10))
+        self.assertEqual(r["whole_breaks_missed"], 1)
+        self.assertAlmostEqual(r["recall"], 0.4)
+
+    def test_excluded_span_is_not_scored(self):
+        truth = [(100.0, 200.0)]
+        r = self.sc.score(truth, [(300.0, 400.0)], [(300.0, 400.0)])
+        self.assertEqual((r["caught"], r["missed"], r["false_pos"]), (0, 100, 0))
+
+    def test_edl_keeps_only_cut_actions(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".edl", delete=False) as fh:
+            fh.write("0.00\t10.50\t0\n20.00\t30.00\t3\nbad line\n40.0\t50.0\t0\n")
+        try:
+            self.assertEqual(self.sc.parse_edl(fh.name), [(0.0, 10.5), (40.0, 50.0)])
+        finally:
+            os.unlink(fh.name)
+
+
+# --------------------------------------------------------------------------
+# League/team tags. Offline by design: the bundled snapshot and a saved ESPN
+# response, never the network.
+# --------------------------------------------------------------------------
+from app import tags
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+class TestTagSuggestions(unittest.TestCase):
+    def test_ncaa_offers_every_ncaa_league_and_aliases_resolve(self):
+        ids = [s["value"] for s in tags.suggest_leagues("ncaa")]
+        self.assertEqual(ids, ["NCAAF", "NCAAM", "NCAAW", "NCAAH", "NCAABSB"])
+        self.assertEqual(tags.suggest_leagues("cfb")[0]["value"], "NCAAF")
+        self.assertEqual(tags.suggest_leagues("wbb")[0]["value"], "NCAAW")
+        self.assertEqual(tags.suggest_leagues("prem")[0]["value"], "EPL")
+
+    def test_teams_match_on_prefix_nickname_city_abbreviation_and_alias(self):
+        """Against the snapshot that ships, so a broken refresh fails here."""
+        first = lambda q, league="": tags.suggest_teams(q, league)[0]["value"]
+        self.assertEqual(first("packe"), "Green Bay Packers")
+        self.assertEqual(first("avalanche"), "Colorado Avalanche")
+        self.assertEqual(first("avs"), "Colorado Avalanche")
+        self.assertEqual(first("col", "NHL"), "Colorado Avalanche")
+        self.assertEqual(first("wpg", "nhl"), "Winnipeg Jets")
+
+    def test_league_filter_narrows_and_ncaa_schools_are_not_repeated(self):
+        nhl = tags.suggest_teams("jets", "NHL")
+        self.assertEqual([s["value"] for s in nhl], ["Winnipeg Jets"])
+        everywhere = [s["value"] for s in tags.suggest_teams("michigan wolverines")]
+        self.assertEqual(everywhere.count("Michigan Wolverines"), 1)
+
+    def test_a_missing_snapshot_means_no_suggestions_not_an_error(self):
+        self.assertEqual(tags.load_snapshot.__wrapped__("/nonexistent/teams.json"),
+                         {"leagues": {}})
+
+
+class TestTagRefresh(unittest.TestCase):
+    def test_espn_teams_parse_from_saved_response(self):
+        payload = json.loads((FIXTURES / "espn_nhl_teams.json").read_text())
+        rows = tags.parse_espn_teams(payload)
+        self.assertIn(["Colorado Avalanche", "COL", "Colorado", "Avalanche"], rows)
+        self.assertEqual(len(rows), 3)
+
+    def test_a_league_that_fails_to_refresh_keeps_its_old_teams(self):
+        """The API being down must never empty the snapshot."""
+        payload = json.loads((FIXTURES / "espn_nhl_teams.json").read_text())
+
+        class HalfDown(tags.TeamProvider):
+            name = "test"
+
+            def teams(self, league):
+                if league["id"] == "NHL":
+                    return tags.parse_espn_teams(payload)
+                raise OSError("connection refused")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "teams.json"
+            path.write_text(json.dumps({"leagues": {"NFL": [["Green Bay Packers", "GB", "Green Bay", "Packers"]]}}))
+            data = tags.refresh(HalfDown(), path=path, log=lambda *_: None)
+            on_disk = json.loads(path.read_text())
+            self.assertEqual(on_disk["leagues"]["NFL"][0][0], "Green Bay Packers")
+            self.assertEqual(len(on_disk["leagues"]["NHL"]), 3)
+            self.assertNotIn("NBA", on_disk["leagues"])
+            self.assertEqual(data, on_disk)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+
+class TestTagEndpoints(ServerTestCase):
+    def test_team_suggestions_are_served_and_filtered_by_league(self):
+        r = self.client.get("/api/tags/teams", params={"q": "packe"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["suggestions"][0]["value"], "Green Bay Packers")
+        r = self.client.get("/api/tags/teams", params={"q": "packe", "league": "NHL"})
+        self.assertEqual(r.json()["suggestions"], [])
+        r = self.client.get("/api/tags/leagues", params={"q": "nh"})
+        self.assertEqual(r.json()["suggestions"][0]["value"], "NHL")
+
+
+# --------------------------------------------------------------------------
+# Aggregator pages -> first three working streams. No network: the page fetch
+# and every probe are stand-ins.
+# --------------------------------------------------------------------------
+from app import aggregator
+
+AGG_PAGE = """
+<html><head><link rel="stylesheet" href="/style.css"></head><body>
+<nav><a href="/">Home</a> <a href="/nhl">NHL</a> <a href="/event/other-game">Other</a></nav>
+<a href="https://social.example/">Follow us</a>
+<a href="https://social.example/share?u=https://agg.example/event/avs-jets">Share</a>
+<table>
+  <tr><td><a href="https://streams-one.example/live/avs?x=1#top">Stream 1</a></td></tr>
+  <tr><td><a href="/event/avs-jets/stream/2">Stream 2</a></td></tr>
+  <tr><td><a href="/go?url=https%3A%2F%2Fstreams-three.example%2Fwatch%2F9">Stream 3</a></td></tr>
+  <tr><td><a href="https://streams-one.example/live/avs?x=1">Stream 1 again</a></td></tr>
+  <tr><td><a href="https://cdn.example/logo.png">logo</a></td></tr>
+  <tr><td><a href="https://www.agg.example/event/other-game">www nav</a></td></tr>
+  <tr><td><a href="https://www.agg.example/watch/avs-jets/4">Stream 4</a></td></tr>
+  <tr><td><span data-href="https://streams-five.example/w/5?ref=agg.example">Stream 5</span></td></tr>
+  <tr><td><button onclick="window.open('https://streams-six.example/w/6')">Stream 6</button></td></tr>
+</table>
+<iframe src="https://player.example/embed/77"></iframe>
+<script>var src = "https:\\/\\/edge.example\\/hls\\/master.m3u8";</script>
+</body></html>
+"""
+
+
+class TestAggregatorLinks(unittest.TestCase):
+    def test_extracts_stream_links_and_drops_navigation(self):
+        links = aggregator.extract_links(AGG_PAGE, "https://agg.example/event/avs-jets")
+        self.assertEqual(links, [
+            "https://edge.example/hls/master.m3u8",
+            "https://player.example/embed/77",
+            "https://streams-one.example/live/avs?x=1",
+            "https://agg.example/event/avs-jets/stream/2",
+            "https://streams-three.example/watch/9",
+            "https://www.agg.example/watch/avs-jets/4",
+            "https://streams-five.example/w/5?ref=agg.example",
+            "https://streams-six.example/w/6",
+        ])
+
+    def test_ad_and_click_tracking_hops_are_not_candidates(self):
+        # An ad redirect once used up a probe slot. Dropped by path shape
+        # only; a stream-ish URL that happens to contain such a segment stays.
+        html = ('<a href="https://ads-host.example/ad/visit.php?al=1">Stream 1</a>'
+                '<a href="https://track.example/click/abc">Stream 2</a>'
+                '<a href="https://s.example/live/ad/3">Stream 3</a>'
+                '<a href="https://s.example/w/4">Stream 4</a>')
+        self.assertEqual(aggregator.extract_links(html, "https://agg.example/event/avs-jets"),
+                         ["https://s.example/live/ad/3", "https://s.example/w/4"])
+
+    def test_the_page_itself_is_not_a_candidate_with_or_without_a_slash(self):
+        html = ('<a href="/event/avs-jets/">refresh</a>'
+                '<a href="https://s.example/w/1">s</a>')
+        self.assertEqual(aggregator.extract_links(html, "https://agg.example/event/avs-jets"),
+                         ["https://s.example/w/1"])
+        self.assertEqual(aggregator.extract_links('<a href="/event/avs-jets">x</a>',
+                                                  "https://agg.example/event/avs-jets/"), [])
+
+    def test_site_menu_does_not_crowd_out_stream_rows(self):
+        # Sponsor's live page, 2026-10-07: a <base href> made the relative site
+        # menu look like sub-pages of the event, and a sister site's 40-odd
+        # league links came next; the 20-link cap was spent before the first
+        # stream row (a data-href) was reached.
+        menu = "".join(f'<a href="watch-{s}-streams/">{s}</a>' for s in ("nfl", "mlb", "f1"))
+        sister = "".join(f'<a href="https://sister.example/watch-l{i}-streams/">l{i}</a>'
+                         for i in range(8))
+        rows = ('<div class="stream-item" data-href="https://s1.example/nhl/avs-jets/"></div>'
+                '<div class="stream-item" data-href="https://s2.example/66198"></div>')
+        html = f'<head><base href="https://agg.example/"></head>{menu}{sister}{rows}'
+        self.assertEqual(aggregator.extract_links(html, "https://agg.example/watch-66198-avs-jets/"),
+                         ["https://s1.example/nhl/avs-jets/", "https://s2.example/66198"])
+
+    def test_pasted_cookie_formats_become_a_header_value(self):
+        # Sponsor's live test, 2026-10-07: couldn't tell whether the paste worked.
+        c = aggregator.clean_cookie
+        self.assertEqual(c("Cookie: a=1; cf_clearance=x.y-1"), "a=1; cf_clearance=x.y-1")
+        self.assertEqual(c("cf_clearance\tx.y-1\t.agg.example\t/\t2026-10-08"), "cf_clearance=x.y-1")
+        self.assertEqual(c("  x.y-1 "), "cf_clearance=x.y-1")
+        self.assertIsNone(c("   "))
+        self.assertEqual(aggregator.clean_user_agent("User-Agent: Mozilla/5.0 X"), "Mozilla/5.0 X")
+
+    def test_cloudflare_challenge_is_recognised(self):
+        body = b"<html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/x'></script>"
+        self.assertTrue(aggregator.is_challenge(403, {}, body))
+        self.assertTrue(aggregator.is_challenge(403, {"CF-Mitigated": "challenge"}, b""))
+        self.assertFalse(aggregator.is_challenge(200, {}, b"<html>just a moment</html>"))
+        self.assertFalse(aggregator.is_challenge(404, {}, b"not found"))
+
+
+def _fake_probe(table, delays=None):
+    delays = delays or {}
+
+    def probe_fn(url):
+        time.sleep(delays.get(url, 0))
+        return dict(table[url], input_url=url)
+    return probe_fn
+
+
+GOOD = {"ok": True, "segment_ok": True, "m3u8_url": "https://cdn/x.m3u8", "message": "ok"}
+BAD = {"ok": False, "segment_ok": None, "message": "403"}
+
+
+class TestAggregatorPick(unittest.TestCase):
+    def test_keeps_first_three_working_in_page_order(self):
+        links = ["a", "b", "c", "d", "e", "f"]
+        table = {"a": BAD, "b": GOOD, "c": BAD, "d": GOOD, "e": GOOD, "f": GOOD}
+        # The last link answers first; it must still not displace earlier ones.
+        delays = {"b": 0.15, "d": 0.1, "e": 0.05}
+        out = aggregator.pick_first_working(links, _fake_probe(table, delays), workers=6)
+        self.assertEqual([p["url"] for p in out["picked"]], ["b", "d", "e"])
+        self.assertFalse(out["timed_out"])
+
+    def test_challenged_or_segment_refused_links_are_skipped(self):
+        challenged = {"ok": False, "message": "No .m3u8 found on that page (HTTP 403)"}
+        gated = dict(GOOD, segment_ok=False)
+        table = {"a": challenged, "b": gated, "c": GOOD}
+        out = aggregator.pick_first_working(["a", "b", "c"], _fake_probe(table))
+        self.assertEqual([p["url"] for p in out["picked"]], ["c"])
+        self.assertEqual([t["ok"] for t in out["tried"]], [False, False, True])
+
+    def test_time_budget_returns_what_is_known(self):
+        table = {"a": GOOD, "b": GOOD}
+        start = time.monotonic()
+        out = aggregator.pick_first_working(
+            ["a", "b"], _fake_probe(table, {"b": 2.0}), workers=2, budget=0.3)
+        self.assertLess(time.monotonic() - start, 1.5)
+        self.assertTrue(out["timed_out"])
+        self.assertEqual([p["url"] for p in out["picked"]], ["a"])
+        self.assertIn("time budget", out["tried"][1]["note"])
+
+
+class TestAggregatorFetch(unittest.TestCase):
+    CHALLENGE = b"<title>Just a moment...</title>challenge-platform"
+
+    def _run(self, plain, chrome, env=None, solver=None):
+        from unittest.mock import MagicMock, patch
+
+        def resp(status, url="https://agg.example/e"):
+            r = MagicMock()
+            r.status_code, r.url, r.headers = status, url, {}
+            r.ok = 200 <= status < 400
+            return r
+
+        plain_s, chrome_s = object(), object()
+
+        def fetch(session, url, headers, timeout, max_bytes=None):
+            status, body = plain if session is plain_s else chrome
+            return resp(status), body
+
+        with patch.object(aggregator, "_plain_session", return_value=plain_s), \
+                patch.object(aggregator.probe, "_browser_tls_session", return_value=chrome_s), \
+                patch.object(aggregator.probe, "_fetch", side_effect=fetch), \
+                patch.object(aggregator, "_flaresolverr_fetch",
+                             side_effect=solver or AssertionError("solver not expected")), \
+                patch.dict(os.environ, env or {"PVARR_FLARESOLVERR_URL": ""}):
+            return aggregator.fetch_page("https://agg.example/e")
+
+    def test_browser_tls_profile_loads_a_page_the_plain_client_cannot(self):
+        out = self._run((403, self.CHALLENGE), (200, b"<html>links</html>"))
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["via"], "chrome")
+
+    def test_flaresolverr_used_only_when_configured(self):
+        solved = {"status": 200, "url": "https://agg.example/e", "response": "<html>ok</html>"}
+        out = self._run((403, self.CHALLENGE), (403, self.CHALLENGE),
+                        env={"PVARR_FLARESOLVERR_URL": "http://fs:8191"},
+                        solver=lambda url, endpoint: solved)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["via"], "flaresolverr")
+
+    def test_a_flaresolverr_failure_is_named_with_its_error(self):
+        # Used to read only "paste your cookie", hiding that FlareSolverr had
+        # been tried and timed out.
+        def solver(url, endpoint):
+            raise ValueError("Timeout after 120.0 seconds.")
+
+        out = self._run((403, self.CHALLENGE), (403, self.CHALLENGE),
+                        env={"PVARR_FLARESOLVERR_URL": "http://fs:8191"}, solver=solver)
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["flaresolverr_failed"])
+        self.assertTrue(out["message"].startswith(
+            "FlareSolverr did not solve the challenge in 120 s: Timeout after 120.0 seconds"))
+        self.assertIn("cf_clearance", out["message"])  # the cookie hint stays as fallback
+
+    def test_flaresolverr_timeout_is_configurable_and_bounded(self):
+        from unittest.mock import patch
+        for raw, want in ((None, 120), ("90", 90), ("1", 10), ("9999", 300), ("junk", 120)):
+            env = {} if raw is None else {"PVARR_FLARESOLVERR_TIMEOUT": raw}
+            with self.subTest(raw=raw), patch.dict(os.environ, env):
+                if raw is None:
+                    os.environ.pop("PVARR_FLARESOLVERR_TIMEOUT", None)
+                self.assertEqual(aggregator.flaresolverr_timeout(), want)
+
+    def test_unconfigured_challenge_asks_for_browser_cookie(self):
+        out = self._run((403, self.CHALLENGE), (403, self.CHALLENGE))
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["challenged"])
+        self.assertIn("cf_clearance", out["message"])
+
+
+class TestFetchWallClock(unittest.TestCase):
+    def test_a_trickling_body_stops_at_the_deadline(self):
+        """`timeout` is per read, so a server dripping bytes used to hold a
+        probe thread for minutes; the body read now has a wall-clock cap."""
+        from unittest.mock import MagicMock
+
+        def drip(_):
+            while True:
+                time.sleep(0.05)
+                yield b"x"
+
+        resp = MagicMock()
+        resp.iter_content.side_effect = drip
+        session = MagicMock()
+        session.get.return_value = resp
+        start = time.monotonic()
+        _, body = probe._fetch(session, "https://slow.example/", {}, timeout=0.2)
+        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertTrue(body)
+
+
+class TestAggregatorSSRF(unittest.TestCase):
+    def test_private_links_on_a_public_page_are_never_probed(self):
+        from unittest.mock import patch
+        page = ('<a href="http://192.168.1.10/admin/x">lan</a>'
+                '<a href="https://8.8.8.8/live/1">ok</a>')
+        probed = []
+
+        def probe_fn(url):
+            probed.append(url)
+            return dict(GOOD)
+
+        fetched = {"ok": True, "url": "https://1.1.1.1/event/1", "html": page, "via": "plain",
+                   "status": 200, "challenged": False, "attempts": [], "message": ""}
+        with patch.object(aggregator, "fetch_page", return_value=fetched):
+            out = aggregator.find_streams("https://1.1.1.1/event/1", probe_fn=probe_fn)
+        self.assertEqual(probed, ["https://8.8.8.8/live/1"])
+        self.assertEqual(out["skipped_private"], 1)
+        self.assertTrue(out["ok"])
+
+
+class TestAggregateEndpoint(ServerTestCase):
+    def test_a_second_run_is_refused_while_one_is_in_progress(self):
+        import asyncio
+        lock = self.server._aggregate_lock
+
+        async def hold_and_post():
+            await lock.acquire()
+        # Holding the lock from a fresh loop is enough: the endpoint only asks
+        # whether it is held.
+        asyncio.run(hold_and_post())
+        try:
+            r = self.client.post("/api/aggregate", data={"url": "https://agg.example/e"})
+            self.assertEqual(r.status_code, 429)
+        finally:
+            lock.release()
+
+    def test_passes_the_manual_cookie_through_and_caps_length(self):
+        from unittest.mock import patch
+        seen = {}
+
+        def fake(url, cookie=None, user_agent=None):
+            seen.update(url=url, cookie=cookie, user_agent=user_agent)
+            return {"ok": False, "message": "x"}
+
+        with patch.object(self.server.aggregator, "find_streams", side_effect=fake):
+            r = self.client.post("/api/aggregate", data={
+                "url": " https://agg.example/e ", "cookie": "cf_clearance=abc", "user_agent": "UA"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(seen, {"url": "https://agg.example/e",
+                                    "cookie": "cf_clearance=abc", "user_agent": "UA"})
+            r = self.client.post("/api/aggregate", data={"url": "https://a/" + "x" * 5000})
+            self.assertEqual(r.status_code, 400)
+
+
+
+# --------------------------------------------------------------------------
+# app.schedules + the schedule endpoints and loop in app.server
+# --------------------------------------------------------------------------
+from unittest.mock import MagicMock  # noqa: E402
+
+from app import schedules  # noqa: E402
+
+
+class TestScheduleStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-sched-")
+        self.path = Path(self.tmp) / "schedules.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_round_trip_is_private_and_a_crashed_search_comes_back_due(self):
+        # The file may hold a cf_clearance cookie, so 0600; and a job that was
+        # mid-search when the process died must be retried, not stuck forever.
+        store = schedules.ScheduleStore(self.path)
+        job = schedules.new_job(start_at=100.0, end_time=200.0, agg_cookie="cf_clearance=x")
+        job["state"] = schedules.SEARCHING
+        store.add(job)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+        again = schedules.ScheduleStore(self.path)
+        loaded = again.get(job["id"])
+        self.assertEqual(loaded["agg_cookie"], "cf_clearance=x")
+        self.assertEqual(loaded["state"], schedules.WAITING)
+
+    def test_unreadable_file_does_not_stop_the_store(self):
+        self.path.write_text("{not json")
+        store = schedules.ScheduleStore(self.path)
+        self.assertEqual(store.all(), [])
+        self.assertTrue(store.enabled)
+
+
+class TestScheduleDecisions(unittest.TestCase):
+    def job(self, **kw):
+        base = dict(start_at=1000.0, end_time=2000.0)
+        base.update(kw)
+        return schedules.new_job(**base)
+
+    def test_due_wait_missed_and_late_start(self):
+        j = self.job()
+        self.assertEqual(schedules.decide(j, 999.0), "wait")
+        self.assertEqual(schedules.decide(j, 1000.0), "search")
+        # PVArr was down at the start time but the window is still open:
+        # start late rather than give up.
+        self.assertEqual(schedules.decide(j, 1900.0), "search")
+        self.assertEqual(schedules.decide(j, 2000.0), "missed")
+
+    def test_retry_waits_for_next_try_and_finished_jobs_are_left_alone(self):
+        self.assertEqual(schedules.decide(self.job(next_try_at=1500.0), 1200.0), "wait")
+        self.assertEqual(schedules.decide(self.job(next_try_at=1500.0), 1500.0), "search")
+        for state in schedules.FINISHED_STATES:
+            self.assertEqual(schedules.decide(self.job(state=state), 3000.0), "wait")
+
+    def test_prune_drops_only_old_finished_jobs(self):
+        jobs = {
+            "old": self.job(id="old", state=schedules.MISSED, finished_at=1.0),
+            "new": self.job(id="new", state=schedules.STARTED, finished_at=90000.0),
+            "wait": self.job(id="wait", created_at=0.0),
+        }
+        self.assertEqual(schedules.prune(jobs, 100000.0), ["old"])
+        self.assertEqual(sorted(jobs), ["new", "wait"])
+
+    def test_merge_puts_picks_first_fills_with_manual_dedupes_and_caps(self):
+        picks = [{"url": "https://p/1"}, {"url": "https://m/1"}]
+        manual = ["https://m/1", "", None, "https://m/2", "https://m/3"]
+        self.assertEqual(schedules.merge_candidates(picks, manual),
+                         ["https://p/1", "https://m/1", "https://m/2"])
+        self.assertEqual(schedules.merge_candidates([], ["https://m/1", " "]), ["https://m/1"])
+
+    def test_miss_reason_names_the_cloudflare_challenge(self):
+        challenged = {"page": {"challenged": True, "status": 403}, "links_found": 0}
+        self.assertIn("Cloudflare", schedules.miss_reason(challenged))
+        nothing = {"page": {"status": 200, "challenged": False}, "links_found": 12,
+                   "tried": [{}] * 12}
+        self.assertIn("12 links", schedules.miss_reason(nothing))
+        # A refused connection has no HTTP status at all; it is not "no links".
+        unreachable = {"page": {"ok": False, "status": None, "challenged": False}, "links_found": 0}
+        self.assertIn("could not be loaded", schedules.miss_reason(unreachable))
+        # A FlareSolverr miss is a normal miss (retried) and says FlareSolverr was used.
+        fs = {"page": {"challenged": True, "status": 403, "flaresolverr_failed": True}}
+        self.assertIn("FlareSolverr did not solve", schedules.miss_reason(fs))
+
+
+@unittest.skipUnless(HAS_TESTCLIENT, "httpx not installed (see requirements-dev.txt)")
+class ScheduleServerTestCase(ServerTestCase):
+    def setUp(self):
+        super().setUp()
+        from unittest.mock import patch
+        self.store = schedules.ScheduleStore(Path(self.tmp) / "schedules.json")
+        self._store_patch = patch.object(self.server, "schedule_store", self.store)
+        self._store_patch.start()
+        self.notifier = MagicMock()
+        self._notify_patch = patch.object(self.server, "notifier", self.notifier)
+        self._notify_patch.start()
+
+    def tearDown(self):
+        self._store_patch.stop()
+        self._notify_patch.stop()
+        super().tearDown()
+
+    def form(self, **kw):
+        now = time.time()
+        data = {"start_at": now + 600, "end_time": now + 4200,
+                "agg_url": "https://agg.example/event/1",
+                "agg_cookie": "cf_clearance=SECRET-CF", "agg_user_agent": "UA",
+                "team_a": "Avalanche", "team_b": "Stars", "sport": "NHL"}
+        data.update(kw)
+        return data
+
+
+class TestScheduleRoutes(ScheduleServerTestCase):
+    def test_create_list_and_cancel_without_leaking_the_cookie(self):
+        r = self.client.post("/api/schedules", data=self.form(stream_headers=json.dumps(
+            {"https://m/1.m3u8": {"cookie": "SESSION=SECRET-HDR"}}), url_primary="https://m/1.m3u8"))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn("SECRET", r.text)
+        job_id = r.json()["schedule"]["id"]
+
+        r = self.client.get("/api/schedules")
+        self.assertNotIn("SECRET", r.text)
+        listed = r.json()["schedules"]
+        self.assertEqual([j["id"] for j in listed], [job_id])
+        self.assertTrue(listed[0]["agg_cookie_set"])
+        self.assertEqual(listed[0]["state"], "waiting")
+        # ...but the loop still has the real cookie to use at start time.
+        self.assertEqual(self.store.get(job_id)["agg_cookie"], "cf_clearance=SECRET-CF")
+
+        self.assertEqual(self.client.delete(f"/api/schedules/{job_id}").status_code, 200)
+        self.assertEqual(self.client.get("/api/schedules").json()["schedules"], [])
+        self.assertEqual(self.client.delete(f"/api/schedules/{job_id}").status_code, 404)
+
+    def test_refusals(self):
+        now = time.time()
+        bad = {
+            "start in the past": dict(start_at=now - 600),
+            "end before start": dict(end_time=now + 300),
+            "window over 24h": dict(end_time=now + 600 + 25 * 3600),
+            "too far ahead": dict(start_at=now + 40 * 86400, end_time=now + 40 * 86400 + 60),
+            "nothing to record": dict(agg_url=""),
+            "file:// manual link": dict(url_primary="file:///etc/passwd"),
+            "non-http aggregator": dict(agg_url="ftp://agg.example/x"),
+            "freeze_timeout": dict(freeze_timeout=0),
+            "long cookie": dict(agg_cookie="x" * 5000),
+        }
+        for name, override in bad.items():
+            with self.subTest(name):
+                r = self.client.post("/api/schedules", data=self.form(**override))
+                self.assertEqual(r.status_code, 400, r.text)
+        r = self.client.post("/api/schedules", data=self.form(output_dir="/etc"))
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.store.all(), [])
+
+    def test_live_jobs_are_capped(self):
+        for i in range(schedules.MAX_LIVE_JOBS):
+            self.store.jobs[str(i)] = schedules.new_job(id=str(i), start_at=1.0, end_time=2.0)
+        r = self.client.post("/api/schedules", data=self.form())
+        self.assertEqual(r.status_code, 429)
+        # Finished jobs do not count against the cap.
+        self.store.jobs["0"]["state"] = schedules.STARTED
+        r = self.client.post("/api/schedules", data=self.form())
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["persistent"])
+
+
+class TestScheduleLoop(ScheduleServerTestCase):
+    def due(self, **kw):
+        now = time.time()
+        fields = dict(start_at=now - 5, end_time=now + 3600, agg_url="https://agg.example/e",
+                      agg_cookie="cf_clearance=c", agg_user_agent="UA", team_a="A", team_b="B",
+                      url_primary="", url_backup1="", url_backup2="", stream_headers={})
+        fields.update(kw)
+        job = schedules.new_job(**fields)
+        self.store.add(job)
+        return job
+
+    def run_pass(self, find=None, start=None):
+        import asyncio
+        from unittest.mock import patch
+        recorder = MagicMock()
+        recorder.candidates = [MagicMock(name="cand")]
+        recorder.candidates[0].name = "Primary"
+        start = start or MagicMock(return_value=("rec123", recorder, Path(self.tmp) / "x.ts"))
+        find = find or MagicMock(return_value={"ok": False, "picked": []})
+        with patch.object(self.server.aggregator, "find_streams", find), \
+             patch.object(self.server, "_start_session", start):
+            asyncio.run(self.pass_and_wait())
+        return find, start
+
+    async def pass_and_wait(self):
+        import asyncio
+        tasks = await self.server._run_due_schedules()
+        await asyncio.gather(*tasks)
+
+    def test_started_path_uses_the_shared_start_with_the_window_end(self):
+        job = self.due(url_primary="https://m/1.m3u8", url_backup1="https://p/2")
+        find = MagicMock(return_value={"ok": True, "picked": [{"url": "https://p/1"}, {"url": "https://p/2"}],
+                                 "page": {"status": 200}})
+        find, start = self.run_pass(find=find)
+        from unittest.mock import ANY
+        find.assert_called_once_with("https://agg.example/e", cookie="cf_clearance=c",
+                                     user_agent="UA", abort=ANY)
+        kwargs = start.call_args.kwargs
+        self.assertEqual(kwargs["candidates"], ["https://p/1", "https://p/2", "https://m/1.m3u8"])
+        self.assertEqual(kwargs["end_time"], job["end_time"])
+        self.assertIsNone(kwargs["duration_minutes"])
+        self.assertEqual(job["state"], "started")
+        self.assertEqual(job["recording_id"], "rec123")
+        # Cleared from the list (and the file) as soon as it starts.
+        self.assertNotIn(job["id"], self.store.jobs)
+        self.assertNotIn(job["id"], self.store.path.read_text())
+        self.assertNotIn("cf_clearance", self.store.path.read_text())
+        self.notifier.notify_recording_started.assert_called_once_with("rec123", "x.ts", "Primary")
+
+    def test_no_picks_retries_in_two_minutes_and_notifies_once(self):
+        job = self.due()
+        challenged = MagicMock(return_value={"ok": False, "picked": [], "links_found": 0,
+                                       "page": {"challenged": True, "status": 403}})
+        _, start = self.run_pass(find=challenged)
+        start.assert_not_called()
+        self.assertEqual(job["state"], "waiting")
+        self.assertEqual(job["attempts"], 1)
+        self.assertAlmostEqual(job["next_try_at"], time.time() + schedules.RETRY_SEC, delta=5)
+        self.assertEqual(schedules.retry_delay(6), schedules.RETRY_SLOW_SEC)
+        self.assertIn("Cloudflare", job["message"])
+        self.assertEqual(self.notifier.send.call_count, 1)
+
+        # Not due again until next_try_at; then a second miss stays quiet.
+        self.run_pass(find=challenged)
+        self.assertEqual(job["attempts"], 1)
+        job["next_try_at"] = time.time() - 1
+        self.run_pass(find=challenged)
+        self.assertEqual(job["attempts"], 2)
+        self.assertEqual(self.notifier.send.call_count, 1)
+        self.assertNotIn("cf_clearance=c", str(self.notifier.send.call_args))
+
+    def test_manual_links_are_used_when_the_page_yields_nothing(self):
+        job = self.due(url_primary="https://m/1.m3u8")
+        _, start = self.run_pass()
+        self.assertEqual(start.call_args.kwargs["candidates"], ["https://m/1.m3u8"])
+        self.assertEqual(job["state"], "started")
+
+    def test_a_refused_start_marks_the_job_failed(self):
+        from fastapi import HTTPException
+        job = self.due(url_primary="https://m/1.m3u8")
+        self.run_pass(start=MagicMock(side_effect=HTTPException(status_code=507, detail="disk full")))
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("disk full", job["message"])
+        self.notifier.send.assert_called_once()
+
+    def test_window_already_closed_is_missed_without_checking(self):
+        job = self.due(start_at=time.time() - 7200, end_time=time.time() - 60)
+        find, start = self.run_pass()
+        find.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(job["state"], "missed")
+
+    def test_cancelled_during_the_check_never_starts(self):
+        job = self.due(url_primary="https://m/1.m3u8")
+
+        def find(url, cookie=None, user_agent=None, abort=None):
+            self.store.remove(job["id"])
+            return {"ok": True, "picked": [{"url": "https://p/1"}]}
+
+        _, start = self.run_pass(find=find)
+        start.assert_not_called()
+        self.assertIsNone(self.store.get(job["id"]))
+
+    def test_an_oversized_pick_is_skipped_not_fatal(self):
+        job = self.due()
+        find = MagicMock(return_value={"ok": True, "picked": [
+            {"url": "https://p/" + "x" * 5000}, {"url": "https://p/2"}]})
+        _, start = self.run_pass(find=find)
+        self.assertEqual(start.call_args.kwargs["candidates"], ["https://p/2"])
+        self.assertEqual(job["state"], "started")
+
+    def test_shutdown_flag_blocks_the_start_and_leaves_the_job_due(self):
+        from app import cleanup
+        job = self.due(url_primary="https://m/1.m3u8")
+        cleanup.shutting_down.set()
+        try:
+            _, start = self.run_pass()
+        finally:
+            cleanup.shutting_down.clear()
+        start.assert_not_called()
+        self.assertEqual(job["state"], "waiting")
+
+    def test_due_jobs_run_concurrently_and_manual_only_is_not_queued(self):
+        # Two games at 19:00: the manual-only one must not wait behind the
+        # other's page scan.
+        import asyncio
+        import threading as th
+        from unittest.mock import patch
+        slow = self.due(team_a="Slow")
+        quick = self.due(team_a="Quick", agg_url="", url_primary="https://m/q.m3u8")
+        release = th.Event()
+
+        def find(url, cookie=None, user_agent=None, abort=None):
+            release.wait(5)
+            return {"ok": True, "picked": [{"url": "https://p/1"}]}
+
+        recorder = MagicMock()
+        recorder.candidates = [MagicMock()]
+        start = MagicMock(return_value=("r", recorder, Path(self.tmp) / "x.ts"))
+
+        async def go():
+            tasks = await self.server._run_due_schedules()
+            for _ in range(50):
+                if quick["state"] == "started":
+                    break
+                await asyncio.sleep(0.05)
+            states = (quick["state"], slow["state"])
+            release.set()
+            await asyncio.gather(*tasks)
+            return states
+
+        with patch.object(self.server.aggregator, "find_streams", find), \
+             patch.object(self.server, "_start_session", start):
+            states = asyncio.run(go())
+        self.assertEqual(states, ("started", "searching"))
+        self.assertEqual(slow["state"], "started")
+        self.assertEqual(start.call_count, 2)
+
+    def test_cancel_mid_scan_puts_the_job_back_to_waiting(self):
+        # What a shutdown does to a job whose page is still being checked.
+        import asyncio
+        import threading as th
+        from unittest.mock import patch
+        job = self.due()
+        release = th.Event()
+
+        def find(url, cookie=None, user_agent=None, abort=None):
+            release.wait(5)
+            return {"ok": True, "picked": [{"url": "https://p/1"}]}
+
+        start = MagicMock()
+
+        async def go():
+            tasks = await self.server._run_due_schedules()
+            await asyncio.sleep(0.2)
+            seen = job["state"]
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return seen
+
+        try:
+            with patch.object(self.server.aggregator, "find_streams", find), \
+                 patch.object(self.server, "_start_session", start):
+                seen = asyncio.run(go())
+        finally:
+            release.set()
+        self.assertEqual(seen, "searching")
+        start.assert_not_called()
+        self.assertEqual(job["state"], "waiting")
+        self.assertIn('"waiting"', self.store.path.read_text())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

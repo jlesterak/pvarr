@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas (Discussions)
+    url: https://github.com/jlesterak/pvarr/discussions
+    about: Setup help, how-do-I questions and open-ended ideas belong in Discussions, not issues.

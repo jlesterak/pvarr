@@ -1,0 +1,1464 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PVArr - Personal Video Recorder</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            arr: {
+              blue: '#0084ff',
+              dark: '#1e293b',
+              sidebar: '#0f172a',
+              card: '#1e293b',
+              accent: '#38bdf8',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Alpine.js CDN -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <style>
+    body {
+      background-color: #0b1120;
+      color: #f1f5f9;
+    }
+    .arr-navbar {
+      background: #0f172a;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .arr-card {
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .arr-input {
+      background: #0f172a;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    .arr-input:focus {
+      border-color: #0084ff;
+      outline: none;
+      box-shadow: 0 0 10px rgba(0, 132, 255, 0.3);
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0f172a;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body class="font-sans min-h-screen flex flex-col text-slate-100" x-data="dashboardApp()">
+
+  <!-- Top *Arr Header Bar -->
+  <header class="arr-navbar sticky top-0 z-40 px-6 py-3 shadow-md">
+    <div class="max-w-7xl mx-auto flex items-center justify-between">
+      <div class="flex items-center space-x-4">
+        <!-- Logo -->
+        <div class="w-9 h-9 rounded-lg bg-arr-blue flex items-center justify-center font-black text-xl text-white shadow-lg shadow-arr-blue/30">
+          P
+        </div>
+        <div class="flex items-baseline space-x-2">
+          <span class="text-xl font-bold tracking-tight text-white">PV<span class="text-arr-accent">Arr</span></span>
+          <span class="text-xs font-semibold px-2 py-0.5 rounded bg-arr-blue/20 text-arr-accent border border-arr-blue/30">v{{ pvarr_version }}</span>
+        </div>
+      </div>
+
+      <!-- Header Action Buttons -->
+      <div class="flex items-center space-x-4">
+        <div class="px-3 py-1 rounded-md text-xs font-medium flex items-center space-x-2 bg-slate-800 border border-slate-700">
+          <span class="w-2 h-2 rounded-full" :class="liveSessions.length > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
+          <span x-text="liveSessions.length > 0 ? liveSessions.length + ' Active Stream(s)' : 'System Idle'"></span>
+        </div>
+
+        <button @click="openNewModal = true" class="bg-arr-blue hover:bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-blue/20 transition flex items-center space-x-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+          <span>Add Recording</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Sub-header Navigation Tabs -->
+  <div class="bg-slate-900/80 border-b border-slate-800 px-6 py-2">
+    <div class="max-w-7xl mx-auto flex space-x-6 text-sm font-medium text-slate-400">
+      <button @click="activeTab = 'active'" :class="activeTab === 'active' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+        Live Recorders (<span x-text="liveSessions.length"></span>)
+      </button>
+      <button @click="activeTab = 'library'" :class="activeTab === 'library' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+        Media Library (<span x-text="libraryFiles.length"></span>)
+      </button>
+    </div>
+  </div>
+
+  <!-- Main Content -->
+  <main class="max-w-7xl mx-auto px-6 py-6 flex-1 w-full space-y-6">
+
+    <!-- TAB 1: Active Recorders -->
+    <div x-show="activeTab === 'active'" class="space-y-6">
+      <!-- Scheduled: one-shot jobs that check an event page at their
+           start time. Times are rendered from epochs in the viewer's own
+           locale, so the container's TZ never has to be right. -->
+      <template x-if="scheduleList.length > 0">
+        <div class="space-y-2">
+          <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">
+            Scheduled (<span x-text="scheduleList.length"></span>)
+          </span>
+          <template x-for="job in scheduleList" :key="job.id">
+            <div class="arr-card rounded-lg border border-slate-800/80 px-4 py-2.5 flex items-start gap-3">
+              <span class="w-2 h-2 rounded-full shrink-0 mt-1.5" :class="scheduleDotClass(job)"></span>
+              <div class="flex-1 min-w-0 space-y-0.5">
+                <div class="text-sm text-slate-200 truncate">
+                  <span x-text="scheduleTitle(job)"></span>
+                  <span class="text-slate-500 text-xs" x-text="' — ' + scheduleWindow(job)"></span>
+                </div>
+                <div class="text-xs">
+                  <span class="uppercase tracking-wider font-semibold" :class="scheduleTextClass(job)" x-text="job.state"></span>
+                  <span class="text-slate-400" x-text="job.message"></span>
+                  <span class="text-slate-500" x-show="job.state === 'waiting' && job.next_try_at"
+                        x-text="'Next try ' + timeLocal(job.next_try_at) + '.'"></span>
+                </div>
+                <div class="text-[11px] text-slate-500 font-mono truncate" x-show="job.agg_url"
+                     x-text="job.agg_url + (job.agg_cookie_set ? '  (cookie set)' : '')"></div>
+              </div>
+              <button type="button" @click="cancelSchedule(job)"
+                      class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold shrink-0"
+                      x-text="['waiting', 'searching'].includes(job.state) ? 'Cancel' : 'Dismiss'"></button>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <template x-if="activeSessions.length === 0">
+        <div class="arr-card rounded-xl p-12 text-center space-y-4">
+          <div class="w-12 h-12 rounded-full bg-slate-800 text-slate-400 mx-auto flex items-center justify-center">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+          </div>
+          <h3 class="text-base font-semibold text-slate-200">No active stream recordings</h3>
+          <p class="text-slate-400 text-xs">Add a new stream candidate URL to begin recording with automatic failover protection.</p>
+          <button @click="openNewModal = true" class="text-arr-accent hover:underline text-xs font-semibold">Start a new recording &rarr;</button>
+        </div>
+      </template>
+
+      <div class="grid grid-cols-1 gap-6">
+        <template x-for="session in liveSessions" :key="session.id">
+          <div class="arr-card rounded-xl p-6 space-y-5 border border-slate-700/60 shadow-lg">
+            
+            <div class="flex items-start justify-between flex-wrap gap-4 border-b border-slate-700/60 pb-4">
+              <div class="space-y-1">
+                <div class="flex items-center space-x-3">
+                  <span class="font-mono text-xs font-bold px-2 py-0.5 rounded bg-arr-blue/15 text-arr-accent border border-arr-blue/30" x-text="session.id"></span>
+                  <div class="flex items-center space-x-2 min-w-0">
+                    <h3 class="text-base font-bold text-white truncate max-w-lg"
+                        x-text="session.is_rebroadcast ? session.channel_name : session.output_filename"></h3>
+                    <!-- Say plainly that nothing is being kept, so a channel is
+                         never mistaken for a recording that has gone missing. -->
+                    <span x-show="session.is_rebroadcast"
+                          class="shrink-0 px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wider bg-sky-500/10 text-sky-400 border border-sky-500/30"
+                          title="Streaming to your media server only — not saved to disk">Rebroadcast</span>
+                  </div>
+                </div>
+                <p class="text-xs text-slate-400 font-mono" x-text="session.output_file"></p>
+              </div>
+
+              <div class="flex items-center space-x-3">
+                <button @click="triggerFailover(session.id)" :disabled="!session.is_running || session.current_candidate >= session.total_candidates" :title="session.current_candidate >= session.total_candidates ? 'No backup stream configured for this session' : 'Switch to the next candidate stream'" class="bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition disabled:opacity-50">
+                  Force Failover
+                </button>
+                <button @click="stopSession(session.id)" :disabled="!session.is_running" class="bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition disabled:opacity-50">
+                  Stop Recording
+                </button>
+              </div>
+            </div>
+
+            <!-- Stats Bar -->
+            <div class="grid grid-cols-2 sm:grid-cols-5 gap-4 bg-slate-900/80 p-3.5 rounded-lg border border-slate-800">
+              <div>
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Status</span>
+                <span class="text-sm font-bold capitalize flex items-center space-x-1.5" :class="statusTextClass(session)">
+                  <span class="w-2 h-2 rounded-full" :class="statusDotClass(session)"></span>
+                  <span x-text="prettyStatus(session.status)"></span>
+                </span>
+              </div>
+              <div>
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Active Candidate</span>
+                <span class="text-sm font-bold text-arr-accent" x-text="'Stream ' + session.current_candidate + ' of ' + session.total_candidates"></span>
+              </div>
+              <div>
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Elapsed Time</span>
+                <span class="text-sm font-bold font-mono text-slate-200" x-text="formatSeconds(session.elapsed_seconds)"></span>
+                <!-- Only rendered when a deadline exists, so an open-ended
+                     recording says nothing rather than saying "no limit" in
+                     every card forever. -->
+                <span x-show="endsIn(session)"
+                      class="text-[11px] block text-slate-500 font-mono"
+                      :title="'Stops at ' + endsAtLocal(session)"
+                      x-text="endsIn(session)"></span>
+              </div>
+              <div>
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">On Disk</span>
+                <span class="text-sm font-bold font-mono" :class="sizeDisagrees(session) ? 'text-amber-400' : 'text-cyan-400'"
+                      :title="sizeDisagrees(session)
+                                ? 'Data is arriving but the file on disk is not growing. Something may have removed it.'
+                                : 'Size of the file on disk'"
+                      x-text="session.filesize_mb + ' MB'"></span>
+                <span x-show="session.segments_lost > 0"
+                      class="text-[11px] block text-amber-400 font-mono"
+                      :title="'The source failed to deliver these: ' + session.segments_failed + ' would not download, ' + session.segments_expired + ' expired before FFmpeg reached them. Each is a gap of a few seconds in picture and sound. A climbing count means this source is unreliable.'"
+                      x-text="session.segments_lost + (session.segments_lost === 1 ? ' segment lost' : ' segments lost')"></span>
+              </div>
+              <!-- Captured is the recorder's own counter. It and On Disk must
+                   agree; when they do not, bytes are going somewhere the file
+                   is not, which is exactly how a deleted-out-from-under
+                   recording looked while it silently lost four minutes. -->
+              <div>
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Captured</span>
+                <span class="text-sm font-bold font-mono text-slate-200"
+                      title="Bytes the recorder has received from the stream"
+                      x-text="toMB(session.bytes_written) + ' MB'"></span>
+              </div>
+            </div>
+
+            <!-- Candidate Stream Slots Badges -->
+            <div class="flex items-center space-x-3 overflow-x-auto pb-1">
+              <template x-for="(cand, idx) in session.candidates" :key="idx">
+                <!-- Clickable: this is the only route back to an earlier
+                     candidate, since failover only ever moves forwards. -->
+                <button type="button"
+                     @click="switchCandidate(session.id, idx + 1)"
+                     :disabled="!session.is_running || (idx + 1) === session.current_candidate"
+                     class="px-3 py-1.5 rounded-lg text-xs flex items-center space-x-2 border shrink-0 transition enabled:hover:border-arr-blue/60 enabled:cursor-pointer disabled:cursor-default"
+                     :title="(idx + 1) === session.current_candidate
+                               ? 'Currently recording this stream'
+                               : (session.is_running ? 'Switch to ' + cand.name : '')
+                             + (cand.detect_note ? ' — ' + cand.detect_note : '')
+                             + (cand.referer ? ' Referer: ' + cand.referer : '')"
+                     :class="(idx + 1) === session.current_candidate ? 'bg-arr-blue/20 text-arr-accent border-arr-blue/40 font-semibold' : 'bg-slate-900/60 text-slate-400 border-slate-800'">
+                  <span class="w-2 h-2 rounded-full" :class="(idx + 1) === session.current_candidate ? 'bg-emerald-400 animate-ping' : 'bg-slate-600'"></span>
+                  <span x-text="cand.name + ': ' + (cand.url.length > 40 ? cand.url.slice(0, 40) + '...' : cand.url)"></span>
+                  <span x-show="cand.fail_count > 0" class="text-amber-500/80"
+                        x-text="'⚠ ' + cand.fail_count"></span>
+                </button>
+              </template>
+            </div>
+
+            <!-- Logs -->
+            <div class="space-y-2">
+              <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">Event Log Stream</span>
+              <div class="bg-black/90 rounded-lg p-3 font-mono text-xs text-slate-300 h-36 overflow-y-auto border border-slate-800 space-y-1">
+                <template x-for="log in session.logs" :key="log">
+                  <p class="leading-relaxed hover:bg-slate-900/50 px-1 rounded" x-text="log"></p>
+                </template>
+              </div>
+            </div>
+
+          </div>
+        </template>
+      </div>
+
+      <!-- Recently finished ------------------------------------------------
+           Collapsed rather than removed. A finished session still holds its
+           log history, and that history is the most useful thing in the app
+           in the minutes right after a recording ends -- it is what diagnosed
+           the delete-while-recording bug. Throwing it away to tidy the page
+           would have thrown away the evidence. -->
+      <template x-if="finishedSessions.length > 0">
+        <div class="space-y-2 pt-2">
+          <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">
+            Recently Finished (<span x-text="finishedSessions.length"></span>)
+          </span>
+          <div class="space-y-2">
+            <template x-for="session in finishedSessions" :key="session.id">
+              <div class="arr-card rounded-lg border border-slate-800/80 overflow-hidden">
+                <button type="button" @click="toggleFinished(session.id)"
+                        class="w-full flex items-center gap-3 px-4 py-2.5 text-left hover:bg-slate-800/40 transition">
+                  <span class="w-2 h-2 rounded-full shrink-0" :class="statusDotClass(session)"></span>
+                  <span class="text-sm text-slate-300 truncate flex-1 min-w-0"
+                        x-text="session.is_rebroadcast ? session.channel_name : session.output_filename"></span>
+                  <span class="text-xs font-mono text-slate-500 shrink-0 hidden sm:inline"
+                        x-text="formatSeconds(session.elapsed_seconds)"></span>
+                  <span class="text-xs font-mono text-cyan-400/70 shrink-0"
+                        x-show="!session.is_rebroadcast" x-text="session.filesize_mb + ' MB'"></span>
+                  <span class="text-xs font-mono text-amber-400 shrink-0"
+                        x-show="session.segments_lost > 0"
+                        :title="session.segments_lost + ' stream segments lost: gaps of a few seconds in this recording'"
+                        x-text="'⚠ ' + session.segments_lost"></span>
+                  <span class="text-xs capitalize shrink-0" :class="statusTextClass(session)"
+                        x-text="prettyStatus(session.status)"></span>
+                  <span class="text-slate-500 shrink-0 text-[10px]"
+                        x-text="expandedFinished[session.id] ? '\u25B2' : '\u25BC'"></span>
+                </button>
+                <div x-show="expandedFinished[session.id]" x-cloak class="px-4 pb-3 space-y-2 border-t border-slate-800/80 pt-3">
+                  <p class="text-xs text-slate-500 font-mono truncate" x-text="session.output_file"></p>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" @click="recordAgain(session.id)"
+                            class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600/90 hover:bg-emerald-500 text-white transition shrink-0">
+                      Record again
+                    </button>
+                    <span class="text-[11px] text-slate-500">
+                      Loads these settings into a new recording, writing to a new file. You press Start.
+                    </span>
+                  </div>
+                  <div class="bg-black/90 rounded-lg p-3 font-mono text-xs text-slate-300 h-36 overflow-y-auto border border-slate-800 space-y-1">
+                    <template x-for="log in session.logs" :key="log">
+                      <p class="leading-relaxed hover:bg-slate-900/50 px-1 rounded" x-text="log"></p>
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- TAB 2: Media Library -->
+    <div x-show="activeTab === 'library'" class="space-y-4">
+      <div class="arr-card rounded-xl overflow-hidden border border-slate-800">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-slate-900/90 text-xs uppercase font-semibold text-slate-400 border-b border-slate-800">
+            <tr>
+              <th class="px-6 py-3.5">Filename</th>
+              <th class="px-6 py-3.5">File Size</th>
+              <th class="px-6 py-3.5">Recorded Date</th>
+              <th class="px-6 py-3.5 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800/80">
+            <template x-if="libraryFiles.length === 0">
+              <tr>
+                <td colspan="4" class="px-6 py-8 text-center text-slate-500">No recorded media files found in library directory.</td>
+              </tr>
+            </template>
+
+            <template x-for="item in libraryFiles" :key="item.filename">
+              <tr class="hover:bg-slate-800/50 transition">
+                <td class="px-6 py-3.5 font-mono font-medium text-white flex items-center space-x-2">
+                  <svg class="w-4 h-4 text-arr-blue shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"></path></svg>
+                  <span x-text="item.filename"></span>
+                </td>
+                <td class="px-6 py-3.5 font-mono text-cyan-400" x-text="item.size_mb + ' MB'"></td>
+                <td class="px-6 py-3.5 text-slate-400" x-text="item.created_at"></td>
+                <td class="px-6 py-3.5 text-right space-x-2">
+                  <a :href="'/api/library/download/' + item.filename" download class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 inline-flex items-center space-x-1">
+                    <span>Download</span>
+                  </a>
+                  <button @click="promptRename(item.filename)" class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200">
+                    Rename
+                  </button>
+                  <button @click="deleteFile(item.filename)" class="px-3 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-xs font-semibold">
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Modal: Create New Recording -->
+  <div x-show="openNewModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" style="display: none;">
+    <div class="arr-card rounded-xl w-full max-w-2xl max-h-full overflow-y-auto p-6 space-y-6 border border-slate-700 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+        <h3 class="text-base font-bold text-white flex items-center space-x-2">
+          <span class="w-3 h-3 rounded-full bg-arr-blue"></span>
+          <span>Add PVArr Recording Session</span>
+        </h3>
+        <button @click="openNewModal = false" class="text-slate-400 hover:text-white">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+        </button>
+      </div>
+
+      <form @submit.prevent="submitRecording()" class="space-y-4">
+        <!-- Autocomplete for the tags. Served from a snapshot bundled with
+             PVArr, so it works with the internet down. -->
+        <!-- Our own dropdown, not a <datalist>: browsers re-filter a datalist
+             by their own rules (Chrome hides it on an exact match and keeps only
+             options starting with the typed text), which dropped good matches
+             like "NHL" or "Avalanche". This shows the server's answer as-is. -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <template x-for="f in nameFields" :key="f.field">
+            <div class="relative">
+              <label class="block text-xs font-medium text-slate-400 mb-1" x-text="f.label"></label>
+              <input type="text" x-model="form[f.model]" required autocomplete="off" :placeholder="f.placeholder"
+                     @input.debounce.150ms="suggest(f.field, form[f.model])"
+                     @keydown.arrow-down.prevent="pickMove(f.field, 1)"
+                     @keydown.arrow-up.prevent="pickMove(f.field, -1)"
+                     @keydown.enter="pickActive(f, $event)"
+                     @keydown.escape="suggestions[f.field] = []"
+                     @blur="setTimeout(() => suggestions[f.field] = [], 150)"
+                     class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white">
+              <ul x-show="suggestions[f.field].length" class="absolute z-10 left-0 right-0 mt-1 rounded-lg border border-slate-700 bg-slate-900 shadow-xl overflow-hidden">
+                <template x-for="(o, i) in suggestions[f.field]" :key="o.value">
+                  <li @mousedown.prevent="pick(f, o)"
+                      :class="i === suggestActive[f.field] ? 'bg-slate-700' : 'hover:bg-slate-800'"
+                      class="px-3 py-1.5 text-sm cursor-pointer flex justify-between gap-2">
+                    <span class="text-white truncate" x-text="o.value"></span>
+                    <span class="text-slate-500 text-xs truncate" x-text="o.label"></span>
+                  </li>
+                </template>
+              </ul>
+            </div>
+          </template>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs font-medium text-slate-400 mb-1" title="Used in the filename while recording. The finished file is renamed to the resolution actually recorded.">Resolution Tag <span class="text-slate-500">(corrected on finish)</span></label>
+            <select x-model="form.resolution" class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white bg-slate-900">
+              <option value="1080p">1080p Full HD</option>
+              <option value="720p">720p HD</option>
+              <option value="4K">4K Ultra HD</option>
+              <option value="480p">480p SD</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-400 mb-1">Freeze Timeout (sec)</label>
+            <input type="number" x-model="form.freeze_timeout" value="15" min="5" max="60" class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white">
+          </div>
+          <!-- Blank is the common case: the global backstop applies and the
+               recording stops when the stream does. A number here is for an
+               event with a known length. -->
+          <div x-show="!form.rebroadcast && !sched.end && !isScheduled">
+            <label class="block text-xs font-medium text-slate-400 mb-1">Stop After (min)</label>
+            <input type="number" x-model="form.duration_minutes" min="0" max="1440"
+                   placeholder="blank = until the stream ends"
+                   class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white">
+            <p class="text-[11px] text-slate-500 mt-1">
+              Keeps trying every candidate until this time is up, then stops
+              cleanly and remuxes. <span class="text-slate-400">0</span> also
+              lifts the safety cap.
+            </p>
+          </div>
+        </div>
+
+        <!-- Optional window. A future Start at turns the submit into a
+             schedule: PVArr checks the event page at that time, not now,
+             because stream links expire and most appear shortly before the
+             event. Sent as epochs, so the container's timezone never matters. -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs font-medium text-slate-400 mb-1">Start at <span class="text-slate-500">(blank = now)</span></label>
+            <input type="datetime-local" x-model="sched.start"
+                   class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white [color-scheme:dark]">
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-400 mb-1">End at <span class="text-slate-500" x-text="isScheduled ? '(required)' : '(optional)'"></span></label>
+            <input type="datetime-local" x-model="sched.end" :required="isScheduled"
+                   class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white [color-scheme:dark]">
+          </div>
+          <p x-show="isScheduled" class="sm:col-span-2 text-[11px] text-slate-500 -mt-2">
+            At the start time PVArr checks the event page, takes the first three
+            working streams (topping up with any links entered manually) and records
+            until End at. If nothing works yet it retries every 2 minutes (every 5 after
+            five tries).
+          </p>
+        </div>
+
+        <!-- Rebroadcast: capture and serve to Plex without keeping anything.
+             Failover still applies; only the destination changes. -->
+        <div class="pt-2">
+          <label class="flex items-start space-x-3 cursor-pointer group">
+            <input type="checkbox" x-model="form.rebroadcast"
+                   class="mt-0.5 w-4 h-4 rounded border-slate-700 bg-slate-900 text-arr-blue focus:ring-arr-blue/40 cursor-pointer">
+            <span class="text-sm">
+              <span class="text-slate-200 group-hover:text-white transition">Rebroadcast only — don't save to disk</span>
+              <span class="block text-[11px] text-slate-500 mt-0.5">
+                Serve this as a live channel to Plex/Emby/Jellyfin without recording it.
+                Failover still works. Nothing is written to your library.
+              </span>
+            </span>
+          </label>
+          <div x-show="form.rebroadcast" x-transition class="mt-3">
+            <label class="block text-xs font-medium text-slate-400 mb-1">Channel Name (optional)</label>
+            <input type="text" x-model="form.channel_name"
+                   placeholder="Defaults to the team names above"
+                   class="w-full px-3 py-2 rounded-lg text-sm arr-input text-white">
+          </div>
+        </div>
+
+        <div class="space-y-3 pt-2">
+          <div class="flex items-baseline justify-between">
+            <label class="block text-xs font-bold text-arr-accent uppercase tracking-wider">Streams</label>
+            <span class="text-[11px] text-slate-500">PVArr keeps the first three that work and fails over between them.</span>
+          </div>
+
+          <!-- Event page: the primary input. PVArr checks every link on
+               it and fills the three slots below with the first three that
+               work -- now with Find, or at the start time for a schedule. -->
+          <div class="rounded-lg border border-slate-800 p-3 space-y-2">
+            <span class="text-xs text-slate-400">Event page that links to several sources</span>
+            <div class="flex gap-2">
+              <input type="url" x-model="agg.url" placeholder="https://events.example/event/..."
+                     class="flex-1 px-3 py-2 rounded-lg text-sm arr-input font-mono text-slate-200">
+              <button type="button" @click="findStreams()" :disabled="agg.state === 'working' || !agg.url"
+                      class="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-50">
+                <span x-text="agg.state === 'working' ? 'Checking links...' : 'Find 3 streams'"></span>
+              </button>
+            </div>
+            <button type="button" @click="agg.showHeaders = !agg.showHeaders"
+                    class="text-[11px] text-slate-500 hover:text-arr-accent"
+                    x-text="agg.showHeaders ? 'Hide browser cookie' : 'Page needs your browser session? Paste its cookie'"></button>
+            <div x-show="agg.showHeaders" class="grid grid-cols-1 sm:grid-cols-2 gap-2" style="display:none;">
+              <input type="text" x-model="agg.cookie" placeholder="Cookie header from your browser"
+                     class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+              <input type="text" x-model="agg.user_agent" placeholder="User-Agent of that same browser"
+                     class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+            </div>
+            <p x-show="agg.message" x-text="agg.message" class="text-xs"
+               :class="agg.state === 'ok' ? 'text-emerald-400' : (agg.state === 'fail' ? 'text-rose-400' : 'text-slate-400')"></p>
+            <ul x-show="agg.tried.length" class="text-[11px] font-mono text-slate-500 max-h-32 overflow-y-auto">
+              <template x-for="(t, i) in agg.tried" :key="i">
+                <li class="truncate" :title="t.note">
+                  <span x-text="t.ok ? '\u2713' : '\u2715'" :class="t.ok ? 'text-emerald-400' : 'text-rose-400'"></span>
+                  <span x-text="t.url + ' \u2014 ' + t.note"></span>
+                </li>
+              </template>
+            </ul>
+            <p x-show="isScheduled && agg.url" class="text-[11px] text-slate-500">
+              Scheduled: this page is checked at the start time, so there is no need to press
+              Find now. A pasted browser cookie can expire before then &mdash; see the README.
+            </p>
+          </div>
+
+          <!-- Manual links: hidden by default now that the event page is
+               the usual input, but always one click away. Opened automatically
+               whenever the slots hold something (Find filled them, or "Record
+               again" pre-filled them), so nothing that will be recorded is
+               ever hidden. -->
+          <button type="button" @click="showManual = !showManual"
+                  class="text-xs text-slate-400 hover:text-arr-accent">
+            <span x-text="showManual ? '\u25be Hide manual stream links' : '\u25b8 Enter stream links manually'"></span>
+            <span x-show="!showManual && filledSlots() > 0" class="text-slate-500"
+                  x-text="'(' + filledSlots() + ' filled)'"></span>
+          </button>
+
+          <div x-show="showManual" class="space-y-3" style="display:none;">
+          <template x-for="slot in slots" :key="slot.key">
+            <div class="space-y-1">
+              <span class="text-xs text-slate-400" x-text="slot.label"></span>
+              <input type="url" x-model="form[slot.key]"
+                     @input.debounce.700ms="probeSlot(slot.key)" @change="probeSlot(slot.key)"
+                     class="w-full px-3 py-2 rounded-lg text-sm arr-input font-mono mt-1"
+                     :class="slot.tone" :placeholder="slot.placeholder">
+
+              <!-- Probe verdict -->
+              <template x-if="probes[slot.key] && probes[slot.key].state !== 'idle'">
+                <div class="text-xs flex items-start space-x-2 px-1"
+                     :class="{ 'text-slate-400': probes[slot.key].state === 'probing',
+                               'text-emerald-400': probes[slot.key].state === 'ok',
+                               'text-rose-400': probes[slot.key].state === 'fail' }">
+                  <span x-show="probes[slot.key].state === 'probing'" class="animate-pulse">◌</span>
+                  <span x-show="probes[slot.key].state === 'ok'">✓</span>
+                  <span x-show="probes[slot.key].state === 'fail'">✕</span>
+                  <div class="space-y-0.5 min-w-0 w-full">
+                    <p x-text="probes[slot.key].message"></p>
+                    <p x-show="probes[slot.key].resolved" class="font-mono text-[11px] text-slate-500 truncate"
+                       x-text="'→ ' + probes[slot.key].resolved"></p>
+
+                    <!-- What PVArr actually tried. The probe has always
+                         recorded this; the dashboard used to discard it, so a
+                         failed detection was a dead end for the operator. -->
+                    <template x-if="probeTrace(slot.key).length">
+                      <div>
+                        <button type="button" @click="traceOpen[slot.key] = !traceOpen[slot.key]"
+                                class="text-[11px] text-slate-500 hover:text-arr-accent underline decoration-dotted">
+                          <span x-text="(traceOpen[slot.key] ? 'Hide' : 'Show') + ' what PVArr tried (' + probeTrace(slot.key).length + ')'"></span>
+                        </button>
+                        <div x-show="traceOpen[slot.key]" x-cloak class="mt-1.5 space-y-1">
+                          <div class="bg-black/60 rounded-md border border-slate-800 p-2 overflow-x-auto">
+                            <table class="text-[11px] font-mono text-slate-400 w-full">
+                              <template x-for="(a, i) in probeTrace(slot.key)" :key="i">
+                                <tr class="align-top">
+                                  <td class="pr-2 text-slate-600 whitespace-nowrap" x-text="a.stage || 'playlist'"></td>
+                                  <td class="pr-2 whitespace-nowrap"
+                                      :class="traceToneClass(a)" x-text="traceOutcome(a)"></td>
+                                  <td class="pr-2 whitespace-nowrap text-slate-500"
+                                      x-text="a.referer ? 'ref: ' + shortHost(a.referer) : (a.stage === 'playlist' ? 'no referer' : '')"></td>
+                                  <td class="text-slate-500 break-all" x-text="a.note || shortUrl(a.url)"></td>
+                                </tr>
+                              </template>
+                            </table>
+                          </div>
+                          <button type="button" @click="copyTrace(slot.key)"
+                                  class="text-[11px] text-slate-500 hover:text-arr-accent">
+                            <span x-text="traceCopied[slot.key] ? 'Copied' : 'Copy trace'"></span>
+                          </button>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+
+              <div class="px-1">
+                <button type="button" @click="toggleAdvanced(slot.key)"
+                        class="text-[11px] text-slate-500 hover:text-arr-accent">
+                  <span x-text="advanced[slot.key] ? 'Hide headers' : 'Set headers manually'"></span>
+                </button>
+              </div>
+
+              <!-- Manual override: only needed when the probe cannot guess -->
+              <div x-show="advanced[slot.key]" class="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1" style="display:none;">
+                <input type="text" x-model="overrides[slot.key].referer" placeholder="Referer"
+                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+                <input type="text" x-model="overrides[slot.key].user_agent" placeholder="User-Agent"
+                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200">
+                <input type="text" x-model="overrides[slot.key].cookie"
+                       :placeholder="cookieNeeded[slot.key] ? 'Cookie \u2014 paste again' : 'Cookie'"
+                       class="px-2 py-1.5 rounded text-xs arr-input font-mono text-slate-200"
+                       :class="cookieNeeded[slot.key] && !overrides[slot.key].cookie ? 'ring-1 ring-amber-500/70' : ''">
+              </div>
+              <!-- PVArr never sends a stored cookie back to the browser: port
+                   8999 has no authentication, and a cookie is a live account
+                   credential that does not expire on its own the way a stream
+                   token does. So a re-recorded candidate that needed one has
+                   to have it pasted in again. -->
+              <p x-show="advanced[slot.key] && cookieNeeded[slot.key] && !overrides[slot.key].cookie" x-cloak
+                 class="text-[11px] text-amber-400/90 pt-1">
+                This candidate used a cookie. PVArr does not hand stored cookies back to the
+                browser, so paste it in again before starting.
+              </p>
+            </div>
+          </template>
+          </div>
+        </div>
+
+        <div class="pt-4 flex justify-end space-x-3 border-t border-slate-800">
+          <button type="button" @click="openNewModal = false" class="px-4 py-2 rounded-lg text-sm text-slate-400 hover:text-white">Cancel</button>
+          <button type="submit" :disabled="submitting"
+                  class="bg-arr-blue hover:bg-blue-600 text-white px-5 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-blue/20 disabled:opacity-50"
+                  x-text="isScheduled ? 'Schedule' : (submitting ? 'Finding streams...' : 'Start Recording Session')">
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    function dashboardApp() {
+      return {
+        activeTab: 'active',
+        openNewModal: false,
+        activeSessions: [],
+        expandedFinished: {},
+        libraryFiles: [],
+        sseConnections: {},
+        form: {
+          // Buccaneers vs Raiders: the only on-theme fixture in sport.
+          sport: 'NFL',
+          team_a: 'Buccaneers',
+          team_b: 'Raiders',
+          resolution: '1080p',
+          freeze_timeout: 15,
+          duration_minutes: '',
+          rebroadcast: false,
+          channel_name: '',
+          output_dir: '',
+          url_primary: '',
+          url_backup1: '',
+          url_backup2: ''
+        },
+        slots: [
+          // Not `required` in the HTML: the slots are usually hidden and the
+          // event page fills them, and a hidden required input blocks the
+          // submit with an error the browser cannot show. submitRecording()
+          // checks that there is something to record instead.
+          { key: 'url_primary', label: 'Primary Stream URL',
+            tone: 'text-emerald-400', placeholder: 'https://cdn.example.com/hls/stream.m3u8?token=...' },
+          { key: 'url_backup1', label: 'Backup Candidate 1 URL',
+            tone: 'text-amber-400', placeholder: 'https://backup1-site.com/channel.php' },
+          { key: 'url_backup2', label: 'Backup Candidate 2 URL',
+            tone: 'text-cyan-400', placeholder: 'https://backup2-site.com/stream' }
+        ],
+        showManual: false,
+        // datetime-local strings, local to the browser; converted to epochs
+        // only when sent.
+        sched: { start: '', end: '' },
+        scheduleList: [],
+        submitting: false,
+        suggestions: { league: [], team_a: [], team_b: [] },
+        suggestActive: { league: -1, team_a: -1, team_b: -1 },
+        nameFields: [
+          { field: 'league', model: 'sport', label: 'Sport / Category', placeholder: 'MLB / NFL / Sports' },
+          { field: 'team_a', model: 'team_a', label: 'Team A / Event', placeholder: 'Buccaneers' },
+          { field: 'team_b', model: 'team_b', label: 'Team B / Rival', placeholder: 'Raiders' }
+        ],
+        agg: { url: '', cookie: '', user_agent: '', showHeaders: false,
+               state: 'idle', message: '', tried: [] },
+        probes: { url_primary: null, url_backup1: null, url_backup2: null },
+        advanced: { url_primary: false, url_backup1: false, url_backup2: false },
+        overrides: {
+          url_primary: { referer: '', user_agent: '', cookie: '' },
+          url_backup1: { referer: '', user_agent: '', cookie: '' },
+          url_backup2: { referer: '', user_agent: '', cookie: '' }
+        },
+        probeSeq: { url_primary: 0, url_backup1: 0, url_backup2: 0 },
+        // Set by "Record again" for candidates whose original run carried a
+        // cookie. The value itself stays on the server -- this is only a flag
+        // saying the operator has to supply it once more.
+        cookieNeeded: { url_primary: false, url_backup1: false, url_backup2: false },
+        reusedFrom: null,
+        traceOpen: { url_primary: false, url_backup1: false, url_backup2: false },
+        traceCopied: { url_primary: false, url_backup1: false, url_backup2: false },
+
+        init() {
+          this.refreshStatus();
+          this.fetchLibrary();
+          setInterval(() => { this.refreshStatus(); }, 3000);
+        },
+
+        // A session is "live" while its thread is still working -- which
+        // includes post-processing, not just capture. Splitting on is_running
+        // keeps a finished recording from sitting at the top of the page
+        // pretending to be active.
+        get liveSessions() {
+          return this.activeSessions.filter(s => s.is_running);
+        },
+        get finishedSessions() {
+          return this.activeSessions.filter(s => !s.is_running);
+        },
+
+        // A Start at in the future makes the submit a schedule. One already
+        // past (or blank) is an ordinary start now.
+        get isScheduled() {
+          const t = this.toEpoch(this.sched.start);
+          return t !== null && t > Date.now() / 1000;
+        },
+
+        toEpoch(local) {
+          if (!local) return null;
+          const ms = new Date(local).getTime();   // datetime-local parses as local time
+          return isNaN(ms) ? null : ms / 1000;
+        },
+
+        filledSlots() {
+          return this.slots.filter(slot => (this.form[slot.key] || '').trim()).length;
+        },
+
+        timeLocal(epoch) {
+          if (!epoch) return '';
+          return new Date(epoch * 1000).toLocaleString([], {
+            weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        },
+
+        scheduleTitle(job) {
+          const teams = [job.team_a, job.team_b].filter(Boolean).join(' vs ');
+          return (job.sport ? job.sport + ': ' : '') + (teams || 'Scheduled recording');
+        },
+
+        scheduleWindow(job) {
+          return this.timeLocal(job.start_at) + ' → ' + this.timeLocal(job.end_time);
+        },
+
+        scheduleDotClass(job) {
+          return { waiting: 'bg-sky-400', searching: 'bg-amber-400 animate-pulse',
+                   started: 'bg-emerald-400', failed: 'bg-rose-500', missed: 'bg-rose-500' }[job.state]
+                 || 'bg-slate-500';
+        },
+
+        scheduleTextClass(job) {
+          return { waiting: 'text-sky-400', searching: 'text-amber-400', started: 'text-emerald-400',
+                   failed: 'text-rose-400', missed: 'text-rose-400' }[job.state] || 'text-slate-400';
+        },
+
+        async cancelSchedule(job) {
+          const live = ['waiting', 'searching'].includes(job.state);
+          if (live && !confirm('Cancel this scheduled recording?')) return;
+          try {
+            await fetch(`/api/schedules/${job.id}`, { method: 'DELETE' });
+          } catch (e) {
+            alert('Cancel error: ' + e);
+          }
+          this.refreshSchedules();
+        },
+
+        async refreshSchedules() {
+          try {
+            const res = await fetch('/api/schedules');
+            const data = await res.json();
+            this.scheduleList = data.schedules || [];
+          } catch (e) {
+            console.error('Schedule check error:', e);
+          }
+        },
+
+        toggleFinished(id) {
+          this.expandedFinished[id] = !this.expandedFinished[id];
+        },
+
+        prettyStatus(status) {
+          // "completed window" is what the underscore rule produces, and it
+          // reads like something went wrong. It did not -- the recording ran
+          // to the end that was asked for.
+          const named = { completed_window: 'finished on schedule' };
+          return named[status] || (status || '').replace(/_/g, ' ');
+        },
+
+        toMB(bytes) {
+          return ((bytes || 0) / 1048576).toFixed(2);
+        },
+
+        // Amber, not green: the thread is still busy but nothing is being
+        // captured any more, and the file is not in the library yet.
+        statusDotClass(s) {
+          if (!s.is_running) {
+            if (['failed', 'aborted_no_space', 'aborted_output_lost'].includes(s.status)) return 'bg-rose-500';
+            if (['completed_partial', 'interrupted'].includes(s.status)) return 'bg-amber-500';
+            return 'bg-slate-500';
+          }
+          return s.status === 'post_processing'
+            ? 'bg-amber-400 animate-pulse'
+            : 'bg-emerald-400 animate-pulse';
+        },
+
+        statusTextClass(s) {
+          if (!s.is_running) {
+            if (['failed', 'aborted_no_space', 'aborted_output_lost'].includes(s.status)) return 'text-rose-400';
+            if (['completed_partial', 'interrupted'].includes(s.status)) return 'text-amber-400';
+            return 'text-slate-400';
+          }
+          return s.status === 'post_processing' ? 'text-amber-400' : 'text-emerald-400';
+        },
+
+        // The recorder has received data but the file on disk is not growing.
+        // That combination is what a recording being deleted underneath looks
+        // like, and it was invisible until both numbers were on screen.
+        // A window is a fact about the session, so it is shown while the
+        // recording is live and stays useful afterwards ("ended on schedule").
+        endsIn(s) {
+          if (s.seconds_remaining === null || s.seconds_remaining === undefined) return '';
+          if (!['recording', 'failing_over'].includes(s.status)) return '';
+          const left = s.seconds_remaining;
+          if (left <= 0) return 'stopping';
+          if (left < 90) return Math.round(left) + 's left';
+          if (left < 5400) return Math.round(left / 60) + 'm left';
+          return (left / 3600).toFixed(1) + 'h left';
+        },
+
+        endsAtLocal(s) {
+          if (!s.ends_at) return '';
+          // Rendered from an absolute timestamp in the viewer's own locale, so
+          // the container's TZ (unset, therefore UTC) never has to be right.
+          return new Date(s.ends_at * 1000).toLocaleString();
+        },
+
+        sizeDisagrees(s) {
+          // Only while actually capturing. During post_processing the remux
+          // has already deleted the .ts, so on-disk is legitimately 0 against
+          // a large captured count -- warning there would cry wolf on every
+          // single successful recording.
+          if (s.is_rebroadcast || s.status !== 'recording') return false;
+          return (s.bytes_written || 0) > 1048576 && (s.filesize_mb || 0) === 0;
+        },
+
+        formatSeconds(sec) {
+          if (!sec) return '00:00:00';
+          const s = Math.floor(sec % 60);
+          const m = Math.floor((sec / 60) % 60);
+          const h = Math.floor(sec / 3600);
+          return [h, m, s].map(v => v < 10 ? '0' + v : v).join(':');
+        },
+
+        async refreshStatus() {
+          this.refreshSchedules();
+          try {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            this.activeSessions = data.sessions || [];
+            this.activeSessions.forEach(session => {
+              if (session.is_running && !this.sseConnections[session.id]) {
+                this.connectSSE(session.id);
+              }
+            });
+          } catch (e) {
+            console.error('Status check error:', e);
+          }
+        },
+
+        connectSSE(sessionId) {
+          const eventSource = new EventSource(`/api/recordings/${sessionId}/logs`);
+          this.sseConnections[sessionId] = eventSource;
+
+          eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            const session = this.activeSessions.find(s => s.id === sessionId);
+            if (session) {
+              if (data.summary) Object.assign(session, data.summary);
+              if (data.log) {
+                session.logs = session.logs || [];
+                session.logs.push(data.log);
+                if (session.logs.length > 200) session.logs.shift();
+              }
+            }
+          };
+
+          eventSource.onerror = () => {
+            eventSource.close();
+            delete this.sseConnections[sessionId];
+          };
+        },
+
+        async fetchLibrary() {
+          try {
+            const res = await fetch('/api/library');
+            const data = await res.json();
+            this.libraryFiles = data.library || [];
+          } catch (e) {
+            console.error('Library error:', e);
+          }
+        },
+
+        toggleAdvanced(key) {
+          this.advanced[key] = !this.advanced[key];
+        },
+
+        probeTrace(key) {
+          const p = this.probes[key];
+          return (p && p.data && Array.isArray(p.data.attempts)) ? p.data.attempts : [];
+        },
+
+        traceOutcome(a) {
+          if (a.error) return 'error';
+          if (a.status === undefined || a.status === null) return '--';
+          return String(a.status);
+        },
+
+        traceToneClass(a) {
+          if (a.error) return 'text-rose-400';
+          const s = a.status;
+          if (s >= 200 && s < 300) return 'text-emerald-400';
+          if (s === 403 || s === 401) return 'text-amber-400';
+          if (s >= 400) return 'text-rose-400';
+          return 'text-slate-400';
+        },
+
+        shortHost(url) {
+          try { return new URL(url).host; } catch (e) { return url; }
+        },
+
+        // Same rule as _looks_like_token() in app/logging_config.py -- keep the
+        // two in step. Some providers carry the token as a path segment, so a
+        // query-only scrub still put it on the clipboard via Copy trace.
+        pathLooksLikeToken(seg) {
+          if (!/^[A-Za-z0-9_\-.~+=%]+$/.test(seg)) return false;
+          const stem = seg.replace(/\.[A-Za-z0-9]{1,5}$/, '');
+          if (stem.length < 16) return false;
+          const alnum = stem.replace(/[^A-Za-z0-9]/g, '');
+          if (alnum.length < 8) return false;
+          if (/^[0-9a-fA-F]+$/.test(alnum) && /[0-9]/.test(alnum)
+              && /[a-fA-F]/.test(alnum)) return true;
+          const cls = c => /[0-9]/.test(c) ? 0 : (/[a-z]/.test(c) ? 1 : 2);
+          let runs = 1;
+          for (let i = 1; i < alnum.length; i++) {
+            if (cls(alnum[i]) !== cls(alnum[i - 1])) runs++;
+          }
+          return alnum.length / runs <= 3.0;
+        },
+
+        shortUrl(url) {
+          if (!url) return '';
+          const scrub = p => p.split('/')
+            .map(s => this.pathLooksLikeToken(s) ? '<redacted>' : s).join('/');
+          try {
+            const u = new URL(url);
+            // The query string is where the token usually lives -- never render it.
+            return u.host + scrub(u.pathname);
+          } catch (e) { return scrub(String(url).split('?')[0]); }
+        },
+
+        async copyTrace(key) {
+          // Plain text, so it can be pasted into a message or an issue. The
+          // whole point of the trace is being able to hand it to someone.
+          const lines = this.probeTrace(key).map(a =>
+            [(a.stage || 'playlist').padEnd(9),
+             this.traceOutcome(a).padEnd(6),
+             a.referer ? 'ref:' + this.shortHost(a.referer) : '',
+             a.note || '',
+             this.shortUrl(a.url)].filter(Boolean).join('  ')
+          );
+          const text = 'PVArr probe trace\n' + lines.join('\n');
+          try {
+            await navigator.clipboard.writeText(text);
+          } catch (e) {
+            // Clipboard needs a secure context; plain http:// LAN access has
+            // none, which is exactly how this dashboard is usually reached.
+            window.prompt('Copy the trace:', text);
+            return;
+          }
+          this.traceCopied[key] = true;
+          setTimeout(() => { this.traceCopied[key] = false; }, 1500);
+        },
+
+        async probeSlot(key) {
+          const url = (this.form[key] || '').trim();
+          if (!url) { this.probes[key] = null; return; }
+          if (!/^https?:\/\//i.test(url)) {
+            this.probes[key] = { state: 'fail', message: 'URL must start with http:// or https://' };
+            return;
+          }
+
+          // Each keystroke can fire a probe; only the newest answer may win, or
+          // a slow early request would overwrite a later, correct one.
+          const seq = ++this.probeSeq[key];
+          this.probes[key] = { state: 'probing', message: 'Checking stream and working out headers...' };
+
+          const body = new FormData();
+          body.append('url', url);
+          if (this.overrides[key].referer) body.append('referer', this.overrides[key].referer);
+
+          try {
+            const res = await fetch('/api/probe', { method: 'POST', body });
+            const data = await res.json();
+            if (seq !== this.probeSeq[key]) return;
+
+            if (data.ok) {
+              this.probes[key] = {
+                state: 'ok',
+                message: data.message,
+                resolved: data.m3u8_url !== url ? data.m3u8_url : '',
+                data: data
+              };
+              // Show what was detected so it can be edited rather than retyped.
+              this.overrides[key].referer = data.referer || '';
+              this.overrides[key].cookie = data.cookie || '';
+            } else {
+              // Keep the payload. This used to be `data: null`, which threw
+              // away the attempt trace at exactly the moment it is worth
+              // having -- the operator was told "every header combination was
+              // rejected" with no way to see which ones, or what came back.
+              this.probes[key] = {
+                state: 'fail',
+                message: data.message || 'Could not verify this stream.',
+                data: data
+              };
+              this.advanced[key] = true;
+            }
+          } catch (e) {
+            if (seq !== this.probeSeq[key]) return;
+            this.probes[key] = { state: 'fail', message: 'Probe request failed: ' + e };
+          }
+        },
+
+        async suggest(field, text) {
+          const q = (text || '').trim();
+          if (!q) { this.suggestions[field] = []; return; }
+          const url = field === 'league'
+            ? '/api/tags/leagues?q=' + encodeURIComponent(q)
+            : '/api/tags/teams?q=' + encodeURIComponent(q)
+              + '&league=' + encodeURIComponent(this.form.sport || '');
+          try {
+            const res = await fetch(url);
+            if (!res.ok) return;
+            const data = await res.json();
+            // Only apply if the box still holds what was asked about.
+            const now = field === 'league' ? this.form.sport : this.form[field];
+            if ((now || '').trim() === q) {
+              this.suggestions[field] = data.suggestions || [];
+              this.suggestActive[field] = -1;
+            }
+          } catch (e) { /* autocomplete is a convenience; typing still works */ }
+        },
+
+        pick(f, o) {
+          this.form[f.model] = o.value;
+          this.suggestions[f.field] = [];
+        },
+
+        pickMove(field, step) {
+          const n = this.suggestions[field].length;
+          if (n) this.suggestActive[field] = (this.suggestActive[field] + step + n) % n;
+        },
+
+        // Enter takes the highlighted suggestion; with none highlighted it
+        // submits the form as before.
+        pickActive(f, event) {
+          const o = this.suggestions[f.field][this.suggestActive[f.field]];
+          if (o) { event.preventDefault(); this.pick(f, o); }
+        },
+
+        async findStreams() {
+          const url = (this.agg.url || '').trim();
+          if (!/^https?:\/\//i.test(url)) {
+            this.agg.state = 'fail';
+            this.agg.message = 'URL must start with http:// or https://';
+            return;
+          }
+          this.agg.state = 'working';
+          this.agg.message = 'Fetching the page and checking its links (can take a minute)...';
+          this.agg.tried = [];
+          const body = new FormData();
+          body.append('url', url);
+          if (this.agg.cookie) body.append('cookie', this.agg.cookie);
+          if (this.agg.user_agent) body.append('user_agent', this.agg.user_agent);
+          try {
+            const res = await fetch('/api/aggregate', { method: 'POST', body });
+            const data = await res.json();
+            this.agg.tried = data.tried || [];
+            this.agg.message = data.message || data.detail || '';
+            if (!data.ok) {
+              this.agg.state = 'fail';
+              if (data.page && data.page.challenged) this.agg.showHeaders = true;
+              return;
+            }
+            this.agg.state = 'ok';
+            // Fill the slots in order; any slot without a pick is cleared so a
+            // stale URL from an earlier paste cannot ride along as a backup.
+            // Only the URL is filled, never the headers the probe found: the
+            // recorder re-probes the page on every connect and rediscovers
+            // them, whereas a pinned cookie would be replayed, expired, on a
+            // failover hours later.
+            this.slots.forEach((slot, i) => {
+              const p = (data.picked || [])[i];
+              this.form[slot.key] = p ? p.url : '';
+              this.overrides[slot.key] = { referer: '', user_agent: '', cookie: '' };
+              this.cookieNeeded[slot.key] = false;
+              this.probes[slot.key] = p ? {
+                state: 'ok', message: p.message,
+                resolved: p.m3u8_url !== p.url ? p.m3u8_url : '', data: p
+              } : null;
+            });
+            // Show what was picked: the operator should see the links that
+            // are about to be recorded, not have them filled in out of sight.
+            this.showManual = true;
+          } catch (e) {
+            this.agg.state = 'fail';
+            this.agg.message = 'Request failed: ' + e;
+          }
+        },
+
+        buildStreamHeaders() {
+          // Keyed by URL, not slot position: an empty backup slot must not
+          // shift headers onto the wrong candidate server-side.
+          const headers = {};
+          this.slots.forEach(slot => {
+            const url = (this.form[slot.key] || '').trim();
+            if (!url) return;
+            const o = this.overrides[slot.key];
+            const entry = {};
+            if (o.referer) entry.referer = o.referer;
+            if (o.user_agent) entry.user_agent = o.user_agent;
+            if (o.cookie) entry.cookie = o.cookie;
+            if (Object.keys(entry).length) headers[url] = entry;
+          });
+          return headers;
+        },
+
+        resetStreamForm() {
+          this.slots.forEach(slot => {
+            this.form[slot.key] = '';
+            this.probes[slot.key] = null;
+            this.advanced[slot.key] = false;
+            this.overrides[slot.key] = { referer: '', user_agent: '', cookie: '' };
+            this.cookieNeeded[slot.key] = false;
+          });
+          this.reusedFrom = null;
+          // A duration belongs to the event just recorded, not to the next
+          // one. Leaving it set would silently cap an unrelated recording.
+          this.form.duration_minutes = '';
+          this.form.output_dir = '';
+          this.slots.forEach(slot => { this.traceOpen[slot.key] = false; });
+          // Same for the window and the event page. The cookie and
+          // User-Agent stay: they belong to the operator's browser, not to
+          // one event, and the next event is usually on the same page.
+          this.sched = { start: '', end: '' };
+          this.agg.url = '';
+          this.agg.state = 'idle';
+          this.agg.message = '';
+          this.agg.tried = [];
+          this.showManual = false;
+        },
+
+        // Load a finished session's settings back into the start form. It
+        // deliberately stops short of starting: candidate URLs carry tokens
+        // that expire in hours, so the operator needs to see them -- and
+        // replace a stale one -- before pressing Start.
+        async recordAgain(id) {
+          let data;
+          try {
+            const res = await fetch(`/api/recordings/${id}/config`);
+            data = await res.json();
+            if (!res.ok) {
+              alert(data.detail || 'Could not load that session\'s settings');
+              return;
+            }
+          } catch (e) {
+            alert('Error loading session settings: ' + e);
+            return;
+          }
+
+          const c = data.config || {};
+          // Clear first, so anything the old session did not set cannot be
+          // inherited from whatever was last typed into the form.
+          this.resetStreamForm();
+
+          ['sport', 'team_a', 'team_b', 'resolution', 'channel_name',
+           'output_dir'].forEach(k => {
+            if (c[k] !== undefined && c[k] !== null) this.form[k] = c[k];
+          });
+          this.form.rebroadcast = !!c.rebroadcast;
+          this.form.freeze_timeout = c.freeze_timeout;
+          // The original end was an absolute time that has already passed. The
+          // server hands back the LENGTH that was asked for instead, so the
+          // new recording gets the same window measured from Start.
+          this.form.duration_minutes =
+            (c.duration_minutes === null || c.duration_minutes === undefined)
+              ? '' : c.duration_minutes;
+          this.form.url_primary = c.url_primary || '';
+          this.form.url_backup1 = c.url_backup1 || '';
+          this.form.url_backup2 = c.url_backup2 || '';
+          // The URLs are the thing to check before pressing Start.
+          this.showManual = this.filledSlots() > 0;
+
+          const headers = c.stream_headers || {};
+          const needsCookie = c.cookie_required || [];
+          this.slots.forEach(slot => {
+            const url = (this.form[slot.key] || '').trim();
+            if (!url) return;
+            const h = headers[url] || {};
+            this.overrides[slot.key] = {
+              referer: h.referer || '',
+              user_agent: h.user_agent || '',
+              cookie: ''
+            };
+            if (needsCookie.includes(url)) {
+              this.cookieNeeded[slot.key] = true;
+              // Open the panel rather than hiding the one thing that will
+              // stop this recording from starting.
+              this.advanced[slot.key] = true;
+            }
+          });
+
+          this.reusedFrom = data.source_session || id;
+          this.openNewModal = true;
+        },
+
+        async submitRecording() {
+          if (this.submitting) return;
+          const aggUrl = (this.agg.url || '').trim();
+          if (!aggUrl && !this.filledSlots()) {
+            alert('Paste an event page, or enter at least one stream link manually.');
+            return;
+          }
+          const endAt = this.toEpoch(this.sched.end);
+          if (this.isScheduled) return this.submitSchedule(aggUrl, endAt);
+          if (endAt !== null && endAt <= Date.now() / 1000) {
+            alert('End at is in the past.');
+            return;
+          }
+
+          // Start now with only an event page: check it first, exactly
+          // as the Find button would, then start with what it picked. If it
+          // found nothing, stop here -- its message says why.
+          if (!this.filledSlots()) {
+            this.submitting = true;
+            try {
+              await this.findStreams();
+            } finally {
+              this.submitting = false;
+            }
+            if (!this.filledSlots()) return;
+          }
+
+          const primary = this.probes.url_primary;
+          if (primary && primary.state === 'fail') {
+            if (!confirm('PVArr could not verify the primary stream:\n\n' + primary.message +
+                         '\n\nStart the recording anyway?')) return;
+          }
+
+          const formData = new FormData();
+          Object.keys(this.form).forEach(k => {
+            const v = this.form[k];
+            // Blank numeric options are omitted, not sent as "": FastAPI parses
+            // Optional[float] from the raw form value and answers 422 on an
+            // empty string, which would reject the whole start. Only the
+            // numeric fields are filtered -- the text fields have server-side
+            // defaults that a deliberately cleared box should not resurrect.
+            if (k === 'duration_minutes' && (v === '' || v === null || v === undefined)) return;
+            // An End at replaces Stop After (the server would prefer it anyway).
+            if (k === 'duration_minutes' && endAt !== null) return;
+            formData.append(k, v);
+          });
+          if (endAt !== null) formData.append('end_time', endAt);
+          const headers = this.buildStreamHeaders();
+          if (Object.keys(headers).length) {
+            formData.append('stream_headers', JSON.stringify(headers));
+          }
+
+          try {
+            const res = await fetch('/api/recordings/start', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (res.ok) {
+              this.openNewModal = false;
+              this.refreshStatus();
+              this.resetStreamForm();
+            } else {
+              alert(data.detail || 'Failed to start recording');
+            }
+          } catch (e) {
+            alert('Error submitting recording: ' + e);
+          }
+        },
+
+        // A schedule stores the event page (and any manual links) and
+        // checks the page at the start time, not now.
+        async submitSchedule(aggUrl, endAt) {
+          const startAt = this.toEpoch(this.sched.start);
+          if (endAt === null) {
+            alert('A scheduled recording needs an End at time.');
+            return;
+          }
+          if (endAt <= startAt) {
+            alert('End at must be after Start at.');
+            return;
+          }
+          const body = new FormData();
+          ['sport', 'team_a', 'team_b', 'resolution', 'freeze_timeout', 'rebroadcast',
+           'channel_name', 'output_dir', 'url_primary', 'url_backup1', 'url_backup2'
+          ].forEach(k => body.append(k, this.form[k]));
+          body.append('start_at', startAt);
+          body.append('end_time', endAt);
+          if (aggUrl) body.append('agg_url', aggUrl);
+          if (this.agg.cookie) body.append('agg_cookie', this.agg.cookie);
+          if (this.agg.user_agent) body.append('agg_user_agent', this.agg.user_agent);
+          const headers = this.buildStreamHeaders();
+          if (Object.keys(headers).length) body.append('stream_headers', JSON.stringify(headers));
+          try {
+            const res = await fetch('/api/schedules', { method: 'POST', body });
+            const data = await res.json();
+            if (!res.ok) {
+              const d = data.detail;
+              alert(Array.isArray(d) ? d.map(x => x.msg).join('\n') : (d || 'Failed to schedule'));
+              return;
+            }
+            this.openNewModal = false;
+            this.resetStreamForm();
+            this.refreshSchedules();
+            if (data.persistent === false) {
+              alert('Scheduled, but PVArr cannot write to its config folder, so this ' +
+                    'schedule will be lost if PVArr restarts before it runs. Check the ' +
+                    'ownership of the /config mount (PUID/PGID).');
+            }
+          } catch (e) {
+            alert('Error scheduling recording: ' + e);
+          }
+        },
+
+        async triggerFailover(id) {
+          if (!confirm('Force failover to next candidate stream?')) return;
+          try {
+            const res = await fetch(`/api/recordings/${id}/failover`, { method: 'POST' });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              alert('Failover refused: ' + (err.detail || ('HTTP ' + res.status)));
+              return;
+            }
+            // The recorder thread reacts a moment after the POST returns, so a
+            // single immediate refresh still paints the old candidate and the
+            // button looks dead. Re-poll over the next few seconds instead of
+            // waiting for the 3s timer to come round.
+            this.refreshStatus();
+            [500, 1500, 3000].forEach(ms => setTimeout(() => this.refreshStatus(), ms));
+          } catch (e) {
+            alert('Failover error: ' + e);
+          }
+        },
+
+        async switchCandidate(id, candidate) {
+          try {
+            const body = new URLSearchParams({ candidate: candidate });
+            const res = await fetch(`/api/recordings/${id}/switch`, { method: 'POST', body });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              alert('Switch refused: ' + (err.detail || ('HTTP ' + res.status)));
+              return;
+            }
+            // Same reason as triggerFailover: the recorder thread reacts a
+            // moment after the POST returns, so one immediate refresh would
+            // still paint the candidate we just left.
+            this.refreshStatus();
+            [500, 1500, 3000].forEach(ms => setTimeout(() => this.refreshStatus(), ms));
+          } catch (e) {
+            alert('Switch error: ' + e);
+          }
+        },
+
+        async stopSession(id) {
+          if (!confirm('Stop recording session?')) return;
+          try {
+            await fetch(`/api/recordings/${id}/stop`, { method: 'POST' });
+            this.refreshStatus();
+            // Post-processing runs after the stop returns, and a remux of a
+            // long recording takes far longer than a second or two. A single
+            // refresh here listed the .ts that the remux was about to delete,
+            // so the next click on it 404'd. Keep checking back.
+            [1500, 5000, 15000, 30000].forEach(ms => setTimeout(() => {
+              this.fetchLibrary();
+              this.refreshStatus();
+            }, ms));
+          } catch (e) {
+            alert('Stop error: ' + e);
+          }
+        },
+
+        async promptRename(oldName) {
+          const newName = prompt('Enter new filename for recording:', oldName);
+          if (!newName || newName === oldName) return;
+
+          const formData = new FormData();
+          formData.append('old_name', oldName);
+          formData.append('new_name', newName);
+
+          try {
+            const res = await fetch('/api/library/rename', { method: 'POST', body: formData });
+            if (res.ok) this.fetchLibrary();
+            else alert('Failed to rename file.');
+          } catch (e) {
+            alert('Rename error: ' + e);
+          }
+        },
+
+        async deleteFile(filename) {
+          if (!confirm(`Delete ${filename}?`)) return;
+          try {
+            const res = await fetch(`/api/library/${filename}`, { method: 'DELETE' });
+            if (res.ok) this.fetchLibrary();
+            else alert('Delete failed.');
+          } catch (e) {
+            alert('Delete error: ' + e);
+          }
+        }
+      };
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+self-hosted
+hls
+dvr
+recorder
+ffmpeg
+plex
+jellyfin
+emby
+hdhomerun
+docker
+fastapi
+live-tv

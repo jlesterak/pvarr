@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in PVArr itself is broken
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **No site-specific support.** PVArr does not maintain per-site recipes. Issues asking for help getting a particular streaming site to work will be closed.
+
+        **Redact before posting.** Remove stream URLs, tokens, cookies and any other credentials from everything you paste. Use **Copy trace** on the dashboard, which already hides them, and check it anyway.
+  - type: input
+    id: version
+    attributes:
+      label: PVArr version
+      description: The image tag you run, or the version the dashboard or `/api` reports.
+      placeholder: "0.8.0"
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host and architecture
+      placeholder: "Debian 12, amd64, Docker 27"
+    validations:
+      required: true
+  - type: textarea
+    id: compose
+    attributes:
+      label: Compose snippet
+      description: The pvarr service from your compose file, with secrets removed.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from `docker logs pvarr`. Redact stream URLs and tokens first.
+      render: text

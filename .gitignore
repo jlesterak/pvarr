@@ -1,0 +1,47 @@
+# Python / Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Environment & Dependencies
+.venv/
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# Recordings & Dynamic Runtime Data
+recordings/
+*.ts
+*.mkv
+*.mp4
+*.log
+channels.conf
+.env
+
+# Runtime state. Once session state is persisted here it holds live cookies and
+# tokenised stream URLs -- treat as a credentials directory, never commit it.
+config/
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Claude Code agent worktrees and settings
+.claude/

@@ -1,0 +1,3977 @@
+# PVArr - Implementation TODO
+
+The project's working log: what was built, why, how it was proven, and what is
+still open. Newest phases are at the bottom.
+
+Sites are never named here. Upstreams are "provider A/B/C/D", pages that list
+several stream links are "event pages" (`app/aggregator.py` in the code), and
+recorded broadcasts are "network A/B". Site-specific field notes live in a
+separate private notes repo and must not be copied into this one, its commit
+messages, tests or screenshots. See README "Intended use".
+
+## Phase 1: Core Failover Engine & Studio Foundations
+- [x] **Task 1: Environment, Project Structure & Dependency Setup**
+- [x] **Task 2: Core Failover Engine (`stream-recorder.py` / `app/recorder.py`)**
+- [x] **Task 3: Sports File-Naming & Storage Module (`app/naming.py`)**
+- [x] **Task 4: Web Server Backend (`app/server.py`)**
+- [x] **Task 5: Web Management Dashboard UI (`app/templates/index.html`)**
+- [x] **Task 6: Application Runner Script (`start.sh`) & Graceful Process Cleanup**
+
+## Phase 2: PVArr Branding, Direct FFmpeg Optimization & *Arr Ecosystem Integration
+- [x] **Task 1: Recorder Optimization & Proxy Fallback Logic (`app/recorder.py`)**
+- [x] **Task 2: *Arr-Style UI & Favicon Integration (`app/templates/index.html` & `app/static/favicon.svg`)**
+- [x] **Task 3: Post-Processing Engine (`app/post_processor.py`)**
+- [x] **Task 4: Media Server & Notification Webhooks (`app/notifications.py`)**
+- [x] **Task 5: Virtual IPTV / M3U Tuner Endpoint (`app/tuner.py` & `app/server.py`)**
+- [x] **Task 6: Dockerization & Deployment Assets (`Dockerfile` & `docker-compose.yml`)**
+
+## Phase 3: Documentation, AI Transparency & GitHub Release
+- [x] **Task 1: Production README.md & AI Transparency Disclosure**
+  - Feature list, architecture overview, API reference, quick start guides (CLI + Docker)
+  - "Finding Your Stream URL" guide (DevTools / `detect-headers` / `curl` verification)
+  - AI transparency callout banner + dedicated `## AI Genesis & Environmental Footprint` section
+  - Env var table, endpoints, and file references verified against the actual codebase
+
+- [x] **Task 2: Git Prep & Publish Automation (`scripts/publish.sh`)**
+  - `.gitignore` verified (excludes `venv/`, `__pycache__`, test recordings, logs, `.env`)
+  - `scripts/publish.sh` stages, commits, and provides exact GitHub remote attach + push commands
+
+## Phase 4: Release Hardening
+- [x] **Task 1: `LICENSE`** — The Unlicense (public domain, no attribution required)
+
+- [x] **Task 2: Automated test suite (`test_pvarr.py`)**
+  - 58 tests, stdlib `unittest`, no new dependencies
+  - Covers: filename sanitisation + path-traversal rejection, output-path
+    collision handling, storage rename/delete guards, M3U + XMLTV generation,
+    dependency resolution, failover candidate parsing, FFmpeg argv construction
+  - Two end-to-end remux tests encode a real 1s transport stream; they skip
+    automatically when FFmpeg is absent
+  - CI: `.github/workflows/test.yml` runs the suite on Python 3.9 / 3.11 / 3.12
+
+## Closed by decision (not open work)
+- **Quantified AI footprint figures — will not add.** The build was never
+  instrumented, and providers do not publish per-token energy for frontier
+  models. Any gram-of-CO₂e or litre-of-water figure produced now would be
+  fabricated — exactly the failure mode a transparency section exists to
+  avoid. Reopen only if real provider usage data becomes available.
+- **Footprint section rewritten in an anarchist/luddite register** with
+  carbon-offset donation links (Cool Earth, Clean Air Task Force, Wren —
+  all three URLs verified live). The "we don't know and they won't say"
+  position is unchanged; only the voice moved.
+
+## Phase 5: Failover Correctness
+- [x] **Failover state-machine coverage (`test_pvarr.py`)** — 22 tests driving
+      the real `_recording_loop` and `_stream_ffmpeg_process` against scripted
+      fakes; no FFmpeg spawned, no real timeouts waited out.
+
+- [x] **BUG FIX: force-failover latched forever (`recorder.py`)**
+      `_force_failover_flag` was set by `POST /api/recordings/{id}/failover`
+      and never cleared. Every subsequent candidate aborted on entry, so one
+      press of the dashboard failover button cascaded through all remaining
+      candidates and marked the recording `failed`. The button did the
+      opposite of its name. Now consumed once, on the candidate being left.
+
+- [x] **BUG FIX: status stuck on `failing_over` (`recorder.py`)**
+      After any failover the dashboard reported `failing_over` for the rest of
+      the recording, even while candidate 2 was recording normally.
+
+## Phase 8: Stream Outcomes & Plex Live Tuner
+
+### Three-state outcome refactor (closes the freeze + partial-write items)
+- [x] `_stream_ffmpeg_process` returned a bool, so "did bytes arrive" stood in
+      for "did the stream finish". A mid-recording stall **and** a non-zero
+      FFmpeg exit after data both read as a clean finish, and the loop stopped
+      instead of failing over — silently truncating the recording at the point
+      of failure. Now returns `StreamOutcome`:
+      `COMPLETED` (exit 0) / `FAILED` (no bytes) / `INTERRUPTED` (data, then
+      stall or crash). Only `COMPLETED` ends the recording.
+- [x] Exhausting all candidates *after* capturing footage now yields
+      `completed_partial` rather than `failed`, so post-processing still runs
+      and the capture is kept. This was the tradeoff that made the original
+      decision look like a dilemma; tracking "did we ever get bytes" dissolves it.
+
+### Plex live tuner — the integration had never worked
+- [x] **`/api/recordings/{id}/stream` did not exist.** `tuner.py` advertised it
+      in every M3U entry, so every channel Plex saw resolved to a 404. Now
+      implemented as a tailing MPEG-TS feed: reads the file as it is written,
+      drains cleanly when the recorder stops, and survives failover invisibly
+      because failover appends to the same file. `?live=true` joins at the
+      write head. Idle cap of 300s so a wedged recorder cannot pin a client
+      open forever.
+- [x] **EPG had no `<programme>` entries.** Plex will not display a channel
+      with nothing in the guide. Each channel now gets a programme spanning a
+      6-hour window from the recording start.
+- [x] **EPG was not XML-escaped.** A filename containing `&` or `<` produced
+      malformed XML that Plex rejects outright. Now escaped, and M3U attributes
+      use `quoteattr` so a quoted filename cannot break the line.
+- [x] **EPG listed stopped sessions the M3U filtered out**, leaving Plex with
+      guide entries for channels it could not tune. Both now filter to running.
+- [x] Channel titles drop the `.ts` extension.
+- [x] `started_at` exposed in the status summary to drive programme times.
+
+### Verified end to end (not just unit-tested)
+- Recorded a real 30s MPEG-TS through the full pipeline; post-processor
+  remuxed to MP4; `ffprobe` confirmed 30.02s of valid video.
+- Against a throttled source simulating a live stream: playlist advertised the
+  channel, the advertised URL was pulled for 8s exactly as Plex would, and
+  `ffprobe` confirmed the received bytes were decodable h264 + aac.
+
+## Decisions
+- **Authentication: accepted risk, will not add.** Deployment is a trusted LAN
+  behind a firewall. Documented prominently in the README instead. Revisit only
+  if this is ever exposed — note that adding Basic auth would break the Plex and
+  Emby tuner fetches unless `/live/*` is exempted or given a token parameter.
+
+## Phase 6: Route Coverage & Path Containment
+- [x] **Route integration tests** — 26 tests over every endpoint via FastAPI
+      `TestClient`. Dev-only dep (`httpx`) in `requirements-dev.txt`; the group
+      skips cleanly when absent so the core suite needs nothing extra.
+
+- [x] **BUG FIX: `/api/status` was never routed (`server.py`)**
+      `get_system_status()` was defined without an `@app.get` decorator. The
+      dashboard polls `/api/status` on a timer to refresh active sessions, so
+      the poll 404'd and the UI never updated during a recording.
+
+- [x] **SECURITY FIX: unauthenticated arbitrary file read/delete (`server.py`)**
+      `?dir_path=` was passed straight through to the library endpoints with no
+      containment, so `GET /api/library/download/passwd?dir_path=/etc` served
+      the file and `DELETE` removed it. No endpoint requires auth, so this was
+      reachable by anyone who could reach port 8999. Now constrained to
+      `recordings/` plus `PVARR_ALLOWED_DIRS`; filenames carrying a directory
+      component are rejected outright.
+
+## Phase 7: Relocation & Stability Audit
+- [x] **Relocated to `~/pvarr`** — already an independent git root (own `.git`,
+      zero files tracked by the old parent, not a submodule), so the move was a
+      plain `mv`. Remote and branch preserved. No tracked file hardcoded the old
+      path; only the venv did, and it was rebuilt.
+
+### Bugs found and fixed
+- [x] **Recordings never reached the mounted volume.** `docker-compose.yml`
+      mounts `./recordings:/recordings`, but the app wrote to `/app/recordings`
+      inside the image layer. Every containerised recording was lost on
+      recreate. `PVARR_RECORDINGS_DIR` now drives the path and the image sets
+      it to `/recordings`. Verified by running the container.
+- [x] **detect-headers never worked for shell installs.** `check_deps` accepts
+      `detect-headers.sh`, but `detect_candidate_headers` ran whatever it found
+      through `sys.executable`. Upstream ships only the `.sh`, so every
+      detection failed silently and fell through to the undetected path. Now
+      dispatches on extension; the Dockerfile installs the `.sh` too.
+      Container `check_deps` now reports all four dependencies OK.
+- [x] **Notifications blocked the event loop.** `notify_recording_started` ran
+      inline in the `async` start handler — up to three HTTP calls at
+      `timeout=5`, so a slow webhook stalled the whole server for ~15s. Now a
+      `BackgroundTasks` job.
+- [x] **`output_dir` was unconstrained** — caller-supplied, `mkdir`'d and
+      written to, i.e. arbitrary directory creation and file write. Same
+      allowlist as the library endpoints.
+- [x] **FFmpeg children were not reaped.** `_recording_loop` called
+      `terminate()` with no `wait()`, accumulating zombies across failovers.
+      Single `_reap_ffmpeg()` path now used everywhere.
+- [x] **No shutdown hook.** Uvicorn drives shutdown through the ASGI lifespan
+      and installs its own signal handlers, so `docker stop` could return with
+      FFmpeg/hls-proxy children still alive. Added a lifespan shutdown that
+      stops every active recorder.
+- [x] Container ran as **root**; now a non-root `pvarr` user (verified
+      `uid=1000` at runtime).
+- [x] **No `.dockerignore`** — `COPY . .` was baking `.git/`, `venv/` and any
+      recorded `.ts` into the image.
+- [x] Three modules each called `logging.basicConfig()` at import; first import
+      won and silently reconfigured the root logger. Centralised in
+      `app/logging_config.py`. CLI also double-printed every line.
+- [x] `start.sh` passed `--reload-dir` with no `--reload` (no-op); removed.
+- [x] Unhandled exceptions returned bare 500s; added a structured handler.
+- [x] `freeze_timeout` was unbounded; now validated 1–600.
+
+### Audited and already correct — no change needed
+- Webhook timeouts: all four `requests` calls already had `timeout=5`.
+- Post-processor already verified `returncode == 0`, destination existence and
+  non-zero size before declaring success, and checked the source before delete.
+- Direct-FFmpeg-first with proxy fallback already behaved as documented.
+- No duplicate output handles: a single `with open(..., "ab")` per attempt.
+
+### Deliberately not done
+- **Pydantic request models.** The dashboard posts `application/x-www-form-urlencoded`;
+  converting the routes to JSON body models would break the UI for no
+  correctness gain. Added field-level validation and structured errors instead.
+
+## Phase 9: Session Lifecycle
+- [x] **Recorder now tracks the post-processed file.** `get_filesize_mb()` and
+      the status summary followed the original `.ts`, which post-processing
+      deletes, so a finished recording showed `0.0 MB` and a `.ts` filename
+      next to a perfectly good `.mp4`. `_on_complete` was discarding the remux
+      result entirely; it now records `final_filepath`. Verified end to end:
+      the dashboard reports `0.67 MB` and the `.mp4` name.
+
+- [x] **`active_recorders` was write-only — an unbounded leak.** Nothing ever
+      removed a finished session, so every recording stayed resident for the
+      life of the process, each holding a 500-line log buffer and candidate
+      state, and `/api/status` returned every session ever started. Finished
+      sessions are now pruned to the newest `MAX_FINISHED_SESSIONS` (20);
+      running sessions are never pruned.
+
+- [x] **Proxy port climbed forever.** `port = 8090 + len(active_recorders) * 2`
+      was derived from the *total* session count, so it rose monotonically and
+      never reused a freed slot — eventually running past the valid port range
+      on a long-lived server. Now allocates the lowest free port among
+      *running* sessions.
+
+### Investigated and closed — not a defect
+- **Tuner stream surviving post-processing.** Previously listed as an open bug
+  on the theory that deleting the `.ts` mid-stream would cut off an in-flight
+  client. It does not: the handler holds an open file descriptor, and POSIX
+  keeps it valid after unlink, so the client reads the recording through to
+  completion. Verified empirically. The earlier entry overstated the problem.
+
+## Phase 10: Paste-and-Record Header Detection
+- [x] **Built-in stream probe (`app/probe.py`).** Finding a stream used to be a
+      manual DevTools ritual: copy the m3u8, copy the `Referer`, copy the
+      `User-Agent`, verify with `curl`, then type all of it into the form. The
+      probe does that work server-side — resolves an m3u8 (or scrapes one out
+      of a page), tries the plausible header combinations against the real
+      origin, and keeps the first that returns an actual `#EXTM3U`. Covered by
+      42 tests driving a scripted fake HTTP layer; no network in the suite.
+
+- [x] **Segment verification.** A playlist that loads is not proof of a
+      recordable stream — origins routinely serve the manifest to anyone and
+      gate the segments. The probe fetches one segment (ranged, 2KB) with the
+      same headers, so a session-gated stream shows as a red field in the
+      browser instead of a recording that dies minutes in.
+
+- [x] **Detection moved to connect time (`app/recorder.py`).** The recorder
+      probes each candidate as it connects, not once at submit. Playlist tokens
+      expire, so a failover an hour into a recording needs a fresh resolution.
+      `detect-headers` is now the *second* choice, tried only when the built-in
+      probe finds nothing — it still earns its place on pages that assemble
+      their m3u8 in JavaScript, which needs a real browser.
+
+- [x] **Cookie support end to end.** Cookies picked up during a probe are
+      carried into FFmpeg's `-headers`, and are settable by hand. Session-gated
+      streams were previously unrecordable without the proxy.
+
+- [x] **Dashboard feedback (`app/templates/index.html`).** Each URL field probes
+      on paste (debounced, newest-answer-wins) and reports what was found:
+      playlist kind, variant count, headers required. Manual `Referer` /
+      `User-Agent` / `Cookie` fields sit under each field, prefilled from the
+      probe, and are sent as per-URL overrides keyed by URL rather than slot
+      position.
+
+### Deliberately not done
+- **No SSRF allowlist on `/api/probe`.** The endpoint fetches a caller-supplied
+  URL, which is the whole point of the feature, and PVArr is an unauthenticated
+  LAN service where blocking private addresses would break legitimate local
+  IPTV sources. Response bodies are capped at 512KB and non-http(s) schemes are
+  refused, so it cannot be turned into a local file reader. Do not expose PVArr
+  to the internet.
+
+## Phase 11: Force-Failover & Completion Ordering
+
+- [x] **BUG FIX: force-failover killed single-URL recordings (`recorder.py`,
+      `server.py`).** The state machine was correct; the guard was missing.
+      With no backup configured, the request advanced past the last candidate,
+      which ends the recording -- so the button stopped a live capture and the
+      API still answered `200 success`. `has_next_candidate` now gates it:
+      `force_failover()` refuses and returns `False`, and the endpoint answers
+      `400` naming the reason. Reproduced live against the real subprocess
+      path before the fix (recording died at t=5s), and after (recording
+      continued past t=11s).
+
+- [x] **BUG FIX: dashboard showed "Stream 2 of 1" (`recorder.py`).**
+      `current_candidate` was `index + 1`, and the index legitimately runs one
+      past the end once candidates are exhausted. Clamped in the status summary.
+
+- [x] **BUG FIX: the failover button looked dead even when it worked
+      (`recorder.py`, `index.html`).** Three causes, all fixed:
+      the loop only set `failing_over` after the current attempt unwound and
+      held it ~1s against a 3s poll, so the state was never observed --
+      `force_failover()` now sets it on the spot; the dashboard's single
+      post-POST refresh fired before the recorder thread had reacted, so it
+      repainted the *old* candidate -- it now re-polls at 0.5/1.5/3s; and a
+      non-2xx reply was discarded silently, so the new refusal would have been
+      invisible -- it is now surfaced. The button also greys out with a tooltip
+      when no backup is configured.
+
+- [x] **BUG FIX: Plex/Emby were told to scan before the remux existed
+      (`server.py`).** `_on_complete` fired `notify_recording_finished` --
+      which triggers the library refresh -- and remuxed afterwards. The media
+      server therefore scanned while only the `.ts` was on disk, indexed a file
+      the remux was about to delete, and did not see the finished `.mp4` until
+      its next scheduled scan. The webhook also quoted the `.ts` name and its
+      pre-remux size. Order reversed; the notification now reports the final
+      file. Costs nothing: this already ran on the recorder thread, not the
+      event loop. Verified end to end with a real 3s TS -- at scan time the
+      `.ts` is gone, the `.mp4` is present and `ffprobe`-valid, and the
+      announcement names the `.mp4`.
+
+- [x] **Regression coverage.** 10 tests (195 -> 205). Nine fail against the
+      pre-fix tree and pass after; the tenth guards behaviour that was already
+      correct. The existing failover tests replaced `_stream_ffmpeg_process`
+      with a scripted fake, so none of this was reachable by them.
+
+## Phase 12: Capture-Loop Reliability  (sponsor-approved)
+
+- [x] **BUG FIX: freeze detection could not fire (`recorder.py`).**
+      `_stream_ffmpeg_process` read the FFmpeg pipe with `stdout.read(32768)`,
+      which parks the loop in the kernel until a full 32KB has arrived. A
+      source that stalled mid-buffer was therefore never noticed: the freeze
+      timeout below the read was unreachable. Measured before the fix --
+      `freeze_timeout_sec=5`, a child that wrote 1KB then hung, and the
+      recorder sat on the dead source for the full 20s of the test without
+      failing over. Now `select()` bounds the wait and `os.read` takes whatever
+      has actually arrived. After the fix the same scenario failed over at
+      ~12s (direct attempt, proxy retry, then the next candidate).
+
+- [x] **BUG FIX: every recording longer than ~8 minutes wedged
+      (`recorder.py`).** FFmpeg was spawned with `stderr=subprocess.PIPE` and
+      that pipe was never read. FFmpeg writes a progress line to stderr, the
+      pipe holds 64KB, and once it filled FFmpeg blocked writing to stderr and
+      stopped producing video entirely. Not a stream fault, and no failover
+      logic could have recovered from it.
+
+      **Measurement, corrected.** The first estimate here (~124 B/s, "under ten
+      minutes") came from the wrong configuration -- `-c:v libx264` with stderr
+      redirected to a file, rather than the recorder's `-c copy` with stderr on
+      a pipe. Re-measured properly over 60s each:
+
+      | configuration | stderr rate | 64KB pipe fills in |
+      | --- | --- | --- |
+      | libx264, to file (the flawed original) | 68.6 B/s | 15.9 min |
+      | libx264, to pipe | 68.6 B/s | 15.9 min |
+      | `-c copy`, unthrottled | 51.5 B/s | 21.2 min |
+      | **`-c copy`, realtime (`-re`) -- the real case** | **184.1 B/s** | **5.9 min** |
+
+      File versus pipe makes no difference; realtime versus unthrottled makes a
+      large one, because the progress line is emitted on a wall-clock timer.
+
+      **Confirmed end to end, not extrapolated.** The pre-fix tree (`be14933`)
+      was checked out into a worktree and run against a realtime `-c copy`
+      source: video stopped at **t=465s (7m45s)** and never resumed. The same
+      test against the fixed tree ran past that point without a stall.
+
+      Fixed twice over, deliberately: `-nostats -loglevel error -hide_banner`
+      cuts the source of the spam (measured 3717 bytes -> **0 bytes** over 30s),
+      and a small daemon thread drains stderr continuously so the pipe cannot
+      fill even if a stream does produce real errors.
+
+      This one was masked by the freeze bug. Fixing freeze detection alone
+      would have turned a silent hang into a failover cascade -- the same
+      deadlock recurring on every candidate in turn.
+
+- [x] **FFmpeg's own errors are now surfaced.** The stderr drain keeps the last
+      15 lines in a bounded buffer. On a failed or interrupted attempt the tail
+      is logged and stored in `candidate.last_error`, so a `403`, a `404` or a
+      codec complaint reaches the dashboard instead of vanishing into an
+      unread pipe. Nothing is attached to a clean completion.
+
+- [x] **Byte counter now moves smoothly.** `bytes_written` advanced only in
+      32KB steps, so the dashboard showed `0.00 MB` for the first several
+      seconds of a low-bitrate stream.
+
+### Cost of the change
+One `select()` wakeup per 0.5s while a stream is idle, and one extra syscall
+per read while it is flowing -- roughly 20/sec on a 5 Mbps stream, which is
+noise. One daemon thread per recording attempt, blocked on a pipe read. No
+additional disk writes. `select()` on pipes is POSIX; PVArr is Linux/Docker.
+
+### Verified end to end
+- Real FFmpeg through the real recorder for 60s: continuous monotonic growth to
+  19.34 MB, no stalls, stderr thread exits cleanly on stop.
+- 211 tests pass (was 195 at the start of Phase 11).
+
+## Phase 15: Library Knew Only About `.ts`
+
+Reported by the sponsor as "delete media errors -- seems it's looking for .ts
+not .mp4". The delete failure was the visible edge of a larger problem.
+
+- [x] **BUG FIX: finished recordings were invisible in the library
+      (`naming.py`).** `list_recordings()` was `glob("*.ts")`. Post-processing
+      remuxes to `.mp4` and deletes the `.ts`, so a recording disappeared from
+      the library at the exact moment it succeeded -- the library could only
+      ever show captures that were still running or had failed to remux.
+      Now lists `.ts`, `.mp4` and `.mkv`, and ignores directories.
+
+- [x] **BUG FIX: the reported delete error.** Stopping a recording refreshed the
+      library after 1.5s -- before a real remux finishes -- so the list showed
+      the `.ts` that was about to be deleted. Clicking delete on that stale
+      entry `404`'d. The dashboard now re-checks at 1.5s, 5s, 15s and 30s while
+      post-processing runs, and the listing shows the remuxed file once it
+      lands.
+
+- [x] **BUG FIX: rename forced `.ts` onto everything (`naming.py`).**
+      `if not new_filename.endswith(".ts"): new_filename += ".ts"` turned
+      `highlights.mp4` into `highlights.mp4.ts` -- a name that lies about the
+      contents, and one Plex would mis-handle. A new name now inherits the
+      file's existing container when it has no recognised extension of its own.
+
+- [x] **BUG FIX: downloads always claimed MPEG-TS (`server.py`).** The
+      `media_type` was hardcoded `video/MP2T`, so a remuxed `.mp4` downloaded
+      with a Content-Type contradicting its contents. Now derived from the
+      extension via `naming.media_type_for()`.
+
+### Verified end to end
+Real 2s TS, real FFmpeg remux: library went from `[]` after remux (pre-fix) to
+`['NFL_Bears_vs_Packers.mp4']`; download returned `video/mp4`; rename to
+`Highlights` produced `Highlights.mp4` rather than `Highlights.mp4.ts`; delete
+returned 200 where it previously 404'd. 234 tests, up from 225.
+
+## Phase 14: Cycling Failover & Manual Stream Selection
+
+- [x] **BUG FIX: the candidate list was a one-way walk (`recorder.py`).**
+      `current_candidate_index` was only ever `+= 1`; nothing reset or
+      decremented it, and the loop exited once it passed the end. So there was
+      no route back to candidate 1 after it recovered, and a blip that touched
+      all three sources ended the recording outright -- even twenty minutes
+      into a three-hour capture with every source healthy again a minute later.
+      An expiring token, which is the most common failure here and resolves
+      itself in minutes, was enough to trigger it. The index now wraps.
+      Automatic and forced failover always shared this path, so both were
+      affected identically.
+
+- [x] **Bounded cycling.** Gives up after `max_cycles` (default 3) complete laps
+      that produced no data. Any bytes at all reset the counter, so a long
+      capture that fails over occasionally can never exhaust its budget. Backoff
+      between fruitless laps escalates 5s / 10s / 20s, capped at 60s, so a set
+      of genuinely dead origins is not hammered in a tight loop; within a lap
+      the original 1s pause is unchanged.
+
+- [x] **Manual switch to a specific candidate.** `POST /api/recordings/{id}/switch`
+      (`candidate=1..3`, 1-based) and clickable candidate badges in the
+      dashboard. Automatic failover deliberately only moves forwards -- see the
+      decision below -- so this is the only way back to the primary.
+
+- [x] **`has_next_candidate` re-derived.** It meant "not yet at the end of the
+      list", which was only right while the walk was one-way. It now means
+      "more than one candidate", since the last one cycles round to the first.
+      The refusal shipped in 0.1.2 therefore narrows to genuinely single-URL
+      sessions -- where forcing a failover would still end the recording -- and
+      that protection is unchanged.
+
+### Decision: no automatic return to the primary
+Considered and rejected: periodically health-checking candidate 1 and switching
+back to it while a backup is working fine. It means abandoning a *working*
+stream for one that might work, and every switch puts a discontinuity in the
+file. For a DVR that trades real footage for possible quality. The
+primary/backup order is about what to try first, not a ranking to keep
+restoring. Returning to an earlier candidate is a manual action instead.
+
+### Verified
+- Real subprocesses, three candidates, candidate 1 dead for the whole of lap 1:
+  the recorder went 1 -> 2 -> 3 -> "Cycling back to Candidate 1 (lap 1 of 3)"
+  and recorded. Pre-fix this path ended the recording.
+- 225 tests (was 211). Three existing tests were rewritten rather than patched,
+  because this change deliberately inverts their premise.
+
+## Agent-team review of Phase 13 (2026-08-30)
+
+Architect / Security / DevOps reviews of the persistence design, run before any
+of it was written. Every claim below was re-verified independently.
+
+### Blocking, and NOT caused by this work -- all fixed, 2026-08-31
+These were live bugs found while reviewing the persistence design, not defects
+introduced by it. All six are closed and verified; the notes are kept because
+each one explains a constraint the next change has to respect.
+- [x] **A fresh install cannot record at all.** `config/`, `recordings/` and
+      `logs/` are untracked in git, so a clean clone has none of them. Compose
+      bind-mounts all three, dockerd creates the missing host directories as
+      **root:root**, and the container runs as uid 1000 -- so `naming.py`'s
+      `record_dir.mkdir()` raises PermissionError on the first recording. The
+      image-time `chown` cannot help: a bind mount grafts the host inode over
+      the image's, and permission checks run against the host. Reproduced
+      against the published image. This is why `config/` is root-owned here.
+      **Fixed** in `docker-entrypoint.sh`: the container now starts as root,
+      aligns the `pvarr` user to `PUID`/`PGID`, chowns the three mount roots
+      non-recursively (a recursive walk of a multi-TB library on every boot is
+      not acceptable), then `exec gosu`s to the unprivileged user. No root
+      process survives into the app. If it is already non-root it cannot fix
+      anything, so it checks writability and exits 1 with the exact `chown`
+      command instead of dying mid-recording.
+      **Verified** against a locally built image with all three mounts
+      deliberately `root:root`: entrypoint reported "Fixing ownership", the app
+      ran as uid 1000, wrote to all three, and the files landed as `1000:1000`
+      on the host. Repeated with `PUID=1500` -- `usermod` path taken, files
+      landed `1500:1500`. CI now builds the image and asserts both on every
+      push.
+- [x] **Remux and notification are skipped on every container stop.**
+      `cleanup.py` registers a SIGTERM handler at import (`server.py` module
+      scope), which overwrites uvicorn's and calls `sys.exit(0)`. The recorder
+      thread is a daemon and `stop()` never joins it, so the completion block --
+      remux, `final_filepath`, notify -- dies mid-flight. The lifespan shutdown
+      hook therefore never runs either. **Demonstrated:** recorded 147 KB, sent
+      SIGTERM, `.ts` left un-remuxed with no notification.
+      **Fixed** in `app/cleanup.py`, rewritten: the handler no longer calls
+      `sys.exit(0)`. It stops every recorder first (so remuxes run
+      concurrently), then waits on them against one shared deadline via the new
+      `StreamFailoverRecorder.wait_until_finished()`, then chains to whatever
+      handler it displaced -- uvicorn's -- so the normal shutdown still happens.
+      `PVARR_SHUTDOWN_TIMEOUT` (default 20s) bounds the wait; compose sets
+      `stop_grace_period: 30s` so Docker does not SIGKILL first.
+      **Verified** by re-running the script that demonstrated the bug: it went
+      from `REMUX RAN: no` to `REMUX RAN: yes` with the marker file present.
+- [x] **`/api/status` served live session cookies** in plaintext to anything on
+      the LAN. `CandidateStream.to_dict()` included `cookie`. Verified with a
+      real request. Consistent with "unauthenticated by design", but it meant a
+      cookie was not a secret PVArr kept.
+      **Decided: redact.** "Unauthenticated by design" is a statement about
+      *PVArr's* data -- your recordings, your session list. It is not a licence
+      to hand out a credential for the sponsor's paid subscription to anything
+      that can open a socket. The two are not the same risk and should not
+      share a policy.
+      **Fixed:** `to_dict()` now reports `has_cookie: bool` and takes
+      `include_secrets=False`; the value is returned only to callers that opt
+      in -- the FFmpeg command builder, and session persistence when it lands.
+      The dashboard never read the field (it fills its cookie box from the
+      caller's own `/api/probe` response), so nothing in the UI changed.
+      Four regression tests assert the token cannot appear anywhere in a
+      serialised status payload.
+- [x] **`config/` was not gitignored.** Once state lands there, `git add -A`
+      would commit live cookies to a public repo. Fixed immediately.
+- [x] **CRLF injection into FFmpeg `-headers` and into hls-proxy's
+      channels.conf.** Values were concatenated unchecked; `probe.py` accepts a
+      `referer=` from a third-party m3u8 query string and percent-decodes it, so
+      a hostile page can supply a real CRLF. Persistence would have made a
+      poisoned header permanent and replayed it every boot. Fixed: rejected
+      (not stripped) at both sinks.
+- [x] **No URL length cap on `/api/recordings/start`**, though `/api/probe` has
+      one. Fixed.
+
+### Design conclusions that changed the plan
+- **Persistence belongs in a new `app/sessions.py`**, not in the recorder and
+  not in `server.py`. The recorder stays a pure engine and gains one more
+  injected callback alongside the existing log/completion/failover ones.
+- **The gap must be measured from the `.ts` mtime, not the last transition.**
+  Under transitions-only writing, a healthy three-hour recording's last
+  transition is at t=0, so a naive gap check would finalise exactly the long
+  recordings the feature exists to save.
+- **`stop()` conflates "operator stopped" with "process going away"** and
+  unconditionally sets `completed`. Persisting that means nothing ever resumes.
+  It has to be split before resume can work at all.
+- **Nothing may be written at shutdown**, because shutdown does not reliably
+  run (see above). Whatever is on disk at an arbitrary instant must suffice.
+- **Do not persist probe-derived headers or the resolved m3u8** except as
+  diagnostics -- tokens expire, and storing them invites a future "skip the
+  probe on resume" optimisation that reconnects with a dead token.
+- **Re-validate `output_filepath` against the allowlist on read-back.** The
+  likeliest trigger is not an attacker but allowlist drift: a stale file naming
+  a directory the sponsor has since removed from `PVARR_ALLOWED_DIRS`.
+- Rejected: one combined `sessions.json`; reusing `get_status_summary()` as the
+  on-disk format; any "last seen alive" heartbeat field.
+
+### Operational
+- **Watchtower on this host recreates PVArr unattended at 04:00 daily** --
+  `MONITOR_ONLY=false`, `CLEANUP=true`, no label filter, 10s grace. That is the
+  exact scenario resume is for, happening on a schedule, mid-recording. Pin
+  `PVARR_TAG` or add `com.centurylinklabs.watchtower.enable=false`.
+- Container logs are unrotated; a resume crash-loop would fill the disk.
+- `./logs:/app/logs` is a dead mount -- logging goes to stdout only.
+- Cost of the write pattern: ~1-2 KB per transition, under 30 MB even for a
+  pathological six-hour flapping session. Three to four orders of magnitude
+  below the video it describes. Negligible, conditional on no timer writes.
+
+## Phase 13: Session Durability & Bounded Recordings  (ACCEPTED, not started)
+
+Agreed with the sponsor 2026-08-30. Build in this order -- each step needs the
+one before it.
+
+- [COMPLETED] **1. Disk-space guard (`recorder.py`, `server.py`).** Mandated by the project
+      directives and never implemented; the unused `import shutil` in
+      `recorder.py` is where it was meant to go. Without it, pointing PVArr at a
+      24/7 channel fills the disk until the host breaks -- and the recordings
+      volume is usually the same filesystem as everything else. Every active
+      recorder checks free space and aborts cleanly below a configured floor.
+      Smallest of these items and the only one that prevents damage, so it went
+      first.
+
+      Checked on the write path, rate-limited to one `statvfs` every 15s.
+      A breach ends the recording rather than failing over -- the problem is
+      local, so another candidate cannot help -- and the footage captured so
+      far is kept and post-processed exactly as an operator stop would be.
+      Status `aborted_no_space` survives the completion block so the reason is
+      not hidden behind "completed". `PVARR_MIN_FREE_GB` (default 5) sets the
+      floor; `0` disables it. `POST /api/recordings/start` refuses with `507`
+      when the volume is already below the floor, rather than starting a
+      capture the guard would abort seconds later.
+
+      **Found on the first run:** the dev box was at 100% -- 152 MB free of
+      225 GB -- so the guard fired immediately and took several unrelated tests
+      down with it. Two real defects came out of that: the test suite depended
+      on the host's free space (fixed -- fixtures disable the guard, and the
+      guard's own tests stub `free_bytes`), and `server._min_free_gb()` read
+      its default off `StreamFailoverRecorder`, which tests routinely replace
+      with a `MagicMock` (fixed -- `DEFAULT_MIN_FREE_GB` is now a module-level
+      constant imported by name).
+
+      Verified live: real recorder, real subprocess, real writes, with only the
+      free-space reading stubbed. Dropped the volume below the floor mid-capture
+      -- stopped in 3.5s, kept 3.81 MB, did not fail over, logged the reason.
+
+- [COMPLETED] **2. Session state persisted to `/config`.** All session state lives
+      in the in-memory `active_recorders` dict, so a `docker restart` or
+      `docker compose up -d` destroys every in-flight recording: the FFmpeg
+      child dies, the `.ts` survives on the volume but is orphaned -- no remux,
+      no notification, no library entry, and the Plex channel vanishes.
+      One small JSON per session (URLs, detected headers, output path, timings,
+      active candidate), written **on state transitions only** -- not on a timer
+      -- so ongoing disk writes stay near zero. Progress is recovered by
+      `stat()`ing the `.ts` at resume, not by persisting counters.
+
+      *Note:* `./config:/config` is already mounted and the Dockerfile creates
+      it, but **nothing writes there yet**, and the host `config/` is owned by
+      root while the container runs as uid 1000 -- so the first write will fail
+      with permission denied until it is chowned. Fix and document with this.
+
+- [COMPLETED] **3. Resume on restart/recreate.** On boot, read the session files
+      and reconnect, appending to the same `.ts` (which is how failover already
+      works). Bounded by a maximum gap -- past it, finalise instead of
+      reconnecting -- and by a resume-attempt counter, so a recording that dies
+      immediately cannot loop against `restart: unless-stopped`. Token expiry is
+      already handled: the recorder re-probes each candidate at connect time.
+
+- [COMPLETED] **4. Recording windows and duration caps.** A recording may carry an
+      end time or a maximum duration; at the deadline it stops cleanly and
+      post-processes normally. This is what makes resume *exact* -- `now < end`
+      means reconnect, `now >= end` means finalise -- reducing the gap heuristic
+      above to a fallback for recordings with no window.
+      - **Sponsor decision:** when a window is set and every candidate fails
+        before it closes, keep retrying until the window ends. The cycling and
+        backoff this needs landed in Phase 14; what remains is lifting the
+        `max_cycles` cap while a window is still open.
+      - **Sponsor decision:** global backstop `PVARR_MAX_HOURS`, default **6**.
+        4 was proposed and revised to 6 on the observation that 4h truncates NFL
+        overtime and extra-innings baseball -- the most likely things being
+        recorded. Per-recording limits override the backstop.
+      - Timezone: the dashboard sends absolute timestamps and renders them back
+        in local time, so the container's TZ (UTC, unset in compose) never
+        matters. This holds only for one-shot windows.
+
+### Declined
+- **Deferred start / scheduled recordings ("start at 1400").** Sponsor declined
+  2026-08-30. It needs a pending-job store, a scheduler, and pending-job UI, and
+  `cron` + `curl` against the existing API covers it at zero cost. Recurring
+  schedules would additionally need real timezone and DST handling.
+  **Reversed 2026-10-08:** the sponsor asked for a simple one-shot schedule
+  that checks an aggregator page at the start time -- something cron + curl
+  cannot do, because the stream links do not exist yet when the job is set
+  up. Built as Phase 27 (below). Recurring schedules remain declined.
+
+## Still open
+
+### Longer-term candidates
+- A retention/cleanup policy for old recordings on disk.
+- Integration coverage for the notification webhooks (currently mocks only).
+- A headless-browser probe path so JavaScript-built m3u8 URLs work without the
+  external `detect-headers`.
+
+---
+
+## Phase 16 — The guide says what is happening (2026-08-31)
+
+humantodo line 2: "update the media guide for Plex so that it shows the name of
+the file/stream as well."
+
+- [x] **Programme descriptions were useless.** Every entry read `PVArr live
+      recording <uuid>`. The uuid is not something the sponsor can act on, and
+      the one question you actually have mid-event -- *which feed am I watching
+      right now?* -- had no answer anywhere in Plex.
+      Now: `<title>` is the recording name, `<sub-title>` is the live source
+      (`Primary`, `Backup 1`), `<desc>` carries the filename being written, the
+      failover position (`2 of 3, failover armed`) and the start time.
+- [x] **Channel titles only stripped `.ts`.** `current_filepath` follows the
+      remux, so a session whose post-processing had finished was advertised as
+      `Bears vs Packers.mp4`. Now strips any container in
+      `RECORDING_EXTENSIONS`.
+
+### Decision: no live counters in the guide
+Considered and rejected: putting elapsed time and megabytes-written into the
+programme description. Plex caches XMLTV and refetches on its own schedule, so
+a counter baked in there is wrong within seconds of being fetched. A number
+that is visibly stale reads as a bug. The description carries only facts that
+hold for the life of the recording; live figures stay on the dashboard, which
+polls. A test asserts no counter leaks back in.
+
+### Notes for the rebroadcast work (line 3)
+`_channel_title`, `_source_name` and `_programme_description` all take a plain
+session dict and never touch a recorder object. A rebroadcast-only channel that
+presents the same keys will get a correct guide entry for free -- but
+`output_filename` will be meaningless for one, since nothing is being written.
+That is the first thing the rebroadcast design has to answer.
+
+## Agent-team review of rebroadcast mode (2026-08-31)
+
+Architect / Security / DevOps, briefed on humantodo line 3 ("an option to not
+record and just rebroadcast"). The reviews surfaced six live bugs that have
+nothing to do with rebroadcast; those were fixed first and are recorded here.
+The feature itself is NOT built -- the design decision is still with the
+sponsor.
+
+### Live bugs found and fixed
+- [x] **Proxy port blocks overlapped.** `_allocate_proxy_port` stepped by 2,
+      but `start_proxy` binds `base_port + candidate_index` and a session holds
+      up to three candidates -- so session A's third candidate bound the port
+      already handed to session B, and B's proxy failed to start. Found
+      independently by Architect and Security. Fixed: a shared
+      `PROXY_PORT_STRIDE = 4`, and the index is taken modulo the stride so a
+      session can never escape its own block.
+- [x] **The live log view froze after 500 lines.** `log_history` is trimmed,
+      but the SSE endpoint tracked a plain index into it, so once trimming
+      began `len(history) > last_sent_idx` was never true again. Silent: no
+      error, the pane just stopped. Fixed with a monotonic sequence number and
+      `logs_since()`; a reader further behind than the buffer is deep gets what
+      is still held rather than nothing.
+- [x] **hls-proxy's pipes were never drained.** Spawned with `stdout=PIPE,
+      stderr=PIPE` and nothing reading either. Exactly the defect that stopped
+      FFmpeg dead at ~7 minutes, in the module next door. stdout is now
+      discarded, stderr drained to a bounded tail, and a proxy that exits
+      immediately now says why instead of failing silently.
+- [x] **`stop_proxy` left zombies.** `kill()` with no `wait()`, one per
+      failover. `_reap_ffmpeg` documents this exact defect and does it right;
+      the proxy path was simply missed.
+- [x] **Failover backoff was not interruptible.** `time.sleep(delay)` with
+      delay up to 60s, against a 20s shutdown budget and a 30s
+      `stop_grace_period` -- a stop landing in a backoff was SIGKILLed, losing
+      the remux that the shutdown fix exists to protect. Now
+      `_stop_event.wait(delay)`.
+      Note: the test fixture had patched `time.sleep` to stay fast. That patch
+      silently stopped working, and the suite went from 1s to 120s. The fixture
+      now zeroes `_failover_delay` instead, and a test asserts a stop during a
+      30s backoff returns in under 5s.
+- [x] **No URL scheme validation, no FFmpeg protocol whitelist.** Verified by
+      Security against ffmpeg 6.1.1: `file://`, `concat:` and `tcp://` were all
+      reachable from `/api/recordings/start`, and captured bytes are readable
+      back through the stream and download endpoints. Bounded in practice --
+      ffmpeg's mpegts demuxer drops non-media content, and `file:` segments
+      under an http parent are already blocked by ffmpeg's own default
+      whitelist -- but it is a cheap fix. Now rejected at the API boundary and
+      pinned with `-protocol_whitelist http,https,tcp,tls,crypto,data`.
+- [x] **Proxy `channels.conf` held a tokenised URL and was never deleted.**
+      Written under `recordings/.proxy_conf/`, which is on the mounted volume.
+      Now removed in `stop_proxy`.
+      **Action for the sponsor:** one pre-existing file is still on disk at
+      `recordings/.proxy_conf/channels_893cc63a.conf`. It is gitignored and was
+      never committed, but it holds a real stream URL. Delete it when
+      convenient -- not doing so myself, per the escalation rule on config
+      files.
+
+### Still open, deliberately not fixed
+- [ ] **No cap on concurrent sessions or on readers per session.** Every tail
+      reader goes through `asyncio.to_thread` onto the default executor
+      (`min(32, cpu+4)` workers), so ~32 active readers starve `/api/probe` and
+      the shutdown hook. Not urgent for a single-sponsor LAN install, and the
+      right fix depends on the rebroadcast decision below.
+- [x] **URL tokens still reach the logs.** Fixed 2026-08-31 -- see the
+      redaction pass below.
+- [x] **Notifications ship the full primary URL** to Discord/Telegram. Fixed
+      2026-08-31; it was a parameter mismatch, not a formatting choice.
+- [ ] **`_failover_delay` and `max_cycles=3` are recording semantics.** A
+      permanent channel should retry forever, not give up after three laps.
+- [ ] **The healthcheck cannot see a wedged session.** Both the Dockerfile and
+      compose healthchecks hit `/api/status`, which returns 200 for a session
+      whose `bytes_written` has been frozen for an hour.
+- [ ] **hls-proxy's bind address is unverified.** It is cloned at build time,
+      not vendored. If it binds 0.0.0.0 it is a second unauthenticated relay on
+      8090+. Check before rebroadcast ships.
+
+### The rebroadcast design decision -- SPONSOR INPUT NEEDED
+Architect and DevOps agree on the shape: keep `StreamFailoverRecorder` and swap
+its *sink*. The failover machinery never touches the file -- only three lines
+inside `_stream_ffmpeg_process` do -- so a sink abstraction reuses 100% of the
+cycling, backoff and freeze detection and duplicates none of it. Rejected: a
+separate recorder class (duplicates ~200 lines of the loop this project has
+spent its whole history debugging).
+
+They disagree on the buffer, and this is the real decision:
+- **Architect** wants an in-memory hub: a bounded per-subscriber queue, evict a
+  slow client rather than drop chunks from the middle of its stream (which
+  hands Plex a corrupt transport stream).
+- **DevOps** says in-memory is the wrong call on this host class and gives the
+  number: at 10 Mbps a stalled client accumulates 75 MB/min, and with no
+  `mem_limit` in `docker-compose.yml` the OOM killer takes uvicorn -- PID 1 --
+  killing every concurrent *recording* too. On a 4 GB NAS that is ~27 minutes
+  from one wedged Plex client to losing the game you were recording.
+
+Lead Engineer's call, for the sponsor to confirm: **DevOps wins on the buffer.**
+The same 75 MB as a capped ring file on disk is page cache, which the kernel
+reclaims under pressure instead of OOM-killing, and is served from RAM anyway.
+It also keeps the existing tail-the-file fan-out, which already works. Architect
+was right that a rotating file breaks a reader holding an fd across truncation
+-- so it needs a fixed-size ring written in place, not log-style rotation.
+
+Two more constraints, from Architect, that any implementation must respect:
+- Chunks are 65536 bytes, which is not a multiple of 188, so chunk boundaries
+  are not TS-packet-aligned. A late joiner must start on a 188-byte boundary or
+  it gets a partial packet before its first PAT/PMT.
+- Each failover spawns a fresh FFmpeg with its own timeline, so there is a PTS
+  discontinuity at every switch. Invisible in a DVR file; it is exactly where a
+  live client drops. Untested -- must be tried on the test server before promising 24/7.
+
+### Sponsor decisions on rebroadcast (2026-08-31)
+- **On-disk ring buffer confirmed.** In-memory fan-out rejected; the OOM risk
+  to concurrent recordings decided it.
+- **Persistence lands first.** Rebroadcast is blocked on Phase 13 items 2 and
+  3, because a permanent channel that vanishes on restart is not permanent.
+- **PVArr does not promise 24/7 recording.** So the PTS discontinuity at each
+  failover is low priority *as a live-streaming concern*. It stays open only
+  to the extent that it affects the recorded file -- see below.
+- [x] **Checked: the failover discontinuity does NOT affect the finished file.**
+      Each failover spawns a fresh FFmpeg with its own timeline and appends to
+      the same .ts. The live-client drop is now explicitly out of scope, but
+      the same discontinuity sits in the middle of every multi-candidate
+      recording, where it could plausibly affect the remux to .mp4, seeking and
+      scrubbing in Plex, or the reported duration. That is an existing-recording
+      concern, not a rebroadcast one, so it is worth an hour to establish
+      empirically. Test locally, do not speculate.
+
+#### Measured, 2026-08-31 (two 10s clips, separate FFmpeg runs, concatenated
+#### as .ts then remuxed exactly as post_processor does)
+- The raw `.ts` reports **10.02s for 20s of content**. ffprobe reads the
+  container timeline, and the second FFmpeg restarts at zero, so everything
+  after the failover is invisible to a duration probe.
+- The remuxed `.mp4` reports **20.03s**, and seeking to 15s -- inside the
+  second half -- works. FFmpeg re-times the discontinuity on the way through.
+- `_on_complete` always remuxes to mp4 and deletes the source, so **the file a
+  user actually keeps is correct**. The sponsor's call to deprioritise stands.
+- Residual, low: if the remux ever *fails*, the kept `.ts` underreports its
+  duration and Plex will show the wrong length. Worth a guard eventually --
+  not worth work now.
+
+## Phase 13 items 2 & 3 -- session persistence and resume (2026-08-31)
+
+Built after the sponsor confirmed persistence lands before rebroadcast.
+
+New module `app/sessions.py`. The recorder was NOT touched beyond a stop
+reason: it stays a pure capture engine, and `server.py` owns the store and
+calls it at transitions. Persistence that reaches into the capture loop is
+persistence that stalls the capture loop.
+
+- One JSON per session under `<config>/sessions/`, written **on state
+  transitions only** -- start, failover, finish. A clean three-hour recording
+  writes twice. Ongoing disk writes are zero.
+- **No progress counters are persisted.** Bytes and elapsed time are recovered
+  by `stat()`ing the `.ts` at resume. A counter in a file disagrees with reality
+  the moment the process dies, which is exactly when it is read.
+- Written 0600 in a 0700 directory. The files hold stream URLs and the session
+  `Cookie` -- a resume against a gated stream cannot work without them.
+- Atomic write via `mkstemp` + `os.replace`. The likeliest moment to be
+  interrupted is a shutdown, which is exactly when this file is being written.
+- Store failure never propagates. On an unwritable directory it disables
+  itself, warns once, and every call becomes a no-op -- a running recording
+  must not die because its state file cannot be written.
+
+### `stop()` now takes a reason, and this was the crux
+It previously set `status = "completed"` unconditionally. Persisting that meant
+a restart read "completed" and nothing ever resumed. An **operator** stop
+finishes the recording: remux, notify, forget the session. A **shutdown** stop
+means the process is going away with the recording still wanted: keep the
+`.ts`, keep the record, decide at boot.
+
+That reverses part of the v0.1.4 fix on purpose. v0.1.4 made a container stop
+remux before exiting; remuxing now would delete the file the resume needs. The
+remux still runs on shutdown **if persistence is unavailable**, since then there
+is nothing to resume from -- better a finished file than an orphaned one.
+
+### Three fates at boot, decided by `resume_decision()`
+Kept a pure function so the policy is testable without a filesystem, a recorder
+or a server.
+- **resume** -- file exists, has content, was written recently, attempt budget
+  intact. Reattach and keep appending.
+- **finalise** -- footage worth keeping but too cold to reconnect (past
+  `PVARR_MAX_RESUME_GAP`, default 300s) or `PVARR_MAX_RESUME_ATTEMPTS`
+  exhausted. Remux and notify. A session that dies, resumes and dies again is
+  reproducibly broken, not unlucky.
+- **discard** -- nothing on disk to keep.
+
+**The gap is measured from the `.ts` mtime, not the last transition.** Under
+transitions-only writing a healthy three-hour recording's last transition is at
+t=0, so a gap measured from that would finalise exactly the long recordings the
+feature exists to save. There is a test for this specific trap.
+
+### Verified end to end
+Real recorder, real subprocess, real bytes. Captured 327,680 bytes; ran
+`stop_all()` exactly as `docker stop` does; confirmed **no remux ran** and the
+state file survived; cleared all in-process state; called `resume_sessions()`.
+The **same file** grew to 655,360 bytes. One file on disk, not two.
+
+290 tests (was 271).
+
+### Found while building
+`config/` on the dev box is root-owned, so the store disabled itself on first
+run -- the exact failure the Phase 13 note predicted. It degraded correctly
+rather than taking the app down. In the container the entrypoint already chowns
+`/config`, so this only bites outside Docker; both cases are now in the README
+troubleshooting section. `PVARR_CONFIG_DIR=/config` is now set in the Dockerfile
+and compose file.
+
+### Not done, deliberately
+Item 4 (recording windows, `PVARR_MAX_HOURS=6`) is still pending. Rebroadcast is
+now unblocked.
+
+## Phase 16b -- Rebroadcast without recording (2026-08-31)
+
+humantodo line 3, built after the sponsor confirmed the on-disk buffer and
+after persistence landed.
+
+### What was built
+`app/ringbuffer.py` -- a fixed-size file written in a circle, with many
+independent readers. `StreamFailoverRecorder` gained a *sink*: bytes go either
+to a growing file (recording) or to a ring (rebroadcast). The capture loop, the
+cycling failover, the backoff and the freeze detection are untouched and shared
+between both modes, which was the whole point of the sink approach -- there is
+no second copy of the loop this project has spent its history debugging.
+
+### Why a file and not memory
+Settled by DevOps' number and confirmed by the sponsor. At 10 Mbps a client
+that connects and stops reading accumulates ~75 MB/min; there is no `mem_limit`
+in `docker-compose.yml`, so the OOM killer takes uvicorn (PID 1) and every
+concurrent *recording* dies with it -- about 27 minutes from one wedged Plex
+client to losing the game. The same 75 MB as a file is page cache: reclaimed
+under pressure, and served from RAM anyway.
+
+### Why written in place, not rotated
+Architect's objection, and it holds. Log-style rotation truncates or renames
+the file out from under a reader holding an open fd, which hands it zero-fill
+in the middle of a transport stream. A fixed file written in a circle never
+changes size, so a reader's descriptor stays valid for the life of the channel.
+
+### Packet alignment
+MPEG-TS is 188-byte packets and a decoder starting mid-packet produces garbage
+until it resynchronises. Capacity is forced to a whole number of packets and
+positions derive from a monotonic absolute offset, so `offset % 188` survives
+every wrap. A lapped reader is skipped forward to the oldest data still held,
+rounded UP to a packet boundary -- rounding down would point at bytes already
+overwritten. There is a test asserting exactly this.
+
+### Decisions worth keeping
+- **Viewers join at the live edge, never at the start of the buffer.** Plex is
+  tuning a live channel; replaying a minute of history would put every viewer a
+  minute behind and further behind on every reconnect.
+- **The writer never blocks on a reader.** A stalled client is lapped and
+  resynchronises. Backpressure from a viewer to the capture thread would let
+  one bad client stall the upstream pull for everyone.
+- **A channel always resumes after a restart, ignoring the file check and the
+  attempt limit.** Its buffer is deleted at shutdown by design, so the
+  recording rules would discard every channel on every restart. There is no
+  restart-loop risk: a channel whose upstream is genuinely dead ends itself
+  through `max_cycles` and is removed that way.
+- **The guide says "Live rebroadcast -- not being recorded".** Saying
+  "Recording to ..." on a channel that keeps nothing would be a promise PVArr
+  is not making.
+
+### Verified end to end
+Real recorder, real subprocess, real ring, real uvicorn on a real socket, three
+concurrent HTTP viewers:
+- **3/3 viewers served, 1 upstream pull.** This is the claim that matters --
+  re-fetching a session-gated stream per viewer is how an account gets
+  throttled.
+- All three landed at the live edge (counters 167-178) with ordered, valid data.
+- `recordings/` empty, library empty, `output_filename` empty.
+- Buffer deleted on stop; session record forgotten.
+
+Note: the FastAPI `TestClient` cannot serve three simultaneous streaming reads
+from threads -- it drives ASGI through a single portal -- so the fan-out half of
+that test runs against a real uvicorn. Worth remembering before concluding a
+streaming endpoint is broken.
+
+323 tests (was 305).
+
+### Still open
+- [x] **FIXED (2026-09-05): the failover PTS discontinuity.** See "Phase 14"
+      below. The sponsor reported it against mpv on a live .ts, which is the
+      report this item was waiting for.
+- [ ] No cap on concurrent channels or on viewers per channel. Each viewer read
+      goes through `asyncio.to_thread` onto the default executor
+      (`min(32, cpu+4)` workers).
+- [ ] The healthcheck still cannot see a wedged channel.
+
+
+## Release v0.2.0 (2026-08-31)  [COMPLETED]
+
+First minor bump of the series. Sponsor-approved. The version level is
+deliberate: 0.1.x had been a recorder that could only record, and rebroadcast
+changes what PVArr *is* rather than adding to what it already did. Backward
+compatible in every respect -- existing recordings behave identically, and the
+two new settings (`PVARR_BUFFER_MB`, `PVARR_BUFFER_DIR`) have working defaults,
+so an upgrade needs no action from a user.
+
+Carries two capabilities the sponsor did not have at v0.1.3:
+- **Recordings survive a restart** (Phase 13 items 2 & 3) -- a `docker restart`,
+  a Watchtower update or a host reboot no longer orphans an in-flight `.ts`.
+- **Rebroadcast without recording** (Phase 16b) -- a live channel for
+  Plex/Emby/Jellyfin that keeps nothing on disk.
+
+Plus the guide naming work (Phase 16) and the six bugs from the agent-team
+review of Phase 13.
+
+323 tests green at the tag.
+
+### Upgrade note
+`PVARR_CONFIG_DIR=/config` must be a mount the container user can write, or
+session persistence disables itself and says so once in the log. It degrades
+cleanly -- recordings still run, they just do not survive a restart. This bit
+the dev box: `config/` was root-owned and the store correctly disabled itself.
+See PUID/PGID in the README.
+
+## Phase 17: Tagging & Library Organisation  (ACCEPTED, not started — future feature)
+
+humantodo line 3. Scoped with the sponsor 2026-08-31. **Do not start this
+without a fresh go-ahead** — it is a deliberate later feature, parked here so
+the analysis is not re-derived from scratch.
+
+### The asymmetry that makes this hard
+The *arr tools make naming look easy because the file is a known entity
+*before* it exists: Sonarr requests episode 7 of TVDB:81189 and derives the
+name from an id it already holds. Renaming is a lookup.
+
+PVArr is the inverse. An operator pastes an HLS URL for a game happening now.
+There is no id — only what was typed into three text boxes, possibly "Pack"
+and "Bears" at 4:58 because kickoff was at 5:00. Matching that to a sports
+database is *fuzzy matching*, not lookup, and that is where these features
+usually die.
+
+The one redeeming signal: PVArr knows the wall clock. A live game is pinned to
+a moment, so "something like Bears vs something like Packers, starting
+2026-08-31T19:05Z" is close to a unique key against a schedule API. That is
+what would make L4 tractable *if* it is ever revisited.
+
+### The Plex constraint (drove the whole design)
+Plex has **no sports metadata agent**. Library types are Movies, TV Shows,
+Music, Photos, Other Videos; there is no TVDB for last night's game. Anything
+fetched from an external DB is invisible unless written in a form Plex reads,
+which for personal media means the naming convention itself.
+
+The pattern that works is sport-as-series under Plex's *Personal Media Shows*
+agent:
+
+    Sports/NFL/Season 2026/NFL - S2026E07 - Bears vs Packers.mp4
+
+Critically, **this needs no external database at all** — sport, teams, date and
+a counter are already in hand. That is why L3/L4 were cut: they buy canonical
+team names and logos, and carry essentially all of the fragility.
+
+### Sponsor decisions (2026-08-31)
+1. **Record flat, then move into a separate configurable library root.** Not
+   organise `recordings/` in place. Keeps the capture path dumb and the path
+   guard simple. Same-filesystem by default.
+2. **`NFL - S2026E07 - Bears vs Packers` is acceptable.** Ugly, but it is what
+   Plex actually understands.
+3. **L1 and L2 only. L3 (.nfo sidecars) and L4 (sports DB) are cut** from the
+   first pass. Ship the offline half, live with it, then judge.
+4. **Retro-tagging the existing library is out of scope.** A sweep that
+   reorganises everything already recorded is a file manager, it is the
+   highest-risk code in the feature, and it is a one-time job better done with
+   `mv` and a shell loop a human can watch.
+
+Also declined: becoming a metadata server (artwork cache, browse UI). Plex
+already is one.
+
+### Scope, as accepted
+- **L1 — Path templates + category routing.** Optional Sports/News/Sitcoms
+  folders, nested by sport and season. Offline, deterministic, testable.
+- **L2 — Plex-friendly `SxxExx` numbering.** The episode counter must be
+  derived by scanning the season folder, **not** kept in a state file. A
+  counter file drifts the moment someone moves a file by hand, and it drifts
+  silently.
+
+### Four blockers already in the code (costed before any work starts)
+1. **The library is flat.** `naming.py:146` uses `iterdir()`, one level deep.
+   The moment a recording lives in `Sports/NFL/` the library UI goes blind —
+   the same class of bug as the `.ts`-only one commented at `naming.py:140`.
+2. **The path guard will refuse.** `_safe_filename` (`server.py:172`) rejects
+   any filename carrying a directory component. That is correct and deliberate:
+   it is the path-traversal defence on endpoints that are unauthenticated by
+   design. Subfolders make every delete/rename/download return 400. It must be
+   **replaced with a resolve-and-contain check, never simply relaxed.** This is
+   the single item most likely to introduce a vulnerability if done casually.
+3. **Cross-filesystem moves are not moves.** `os.replace` will not cross a
+   mount. If the library root is a different volume, a 6 GB game is a real
+   copy: minutes of I/O, both copies on disk simultaneously, and the
+   disk-space guard needs to account for it.
+4. **Remux writes beside the source** (`post_processor.py`, `with_suffix`).
+   Organising is a separate step afterwards with its own failure path, and the
+   notification plus the library entry must reference the *final* location,
+   not where the file was born.
+
+### Process note
+This touches `naming.py`, `server.py`, `post_processor.py`, `tuner.py`,
+`sessions.py` (the persisted output path) and the dashboard template, changes
+the on-disk layout, and rewrites a security control. Per the project
+directives that is a **convene-the-team change** — Architect, Security and
+DevOps get a scoped design before any code is written. Blocker 2 is the
+Security brief; blocker 3 is the DevOps brief.
+
+### If L4 is ever revisited
+Provider survey, done 2026-08-31:
+- **TheSportsDB** — the only realistic fit. Free tier, community-run,
+  teams/leagues/logos/events. Good coverage of major leagues, patchy below.
+  Requires a key. Would go behind a small provider interface as the single
+  implementation, entirely optional, strictly post-remux, and structurally
+  incapable of failing a recording.
+- **ESPN's undocumented JSON endpoints** — widely used, entirely unofficial,
+  can vanish overnight, ToS grey. Do not build on it.
+- **API-Sports and similar** — commercial, per-request quotas.
+- **Sportradar / Stats Perform** — enterprise pricing. Not for a self-hosted
+  tool.
+
+## Version badge lied about the running build (2026-08-31)  [COMPLETED]
+
+**Symptom.** The sponsor pulled v0.2.0 onto the test server and the dashboard header
+still read `v1.0.0`. Indistinguishable from "the pull did not take" — the worst
+possible ambiguity at the exact moment you are trying to confirm which build
+you are testing.
+
+**Cause.** `app/templates/index.html:89` carried the literal string `v1.0.0`,
+hardcoded from the first commit and never wired to `__version__`. It has
+therefore been wrong for every release in the 0.1.x series; nobody noticed
+because it was wrong in a stable way. `scripts/publish.sh` bumps
+`app/__init__.py` and CI checks the tag against it, but neither can reach a
+number baked into markup.
+
+**Fix.** `__version__` is registered as a Jinja global
+(`templates.env.globals["pvarr_version"]`) rather than threaded through the one
+route's context dict — a global cannot be forgotten by a route added later,
+which is how this class of bug returns. The template renders
+`v{{ pvarr_version }}`.
+
+`/api/status` now also reports `version`, so "what is the test server actually running?"
+is answerable with `curl` without trusting a number rendered in a page. That is
+the check the sponsor actually needed and did not have.
+
+**Proven.** Reintroduced the hardcoded literal and confirmed the new guard
+fails with the offending file and line named, then restored it. Three tests
+fail with the bug present, all pass without it.
+
+Seven tests added (330 total, was 323):
+- the badge renders the real `__version__`
+- the page does not contain a stale `v1.0.0`
+- **no template anywhere hardcodes a `vX.Y.Z` literal** — the regression guard;
+  this is the one that would have caught the original bug
+- `/api/status` and `/openapi.json` both report `__version__`
+- `__version__` is semver, and the assignment line still matches the regex
+  that `scripts/publish.sh` and the CI tag guard both sed. If that line is ever
+  reformatted the release script silently fails to bump and CI's tag-vs-code
+  check reads an empty string.
+
+## Deleting a live recording silently destroyed it (2026-08-31)  [COMPLETED]
+
+Found by the sponsor on the test server during v0.2.0 testing. The most damaging bug
+found in this project so far: it destroys footage and reports success.
+
+**Symptom.** Candidate 1 failed, candidate 2 connected and ran for four
+minutes, elapsed time climbed, but recorded size stayed at 0 MB and no file
+appeared in the library. `ls` of the recordings directory showed only
+`.nfs000000000e3b01ab00000001`. A manual force-failover to candidate 3 made a
+proper `.ts` appear and data start filling.
+
+**Root cause, confirmed in the container log:**
+
+    "DELETE /api/library/2026-08-31_<Sport>_<TeamA>_vs_<TeamB>_1080p.ts" 200 OK
+
+issued mid-recording against the running session's own output file. The library
+delete endpoint unlinked it without ever asking whether a recorder was writing
+to it, and answered 200.
+
+**Why it was silent.** An append handle keeps working perfectly after its file
+is deleted — writes succeed, the offset advances, nothing raises. The bytes go
+to an inode with no name and are freed when the handle closes. The directory is
+NFS-exported from a NAS, so it showed as a silly-rename (`.nfsXXXX`); on a
+local filesystem there would have been nothing to see at all.
+
+Three separate mechanisms all failed to notice, each for a defensible reason:
+- **Freeze detection** watches `last_write_time`, updated on every *successful*
+  write. The writes were succeeding. The stream looked perfectly healthy.
+- **`get_filesize_mb()`** stats the path, not the handle. Path gone -> 0.0.
+- **The dashboard** renders only `filesize_mb`, never `bytes_written`, so the
+  two never visibly disagreed.
+
+**Why candidate 3 "fixed" it.** Every attempt reopens with `open(path, "ab")`,
+which recreates a missing file. The manual failover made a fresh, correctly
+named file. That behaviour is diagnostic of nothing else.
+
+### Fix, in two halves
+
+**1. PVArr refuses (`server.py`).** `_active_output_paths()` maps every live
+recorder's `output_filepath`, `current_filepath` and `final_filepath` to its
+session id; `_refuse_if_recording()` raises **409** from both the delete and
+the rename endpoint. Rename is included because renaming out from under a
+handle strands the recording writing to a path nothing will look at. A
+rebroadcast channel blocks nothing — it keeps no file.
+
+**2. PVArr notices anyway (`recorder.py`).** Half 1 cannot help when something
+*outside* PVArr removes the file, which on a NAS export is a real scenario —
+File Station, SMB, a cleanup cron, another *arr tool. The new `_FileSink`
+carries `is_intact()`, comparing the inode of the open handle against the inode
+at the path, rate-limited to every 15s alongside the disk guard.
+
+**`st_nlink == 0` is the wrong test and there is a test asserting so.** A
+silly-rename is a *rename*, so the link count stays 1 and a link-count check
+passes happily on exactly the case this exists to catch. Only the inode
+comparison works.
+
+On detection: log loudly, recreate the file, continue. After
+`MAX_OUTPUT_REOPENS` (3) it stops with status `aborted_output_lost` rather than
+looping forever against something that keeps deleting the file. `_RingSink`
+answers `is_intact() -> True` so the capture loop never branches on sink type.
+
+### Proven
+Unit tests plus a real-recorder end-to-end run (`e2e_delete_live.py`): deleted
+the `.ts` from under a live capture, and the recording recovered —
+
+    file recreated      : True
+    bytes on disk after : 1212416      (not a phantom)
+    reopen count        : 1
+    still recording     : True
+    logged loudly       : True
+
+The same script demonstrates the old behaviour for contrast: write-after-unlink
+raises nothing and the path does not exist.
+
+17 tests added (347 total, was 330), including the silly-rename case and a
+guard that a broken sink can never take a recording down.
+
+### Still open from the same logs
+- [x] **hls-proxy 404s on `cand_0`.** `http://127.0.0.1:8090/channel/cand_0:
+      Server returned 404 Not Found` at 12:14:42, 12:21:00 and 12:30:17.
+      Fallback mode has never once worked for candidate 1 in these logs.
+      Resolved in "Candidate 1's 404s" below (v0.2.3): the channel mode was
+      keyed off the referer, so the proxy scraped a playlist as an HTML page.
+- [x] **Segments with a non-video file extension.** Candidate 1's playlist
+      lists segments on URLs ending `.image`
+      (`... is not in allowed_segment_extensions`).
+      FFmpeg refuses them by extension. Resolved in v0.2.3 -- and note the
+      guess recorded here was **wrong**: `-allowed_extensions ALL` does nothing
+      on the shipped build. Measurement inside the image found
+      `-extension_picky 0`, and the flags are now probed per binary.
+- [x] The dashboard still never shows `bytes_written`. Had it been beside
+      `filesize_mb`, the disagreement would have been visible immediately.
+      Shipped in v0.2.2 as *Captured*, with *On Disk* going amber on a
+      disagreement.
+
+## Release v0.2.1 (2026-08-31)  [COMPLETED]
+
+Patch. Sponsor-approved. One bug, but the most damaging one found so far:
+deleting a recording from the library while it was still running destroyed the
+footage and returned 200 OK.
+
+Anyone on v0.2.0 has a delete button that eats live recordings, which is why
+this did not wait for other changes to accumulate.
+
+- Delete and rename now return `409` for a file a live recorder owns.
+- The capture loop detects its output file vanishing (inode comparison against
+  the path, every 15s), recreates it, and continues; three strikes stops with
+  `aborted_output_lost`.
+- The dashboard version badge shows the real `__version__` instead of the
+  hardcoded `v1.0.0` it had carried since the first commit, and `/api/status`
+  reports the running version so it can be confirmed with `curl`.
+
+347 tests green at the tag. Nothing to do on upgrade.
+
+## Dashboard honesty pass (2026-08-31)  [COMPLETED]
+
+Two things the sponsor hit while testing v0.2.1 on the test server, plus the
+`bytes_written` item that had been sitting in "Still open" since the
+delete-while-recording bug.
+
+### 1. "Completed" was shown while the remux was still running
+**Symptom.** Stopped a recording; status read `completed` but the dot kept
+pulsing green.
+
+**Cause.** `stop()` sets `status = "completed"` immediately, but
+`on_completion_callback` -- the remux -- then runs on the recorder thread and
+`is_running` is not cleared until it returns. The log shows the window: stop at
+12:39:18, `Remux successful` at 12:41:47. Two and a half minutes of
+`completed` + green pulse, with no `.mp4` in the library the whole time.
+
+Both halves were half right, which is why it looked merely cosmetic: the
+capture *had* finished, and the thread *was* still working. Greying the dot
+would have been the wrong fix -- it would have claimed done while the remux ran.
+
+**Fix.** A real `post_processing` status for the duration of the callback, with
+the resolved final status restored in a `finally`. An `aborted_no_space` or
+`aborted_output_lost` session still comes out the far side with its own status
+intact, and a callback that raises no longer strands the session.
+
+### 2. Finished sessions cluttered the dashboard
+Collapsed, not removed. A finished session still holds its log history, and
+that history is the most useful thing in the app right after a recording ends
+-- it is what diagnosed the delete bug. Removing finished sessions to tidy the
+page would have thrown away the evidence.
+
+Live sessions (including post-processing) render in full; finished ones become
+a one-line row under *Recently Finished* that expands to its event log. The
+header dot now keys off live sessions rather than "any session exists", which
+is the specific reason a stopped recording kept blinking.
+
+### 3. `bytes_written` is on screen
+It was in `/api/status` all along and the page rendered only `filesize_mb`, so
+when the two disagreed there was nothing visible to show it. Four minutes of
+footage were lost to a discrepancy the dashboard already had the data to
+display.
+
+*On Disk* and *Captured* now sit side by side, and On Disk turns amber when
+Captured is climbing while the file is not -- the signature of writing into a
+deleted file. Scoped to `status === 'recording'` only: during post-processing
+the remux has already removed the `.ts`, so on-disk is legitimately 0 and
+warning there would cry wolf on every successful recording.
+
+### Verified
+357 tests (was 347). The Alpine helpers cannot be exercised by the Python
+suite, so the state machine was run directly in node against five sessions
+(recording, post-processing, completed, aborted, and one writing into a hole)
+and each produced the right dot, colour and warning. That run is what caught
+the post-processing false positive. `node --check` on the extracted inline
+script guards against a syntax error taking the whole page blank -- something
+no Python test would notice.
+
+## README intro pass (2026-08-31)  [COMPLETED]
+
+humantodo lines 5-8, folded in ahead of the next release. Doc-only.
+
+- **Dropped "Default port: 8999" from the intro.** It was duplication: the port
+  is already in Quick Start and in the `PORT` row of the configuration table.
+  The Quick Start line now says outright that 8999 is the *default* and points
+  at `PORT`, so nothing is lost by removing it from the top.
+- **Pronunciation note.** Clarified how the name is said (since cut to a
+  single line in the README).
+
+Not shipped on its own; rides with the next release.
+
+## v0.2.1 validated on the test server (2026-08-31)
+
+Sponsor ran the full plan against real streams on the NAS-backed NFS volume.
+All four passed. Recording it here because two of these were only ever proven
+on the dev box, and one was never proven at all.
+
+1. **Delete guard.** Deleting or renaming a file a live recording is writing to
+   is refused; the file survives; unrelated library files still delete. The
+   guard did not turn the library read-only.
+
+2. **External delete, on real NFS.** ***The important one.*** Deleting the `.ts`
+   from the NAS side — outside PVArr, where the 409 cannot help — is detected,
+   the file is recreated, and the recording continues. This was verified locally
+   against ext4 only; NFS silly-rename semantics on a real export were exactly
+   where the inode check could have been wrong, and they are not. The reasoning
+   behind rejecting `st_nlink == 0` in favour of the inode comparison now has
+   field evidence, not just a unit test.
+
+3. **Rebroadcast.** First clean end-to-end run against real streams — both
+   previous attempts were eaten by the delete bug before they got anywhere.
+   Channel serves, guide says it is not being recorded, nothing kept on disk.
+
+4. **Guide naming.** Plex Info shows the recording name and the feeding
+   candidate.
+
+### Still not proven
+- [ ] **PTS discontinuity across a failover, seen by a live rebroadcast
+      viewer.** The channel itself works; what has still never been observed is
+      a failover *while a client is watching it*. That remains the first thing
+      to look at if Plex ever drops a channel mid-game. Recordings are
+      unaffected and measured — only the live viewer path is open.
+
+## Release v0.2.2 (2026-08-31)  [COMPLETED]
+
+Patch. Sponsor-approved. No change to how recording works — this is the
+dashboard telling the truth, plus a README pass.
+
+Everything in it came out of the sponsor's v0.2.1 test session:
+- **`post_processing` status.** A stopped recording no longer reports
+  "completed" beside a pulsing green dot while the remux is still running and
+  no `.mp4` exists in the library yet.
+- **Finished sessions collapse** to a one-line row that expands to its event
+  log, instead of sitting at the top of the page looking active. Collapsed
+  rather than removed: the log history is the evidence, and it is what
+  diagnosed the delete-while-recording bug.
+- **`bytes_written` is on screen** as *Captured*, beside *On Disk*. On Disk
+  turns amber when the two diverge — the signature of writing into a deleted
+  file, which was invisible before despite the API carrying both numbers all
+  along.
+- **README intro pass** (humantodo lines 5-8): the duplicated port line is
+  gone, and the pronunciation note now defends against the mispronunciation
+  that actually happens.
+
+357 tests green at the tag. Nothing to do on upgrade.
+
+## Candidate 1's 404s: two bugs, neither of them the stream (2026-08-31)  [COMPLETED]
+
+Sponsor asked whether the stream was down or the headers were wrong. Neither.
+The stream was healthy, both tokens were valid, and header detection was
+correct. Both failures were ours.
+
+### Was the stream down? No.
+Decoded from the failing URLs in the log: the segment token `x-expires`
+expires 2026-09-01T00:00:00Z and the playlist path token 2026-08-31T20:43:06Z
+-- 11.5 and 8.2 hours *after* the failure. The probe also succeeded
+("Probe resolved Candidate 1: media, headers none"), so the origin was serving
+a playlist. Nothing was expired and nothing was down.
+
+### Bug 1 — the proxy fallback has never worked for a stream needing no Referer
+`start_proxy` chose the hls-proxy channel mode with
+`mode = "literal" if candidate.referer else "direct"`.
+
+The referer decides nothing of the sort. In hls-proxy, **literal** means "this
+URL *is* the playlist"; every other mode makes it fetch the URL as an HTML
+page, look for an `<iframe>`, then look for an m3u8 inside that. So a stream
+needing no `Referer` -- the common case, and exactly what the probe reported
+for candidate 1 -- got `direct`, and the proxy tried to scrape MPEG-TS playlist
+text as a web page. No iframe, no m3u8, and it answered
+`404 Channel not found or scrape failed: cand_0`.
+
+That is the 404 in the log, three times over. **The entire fallback path was
+dead for any stream that does not need a Referer**, which was never noticed
+because the streams that reach fallback usually do need one.
+
+Fixed: the mode is now chosen by whether we hold a playlist (`.m3u8` in the
+path) or a page to scrape. The referer is written to its own field either way.
+
+### Bug 2 — the fallback could not have rescued this stream anyway
+Candidate 1 serves its MPEG-TS segments on URLs ending `.image`. FFmpeg's HLS
+demuxer refuses them by extension, which is what killed Direct Mode. hls-proxy
+mirrors the upstream extension onto its own `/proxy.<ext>` path, so the
+rewritten segments get refused for the same reason.
+
+Which FFmpeg option unlocks this is **not** guessable, and they are not
+interchangeable. Measured inside the shipped image (Debian ffmpeg 5.1.9)
+against a real `.image` segment:
+
+| flags | result |
+|---|---|
+| none | refused: `not in allowed_segment_extensions` |
+| `-allowed_extensions ALL` | refused: same |
+| `-allowed_segment_extensions ALL` | refused one step later: `extension none mismatches` |
+| **`-extension_picky 0`** | **PASS, 42676 bytes** |
+
+`extension_picky` does not exist on upstream ffmpeg 6.1 (this dev box), which
+has only `allowed_extensions` -- and passing an option a build does not know is
+fatal. So `hls_extension_flags()` asks the binary what it supports and sends
+only that, cached per path.
+
+**Scoped to the fallback only.** There the playlist comes from our own proxy on
+127.0.0.1, so "any extension" means "any file this process already fetched and
+rewrote", not "anything a remote playlist cares to name". Direct Mode keeps
+FFmpeg's strict default, and `-protocol_whitelist` forbids `file://` on both
+paths regardless -- the protocol list, not the extension list, is what actually
+stops a hostile playlist reading local files. There is a test asserting that.
+
+### Verified
+The dev box could not reproduce any of this: ffmpeg 6.1 here happily accepts a
+`.image` segment and does not even have the option that matters. Everything
+above was measured **inside `ghcr.io/jlesterak/pvarr:0.2.2`** against a local
+origin serving real MPEG-TS bytes at a `.image` URL, through the real
+hls-proxy, driven by PVArr's own `start_proxy` and `_build_ffmpeg_cmd`:
+
+    ffmpeg flags probed : ['-allowed_extensions','ALL',
+                           '-allowed_segment_extensions','ALL',
+                           '-extension_picky','0']
+    channels.conf mode  : 'literal'   <-- was 'direct', the 404
+    bytes captured      : 42676       <-- was 0
+
+That is the whole reason to keep a copy of the shipped image around: reasoning
+from the dev box's FFmpeg would have produced a confident, wrong fix.
+
+370 tests (was 357).
+
+### Still open
+- [ ] Whether candidate 1 *records* for the sponsor now. This proves the
+      mechanism against a synthetic origin of the same shape; it does not prove
+      that particular provider stays up.
+
+## Release v0.2.3 (2026-08-31)  [COMPLETED]
+
+Patch. Sponsor-approved ("shipit"). One fix, but it reopens a whole path:
+
+- **The proxy fallback works again for streams that need no `Referer`.** The
+  channel mode was chosen from the referer, which decides nothing about whether
+  a URL is a playlist or a page to scrape. Any candidate without a Referer got
+  sent down the scrape path and came back `404 Channel not found or scrape
+  failed`. That is not a tuning issue — the fallback was non-functional for
+  that entire class of stream.
+- **Segments with non-video extensions (`.image`, `.png`, and friends) now record through the
+  fallback.** FFmpeg's option for this differs between builds and passing an
+  unknown one is fatal, so PVArr probes the binary and sends only what it
+  supports. Strict default kept on Direct Mode; `-protocol_whitelist` still
+  forbids `file://` on both paths.
+
+370 tests green at the tag. Nothing to do on upgrade beyond pulling the image.
+
+### Note for next time: the image is published twice
+`scripts/publish.sh` builds and pushes `:X.Y.Z` and `:latest` from whatever
+machine runs it, and *then* the `v*` tag makes CI build and push the same tags
+again. Same Dockerfile, so the same image — but only the CI build runs the test
+suite first, and only CI is reproducible. Worth switching the script to
+`--skip-docker` by default and letting the tag be the single publisher.
+
+## The proxy's channels.conf could outlive its session (2026-08-31)  [COMPLETED]
+
+Found while clearing the sponsor's stale `channels_893cc63a.conf`. That file
+was already gone -- `_remove_proxy_conf()` had cleaned it up -- but the sweep
+showed the cleanup was reachable only on the straight-line path.
+
+`channels.conf` holds the **fully tokenised stream URL** and is written to the
+mounted recordings volume, where anything with read access to that share can
+see it. Two ways it survived:
+
+1. **The fallback block was not in a `try/finally`.** Anything raising between
+   `start_proxy()` and the teardown -- the capture call, the ffmpeg command
+   build -- skipped `stop_proxy()`, leaving both the credential on disk *and*
+   an orphaned hls-proxy still holding its port.
+2. **`self._proxy_conf_file = conf_file` was set several lines after the
+   write.** `_remove_proxy_conf()` can only delete what it has been told
+   about, so a failure in between orphaned the file with no reference left to
+   it -- unreachable by any later cleanup.
+
+Fixed both: the bookkeeping now happens immediately before the write, and the
+fallback block tears down in a `finally`.
+
+### Proven, not assumed
+Each guard was checked by reverting its fix and confirming the matching test
+goes red:
+- revert the `finally` -> `tokenised channels.conf outlived the session`
+- revert the ordering -> `orphaned conf: nothing held a reference to it`
+
+373 tests (was 370).
+
+### Also cleaned up
+A real tokenised stream URL had been hardcoded at line 16 of a scratchpad
+test script (`e2e_proxy_mode.py`) while reproducing the candidate 1 404s.
+Scrubbed. Session-local temp dir, token expiring the same night, but it should
+not have been written down. Repo and scratchpad both verified clean for that
+host.
+
+
+## Phase 13 item 4: Recording windows & duration caps (2026-08-31)  [COMPLETED]
+
+A recording may now carry a length. At the deadline it stops cleanly and
+post-processes exactly as an operator stop does. Both sponsor decisions from
+the Phase 13 spec are implemented as agreed.
+
+### What was built
+- `duration_minutes` (what a curl or cron caller wants) or `end_time` (an
+  absolute epoch, what the dashboard sends) on `POST /api/recordings/start`.
+  **Stop After (min)** on the new-recording form; blank means "until the
+  stream ends".
+- `PVARR_MAX_HOURS`, default **6**, for recordings given no length. A capture
+  pointed at a 24/7 channel never ends by itself -- the stream does not stop,
+  so no failover ever fires and it runs until the disk guard trips. That is a
+  safety net doing a scheduler's job.
+- Checked on the write path *and* at the top of each failover lap. Write path
+  alone would never fire on a healthy stream's deadline... in fact the reverse:
+  a healthy stream never leaves the write loop, and a lap-only check would sit
+  through up to 60s of backoff, or miss the deadline entirely if every
+  candidate happened to be down as the window closed.
+- `ends_at` and `seconds_remaining` in the status summary; the card shows
+  "42m left" under Elapsed, titled with the absolute local time.
+
+### Stored absolute, never as a duration
+A duration restarts its clock on every resume, so a recording that crashed
+twice would run well past the end that was asked for -- and each restart would
+be handed a fresh six hours by the backstop, which is the exact thing the
+backstop exists to prevent. `end_time` is persisted as an absolute epoch and
+the backstop is measured from the *original* `start_time`. `resume_decision()`
+now finalises rather than resuming a session whose window closed while the
+container was down: an exact answer where the mtime gap was a guess.
+
+### Sponsor decision: retry until the window closes
+`max_cycles` is a guess at "these sources are dead"; an explicit end time is a
+statement that the event runs until then, and a stream down at kick-off is
+often back minutes later. So the give-up cap is lifted while a window is open.
+
+Deliberately keyed off an **explicit** window and not the backstop: with no
+duration given, the 6h figure is a default the operator may not know about, and
+retrying for six hours against three dead URLs is not what anyone means by a
+safety net. There is a test for that distinction.
+
+### The status has to stay honest
+First cut called every deadline stop `completed_window`. Wrong, and the test
+caught it: if the stream died twenty minutes into a two-hour window and never
+came back, "finished on schedule" hides a truncated file behind a reassuring
+word -- the same failure as reporting "completed" while a remux was still
+running. Now:
+- capturing when the deadline arrived -> `completed_window` ("finished on
+  schedule")
+- window closed after several dead laps, bytes on disk -> `completed_partial`
+- window closed having captured nothing -> `failed`
+
+### Rebroadcast is exempt from the backstop
+Found while writing this, not after. A live channel is meant to sit there --
+the sponsor starts one and expects it in Plex tomorrow -- and it writes into a
+fixed-size ring, so none of the reasoning behind the backstop applies. Without
+the exemption this change would have silently killed every channel at the six
+hour mark. An explicit `end_time` is still honoured, for a deliberately finite
+channel.
+
+398 tests (was 373). The dashboard helper was additionally exercised in node
+across nine cases (null, undefined, sub-minute, minutes, hours, zero, negative,
+and the two status gates).
+
+
+## Credential redaction in logs and notifications (2026-08-31)  [COMPLETED]
+
+Follow-on from clearing the stale `channels.conf`: same class of leak, larger
+blast radius. `redact_url_secrets()` in `logging_config.py` strips userinfo,
+query string and fragment from any URL in a string, keeping scheme, host and
+path -- which is what identifies the candidate and is the whole diagnostic
+value of the line.
+
+### Applied at the sinks, not the call sites
+A redaction you have to remember to call is one that gets forgotten at the next
+call site added -- and these URLs are not all ours to sanitise at source, since
+a token can arrive inside FFmpeg's own error text. So it goes in
+`StreamFailoverRecorder._log()`, which every recorder log line passes through.
+
+### The notification leak was a parameter mismatch, not a formatting choice
+`notify_recording_started(session_id, filename, candidate_name)` renders its
+third argument as "Stream: {value}". `server.py` was passing `candidates[0]` --
+the raw tokenised primary URL. So **every** "recording started" message shipped
+a live stream token to Discord and Telegram, where it lands in a third party's
+message history that cannot be expired or deleted. That is a worse exposure
+than the same token in a local log, and worse than the conf file, which never
+left the box.
+
+Fixed at the call site (pass `recorder.candidates[0].name`) *and* at the sink,
+because a notification cannot be recalled.
+
+### Also found while doing it
+`trigger_media_server_refresh()` and `send_telegram()` logged raw exception
+text on failure. `requests` puts the failing URL in its exception message, and
+those URLs carry `X-Plex-Token`, `api_key` and the Telegram bot token in their
+query strings -- so a Plex refresh failing would print the Plex token to
+stdout. All four handlers now redact.
+
+### Proven, not assumed
+- revert the `_log` redaction -> `'SECRET' unexpectedly found in [...log_history]`
+- revert the call site -> `'SECRET' unexpectedly found in '<id> <file> https://cdn.example/live.m3u8?token=SECRET'`
+
+408 tests (was 398).
+
+### Deliberately NOT redacted -- sponsor call if this should change
+`candidates[].url` in `/api/status` still carries the full tokenised URL. The
+operator typed it, the dashboard shows it back to them, and the advanced header
+override fields are keyed by it, so redacting it would break the UI and hide
+the operator's own input from them. It is an API contract decision rather than
+a bug fix, so it is recorded here rather than made quietly. Note that PVArr has
+no authentication at all, so port 8999 is trusted-LAN-only either way -- which
+is the real reason this one is not urgent.
+
+## Release v0.3.0 (2026-08-31)  [COMPLETED]
+
+Minor, not patch: recording windows are new capability, and the API grew two
+optional fields. Backward compatible -- every existing call, compose file and
+mount works unchanged. Sponsor-approved ("ship it").
+
+**What a user gets that they did not have before:**
+- **Recording windows.** *Stop After (min)* on the new-recording form, or
+  `duration_minutes` / `end_time` on `POST /api/recordings/start`. The
+  recording stops cleanly at the deadline and post-processes normally, and the
+  card shows the time remaining.
+- **A 6-hour backstop** (`PVARR_MAX_HOURS`) for recordings given no length,
+  because a capture pointed at a 24/7 channel never ends by itself. Live
+  rebroadcast channels are exempt.
+- **Stream tokens no longer leave the box.** Every "recording started"
+  notification had been shipping the fully tokenised primary URL to Discord and
+  Telegram; a failed Plex or Emby refresh had been printing its token to
+  stdout. Both fixed, plus redaction of every recorder log line.
+- **The proxy's `channels.conf` can no longer outlive its session**, so a
+  tokenised URL is not left on the recordings share by a failed fallback.
+
+**On upgrade:** nothing to do. Pull and restart.
+
+  - One behaviour change worth knowing: a recording started with no duration
+    now stops after 6 hours where previously it ran until the disk guard or the
+    stream ended. Set a duration per recording, raise `PVARR_MAX_HOURS`, or set
+    it to `0` to restore the old behaviour.
+
+408 tests green at the tag.
+
+### Shipped without the test-server pass
+The sponsor chose to ship before field-testing the three checks recommended
+above (candidate 1 recording, a short duration stopping on time, a rebroadcast
+channel unaffected by the cap). Recorded because if any of them misbehaves,
+this is the release to look at -- and the 6-hour default is the change most
+likely to surprise, since it alters what an existing untouched workflow does.
+
+## humantodo line 2, step 1: the probe says what it tried (2026-08-31)  [COMPLETED]
+
+Sponsor asked whether their testing would help line 2 ("resolve the instances
+where the app can't detect headers automatically") or whether to build first.
+Answer: their testing is the input -- I cannot invent failing providers, and
+every fix that stuck this session came from their data -- but it would have
+come back as "it didn't work", because the dashboard was throwing the evidence
+away.
+
+### What was already there
+`probe_stream()` has always recorded an `attempts` list -- every URL, the
+referer sent, the status returned -- and `/api/probe` has always returned it.
+The dashboard rendered only `message`, and on failure did
+`this.probes[key] = { ..., data: null }`, discarding the trace at exactly the
+moment it was worth having.
+
+### What was missing
+- **The segment check recorded nothing.** "Segments rejected -- stream may be
+  session gated" with no status code tells an operator something is wrong and
+  nothing about what. It now records status, and the variant-playlist descent
+  for a master playlist too.
+- **The segment's extension was never surfaced.** This is the candidate 1 case:
+  playlist 200, segment 200, everything "fine", and it still will not record,
+  because FFmpeg refuses `.image` by extension. That cost an hour to diagnose
+  from logs. The trace now names it at probe time.
+- **A 2xx that is not a playlist looked like an unexplained failure.** Usually
+  an anti-bot interstitial answering 200 with HTML. Now called out -- and
+  scoped to a *successful* status, because on a 403 the body is obviously not a
+  playlist and saying so reads like a second, unrelated problem.
+- **The page fetch was not a recorded step**, so a scrape that found no m3u8
+  showed nothing before the failure.
+
+### Dashboard
+Collapsed "Show what PVArr tried (n)" under the probe verdict, colour-coded by
+status, with a **Copy trace** button. Query strings are stripped from every URL
+in the trace, so it carries no access token and is safe to paste into a bug
+report. Falls back to a prompt() when the clipboard API is unavailable --
+plain-http LAN access is not a secure context, which is exactly how this
+dashboard is normally reached.
+
+### Proven
+- Three failure shapes driven end to end against a local origin: referer-gated
+  playlist with `.image` segments, the same with no referer hint, and a public
+  playlist with 403 segments. Each produced the right trace.
+- The UI guard was checked by restoring `data: null` and re-running the helper
+  in node: 1 trace row with the fix, **0 without it**.
+
+419 tests (was 408).
+
+### Next, and it needs the sponsor
+Throw the streams that fail header detection at the probe and send the traces.
+The fix depends entirely on what they show: a referer heuristic, a
+cookie-capture step, or -- if the m3u8 is built in JavaScript -- no amount of
+probing helps and the right answer is a better message pointing at DevTools and
+the optional `detect-headers` browser path.
+
+## humantodo line 2, step 2: "needs a header" vs "not talking to us" (2026-08-31)  [COMPLETED]
+
+The sponsor supplied a failing tokenised HLS link (provider A) and asked
+whether the JavaScript limitation explained it. It did not, and chasing it
+produced a better answer than the feature we set out to build.
+
+### The evidence
+Tried from the dev box with every plausible referer and several user-agents
+(Chrome, curl, VLC), in both requests and curl. **Identical 139-byte nginx 403
+every time.** Then the decisive test:
+
+    https://<host>/            -> 403   (the host's own front page)
+    https://<host>/hello-there -> 403
+    bogus token + real path    -> 403
+    real token + bogus path    -> 403
+
+The host refuses the request before it ever looks at the path, so the token was
+never evaluated and no header was ever going to matter. Its sibling hosts
+behaved the same.
+
+The sponsor then confirmed 403 from the test server **and** in a real browser
+on their own network. (Phase 18 later showed the browser check was not a fair
+test: pasting the URL sends none of the embedded player's context.)
+
+### What PVArr got wrong
+It answered all of that with "The stream likely needs a cookie or a referer
+PVArr cannot guess -- copy them from DevTools." That sent the sponsor hunting
+in DevTools for a header that does not exist, on a link that was not going to
+work for anybody.
+
+### The fix
+On **total** failure only, the probe now asks the origin for its own front
+page and records it in the trace as stage `origin`. If the root is refused with
+the same status as the playlist (401/403/429), the message says the host is
+refusing us outright, that this is not a missing header, and that the link has
+probably expired -- instead of pointing at DevTools. When the root *does*
+answer, the old advice stands and is now stated with more confidence, because
+we have evidence the host is gating this stream specifically.
+
+Costs one extra request, and only on a probe that already failed. A successful
+probe is unchanged; there is a test asserting that.
+
+### Also corrected: the README was wrong about detect-headers
+Checked inside the shipped image: `detect-headers` is a symlink to upstream's
+**shell** version -- 11 curl calls, zero browser references, no Playwright
+module and no Chromium in the image. The README claimed it "drives a real
+browser and can see what a plain fetch cannot". True of upstream's Python
+variant, false of what we ship, and it is exactly the claim that made the
+JavaScript theory sound plausible. README now says what is actually in the
+container and what it can and cannot do.
+
+425 tests (was 419). Verified against two local origins (root answers / root
+refuses) and against the sponsor's real URL, which now produces the correct
+message.
+
+### Still open for line 2
+This URL turned out to be a dead link, so it taught us nothing about header
+detection itself. Still need traces from a stream that *is* reachable and still
+fails to detect -- that is the case the original humantodo line is about.
+
+### Housekeeping
+The dev box hit 100% disk (6.7 MB free) mid-session and took 302 tests down
+with it. Cause was 16.66 GB of dangling images from this session's own docker
+builds; `docker image prune` recovered it. Worth remembering that building the
+shipped image to test against is not free.
+
+## humantodo line 2, step 3: it was the wrong URL, not the wrong headers (2026-08-31)  [COMPLETED]
+
+Sponsor tested **five streams from five different providers**. All five gave
+the same "Every header combination was rejected (403)... copy them from
+DevTools", and all five 403'd under curl and in a browser too.
+
+Five independent providers do not all break the same way by coincidence. The
+common factor is not the providers -- it is what was being pasted.
+
+### The cause
+`_probe_candidate()` probes `candidate.url` -- **the URL the operator typed** --
+fresh at connect time and again on every failover. The resolved playlist is
+kept separately in `candidate.m3u8_url` and is never fed back in as input.
+
+That makes the choice of pasted URL decisive:
+
+- Paste a **page**: PVArr scrapes it and mints a token itself, from the machine
+  doing the recording, every single time it connects. Token expiry mid-capture
+  fixes itself.
+- Paste a **tokenised m3u8**: there is nothing to re-resolve. Every retry
+  replays the same token. And that token was minted for the operator's *browser
+  session*, often expiring in minutes -- so a URL copied out of DevTools is
+  frequently dead before it is pasted, and dead for good.
+
+Reproduced end to end against a local origin that mints per-session tokens with
+a short TTL: the copied m3u8 probes fine immediately, 403s seconds later, and
+the same origin's page URL keeps working indefinitely with a fresh token each
+probe.
+
+### The fix
+`looks_tokenised()` spots an access token in a URL -- either in the query
+string (token/sig/hash/expires/hdnts/...) or baked into the path as a long
+opaque segment, which is what nginx `secure_link` does and what the sponsor's
+provider used. On a 401/403/404 from a host that *is* otherwise answering, the
+message now names the real problem and says to paste the page URL instead of
+sending the operator after headers that do not exist.
+
+Precedence matters: the "host refuses its own front page" check still wins,
+because telling someone to paste the page URL of a host that refuses everything
+would be wrong advice. There is a test for that ordering.
+
+The path heuristic needs randomness, not just length -- `2024-nfl-week-1-
+highlights` is 26 characters of ordinary slug. Long hex, or a mix of upper and
+lower case, neither of which occurs in a human-written path segment.
+
+### README was overselling this too
+It said "an expired token is re-resolved rather than replayed", full stop. Only
+true when a page URL was pasted. Corrected, and "Getting the URL to paste" now
+leads with paste-the-page and explains why, rather than presenting the DevTools
+m3u8 as an equal option.
+
+434 tests (was 425).
+
+### Still open
+Whether this actually resolves the sponsor's five. It explains all the observed
+evidence, but the confirming test is theirs to run: paste the **page** URL for
+those same five streams. If a page URL still fails on a host whose root answers,
+that is a genuine header-detection gap and the trace will finally show it.
+
+## humantodo line 2: the root cause, and a decision for the sponsor (2026-08-31)
+
+Sponsor pasted the page URL for the failing streams and got "No .m3u8 found on
+that page (HTTP 200)". So both exits are closed:
+
+- **page URL** -> the player builds the m3u8 in JavaScript; nothing to scrape
+- **DevTools m3u8** -> token is session-bound and short-lived; 403
+
+Their original instinct ("could it be the javascript limitation you mentioned")
+was right. It was wrongly ruled out on provider A's URL, where a dead host
+made it look like something else, and not revisited when the pattern turned out
+to hold across five providers.
+
+### The capability PVArr documents for this has never shipped
+1. The Dockerfile clones `pcruz1905/hls-restream-proxy` and copies
+   `detect-headers-py.py` *if present*.
+2. That repo ships only `detect-headers.sh` -- 11 curl calls, no browser.
+3. The maintainer's local `detect-headers-py.py` is **untracked in
+   git**. It exists on this dev box and nowhere else.
+
+So the Dockerfile's condition for the Playwright script has never once been
+true, in any build. `_detect_via_script` was documented "(browser-backed)" and
+the README claimed it "drives a real browser". Both described a file that was
+never published. Docstring and README both corrected.
+
+The five failures are therefore not five awkward providers. They are one
+missing feature.
+
+### Measured cost of the real fix
+Inside `ghcr.io/jlesterak/pvarr:0.3.0`, `pip install playwright` plus
+`playwright install --with-deps chromium`:
+
+    baseline image   710 MB
+    after            1645 MB
+    DELTA            935 MB      (2.3x the image)
+
+RAM is transient rather than resident -- a few hundred MB while a page renders,
+released after. CPU is a few seconds per candidate at connect and at each
+failover, not continuous. Nothing touches the capture path: if the browser is
+absent or fails, PVArr behaves exactly as it does today.
+
+### Two architectures -- SPONSOR DECISION NEEDED
+- **A: bake it into the image.** +935 MB for every user, including the majority
+  who never hit a JS-built URL. Simplest to operate, worst to distribute.
+- **B: optional sidecar container.** Main image unchanged; a second container
+  runs the browser and PVArr asks it over HTTP for a page's m3u8. Costs nothing
+  for anyone who does not need it, and the sponsor pulls it only on the test server.
+  This is exactly the FlareSolverr pattern the *arr ecosystem already uses for
+  pages that need a real browser, so it will be familiar to users.
+- **C: do nothing.** These providers stay unusable in PVArr.
+
+Recommended: **B**. An optional heavyweight dependency should be opt-in, and
+the ecosystem precedent is strong.
+
+### Open question for the sponsor
+Whether the DevTools m3u8 failed *immediately* or worked briefly first. Pure
+TTL means a manual stopgap exists for short recordings; immediate failure means
+it is bound to the browser session or IP and there is no stopgap. The fix is
+the same either way.
+
+## humantodo line 1: integrate rather than build (2026-08-31)
+
+Sponsor confirmed line 1 was pointing at exactly the FlareSolverr discussion:
+when a problem is already solved by a tool in this ecosystem, wire it up rather
+than growing our own. Sizes, measured rather than guessed:
+
+    comskip     333 KB installed (deps already present)
+    yt-dlp      3.1 MB
+    curl_cffi   13 MB   (prebuilt wheel, no compiler)
+    Chromium    935 MB
+
+### Decided and built: yt-dlp  [COMPLETED]
+`app/ytdlp.py`, wired into `detect_candidate_headers` between the built-in
+probe and the detect-headers script. Cheapest first.
+
+It exists for the case the probe *structurally* cannot handle. The sponsor ran
+`document.documentElement.outerHTML.includes('m3u8')` on their pages and got
+**false**: the player fetches its manifest over XHR and hands it to hls.js, so
+the URL is never in the document. No scraper will ever find it. That result
+also downgrades FlareSolverr for this purpose -- it returns rendered HTML, not
+intercepted requests, so it would not find the URL either. Its remaining value
+is Cloudflare cookies.
+
+Design notes:
+- **Subprocess, not import.** yt-dlp can hang on a slow origin; a subprocess
+  takes a timeout and an in-process call does not. It is also then replaceable
+  without a PVArr release, which matters for a tool that ships fortnightly.
+- **`-J`, not `-g`.** `-g` prints only the URL; the JSON carries
+  `http_headers`, which is where the Referer and User-Agent live. The URL
+  without them just moves the 403 one step later.
+- **Skipped for pasted playlist URLs.** The probe has already tried that exact
+  URL with every header combination it has. Calling yt-dlp would add up to 20s
+  to a *failover* to learn nothing. Caught because the suite jumped from 1.3s
+  to 15.1s the moment it was wired in -- the dev box has yt-dlp installed, so
+  tests were really shelling out. Same class of defect as the disk guard
+  reading the host's free space.
+- **Timeout 20s, not 45.** This runs while a live recording is off the air.
+
+### `--impersonate` is another extension_picky
+`--help` on yt-dlp 2024.04.09 mentions impersonate three times, and
+`--impersonate chrome` exits with a Python traceback: the option is recognised,
+but every target needs `curl_cffi`. Passing it on such a build turns every
+resolution into a hard failure -- and the first version of this module passed
+it unconditionally, with a comment claiming it was "silently ignored". It is
+not.
+
+`impersonation_available()` runs `--list-impersonate-targets` and looks for a
+row not marked "(not available)". Cached per binary. Exactly the lesson from
+`hls_extension_flags`: ask the binary what it can do, never what its help text
+mentions.
+
+`curl_cffi` is now in requirements, so the container can use a browser TLS
+profile. **Measured against provider A's host: it does not help there.** The
+same request with a browser TLS profile returns the same 403, same 139 bytes,
+as plain requests. That host appeared to block by network, not by TLS client
+-- more evidence the link was simply dead (overturned in Phase 18). Kept
+anyway: it is 13 MB and the capability is general.
+
+Verified against real yt-dlp output, not only mocks: resolves a public Mux HLS
+test stream, correctly reports impersonation unavailable on the system binary
+and available in the venv.
+
+452 tests (was 434).
+
+### comskip  [COMPLETED -- built in 04c6a8d (chapters) and ae98ad1 (verified cut)]
+The plan below is kept for its reasoning; the freezedetect half was dropped
+(see "The sponsor corrected me twice" further down). Measured results are under
+"comskip defaults, measured on a real game".
+Sponsor decision: **comchap (chapter marks) as the default, comcut (actual
+removal) as an option.** Non-destructive by default is the right call next to
+everything else this project does to avoid losing footage -- a false positive
+in a cut eats a play that cannot be re-recorded.
+
+Sponsor corrected my pessimism: broadcast TV recordings are comskip's home
+turf -- real station logos, real black frames, real ad breaks. Other sources
+show a static card ("Commercial Break In Progress"), which comskip will likely
+miss because it is neither black nor logo-free.
+
+The shipped FFmpeg already has `freezedetect`, `blackdetect`, `blackframe` and
+`silencedetect` -- verified inside `ghcr.io/jlesterak/pvarr:0.3.0`. A static
+break card is a frozen frame, so `freezedetect` catches precisely the case
+comskip misses, at zero added dependency. Plan: comskip for the OTA
+rebroadcasts, a freezedetect pass for the static-card streams, both writing
+chapters.
+
+Runs after the remux, off the capture path entirely. ~20-40 min of CPU for a
+3-hour recording, single-threaded.
+
+### Considered and declined
+- **Tdarr / Unmanic** -- do not build transcoding. Point them at the recordings
+  folder; that is what they are for.
+- **Sonarr / Radarr APIs** -- PVArr is not indexer-driven, there is no release
+  to grab. The Plex/Emby tuner integration already covers the ecosystem need.
+- **Bazarr** -- live streams do not carry subtitles worth fetching.
+
+### Still open
+- **Apprise** would replace the hand-rolled Discord/Telegram code with 100+
+  targets and let us delete code rather than add it. Not urgent.
+- **FlareSolverr**, narrowed: Cloudflare cookies only, since the m3u8 is not in
+  the DOM. Worth it only if a provider turns out to be Cloudflare-gated *and*
+  yt-dlp cannot resolve it.
+
+## Release v0.4.0 (2026-08-31)  [COMPLETED]
+
+Minor: new capability and two new Python dependencies, backward compatible.
+Sponsor-approved ("ship it").
+
+**What a user gets that they did not have before:**
+- **yt-dlp resolution.** PVArr can now resolve a page whose player fetches its
+  manifest over XHR -- the case its own scraper structurally cannot see,
+  because the m3u8 never enters the HTML. Extractors for thousands of sites,
+  plus a browser-compatible HTTPS client (`curl_cffi`).
+- **The probe says what it tried.** "Show what PVArr tried" under a failed
+  probe lists every header combination, its status, the segment fetch and its
+  extension, with a Copy trace button. Query strings stripped, so it is safe
+  to paste into a bug report.
+- **It stops blaming headers for things that are not headers.** A host that
+  refuses its own front page is named as such; a rejected access token is named
+  as such, with the advice to paste the page URL instead of hunting DevTools
+  for a header that does not exist.
+- **Recording windows and a 6-hour backstop** (from v0.3.x work carried here in
+  full).
+- **Stream tokens no longer reach logs or notifications.**
+- **Buccaneers vs Raiders** as the example fixture.
+
+**On upgrade:** nothing to do. Pull and restart.
+
+  - The image grows ~16 MB (yt-dlp + curl_cffi).
+  - Unchanged from v0.3.0: a recording started with no duration stops after
+    6 hours. Set a duration, raise `PVARR_MAX_HOURS`, or set it to `0`.
+
+452 tests green at the tag.
+
+### Known limitation shipped knowingly
+The sponsor's five failing providers are not fixed by this. yt-dlp may resolve
+some of them -- that is the test to run -- but for a provider it has no
+extractor for, whose manifest is XHR-only, the remaining answer is real
+request interception in a browser, which is not built. What v0.4.0 guarantees
+is an accurate diagnosis instead of a misleading one.
+
+## Commercial detection (comskip)  [COMPLETED — needs field validation]
+
+`app/commercials.py`. Off by default (`PVARR_COMSKIP=1`), chapters by default
+(`PVARR_COMSKIP_MODE=chapters`), operator's own ini honoured
+(`PVARR_COMSKIP_INI`). comskip added to the Dockerfile: 333 KB, dependencies
+already present.
+
+### Design
+- **Chapters, not cuts.** A false positive in chapter mode costs a click. In
+  cut mode it deletes a play that cannot be re-recorded. `cut` is accepted as a
+  setting but deliberately **not implemented** -- it needs its own verification
+  pass (confirm the output is playable and the duration dropped by the expected
+  amount before replacing the original), and shipping the destructive half
+  without that is how a heuristic eats someone's recording. It logs and falls
+  back to chapters. There is a test for that.
+- **Runs last, after the notification.** 20-40 min of CPU on a three-hour
+  capture. Putting it before the notification would make an operator wait half
+  an hour to be told about a recording they could already watch.
+- **Chapters are written via stream copy** to a temp file and moved into place
+  only on success -- the file is already in the library and someone may be
+  watching it.
+
+### The sponsor corrected me twice, both times usefully
+1. I expected comskip to do badly on these streams. Wrong for broadcast TV
+   recordings, which are exactly what it was built for -- real logos, real
+   black frames, real ad breaks.
+2. I proposed `freezedetect` for the "commercial break in progress" cards.
+   **The sponsor pointed out those cards usually have a moving background**,
+   which defeats it. Measured, and they are right: a synthetic static card
+   produces 3 freeze events, an animated one produces **0**.
+
+So the animated-card case is still unsolved and is NOT claimed to be. See the
+open item below.
+
+### A sharp edge the tests caught
+`process()` removed whatever directory `detect()` handed back. In practice
+`detect()` always makes its own `mkdtemp`, so it was safe -- but a recursive
+delete resting on an assumption is the wrong shape of code in a project this
+careful about not losing footage. `_discard_workdir()` now refuses to remove
+anything that is not under the temp root, or that is the recording's own
+directory.
+
+### Verified end to end inside `ghcr.io/jlesterak/pvarr:0.4.0`
+Real comskip, real ffmpeg, on a real MP4:
+
+    comskip found   : /usr/bin/comskip
+    result          : {'ran': True, 'breaks': 0, 'mode': 'chapters', 'applied': True}
+    file intact     : True
+    ffprobe chapters: TAG:title=Show Segment
+
+471 tests (was 452).
+
+### Open
+- [ ] **Detecting an animated break card.** freezedetect is out. Candidate
+      signals: an abnormally long gap with no scene cuts (live sport cuts
+      constantly, a card does not), and the very low encoded bitrate of a
+      simple loop. **Needs a real sample to measure against** -- building a
+      detector from my guess about what these cards look like would repeat the
+      `-allowed_extensions ALL` mistake exactly. A 60-second clip spanning one
+      break would settle it.
+- [x] Whether comskip's defaults are any good on broadcast TV recordings --
+      measured 2026-09-30, see below. **Tuned ini: open.**
+
+### comskip defaults, measured on a real recording (2026-09-30)
+Sample: a 3h44m network football broadcast ("network A"), 1280x720 (named
+1080p by 0.5.1; the 0.6.0 retag fix postdates this recording). **This source
+carries real broadcast ads, not a break card**, so it is comskip's home turf.
+It says nothing about the animated-card case above.
+
+Ground truth, built without comskip: network A's corner logo is on every
+broadcast frame and on no ad. A per-pixel median over keyframe crops gives the
+logo template; per keyframe (every 4 s) the fraction of logo pixels lit is
+bimodal (2397 frames at 1.0, 869 at 0.0, ~100 between). Absent runs >= 20 s:
+**27 breaks, 65.1 min**. Spot-checked by eye: all ads, sponsor bumpers, or the
+halftime studio show (1:46:40-1:56:24, excluded from scoring as a judgement
+call).
+
+Bitrate and keyframes carry no signal on this source: it is re-encoded at
+~1.5 Mb/s constant (p10 1422, p90 1535 kb/s per 30 s) with a fixed 4.000 s
+GOP. So the "low bitrate of a simple loop" idea for break cards cannot be
+relied on either, at least from this source.
+
+comskip 0.82.011 from the 0.5.1 image, PVArr's shipped minimal ini
+(`output_edl=1`, `output_ffmeta=1`), one core niced: **17m54s**.
+
+| | |
+|---|---|
+| breaks detected | 21 (46.8 min) |
+| ad time caught | 40.1 of 55.3 min -- **73%** |
+| ad time missed | 15.2 min |
+| game marked as ad | 1.8 min (4% of what it flagged) |
+
+Every "game marked as ad" span is 10-36 s and sits *between* two true breaks
+or at a break edge -- almost certainly bumpers carrying the logo, i.e. the
+answer key being strict, not comskip eating plays. **Precision is effectively
+fine for chapters, and good enough that `cut` would not have cost a play on
+this game.** Recall is the weakness: three whole breaks missed (0:06:32 200 s,
+1:27:28 152 s, 2:34:44 140 s), plus partial misses on six more.
+
+- [ ] **Tune a sports ini against this answer key.** Each run is ~18 min on
+      one core; several can run in parallel. The harness (logo track -> truth,
+      EDL -> score) is small and should live in `scripts/` so any tuning claim
+      is a number, not an impression. Do not ship a tuned ini as the default
+      until it beats 73% recall without raising game-marked-as-ad time.
+      **Harness built** (`scripts/score-comskip.py`, 84fd96b). Sweep below.
+
+### comskip tuning sweep on the same game (2026-09-30)
+Scored with `scripts/score-comskip.py` (its key: 25 breaks; halftime
+6356-6984 excluded, hence 72% not 73% for the baseline). 14 runs, one
+setting varied at a time where it mattered; comskip is deterministic
+(baseline and its verbose twin, and `111` and its verbose twin, agree to the
+second).
+
+comskip's real defaults, read from the verbose log: `detect_method=123`
+(black, logo, resolution, closed captions, aspect, silence),
+`max_commercialbreak=600`, `max_commercial_size=120`,
+`min_show_segment_length=120`, `logo_threshold=0.8`.
+
+| ini on top of defaults | recall | game as ad | whole breaks missed |
+|---|---|---|---|
+| none (shipped) | 72% | 1.3 min | 4 |
+| `detect_method=107` (drop CC) | 72% | 1.3 | 4 |
+| `detect_method=111` (CC -> **scene change**) | **80%** | 1.4 | **2** |
+| `detect_method=255` (everything) | 80% | 1.4 | 2 |
+| 111 + `max_commercial_size=180` or `240` | 80% | 1.4 | 2 |
+| 111 + `min_commercialbreak=20` | 80% | 1.4 | 2 |
+| 111 + `logo_threshold=0.75` | 80% | 1.4 | 2 |
+| 111 + `max_commercialbreak=900` | 72% | 1.3 | 4 |
+| `logo_threshold=0.70`, longer limits, 107+longer limits | 72% | 1.3 | 4 |
+
+- **Scene change is the one lever.** It recovers two whole breaks the
+  default drops (1:27:28 152 s, 2:34:44 140 s), ~5 min of ads, for +6 s of
+  game-as-ad and no measurable CPU cost (same wall time as the default).
+- **`max_commercialbreak=900` cancels it**, reproducibly. Not investigated
+  further; do not combine the two.
+- **Still missed under every setting:** 0:06:32 (204 s). comskip sees logo
+  0.00 across a 131 s block and keeps it as show anyway, flagged `E`
+  ("exceeds"). Raising `max_commercial_size` does not change that, so the cap
+  it exceeds is something else. Also two 36 s breaks and 30-48 s slivers at
+  the edges of four more.
+- An earlier explanation in this session -- "back-to-back ads with no black
+  frame between exceed the 120 s single-ad cap" -- was **wrong**: raising the
+  cap changed nothing. Recorded so it is not repeated.
+
+- [x] **Scorer fixed for logos on a plate (2026-10-01).** On the first
+      network B recording (hockey, a doubleheader tail + studio shows) the
+      answer key said only 30.6 min of ads and had the logo "present" through
+      a plainly visible 3.5 min ad break. Cause: across the whole file the
+      logo's white letters were on screen too rarely to pass the stability
+      test, so the template was only the black square behind them, and any ad
+      with a dark top-left corner matched. Fix: `truth --ref SECONDS` builds
+      the template from the 4 min around a moment known to show the logo, and
+      the light and dark parts of the logo are scored separately (both must
+      match). Result: scores go bimodal (0.0 / 0.9+), that ad break reads as
+      ad end to end. Without `--ref` the network A key is unchanged.
+### Second network: hockey on network B (2026-10-01)
+Sample: a 3h03m hockey broadcast, 1280x720, network B. Starts with the tail
+of the previous game and a studio show. Key: `truth --logo-box 70:60:24:40
+--ref 2400 --min-break 100` (network B's logo inside the scorebug).
+`--min-break 100` because the scorebug also drops for 20-48 s during replays
+and goal celebrations; at the default 20 s those counted as ~20 phantom
+"breaks". Excluded as studio/judgement calls: pre-game 796-1340, 1st
+intermission 3812-4924, 2nd intermission 7360-8472, post-game 10772-end. 10
+in-game breaks, 128-148 s each. Each comskip run ~38 min on one core (3 h
+file).
+
+| ini | recall | game as ad | whole breaks missed |
+|---|---|---|---|
+| none (shipped) | 66% | 0.1 min | 0 of 10 |
+| `detect_method=111` | 66% | 0.1 min | 0 of 10 |
+
+- **Every break found, every break trimmed the same way:** comskip starts
+  ~10 s late and stops **35-50 s early**, so ~90 s of each ~140 s break.
+  Hypothesis, not checked: network B ends breaks with in-house promos carrying
+  its own top-right bug, and comskip's logo learner picked that bug.
+- **`111` is neutral here**: no gain, and no extra game marked as ad. With
+  +8 points on network A and nothing lost on network B, the evidence now
+  supports making it the default (sponsor's call; small change to
+  `_DEFAULT_INI` + README).
+- [ ] **Sponsor decision: ship `detect_method=111` in the default ini?**
+- [ ] Investigate the network B tail miss: which logo comskip learned (verbose
+      log / `.logo.txt`), and whether pinning the logo area fixes the ends.
+- [x] **Validate `detect_method=111` on a second recording, ideally another
+      network, before making it the default ini.** **Done 2026-10-01 on
+      network B, above.** One recording is one broadcaster's ad-insertion
+      habits; a setting that helps here can split show blocks elsewhere. Until
+      then it is a documented tip, not a default. Cost to validate: ~30 s for
+      the key + one comskip run (~18 min alone).
+
+## Integration candidates — decided (2026-08-31)
+
+Sponsor reviewed the register: **#1 and #8 approved and built. #4-6 closed as
+NOGO, not to be raised again.**
+
+### Built
+- **#1 Apprise** — `notifications.py` rewritten around it. One interface to
+  100+ services; the hand-rolled Discord and Telegram senders are gone, which
+  means one payload format, one error path, and **one place where redaction
+  happens** rather than two to forget. Existing `DISCORD_WEBHOOK_URL` and
+  `TELEGRAM_*` are translated into Apprise URLs at startup -- an upgrade that
+  silently stops notifying is worse than one that never started. New:
+  `PVARR_APPRISE_URLS` for anything else. 1.8 MB.
+- **#8 comcut** — `PVARR_COMSKIP_MODE=cut` now really cuts, with the
+  verification that was missing. The cut is written beside the recording and
+  only replaces it if ffprobe can read it *and* the duration is within 30s of
+  the expected length. `PVARR_COMSKIP_KEEP_ORIGINAL=1` (the default) keeps the
+  uncut file too. Overlapping comskip ranges are merged before inversion --
+  inverting them unsorted silently drops content.
+
+### Still open, sponsor's call
+- **#2 FlareSolverr** — HOLD. Returns rendered HTML, not intercepted requests,
+  and the sponsor's `includes('m3u8')` was false, so it will not find their
+  manifests. Its value is a browser session's cookies only. (Later wired in
+  for event pages only -- Phase 25.)
+- **#3 Headless browser with request interception** — HOLD, +935 MB measured.
+  The real answer for an XHR-only manifest yt-dlp has no extractor for. Prefer
+  a sidecar over baking it in.
+- **#7 Gluetun / VPN egress (docs only)** — proposed while provider A's hosts
+  appeared to refuse every client, a real browser included. Phase 18 showed
+  that verdict was wrong (the refusal was a TLS-client check), so this lost
+  its reason. Not built.
+
+### Closed — NOGO, do not revisit
+- **#4 Tdarr / Unmanic** — point them at `recordings/`; transcoding is not
+  PVArr's job.
+- **#5 Sonarr / Radarr APIs** — PVArr is not indexer-driven; there is no
+  release to grab.
+- **#6 Bazarr** — live streams carry no subtitles worth fetching.
+
+## Field results from v0.4.0 (2026-08-31)
+
+The sponsor tested live while this was being built. Three findings:
+
+1. **The dashboard probe was not calling yt-dlp.** It was wired into the
+   recorder only, so an operator testing a page from the dashboard was told to
+   go to DevTools while the recorder would have resolved it. Fixed: the
+   fallback now lives inside `probe_stream()`, so the dashboard and the
+   recorder cannot drift apart -- the same reasoning as `_launch_session()`
+   being shared between a fresh start and a resume.
+2. **A DevTools m3u8 from provider B records fine.** Probe clean, needs a
+   Referer, segments fetch as `.ts`. Its token carried about **4 hours** of
+   life, which is plenty for one event and means the manual workflow is
+   viable per-recording. It cannot survive a token expiry mid-capture,
+   because a pasted m3u8 has nothing to re-resolve.
+3. **The origin check earned its place immediately.** On a provider A link it
+   correctly reported a wholesale refusal rather than a missing header, first
+   time, with no analysis from me.
+
+
+
+## Field session, continued: the sponsor is testing a build without the fix
+
+Every "No .m3u8 found on that page (HTTP 200)" the sponsor reported carries a
+trace of exactly one line -- `page 200 scraped for an m3u8`. That is the
+**v0.4.0** message and the v0.4.0 code path. The probe -> yt-dlp wiring landed
+after that tag, so their page-URL tests are currently exercising a build that
+never tries yt-dlp at all. Until they are on a build that has it, a page URL
+failing tells us nothing.
+
+That is the blocker, not any individual stream.
+
+### Two distinct failure classes, now cleanly separated by the trace
+1. **The host refuses everyone.** Provider A's playlist hosts: identical 403
+   to every referer, every user-agent, requests/curl/curl_cffi with a browser
+   TLS profile/a real browser, and to their own front page -- from the
+   sponsor's network *and* from this dev box. Looked unwinnable from any
+   client we have (overturned in Phase 18).
+2. **The host answers, the stream is gated.** Provider C returns **200** on
+   its own root (confirmed independently from this box) and 403s the
+   playlist. That is winnable: it needs the right token, and possibly a
+   session cookie. Reaching it requires resolving the page, which requires
+   yt-dlp, which is not in their build.
+
+The origin check is what makes these two distinguishable at a glance, and it
+did so with no analysis from me in either case.
+
+### Message improved
+The tokenised-URL message now says what to do when the page URL *also* fails --
+copy the session Cookie -- rather than leaving the operator in the loop the
+sponsor actually hit: DevTools m3u8 is expired, page URL finds no m3u8, repeat.
+
+## Release v0.5.0 (2026-09-01)  [COMPLETED]
+
+Minor: new capability and one new dependency, backward compatible.
+Sponsor-approved ("sheeeep eeeetttt").
+
+**The one that matters for the sponsor's testing:**
+- **The dashboard probe now calls yt-dlp.** It was wired into the recorder
+  only, so testing a page from the dashboard reported "No .m3u8 found on that
+  page" while the recorder would have resolved it. Every page-URL test run
+  against v0.4.0 was therefore meaningless. The fallback now lives inside
+  `probe_stream()`, so the dashboard and the recorder cannot drift apart.
+
+**Also new:**
+- **Notifications through Apprise.** ntfy, Gotify, Pushover, Matrix, Slack,
+  email and plain webhooks via `PVARR_APPRISE_URLS`. Existing
+  `DISCORD_WEBHOOK_URL` and `TELEGRAM_*` are translated automatically and keep
+  working -- no `.env` edit needed.
+- **`PVARR_COMSKIP_MODE=cut` really cuts now**, and refuses to replace a
+  recording unless ffprobe can read the result and its duration is within 30s
+  of expected. `PVARR_COMSKIP_KEEP_ORIGINAL` defaults to on.
+- **Better failure advice.** A gated stream whose host is answering now names
+  the session Cookie as the next step, instead of looping the operator between
+  an expired DevTools m3u8 and a page with no m3u8 in it.
+
+**On upgrade:** nothing to do. Pull and restart. Notifications keep working
+unchanged. The image grows 20 MB (1.11 GB -> 1.13 GB), all of it comskip and
+its `libav*` dependencies -- measured, not estimated. The "333 KB" quoted to
+the sponsor when comskip was approved was the binary alone and was wrong.
+
+500 tests green at the tag.
+
+### What this does not fix
+Streams from provider A. **This verdict was wrong -- see Phase 18.**
+
+## Phase 18 — Why provider A's streams were unrecordable (2026-09-01)  [COMPLETED -- live validation pending]
+
+Sponsor field-tested a set of pages. Every one resolved to one of two
+upstream providers: provider B (already worked) or provider A (did not).
+Several front-end domains, two actual providers. **No provider domain belongs
+in the code** -- sponsor's explicit instruction, and correct: front-ends are
+disposable and rotate. (The site-by-site investigation is kept in private
+notes, not in this repo.)
+
+### My earlier verdict was wrong
+v0.5.0 recorded that provider A "returns an identical 403 to every client
+including a real browser". That was measured by *pasting the URL into a
+browser*, which sends no Referer, no Origin, and none of the context the
+embedded player has. It was never a test of the request the player makes.
+I then repeated the conclusion for several sessions without rechecking it.
+
+### What is actually happening, proven from the sponsor's machine
+A browser plays the stream. `curl` on the same machine, same second, same IP,
+replaying the browser's own exported request header-for-header, gets 403. The
+`If-None-Match` value differed on every capture while the URL stayed the same,
+which proves the token is neither single-use nor expiring -- the browser
+re-fetches that exact URL continuously and succeeds.
+
+That leaves only the TLS handshake. Confirmed with `curl_cffi`: of the browser
+TLS profiles tried, exactly one was answered (200, 1177 bytes -- matching the
+length in the browser's own ETag) and the rest got 403. The origin appears to
+allow a few known clients rather than block bad ones.
+
+### Two gates, not one -- and they are different gates
+- **Playlist**: needs a browser TLS profile **and** `Referer`/`Origin`. This
+  is the part FFmpeg cannot do; OpenSSL presents one TLS client profile and
+  cannot present another.
+- **Segments** (a different host from the playlist): need **only**
+  `Referer`/`Origin`. A plain client with the headers got 200 and 5.8 MB; any
+  client without the Referer got 403. No special TLS client needed.
+
+### Consequence for the design
+The relay only has to carry the **playlist**, not the video. ~1.2 KB every 6s
+(~200 B/s), no measurable CPU, and the video path is unchanged -- FFmpeg still
+pulls segments straight from the CDN. Segment URLs are absolute and on another
+host, so no playlist rewriting is needed. No `#EXT-X-KEY`, so no key fetch.
+
+Live rolling playlist (`#EXT-X-MEDIA-SEQUENCE`, no `#EXT-X-ENDLIST`) with a
+3-segment / ~18s window, so the relay must keep serving fresh copies for the
+life of the recording. Falling 18s behind loses video.
+
+### The Referer is the iframe origin, not the page
+The player lives in an iframe on a third domain, and the CDN wants *that*
+origin, not the page the operator pasted. Deriving Referer from the pasted URL
+sends the wrong value and still 403s. The generic fix is to follow the
+`<iframe src>` chain while scraping and use the origin of the document that
+actually yielded the playlist. Discovered per stream, so it survives any
+domain rotation.
+
+### Also found: path-embedded tokens defeat our redaction
+`/secure/<token>/rtmp/stream/<token>/playlist.m3u8` carries the credential in
+the **path**. `redact_url_secrets()` strips the query string and keeps the path,
+so a URL of this shape still reaches Discord/Telegram with the token intact.
+Same leak class as the one fixed in 0.4.0, different URL shape. Fix generically,
+not by matching this layout. **[FIXED in Phase 19]**
+
+### Not yet built -- needs sponsor go-ahead
+New loopback listener + change to the recorder's core path. Escalation
+required per Directive 3.
+
+### A third front-end, followed by hand (2026-09-01)
+One more front-end page served different JavaScript when DevTools was open (a
+`debugger;` trap that wipes the document), so no m3u8 was captured in the
+browser. Chased from a plain HTTP client on the sponsor's own machine instead,
+four hops: the page's `<iframe src>`; an embed that sets a variable
+(`window.fid=...`) and loads an external script; that script
+`document.write`s the next iframe, interpolating the variable (**not in any
+HTML**, which is why scraping found nothing); and the player, whose playlist
+URL is a per-character array joined at runtime (`["h","t","t","p","s",...]
+.join("")`). It led to provider C -- two upstreams across everything tested,
+not three. Nothing to work around in PVArr for the `debugger;` trap: we never
+run the page's JavaScript.
+
+### The Referer must be the innermost document, measured
+Against provider C's extracted playlist:
+
+| Referer sent | result |
+|---|---|
+| the document containing the URL (innermost) | **200** |
+| an intermediate iframe | 403 |
+| the page the operator pastes | 403 |
+| none | 403 |
+
+Only the origin of the document that actually yielded the playlist works.
+Intermediate hops are refused. This is the rule to implement.
+
+### Corrected gate matrix -- the two providers differ
+| | playlist | segments |
+|---|---|---|
+| provider C | Referer only | **nothing at all** (200 bare) |
+| provider A | browser TLS profile + Referer | Referer only |
+
+Provider C needs **no relay**: FFmpeg can fetch the playlist itself given
+`-headers 'Referer: ...'`. Only provider A's playlist needs the browser TLS
+profile, and only that one justifies the loopback relay. Build the resolver
+first; the relay is a smaller, separable second step that need not block it.
+
+Segment window is ~72s on provider C (15 x ~4.8s) vs ~18s on provider A.
+
+### What the resolver has to handle
+Beyond `<iframe src>`: scripts that `document.write` an iframe using a variable
+set by the parent (`window.fid`), and character-array-joined URLs. All three
+are generic page patterns, not site-specific, and all three are resolvable
+without executing JavaScript. No headless browser needed for this chain.
+
+
+### Built 2026-10-05, step 1: the resolver follows the embed chain
+`probe._follow_embeds` walks `<iframe src>` breadth-first, fetches a document's
+external scripts when it has no iframe (for the `document.write` case),
+substitutes `'...' + var + '...'` with values the document set via
+`window.x=` / `var` / `let` / `const`, and collapses `[...].join("")` arrays.
+The playlist's Referer is now the document that held it. Caps: 12 extra
+fetches per probe, 4 scripts per document. Each embed is fetched with the
+Referer a browser would send (full URL same-origin, origin otherwise). No
+provider names anywhere. `TestProbeFollowsTheEmbedChain` replays the
+2026-09-01 chain with placeholder domains and fails on the old probe.
+
+### Step 2: FFmpeg sends the Origin the probe verified
+The probe has always tested `Referer` and `Origin` as a pair, but FFmpeg's
+`-headers` carried only `Referer`, so segments were requested with less than
+had been proven to work. The 2026-09-01 segment gate was measured as
+"Referer/Origin", so this is the cheap half of making it pass. `Origin` is now
+derived from the Referer and sent with it.
+
+### Step 3: the TLS-client gate, and the playlist relay
+Sponsor go-ahead given 2026-10-05 (the "not yet built" note above).
+- **Probe.** When every plain playlist attempt ends 401/403, the same header
+  sets are retried through a `curl_cffi` session with a browser TLS profile. Success
+  sets `impersonate: true` on the result. Segments are still checked with the
+  plain client, because FFmpeg fetches those itself; that is the honest test.
+- **Relay (`app/relay.py`, new).** `ThreadingHTTPServer` on `127.0.0.1`, an
+  ephemeral port, started per FFmpeg attempt and stopped in a `finally`. Each
+  reload fetches the upstream playlist with that TLS profile and the probe's
+  Referer/Origin/UA/Cookie, absolutises every URI, and routes only nested
+  playlists (variants, renditions) back through itself. Segments and keys keep
+  their real URLs. It answers only for playlists it was given or that those
+  playlists list (cap 64), so it is not an open proxy. No disk writes, no new
+  knob, no new port to publish. Cost: one TLS handshake per reload.
+- **Recorder.** `CandidateStream.needs_relay` is set by the probe on every
+  connect (reset first, so yt-dlp/detect-headers/raw paths never relay). Direct
+  mode then hands FFmpeg the relay URL with the same `-headers`.
+- **Tests.** `TestProbeRetriesWithABrowserTlsProfile` (2) and
+  `TestPlaylistRelayRecordsAGatedStream` (3): real FFmpeg records a
+  master -> media -> segments HLS through the relay from a local origin that
+  refuses FFmpeg the playlists, plus the recorder routing and teardown.
+  `ProbeTestCase` now stubs the browser-TLS session, so no probe test can
+  reach the network.
+
+Provider domains that had crept into a `logging_config.py` comment and two
+redaction test fixtures (Phase 19) were replaced with placeholders, so
+`grep` over `app/` and `test_pvarr.py` finds none. Since 2026-10-08 they are
+kept only in private notes, outside this repo.
+
+### Known limits
+- The TLS-client gate itself cannot be reproduced offline; the tests stand in
+  a header gate for it. Needs one live check (below).
+- If yt-dlp, not the probe, resolves a TLS-gated playlist, nothing sets
+  `needs_relay`. The probe now follows embeds, so it should get there first.
+- Embed *pages* that themselves demand the browser TLS profile are not retried; not
+  observed so far (the 2026-09-01 chain was walked with a plain client).
+
+### Review fixes (2026-10-05, sponsor-requested review)
+- **Quadratic m3u8 search.** `_M3U8_RE` (`[^sep]+\.m3u8`) took 13.7s on a
+  60 KB base64 data URI; the embed walk reads up to 13 documents, so one bad
+  page could stall a failover. Now: find each `.m3u8`, scan out from it (URL
+  length capped at 4096). Same matches, linear. `TestPlaylistSearchIsLinear`.
+
+- **Relay chose nested playlists by extension.** A variant at `/live/720p` or
+  a `.m3u` rendition went to FFmpeg direct and was refused, while the probe
+  (fetching variants with the browser TLS profile) reported OK. Now chosen by tag: the line after
+  `#EXT-X-STREAM-INF`, and `URI=` on `#EXT-X-MEDIA` /
+  `#EXT-X-I-FRAME-STREAM-INF`. `TestRelayRoutesNestedPlaylistsByTag`.
+
+- **SSRF.** The embed walk and the relay's nested fetches followed any URL a
+  page or playlist named, including loopback, LAN, link-local (cloud metadata)
+  and the container's own API -- and the relay sends the stream's cookie.
+  `probe.is_private_url` (resolves hostnames, anything not globally routable
+  counts) now gates both, unless the pasted URL is itself private. Not covered:
+  a public host that *redirects* to a private one, or DNS rebinding between
+  check and fetch. `TestEmbedWalkStaysOffThePrivateNetwork`, plus a relay test.
+  - [COMPLETED] **Redirects and playlist contents** (branch
+    `fix/private-redirects`; closes the two Phase 25 [PENDING] SSRF items on
+    `feat/aggregator-sportsdb`; merged after both feature branches on
+    2026-10-07 and those two lines flipped). `probe.NoPrivateRedirects` wraps
+    every probe/relay session and follows redirects by hand, running
+    `is_private_url` on each hop; only http(s) hops, and an explicit Cookie is
+    dropped when a hop changes host. `probe.private_playlist_uri` refuses a
+    playlist naming a private segment, key, variant or rendition: the probe
+    fails with the URL in its message, the relay answers 403. yt-dlp's
+    resolved URL gets the same check. LAN sources stay supported: the rule is
+    "private only if the operator's own URL was private", per request for
+    redirects. `TestRedirectsAndPlaylistsStayOffThePrivateNetwork`, two relay
+    tests. **Not enforceable:** FFmpeg in direct mode follows redirects and
+    fetches segments itself on every reload; the probe checks the playlist,
+    first variant and first segment at connect time, the relay checks every
+    reload it carries, hls-proxy fallback is unchecked. After merging the
+    aggregator: its `_plain_session()` should return
+    `probe.NoPrivateRedirects(requests.Session())` (one line) -- its
+    browser-TLS session already gets the guard. DNS rebinding: still accepted.
+
+- **Relay stop race.** `stop()` cleared `_server` while a handler thread could
+  still be in `_local()` reading the port from it (AttributeError, a 500 to
+  FFmpeg mid-teardown). The port is now stored once in `start()`.
+
+- **Guard tests added** for promises the code made but nothing checked: the
+  relay 404s every path it did not hand out (`TestRelayRoutesNestedPlaylistsByTag`),
+  one probe spends at most 12 embed fetches (`TestEmbedWalkIsBounded`), and
+  the relay is torn down when FFmpeg raises.
+
+- **Cleanups.** One `origin_of()` builds the Origin for both FFmpeg's
+  `-headers` and the relay. The relay now streams the upstream playlist and
+  stops at 8 MB (not the probe's 512 KB: a long event playlist with tokenised
+  URLs can pass that, and truncating it would lose video).
+
+### Live test for the sponsor
+1. Rebuild the local image from this commit (`docker compose -f
+   docker-compose.build.yml up -d --build`), not the test server.
+2. Paste the page URL (not the m3u8) of a stream that resolves to the
+   TLS-gated provider. Expect the check line to end "...(relayed)" and the
+   trace to show 403s then a 200 marked "with a browser TLS profile".
+3. Record 10+ minutes. Expect `[Relay] Playlist is only served to a browser
+   TLS profile` in the log, a growing `.ts`, and `segments_lost` near 0 (the
+   window is only ~18s, so a slow relay shows up as lost segments).
+4. Also paste one of the Referer-only provider's pages: it must record with
+   **no** relay line (Referer now taken from the innermost iframe).
+5. If step 2 fails on segments (403), capture the trace: the segment gate may
+   want something beyond Referer/Origin.
+
+## Phase 14: Failover timeline continuity (2026-09-05)  [COMPLETED]
+
+### The report
+The sponsor watches the live `.ts` with mpv while a recording runs, and uses
+`--start=` to skip around it. Failover broke both.
+
+### What was wrong
+Every failover spawns a fresh FFmpeg, and FFmpeg normalises each input to its
+own zero -- verified against a source whose own clock read one hour, which still
+came out of `-c copy -f mpegts` starting at 1.42s. Those bytes are appended to
+the same file, so the timeline stepped *backwards* at every switch.
+
+Reproduced locally in ten minutes with two 10s clips spliced the way the
+recorder splices them:
+- `ffprobe` read the 20s file as **10.02s** -- everything after the splice was
+  invisible to a duration probe.
+- One backward jump at the splice: `11.383 -> 1.423`.
+- mpv: `DTS 128090 < 1024490 out of order`, `Invalid audio PTS: 10.031 ->
+  0.000`, **`Reset playback due to audio timestamp reset`**, then an A/V
+  desynchronisation warning.
+
+This was previously measured (2026-08-31) and correctly judged not to affect the
+finished `.mp4`, because `_on_complete` remuxes and the remux re-times the
+splice. That finding still stands. What it missed is that the raw `.ts` is not
+an intermediate nobody looks at -- it is what the live tuner endpoint serves and
+what the sponsor actually watches.
+
+### The fix
+Read the last timestamp back out of the bytes we just wrote, and pass the next
+FFmpeg `-output_ts_offset`. No new process, no new file, no measurable CPU.
+
+- `last_timeline_position()` walks the 188-byte packet grid for PES headers and
+  takes the **maximum** PTS, not the last one found: audio and video interleave
+  and neither is reliably ahead, so "last" under-reports and an offset that is
+  too small puts the backward jump straight back.
+- `_ts_alignment()` finds the packet grid by looking for three sync bytes at
+  188-byte spacing, rather than making callers track a running byte count --
+  which a resumed recording could not reconstruct anyway. The capture loop reads
+  64KB chunks, which is not a multiple of 188, so a sliced tail almost never
+  starts on a boundary.
+- `_TailBuffer` keeps ~256KB as a deque of the original chunks. The obvious
+  version, `buf = (buf + chunk)[-CAP:]`, copies a quarter of a megabyte on every
+  chunk, ~10x/sec per recording, for the life of every recording, to serve a
+  value read once. (DevOps caught this; it is what I was about to write.)
+
+### Findings from the agent team that changed the implementation
+- **Architect, blocking:** "advance the offset at the end of
+  `_stream_ffmpeg_process`" is unreachable on the paths that matter. The body
+  returns from six places and all but one are followed by another FFmpeg
+  appending to the same file; only the operator-stop path falls off the end, and
+  that is the one case with no next segment. Now funnelled through a
+  `try/finally`. There is a regression test that fails without it.
+- **Architect:** resume was a second instance of the same bug -- a resumed
+  session is a new recorder object appending to a file an earlier process wrote,
+  so the offset would start at zero against a timeline hours in, reintroducing
+  the jump on every container restart. `_seed_timeline()` recovers it from the
+  tail of the existing file.
+- **Architect:** a 33-bit PTS wraps every ~26.5h while our own offset keeps
+  counting, so past the wrap a raw reading is *smaller* than where we are.
+  `advance_timeline_position()` treats a reading as a distance travelled the
+  short way round the circle, and refuses to move backwards.
+- **Security, blocking:** the offset is derived from stream content, which is
+  remote and therefore hostile. `str()` of a float is not a safe serialisation
+  for an FFmpeg argument -- `nan`/`inf` render as words and large magnitudes
+  render in exponent notation, none of which FFmpeg accepts as a duration.
+  `output_ts_offset_flags()` validates finiteness, sign and magnitude and
+  formats fixed-point, failing closed to *no offset* rather than a bad one.
+- **Security:** skip the scan entirely when an attempt delivered no bytes -- a
+  stream that fails instantly can cycle candidates quickly, and there is no
+  splice to measure anyway. An empty `_TailBuffer` is falsey, so this is the
+  same check as "did we get data".
+- **DevOps:** `-output_ts_offset` is a core muxer option present in every FFmpeg
+  of the last decade, confirmed against the 6.1.1 in this environment and the
+  5.1.9 in the shipped image. It does **not** need the runtime `ffmpeg -h`
+  probe that `hls_extension_flags()` uses -- that machinery exists for options
+  with genuine build-to-build variance, and adding a subprocess call per
+  recording start here would buy nothing.
+
+### Where the reviews disagreed, and how it was settled
+Architect flagged that `_RingSink` writes positionally into a wraparound buffer,
+so reading "the last 256KB" of a rebroadcast ring is not meaningful once it has
+wrapped, and asked whether rebroadcast was in scope. It dissolves: the tail is
+captured from the chunks on their way to the sink, before the sink sees them, so
+it is identical for a file and a ring. Rebroadcast splices are corrected the
+same way. Only the start-up *seeding* is file-only, and a ring has no prior
+timeline to rejoin because it is discarded with the process.
+
+### Verified
+- Four appended segments, real FFmpeg: timeline rises monotonically across all
+  1000 video packets; duration reads 44.17s for 40s of content (the extra is
+  three splices' worth of gap).
+- mpv on the four-segment file: **no timestamp reset, no DTS-out-of-order**.
+  `--start=38` into the final segment plays with `A-V: 0.000`.
+- Both defects the reviews caught were re-introduced deliberately to confirm the
+  new tests fail: neutering the argv fails 2 tests + 1 error; removing the
+  `try/finally` funnel fails 3.
+- 537 tests (was 500). Suite green.
+
+### Residual, accepted
+- mpv still prints `Invalid audio PTS: 10.03 -> 11.38` at a splice. That is a
+  *forward* step and mpv carries on; the line that mattered,
+  `Reset playback due to audio timestamp reset`, is gone.
+- Each splice leaves a ~1.4s gap, from FFmpeg's default muxer preload. Closing
+  it would mean subtracting a version-specific constant, and that cushion is
+  load-bearing: a PES header carries only the timestamp of the *first* frame it
+  packs, so the reading under-reports the true end of a segment by up to ~70ms.
+  The cushion absorbs that. In production the real gap is larger than 1.4s
+  anyway -- the footage genuinely did not arrive -- so a seamless splice would
+  be a lie about the timeline. Not worth chasing.
+- One corrupt frame at each splice, where the previous segment's final PES is
+  cut off mid-packet. Unavoidable without re-muxing the boundary; one frame
+  against a full playback reset.
+
+---
+
+## Phase 15: Record again, and the filename overwrite it exposed (2026-09-05) [COMPLETED]
+
+### The report
+Sponsor stopped a recording by mistake during live testing, after post-processing
+had already remuxed and deleted the `.ts`. Asked for a way to recreate a recently
+finished stream, writing to a new file, and then widened it: "not just for this
+stream/recording, but all please."
+
+### Decided with the sponsor before building
+- **Scope**: in-memory sessions only (last 20, cleared on restart). Persisting
+  finished configs would put live account cookies and tokenised URLs at rest in
+  `/config` indefinitely, and the tokens expire in hours anyway -- a config that
+  survives a restart is mostly a dead config.
+- **Behaviour**: pre-fill the start form, do not start outright. Candidate URLs
+  carry `st=` tokens with a few hours' life; one-click would fail at the probe
+  for most of a URL's life and cost the operator the time.
+
+### The data-loss bug this uncovered
+`get_output_path` de-duplicated with `while path.exists()` against the `.ts`
+only. Post-processing remuxes to `.mp4` and **deletes** the `.ts`, so recording
+the same fixture twice on one day found the stem apparently free, reused it, and
+`remux_recording`'s `ffmpeg -y` overwrote the first recording's finished `.mp4`
+silently. Live in every version to date; "Record again" would have triggered it
+on first use. Nothing to do with the new feature -- it just needed the same two
+teams twice.
+
+### Findings from the agent team that changed the implementation
+- **Security**: `/api/status` already exposes tokenised candidate URLs, referer
+  and user-agent to any unauthenticated caller, so returning those changes
+  nothing. But `CandidateStream.to_dict()` withholds the **cookie** on purpose
+  (`app/recorder.py:493-520`) -- a live credential for the sponsor's paid
+  account that, unlike a stream token, never expires on its own. The endpoint as
+  designed would have reverted that fix. Now returns `cookie_required` (a list
+  of URLs) and the value stays in-process.
+- **DevOps**: the collision fix alone left a wide TOCTOU window. Nothing creates
+  the file at name-selection time -- `_FileSink` opens it on the capture thread
+  seconds later -- so two "Record again" clicks a second apart both stat an
+  empty directory, both get the same path, and both open it `"ab"`. Result is
+  two FFmpeg processes interleaving TS packets into one file, which looks like a
+  valid recording, and `_output_ok`'s inode check cannot see it because both
+  handles hold the same inode. Fixed with `O_CREAT|O_EXCL` at reservation time.
+  That also converts two silent failures into loud ones: `Path.exists()` answers
+  False on OSError, so a stale NFS handle read as "name is free", and an
+  `output_dir` owned by another uid failed only later on a background thread
+  after the API had returned 200. Both are now the existing 400.
+- **Architect**: do **not** bump `SCHEMA_VERSION` for an additive record field --
+  `sessions.py:166` discards any record whose schema does not match exactly, so
+  a bump would drop every in-flight recording at boot, with no remux and an
+  orphaned `.ts`. Also: `SessionStore.save()` catches `TypeError` and responds by
+  disabling persistence for the whole process, so one non-JSON value in the new
+  field would silently cost every recording its ability to resume -- values are
+  coerced to `str` by construction. And the original absolute `end_time` must
+  not be replayed: it is in the past by then and `/start` answers 400. A
+  duration derived from `end_time - started_at` is offered instead, clamped to
+  the 1440 ceiling `/start` enforces.
+
+### Where the reviews overlapped, and how it was settled
+Security and Architect independently reached the same conclusion about the
+cookie, from different directions -- one from the threat model on port 8999, one
+from noticing that `recorder.candidates[i].cookie` is a *scraped* token by then,
+not the operator's input, because `detect_candidate_headers` re-scrapes at every
+connect. Both point at the same fix, and it also settles where to read config
+from: the session record (`header_overrides`, never mutated after `__init__`),
+not the live recorder.
+
+### Verified
+- 555 tests (was 537). Suite green.
+- Three mutations confirm the new tests bite: de-duplicating on `.ts` only fails
+  3; returning the name without creating it fails 3 + 1 error; adding `cookie`
+  to the returned headers fails 2.
+- `reserve_output_path` against a directory holding a finished `game.mp4`
+  returns `game_1.ts` and leaves the `.mp4` byte-identical.
+
+### Known, not fixed here (separate commits)
+- **[FIXED in Phase 19]** `server.py` calls `recorder.stop()` synchronously on the event loop, blocking
+  the FastAPI thread for up to ~7s (`proc.wait(timeout=5)` + `wait(timeout=2)`)
+  -- the dashboard freezes while a recording stops. The obvious fix
+  (`asyncio.to_thread`) opens a port-reuse race, because `recorder.stop()` sets
+  `is_running = False` *before* `stop_proxy()`, and `_allocate_proxy_port`
+  excludes only running recorders. The two must move together.
+- **[FIXED in Phase 19]** `stop_proxy()` sets `self._proxy_process = None` even when both `terminate()`
+  and `kill()` throw, so a proxy that refuses to die is forgotten and its port
+  is reported free.
+- On an `aborted_no_space` finish, `_on_complete` still remuxes unconditionally.
+  Remuxing a 20 GB `.ts` needs 20 GB that by definition is not there; FFmpeg
+  hits ENOSPC and the `.ts` is correctly kept, but the partial `.mp4` that
+  `ffmpeg -y` already created is left on the volume and shows up in the library.
+
+---
+
+## Phase 16: Resume reattaches to the working candidate (2026-09-05) [COMPLETED]
+
+Found while live-testing the resume path with the sponsor, by bouncing the
+server under a running recording.
+
+### What was wrong
+`_on_failover` writes `current_candidate_index` to the session record on every
+failover (`server.py:546`), with a comment stating the intent outright: "a
+resume should reattach to the candidate that was actually working, not start
+again from the primary that had already failed." Nothing ever read it back.
+`_launch_session` did not restore it and `recorder.py:598` always initialises to
+0, so the saved value was dead data and every resume restarted at candidate 1 --
+the one already known to be down. Cost is a fresh stall and another gap in the
+footage, on a recording that had just been interrupted.
+
+### Observed
+Bounced the server mid-recording at 18:45. The record on disk read
+`current_candidate_index: 1`; the recorder came back logging
+`=== Active Stream: Candidate 1/2 (Candidate 1) ===`.
+
+### Fixed
+`_launch_session` restores the index after construction, coercing to int and
+clamping anything outside the candidate list to 0 -- the record is JSON on disk
+and the list can be shorter than it was when written.
+
+### Verified
+- 559 tests (was 555). Removing the restore fails 1.
+- Same live run confirmed the timeline work end to end: 22885 video packets,
+  1.471 -> 767.446, **zero backward jumps**, across both a candidate switch
+  (+1.604s at 121.4s) and a container restart (+1.638s at 694.6s). Resume logged
+  `Continuing the timeline of an existing recording at 694.77s` and the live
+  FFmpeg argv carried `-output_ts_offset 694.775000`.
+
+### Also found, NOT fixed (needs its own change)
+**An open dashboard tab blocks shutdown.** The dashboard holds an EventSource on
+`/api/recordings/{id}/logs` for as long as the tab is open. Uvicorn's graceful
+shutdown waits for open connections *before* running the lifespan shutdown hook,
+so `stop_all()` never fires while a tab is watching. Measured at ~80 seconds
+from SIGTERM to `Application shutdown complete` with one tab open.
+`docker-compose.yml` sets `stop_grace_period: 30s`, so in a container Docker
+SIGKILLs first: the recorder never marks the session for resume and FFmpeg dies
+with the container. This defeats the resume feature precisely when it is needed
+-- a `docker restart` or a Watchtower update with the UI open. Likely the reason
+resume has felt unreliable in production.
+
+---
+
+## Phase 17: An open dashboard tab no longer blocks shutdown (2026-09-05) [COMPLETED]
+
+Found in Phase 16's live bounce; fixed here as its own change.
+
+### What was wrong
+Uvicorn drains open HTTP connections *before* running the ASGI lifespan
+shutdown hook -- and that hook is what calls `stop_all()`, which stops each
+recorder with `reason="shutdown"` and leaves the `.ts` marked for resume. The
+dashboard holds an `EventSource` on `/api/recordings/{id}/logs` open for as long
+as a browser tab is on it, and `log_generator` loops until `recorder.is_running`
+goes false -- which only happens inside the hook it is blocking. Deadlock by
+construction, broken only when the operator closes the tab.
+
+`register_signal_handlers` (`cleanup.py`) was written to prevent exactly this:
+stop the recorders on SIGTERM, *then* chain to uvicorn so the streams can drain.
+It does not work, and the docstring's reasoning is inverted. It registers at
+import; uvicorn then calls `install_signal_handlers()`, which uses
+`loop.add_signal_handler` and **replaces** the `signal.signal` handler. Ours ran
+last, after `Finished server process`, doing nothing useful.
+
+### Measured
+Bounced the server under a live recording with one dashboard tab open:
+80 seconds from SIGTERM to `Application shutdown complete`. `docker-compose.yml`
+sets `stop_grace_period: 30s`, so in a container Docker SIGKILLs at 30 -- before
+`stop_all()` has run at all. No resume marker, no remux, FFmpeg killed
+mid-write, on precisely the recording resume exists to protect.
+
+### Fixed
+`start.sh` now passes `--timeout-graceful-shutdown` (public uvicorn option,
+`PVARR_GRACEFUL_TIMEOUT`, default 5). The drain is bounded, so the lifespan hook
+always runs and always has the full `PVARR_SHUTDOWN_TIMEOUT` budget.
+
+Chosen over the alternatives deliberately: making `log_generator` watch a
+shutdown flag needs a pre-drain hook we cannot reliably get, because uvicorn
+owns the signal handlers by then; re-installing our own via
+`loop.add_signal_handler` at lifespan startup would work but needs
+`loop._signal_handlers` (private) to chain to uvicorn's, and a shutdown path is
+the worst place to depend on an internal. The flag is supported, one line, and
+bounds *every* long-lived response -- the tuner and live `/stream` endpoints
+too, not just the log SSE.
+
+### Verified
+- Isolated second instance, own config and recordings dir, one SSE client held
+  open: **15.0s before, 5.5s after**, with `Application shutdown complete` and
+  the recorders stopped in both. (The 15s floor is because the test recorder
+  gave up on a dead URL and ended the stream itself; a healthy recording never
+  does, which is the 80s case.)
+- 562 tests (was 559). Two mutations bite: removing the flag from `start.sh`
+  fails 1; shrinking `stop_grace_period` below the budget fails 1.
+- The budget test parses `start.sh`, `cleanup.py` and `docker-compose.yml`, so
+  the three cannot drift apart again silently.
+
+### Left alone, deliberately
+`register_signal_handlers` still runs and is now redundant under uvicorn, but it
+is the only shutdown path for the `stream-recorder.py` CLI entry point. Removing
+it would break that; correcting its docstring is worth doing but is not this
+change.
+
+---
+
+## Phase 18: Acting on the pre-release cloud review (2026-09-05) [COMPLETED]
+
+Ultrareview run against `v0.5.0` before shipping 0.5.1. Three findings, all
+confirmed against the code here, all fixed.
+
+### 1. Twenty-five tests never ran in CI (the serious one)
+`if __name__ == "__main__": unittest.main()` sat at line 5749, and every test
+class added this session was appended *below* it. `unittest.main()` reflects
+over `__main__`'s globals at the moment it is called and then `sys.exit()`s, so
+those classes were never defined, never discovered, and never run -- and nothing
+failed, the count simply dropped.
+
+Measured: `python test_pvarr.py` (what CI runs) collected **537**;
+`python -m unittest test_pvarr` (what I ran, which imports the module and
+executes the whole file) collected **562**. The four classes guarding the
+`.mp4` overwrite fix, the atomic reservation, the whole `/config` endpoint
+including its "never return the cookie" contract, the resume candidate index,
+and the shutdown budget were all invisible to CI while I reported them green.
+
+Fixed by moving the entry point to the end of the file, and guarded by
+`TestEveryTestInThisFileActuallyRuns`, which fails and names any class stranded
+below it, and separately asserts the two ways of running the suite collect the
+same count. Re-stranding a class fails 2 tests and prints the offending line.
+
+**Process lesson, worth keeping:** verify a suite the way CI invokes it, not the
+way that is convenient locally. `-m unittest` and `python test_pvarr.py` are not
+equivalent, and the difference is silent.
+
+### 2. A refused start left a 0-byte stub and burnt a slot
+Regression introduced by Phase 15's `reserve_output_path`. The name is claimed
+by creating the file (`server.py:742`), but the disk-space floor rejects with
+507 afterwards (`server.py:782`), and nothing gave the name back. Every refused
+start left a 0-byte `.ts`, so the same fixture climbed `_1`, `_2`, ... and after
+999 could not be recorded at all. Before Phase 15 no file was created, so a 507
+left nothing behind.
+
+Fixed with a `finally` that calls `_discard_reservation()` whenever the recorder
+was never created. It removes the file **only if it is still empty** -- once
+anything is written the recorder owns it, and cleanup must never be able to
+delete footage on a late failure. Five tests, and two mutations bite: removing
+the rollback fails 3, letting it delete a non-empty file fails 1.
+
+### 3. The parallel `session_records` dict (nit, taken anyway)
+Phase 15 added a second module-level dict that had to be inserted and pruned in
+lockstep with `active_recorders` -- the docstring itself called drift "a leak",
+which is a fair sign the shape was wrong. Collapsed onto the recorder as
+`recorder.session_record`, declared in `StreamFailoverRecorder.__init__`. One
+object, one lifetime, no paired pop, and `_prune_finished_sessions` goes back to
+touching one dict.
+
+### Accepted, not fixed
+A session that was *already running* when PVArr is upgraded to 0.5.1 has no
+`naming` block in its persisted record, so "Record again" offers `Sports` /
+`TeamA` / `TeamB`. Its URLs, headers and freeze timeout are still correct, and
+the operator sees the form before pressing Start. Reconstructing the teams from
+the filename is not possible without guessing -- `sanitize_token` is lossy, which
+is why the inputs are stored in the first place. One-off, affects only the
+upgrade window, and now stated in the README.
+
+### Verified
+- 569 tests, CI-style (`python test_pvarr.py`) and via `-m unittest`, both green
+  and both reporting the same count.
+
+## Phase 19: Path tokens, the stop freeze, and a proxy that would not die (2026-09-14) [COMPLETED]
+
+Two items carried since Phase 15 and one since the provider A investigation.
+Sponsor-approved as one unit because two of them share a race.
+
+### 1. Tokens carried in the URL *path* reached Discord
+`redact_url_secrets()` dropped the query string and kept the path. Provider A
+puts its credential in the path (`/secure/<token>/rtmp/stream/<token>/...`), so
+that URL reached the log history, stdout and chat notifications intact.
+
+Fixed without matching any provider's layout: a path segment is redacted when
+it *looks generated*, measured by how often its characters change class
+(digit / lower / upper). Tokens switch every one or two characters; names like
+`media_w1234567_b2596000_12345` stay in one class for long runs. Hex mixing
+digits and letters is caught outright. Errs towards redacting: a long CamelCase
+name (`NFL_Green_Bay_Packers`) can be hidden, and that is accepted.
+
+Measured over 20,000 random tokens per length, after one correction to my own
+first draft -- which counted only letters and digits towards the 16-character
+minimum, so `-`/`_` let **40%** of 16-char base64url tokens through, and whose
+run test missed ~7% of 20-char hex:
+
+| length | base64url missed | hex missed |
+|---|---|---|
+| 16 | 0.65% | 0.04% |
+| 20 | 0.33% | 0.04% |
+| 32 | 0.05% | 0.00% |
+
+Tokens under 16 characters are not caught. Of 20 realistic path names, only the
+two CamelCase team names were wrongly redacted.
+
+**Copy trace** had the same leak in the browser: `shortUrl()` in `index.html`
+kept `host + pathname`. It now applies the same rule. Checked for parity by
+running the extracted JS under node against Python's output on 3,008 URLs: 0
+mismatches. There is no JS test harness, so that check is not in the suite --
+the two copies must be kept in step by hand (comment at both sites).
+
+Also found while fixing it: two call sites cut URLs to 70 characters *before*
+the sink redacted them, which can shorten a path token below the length that
+looks like one and leak its first characters. `url_for_log()` redacts first.
+
+### 2. Stopping a recording froze the whole server for up to ~7s
+`POST /stop` called `recorder.stop()` on the event loop, and stop() waits on
+FFmpeg (5s) and hls-proxy (2s). Now `asyncio.to_thread`. The race Phase 15
+warned about is real: stop() clears `is_running` before the proxy exits, and
+`_allocate_proxy_port()` counted only running sessions, so a start in that
+window could be handed a still-bound port. The allocator now also counts
+`holds_proxy_port`.
+
+### 3. A proxy that survived SIGKILL was forgotten
+`stop_proxy()` dropped its reference unconditionally, so its port read as free.
+It now keeps the reference unless the child was confirmed reaped, logs an
+ERROR, and `start_proxy()` refuses to overwrite a held proxy (goes direct
+instead). stop_proxy() works on a local reference, since an operator stop and
+the recorder thread's own teardown can now run concurrently.
+
+### Verified
+- 10 new regression tests. The first 9 fail against the previous code (source
+  files stashed, tests run, restored) and pass against the fix; the 10th pins
+  the 16-char/short-hex correction above.
+- 579 tests green via `python test_pvarr.py`.
+
+### Still open from Phase 15
+The `aborted_no_space` remux leaving a partial `.mp4` on a full volume.
+
+## Phase 20: Recordings lose whole HLS segments (2026-09-14) [COMPLETED -- retries deferred]
+
+### The report
+Sponsor: the recording is lower quality than the same stream in Firefox/Chrome,
+and in mpv the video freezes for seconds to minutes while the audio carries on,
+then jumps and runs fast until it catches up.
+
+### Measured, on a 35-minute recording of a live sports stream (2026-09-13)
+Per-packet timestamps via ffprobe (35 min, remuxed .mp4):
+- **81 holes, 414.7s of 2107.6s missing (~20%)**. Hole sizes are exactly 4.0s
+  (59) or 8.0s (22) -- one or two whole segments of a ~4s-segment stream.
+- **Audio has the same 81 holes at the same timestamps.** Audio is not
+  actually continuous; mpv plays audio straight across a gap but cannot do the
+  same for video, so it holds the last frame and then races to resync. The
+  "video-only freeze" is how the player presents a hole in both.
+- No compressed/fast-forward timestamps in the file and no non-monotonic DTS:
+  the file is not mis-timed, it is missing data.
+- Pattern is very regular early on: often 8s delivered, 4s lost, repeating --
+  "get two segments, lose one" -- and **no holes at all in the last 5 min**.
+- **It is 1280x720 at ~1.19 Mbit/s**, despite `1080p` in the filename (that
+  token comes from the naming form, not from the stream). Only the scale of
+  the "lower quality" report is explained by this; which variant the browser
+  was actually getting is unknown.
+
+### Why nobody saw it
+FFmpeg runs with `-loglevel error`. The HLS demuxer reports both likely causes
+-- "Failed to open segment" and "skipping N segments ahead, expired from
+playlists" -- at *warning* level, so PVArr's log carries no trace of a loss
+this large. The freeze detector watches output bytes, and 4-8s holes never
+reach its threshold.
+
+### Candidate causes (not yet distinguished -- needs the session log)
+1. **Segment fetch errors, never retried.** `-seg_max_retry` defaults to 0: one
+   403/timeout on a segment and FFmpeg moves on. Browsers (hls.js) retry.
+   The option exists in the local 6.1 but **not in the shipped image**:
+   checked inside the running container, Debian bookworm's FFmpeg 5.1.9 lists
+   no `seg_max_retry` at all. Using it means a newer FFmpeg in the image -- an
+   image-size and dependency decision for the sponsor, not a flag change.
+2. **Falling behind a short live window** so segments expire before they are
+   fetched -- would fit the regular get-two-lose-one pattern.
+3. **Variant choice.** `probe.py` descends to `variants[0]` for its segment
+   check and `ytdlp._pick_format()` claims FFmpeg "can switch down
+   mid-recording" -- FFmpeg's HLS demuxer does no adaptive switching, so that
+   docstring is wrong. Needs the master playlist to know what was on offer.
+   Live session c7ef5f46 (2026-09-14, local container): probe reported
+   `media, headers Referer` -- the pasted URL is a single variant playlist,
+   not a master, so FFmpeg is locked to it (1280x720 again) and no variant
+   logic in PVArr could have chosen better.
+
+### Proposed next steps -- need sponsor go-ahead (changes FFmpeg execution)
+1. **[DONE -- see "Built" below]** Raise FFmpeg to `-loglevel warning`, count
+   skipped/failed segments, and show the count on the dashboard and in the
+   completion notification.
+2. Add `-seg_max_retry` where the binary supports it.
+3. Reproduce locally against a served live playlist with injected segment
+   failures and a short window, to prove which of 1/2 produces this exact
+   pattern before choosing the fix.
+4. Ask the sponsor for this recording's session log (Direct vs Fallback mode,
+   failovers, time of the last 5 clean minutes) -- to be pasted, not fetched.
+
+### Live test, 2026-09-14 (local container, session c7ef5f46) -- stream was clean
+Sponsor ran a real recording on the dev machine (container `pvarr`, image
+v0.5.0) so it could be observed live. Remote-host rules respected: nothing
+touched the test server; the one outside connection (a diagnostic FFmpeg against the
+stream CDN) had explicit sponsor approval.
+
+- Source: provider B, direct mode, single 720p variant (~1.8 Mbit/s),
+  4s segments, **15-segment (60s) live window**.
+- Hole detector on the growing `.ts` (reads only appended bytes, pipes to
+  ffprobe): **0 video and 0 audio holes over 20+ minutes**.
+- A parallel FFmpeg with the same argv at `-loglevel verbose`: ~23 minutes, every
+  segment number exactly +360000 (4s at 90kHz) after the last, **no warnings,
+  no skips, no failed opens**. One 7s playlist delay was absorbed without loss.
+- mpv playing the growing `.ts` from 30s behind the write edge for 8 minutes:
+  no buffering, no EOF, no jumps in its log. **mpv neither damages a growing
+  file nor stutters on one**, ruling it out for the 2026-09-13 report.
+- Sponsor heard audio drop at ~9:50 for ~20s. Measured: 27.0s of AAC silence
+  (577-604s), packets continuous, 1,267 tiny (<30 B) packets = exactly 27s at
+  46.9 packets/s -- encoded digital silence *sent by the source*. Frames show
+  the programme going to an ad break: the source mutes the break transition.
+  Not a PVArr fault; potentially a useful break marker for comskip.
+
+**Conclusion:** the 2026-09-13 loss (81 segment holes, ~20%) is not reproducible
+on a healthy source and most likely belonged to that stream (link no longer
+available). Sponsor agrees. The ~60s window here would tolerate a ~48s stall,
+which cannot produce that recording's 4s-every-8s pattern -- consistent with a
+different, worse upstream.
+
+**Still recommended (unchanged, needs go-ahead):** step 1 above -- surface FFmpeg
+segment warnings and a skipped-segment count, so the next bad source is
+diagnosed on the night instead of from the finished file. Retries remain
+blocked on a newer FFmpeg in the image, with no evidence yet that they would
+have helped.
+
+### Built: segment-loss visibility (2026-09-14) -- sponsor approved ("1-y")
+- FFmpeg runs at `-loglevel repeat+level+warning`. `_drain_stderr(ffmpeg=True)`
+  reads stderr buffered, counts lost segments from two hls-demuxer warnings, and
+  keeps warnings out of the 15-line failure tail.
+- Counted: `Failed to open segment N of playlist P` (deduplicated per FFmpeg
+  process, since 6.1 repeats it per retry) and `skipping N segments ahead,
+  expired from playlists`. Both anchored to the whole line and to the hls
+  context. "Packet corrupt" follows a loss and is deliberately not counted.
+- Logged once on the first loss, then at most one summary a minute, flushed at
+  the end of each attempt and at finish. Exposed as `segments_lost` /
+  `segments_failed` / `segments_expired` in `/api/status`, shown under On Disk
+  and on finished rows, and appended to the finished notification when > 0.
+- Counts are in memory: a resumed recording starts again from zero (README).
+
+**Proof the parsing matches real FFmpeg.** A local fake live source
+(`hls_lab.py` in the session scratchpad: 2s segments, 10s window, 404 on segment
+8, 14s stall on segment 14) produced the exact warning lines on host 6.1 and
+on the image's 5.1.9 in a throwaway container; those literal lines are the
+test fixtures. Then an end-to-end run of the *real* capture path
+(`_build_ffmpeg_cmd` -> FFmpeg -> pump -> counters -> log, no mocks) against
+the same source reported `segments_lost=3 failed=1 expired=2` on both versions,
+first loss logged at once and the rest as one summary.
+
+### Agent team review -- what changed the implementation
+Architect, Security and DevOps reviewed the diff in parallel. No blockers.
+- **stderr was read one byte per syscall** (Architect, DevOps). `bufsize=0`
+  makes it raw `FileIO`. DevOps measured 86 us/line unbuffered vs 1 us
+  buffered -- ~5% of a core per recording at 200 warnings/s. Now wrapped in a
+  64 KB `BufferedReader`, lines capped at 4 KB.
+- **Unanchored patterns let source-controlled text inflate counts** (Security):
+  any warning quoting an HTTP reason phrase or a playlist URI could carry
+  "skipping 999999999999 segments ahead". Now anchored to the hls context's own
+  line; one line adds at most 10,000.
+- **Nested context prefixes** (`[a @ ..] [b @ ..] [warning]`) escaped the
+  warning filter into the tail (Architect, Security). Prefix group now `*`.
+- **Failure explanation cut before redaction, and stored raw** (Security,
+  pre-existing, worsened by the new tag prefixes). Now redacted per line
+  before the 500-char cut; `last_error` is stored redacted.
+- DevOps: operator notes added to README (FFmpeg's level, `PVARR_LOG_LEVEL`
+  does not change it, the count depends on FFmpeg's wording).
+
+**Where the reviews disagreed.** Architect and Security expected FFmpeg to
+collapse identical warnings into an untagged "Last message repeated N times"
+(undercounting repeated expiries, and cluttering the tail); DevOps measured 6.1
+and saw no collapsing. Not settled by guessing which build does what: added
+`repeat` to the log flags, which disables collapsing on every version.
+Verified accepted by 5.1.9 and 6.1; with buffered reads the extra lines cost
+~1 us each.
+
+**Declined, recorded here:**
+- `finish()` can read the tail before the pump has consumed FFmpeg's last error
+  lines (Architect). Pre-existing race, cosmetic; fixing needs the pump thread
+  handed back and joined.
+- Losses counted after the final flush miss the "Recorder finished" line
+  (Architect, DevOps). `/api/status` and the notification read the live counter.
+- `stop_all()` reaps recorders serially, up to ~7s each, before the shutdown
+  budget starts (DevOps). Pre-existing; several FFmpegs ignoring SIGTERM could
+  outlast Docker's 30s grace period. Worth its own change.
+- A configurable FFmpeg log level (DevOps suggested only as an escape hatch).
+  Not added; no evidence it is needed once reads are buffered.
+
+### Verified
+- 593 tests green. The 10 tests added with the feature fail against the
+  previous commit; the 6 added for review findings fail against the pre-review
+  code (each fix reverted in a scratch copy) and pass on the final code.
+- End-to-end on the final code (buffered reads, `repeat` flag) against the lab
+  source: `segments_lost=3 failed=1 expired=2`, empty `last_error`, one log line
+  plus one summary -- identical on host FFmpeg 6.1 and the image's 5.1.9.
+
+## Phase 21: Live test 2026-09-20 -- a stale container reopened the timeline bug [COMPLETED]
+
+Sponsor reported, mid-event, on a live sports recording (local
+container, session `176086e4`): playback "speeding up and slowing down", and
+mpv refusing to seek anywhere past roughly 5 minutes into the growing `.ts`.
+Asked whether it was a laptop hardware limit. Nothing touched the test server; every
+measurement below is from the workspace and the local container.
+
+### What was measured
+- `ffprobe` on the growing `.ts` (944 MB at the time): `duration=492.689`,
+  `bit_rate=15290901`. Both nonsense -- 8 minutes of declared runtime for
+  ~80 minutes of captured video, and a "15 Mbit/s" figure that is only
+  file size divided by the bogus duration.
+- Sampling the first video PTS at twelve byte offsets across the file: the
+  timeline climbs cleanly 1.5s -> 2824s over the first 60% of the bytes, then
+  **resets to 407s at ~70%, and again to 75s at ~90%**. FFmpeg later confirmed
+  it on the remux: four `timestamp discontinuity` corrections.
+- The resets line up exactly with the failover storm at 21:54--21:56 UTC that
+  the sponsor triggered by hand, which cycled 1 -> 2 -> 3 -> 1 -> 2 before
+  settling on Candidate 2 in direct mode.
+- Seek probe, `mpv --no-config --vo=null --ao=null --start=N --frames=2`:
+  300s succeeds, 2700s returns "got EOF with no data before it". lavf seeks
+  MPEG-TS by estimating a byte offset from the declared duration, so every
+  target past ~492s estimates past EOF. `--demuxer-lavf-o=fflags=+genpts`
+  changes nothing; the duration is wrong before genpts ever runs.
+
+### Not a hardware limit
+Recording FFmpeg was at **0.4% CPU** -- it is a stream copy, it never decodes.
+Load average 2.25 was Firefox (27%) and the compositor. Source is 1280x720p30
+at ~1.6 Mbit/s despite the `1080p` in the filename, which a laptop decodes
+without noticing. The "speeding up and slowing down" is the four PTS resets:
+at each splice the presentation clock jumps backwards by tens of minutes and
+mpv's A/V sync chases it, dropping or rushing frames until it recovers.
+
+### Root cause: the container is a release behind
+`GET /api/status` reports **0.5.0**. The local `ghcr.io/jlesterak/pvarr:latest`
+image was **built 2026-08-31**; `segments_lost` is absent from its status
+payload, confirming pre-v0.5.1 code. The fix that prevents exactly this --
+`fb25395 fix: continue the timeline across a failover instead of restarting it`,
+which introduced `_timeline_offset` / `_advance_timeline` (Phase 14, above) --
+landed 2026-09-05 and ships in **v0.5.1**. GHCR has `0.5.1` and a current
+`latest` (both HTTP 200, anonymous pull token), so the image on this host is
+simply stale; watchtower has not replaced it.
+
+**No code change is warranted.** The bug is fixed in `main` and in the released
+image. The action is to pull.
+
+### Recovery recipe (verified on the live file, does not disturb the recording)
+Remuxing to MP4 makes FFmpeg normalise the splices and write a real index:
+
+    ffmpeg -i <growing>.ts -c copy -bsf:a aac_adtstoasc \
+           -map 0:v:0 -map 0:a:0 <out>.mp4
+
+12 seconds for 975 MB, output 925 MB, `duration=4704.80` (1h18m, matching the
+capture minus failover dead air) and `bit_rate=1573871` (sane). Seeks verified
+at 300 / 1800 / 2700 / 3600 / 4500s, all OK. Reading the file is safe while
+FFmpeg appends to it; **rewriting the `.ts` in place is not**, and was not
+attempted.
+
+### Open, for the sponsor
+- **Disk.** `/` is at 97%, 6.5 GB free after the remux, against a 5.0 GB
+  `min_free_disk_gb` floor. At the measured ~230 KB/s the live recording hits
+  that floor and auto-aborts in roughly 1.9 hours, with 4.5 hours still on its
+  schedule. Freeing space is the only thing that keeps the capture alive.
+- **Disk, resolved the same day.** `docker builder prune -a` reclaimed 4.55 GB
+  of build cache with `ACTIVE=0` -- no recording touched, nothing user-facing
+  deleted. 6.5 GB -> 9.4 GB free, then 8.4 GB after pulling the current image,
+  which puts the live capture comfortably clear of the floor for its remaining
+  window. Ten stale `pvarr` image tags (0.1.0 through 0.4.0 plus four local
+  build tags, ~3.6 GB reclaimable) were **not** removed: the sandbox refused
+  the `docker rmi`. Left for the sponsor.
+- **Image pulled, container deliberately not restarted.** `:latest` is now
+  `sha256:c275df55` (built 2026-09-06 = v0.5.1). The running container still
+  references the old `sha256:cf6fa05b` and is mid-game. Restarting it is the
+  sponsor's call and should wait for the final whistle. Note `pvarr` carries
+  `com.centurylinklabs.watchtower.enable=false`, so watchtower (04:00 daily,
+  `WATCHTOWER_CLEANUP=true`) will never do this on its own -- correct for a
+  recorder, but it means the image only moves when someone moves it. **That is
+  the whole reason a fix released on 2026-09-05 was still absent on 2026-09-20.**
+
+### Closed 2026-10-05
+"No code change is warranted" above turned out to be only half the story: the
+same live test exposed two real defects, both fixed that day and both shipped
+in **v0.6.0** (`e0cc697`):
+- `e10dfff` -- `last_write_time` was set before `subprocess.Popen`, so the
+  freeze timeout also had to cover the cold-connect warm-up (Phase 22, with 5
+  tests in `TestFreezeDetection`, 3 of which fail against the old code).
+- `7d1f17d` -- `naming.probe_video_resolution` was imported but never called,
+  so `_1080p` names were never checked against the video (Phase 23,
+  `TestResolutionRetag`).
+The timeline splice itself has been guarded since Phase 14
+(`TestRealFailoverSpliceIsMonotonic` and friends), so no new test was added
+here. Checked on the local host: the `pvarr` container runs image `425d978d`
+and `/api/status` reports **0.6.0**; the stale image tags are gone (only
+`:latest` remains). Nothing left open.
+
+## Phase 22: The freeze watchdog counted a cold connect as a freeze [COMPLETED]
+
+Chased down from the Phase 21 observation, and it was a real defect rather than
+tuning. `last_write_time` was set *before* `subprocess.Popen`, and the single
+`freeze_timeout_sec` budget then had to cover process spawn, TLS to the edge,
+the playlist fetch, enough segment downloads for FFmpeg to probe the streams,
+and the first mux output -- none of which is a freeze. On a cold connect to a
+live HLS source that routinely exceeds 15s, so a perfectly good candidate was
+abandoned for warming up slowly, and with three candidates over three laps a
+briefly-sluggish edge burned every attempt in the list.
+
+### The fix (`app/recorder.py`)
+- New `STARTUP_GRACE_SEC = 30` class constant. The idle budget is now chosen per
+  iteration: `freeze_timeout_sec` once `written_for_this_session > 0`, otherwise
+  `max(freeze_timeout_sec, STARTUP_GRACE_SEC)`. The grace can never apply to a
+  stream that has already delivered, so a mid-recording stall is caught exactly
+  as fast as before -- that is asserted, not assumed.
+- `last_write_time` moved to after `Popen` and `_drain_stderr`. Spawning the
+  process is PVArr's own overhead and has no business inside a budget that
+  exists to judge the source.
+- The two failures now log differently. "No data from <candidate> in the first
+  Ns" for one that never started; "Stream freeze detected!" only for one that
+  went quiet after delivering. Previously both said the latter, which is what
+  made the 2026-09-20 storm read as six dying streams.
+- **No new user-facing knob.** The dashboard field, the API parameter and the
+  session record are untouched, so nothing needs migrating and **Record again**
+  keeps working on sessions recorded before this.
+
+### Why 30s is not a failover penalty
+A candidate that is genuinely dead makes FFmpeg exit non-zero within a second
+or two and is caught by the existing `poll()` branch long before the grace
+expires; every individual socket read is already capped by the argv's
+`-rw_timeout 15000000`. Only a candidate that is *connected but slow* ever
+spends the budget, which is precisely the case that used to be thrown away.
+
+### Proven
+- 5 new tests in `TestFreezeDetection`. `_FakeProc` gained `delay_before`,
+  feeding the pipe from a thread and withholding the exit status until the data
+  lands, so the capture loop really sits in `select()` through a slow start.
+- 3 of the 5 fail against the pre-fix `recorder.py` (checked in a scratch copy
+  with `git show HEAD:app/recorder.py`): the slow first byte is abandoned, the
+  log wording is wrong, and the constant does not exist. The other two pin the
+  boundaries -- grace removed restores the old loss, and a generous grace must
+  not delay a mid-stream stall (asserted under 2s against a 5s grace).
+- Full suite: **598 tests, OK.**
+
+## Phase 23: The filename's resolution tag was never checked (2026-09-20) [COMPLETED]
+
+### The problem
+The `_1080p` in a recording's name came straight from the Add Recording form's
+**Resolution Tag** dropdown, which defaults to 1080p, and nothing ever compared
+it with the video. Found in Phase 20 and again in Phase 21: both recordings
+were named `_1080p` and were 1280x720 throughout. `naming.probe_video_resolution`
+already existed but was imported by `server.py` and never called -- and on any
+failure it answered "1080p", the very guess it was meant to replace.
+
+### The fix
+- `probe_video_resolution` returns `None` when it cannot measure, instead of
+  "1080p", and reads only the first line of ffprobe's output (an MPEG-TS can
+  list the stream once per program).
+- `naming.retag_resolution(path, tag)` swaps the trailing tag, anchored to the
+  end of the stem so a team name containing "720p" is never touched. It drops
+  the old `_N` collision counter; operator-renamed files (no tag) are untouched.
+- `remux_recording` probes the `.ts` before remuxing and writes the finished
+  file under the measured tag. The new name is claimed with
+  `reserve_output_path`, because the `.ts` only reserved the *old* name and the
+  remux runs `ffmpeg -y` -- without this a finished `_720p.mp4` of the same
+  fixture would be overwritten. A failed remux releases the claimed name.
+  Covers both `_on_complete` and `_finalise_orphan`, since both call it.
+- The live `.ts` keeps the form's tag: there is no video to measure at start,
+  and renaming a file FFmpeg is appending to is not worth the risk.
+- Cost: one ffprobe (reads the file's first few MB, 5s timeout) per finished
+  recording, on the recorder thread that already runs the remux.
+
+### Known limit
+The probe reads the start of the file. A recording that failed over from a
+1080p candidate to a 720p one is tagged by whichever came first.
+
+### Verified
+- 11 new tests (`TestResolutionRetag`), including real FFmpeg round trips: a
+  1280x720 `.ts` named `_1080p` finishes as `_720p.mp4`; an existing
+  `_720p.mp4` is not overwritten (new file gets `_720p_1.mp4`); a correct tag
+  keeps its name; a failed remux leaves no placeholder.
+- 609 tests green via `python test_pvarr.py`.
+
+## Phase 24: CI `tests` red on every push since 2026-08-31 (2026-09-20) [COMPLETED]
+
+Found while checking the v0.6.0 release. The `publish` workflow (Python 3.12)
+was green and the image shipped, but the `tests` workflow had failed on every
+push to `main` since `df9fc2f` (2026-08-31). Only the Python 3.9 job failed,
+at "Install dependencies", before any test ran; 3.11, 3.12 and the image job
+passed. Cause: `yt-dlp>=2026.8.19` declares `requires_python >=3.10` (checked
+on PyPI). Released images were never affected (3.12). The matrix is now 3.10 /
+3.11 / 3.12, and README's stale "Python 3.8+" now says 3.10+.
+
+## Phase 16: Host Instrumentation
+
+- [x] **`scripts/watch-host.sh` — measure a recording host instead of guessing.**
+      The sponsor's question before a live capture was whether the target host
+      could take the disk I/O and general load. There was no way to answer it
+      from the workspace: PVArr reports what *it* thinks it captured, and
+      nothing recorded what the machine underneath was doing. The script
+      samples load, CPU idle, available memory, free space on the recordings
+      volume, per-device read/write KB/s and I/O busy time from
+      `/proc/diskstats`, FFmpeg process count / CPU / RSS, and captured MB from
+      `/api/status`, into a CSV plus a summary on exit.
+
+      Runs on the host being measured, unattended if wanted
+      (`--duration 5h`). Dependencies are coreutils and `/proc`; the
+      `/api/status` columns need `curl` + `python3` and degrade to `NA`
+      without them. System metrics only — it never reads the video and never
+      takes a frame grab.
+
+      Device resolution handles the awkward cases: a partition with no
+      `/proc/diskstats` row of its own falls back to the parent whole disk,
+      and `/dev/mapper` LVM/crypt paths resolve through `readlink -f` to their
+      `dm-N` name. Verified against a live recording on the workstation
+      (`dm-1`, an LVM volume): four samples, plausible throughput, FFmpeg
+      correctly counted at one process.
+
+      **Expected shape for a 1080p sports HLS capture**, for comparison when
+      reading a real run: FFmpeg is `-c copy`, so there is no transcode — CPU
+      should sit near idle, and a few percent is already suspicious. Writes are
+      a sequential append flushed per 64KB chunk to the page cache, never
+      `fsync`ed, so the kernel batches them; sustained write rate is simply the
+      stream bitrate (~5 Mbps ≈ 625 KB/s ≈ 2.2 GB/hour). Disk busy time should
+      be low single-digit percent on anything that is not a heavily contended
+      spindle. The floor that stops a capture is `PVARR_MIN_FREE_GB`, default
+      5.0 GB, re-checked every 15s during recording
+      (`Recorder.DISK_CHECK_INTERVAL_SEC`), and it aborts rather than failing
+      over — a local problem is not fixed by another stream.
+
+### Not done, and why
+- **Remote monitoring of the test host.** Out of bounds by Directive 6 and
+  architecturally wrong anyway: the measurement has to run on the host being
+  measured, not be pulled across a network by a process that is not awake when
+  the capture is.
+
+### Live session 66954d39, 2026-10-04 (local container, v:latest) -- cause 2 confirmed  [PENDING]
+- Source: provider B, direct mode, 720p, ran 20:22-00:01 UTC.
+- **584 segments lost, all 584 "expired", 0 failed to download.** Steady
+  2-8/min from minute 3 to the end. So it is candidate cause 2 (falling behind
+  the live window), not cause 1 (fetch errors) -- `-seg_max_retry` would not
+  have helped this session.
+- Final MP4 2125 MB over ~3h39m = ~1.3 Mbit/s against ~1.8 Mbit/s for this
+  source class: roughly a quarter of the programme missing.
+- Container CPU 5%, host idle afterwards; nothing pointed at local CPU.
+- Candidates 1 and 2 were the **same URL**, so failover could not help.
+- End: stream stopped at ~23:59, both candidates froze, lap cycling, remux OK.
+- Next: measure segment duration / window length / per-segment fetch time on
+  that provider (needs sponsor approval for an outside connection), then
+  reproduce locally with a short window + slow segment server.
+- **Outside probe, 2026-10-05 (sponsor-approved, one use):** playlist already
+  404 -- stream over, token dead. Nothing measured. Per-request approval is
+  needed again for the next live game.
+- **Timestamp gaps in the finished MP4** (packet PTS only, no frames decoded):
+  3.56h span, **423 gaps, 34.8 min missing (16%)**. Gap sizes: 316 x 4s,
+  102 x 8s -- so **segments are 4s** and one or two vanish at a time. Median
+  13-16s between gaps (p10 12s, p90 44s): a steady **get-three-lose-one**
+  rhythm the whole game, not bursts. Network hiccups would come in bursts.
+- FFmpeg argv has no `-re`/`-readrate`, so FFmpeg is not throttling itself.
+- Leading hypothesis (unproven): the source playlist window is ~3 segments
+  (12s) but FFmpeg only sees a *new* playlist every ~16s (CDN caching of the
+  playlist, or reloads landing on out-of-sync edge servers). Then a segment
+  rotates in and out between two fetches and **never appears in any playlist
+  FFmpeg reads** -- "expired", zero failures, exactly this pattern.
+- Decisive test, next live game: poll the playlist every 1s for 2 min, log
+  media-sequence, window length, `Cache-Control`/`Age`, and which edge
+  answered. Two minutes settles it.
+- Likely fix if confirmed: a small playlist relay (design already sketched in
+  Phase 18) that polls the source every ~1s with a cache-buster and serves
+  FFmpeg a longer rolling window -- video still goes straight from the CDN.
+  Architecture change -> sponsor decision.
+
+## Phase 26: League and team tags with offline autocomplete (2026-10-05) [IN PROGRESS -- sponsor review pending]
+
+Branch `feat/sportsdb`, cut from main at 7013b65, independent of the
+aggregator branch. Sponsor request (scope set 2026-10-05): no game scheduling
+in advance -- autocomplete league and team names on the new-recording form so
+recordings are tagged consistently, and it must work offline.
+
+### Decision: this revisits Phase 17's "L4 cut" and the ESPN warning
+Phase 17 cut a sports DB and said not to build on ESPN's unofficial API.
+Both still hold for a *runtime* dependency. This design has none: the data is
+a snapshot in the repo, ESPN is consulted only by a maintainer running
+`python3 -m app.tags --refresh`, and a league that fails to refresh keeps its
+old teams. If ESPN vanishes, autocomplete keeps working on the last snapshot.
+
+### Team-data source survey, re-measured 2026-10-05 (real requests)
+- **ESPN site API** (`site.api.espn.com/.../{sport}/{league}/teams?limit=1000`):
+  200 for all 20 leagues, no key. Only free source with full NCAA: 762
+  football, 362 men's and 362 women's basketball, 116 hockey, 437 baseball.
+  Chosen for refresh.
+- **TheSportsDB free key `123`**: works with no signup (team search, next and
+  last event returned for the Avalanche), but thin on NCAA. The natural
+  candidate for a keyed provider later.
+- **NHL `api-web.nhle.com`**: works, NHL only.
+
+### Built
+- [x] `app/tags.py`: curated `LEAGUES` (id, full name, aliases, provider path),
+      `TEAM_ALIASES` for fan nicknames, prefix/word-prefix/substring matching
+      (abbreviations and aliases exact or prefix only -- as substrings they
+      matched "avs" to "SAVS"), league filter, NCAA de-duplication. Index built
+      once; endpoints are plain `def` so the few-ms scan stays off the loop.
+- [x] `TeamProvider` seam + `ESPNProvider`; `PROVIDERS` registry and
+      `--provider` flag for a keyed source later.
+- [x] `app/data/teams.json` (~130 KB, ~2,400 teams, 20 leagues), written
+      atomically and 0644 (mkstemp's 0600 would be unreadable to PUID in the
+      image).
+- [x] `GET /api/tags/leagues`, `GET /api/tags/teams`; `<datalist>` on the
+      Sport / Team A / Team B boxes. No new frontend dependency.
+- [x] Storage: nothing new needed. Sport/teams were already saved with the
+      session (`naming` in the session record) and already name the file
+      (`DATE_SPORT_TeamA_vs_TeamB_RES`), so canonical values flow straight in.
+- [x] Tests (offline): league aliases, team matching against the shipped
+      snapshot, league filter, NCAA de-dup, missing snapshot, ESPN parsing
+      from a saved fixture (`fixtures/espn_nhl_teams.json`), refresh with the
+      API half down keeps old data, endpoints.
+
+### Pre-merge review, 2026-10-06
+- [COMPLETED] Accented suggestions made mangled filenames: the snapshot holds
+  ~40 names like "CF Montréal" and "Atlético Madrid", and `sanitize_token`
+  replaced every non-ASCII letter with `_` (`CF_Montr_al`). Accents are now
+  folded first (`CF_Montreal`); reproduced through `generate_sports_filename`
+  and guarded by a test.
+
+### Open
+- [PENDING] Sponsor: try the form after Wednesday; decide whether full names
+  ("Colorado Avalanche") or short ones ("Avalanche") read better in
+  filenames. Today the suggestion is the full name; free text still works.
+- [PENDING] Optional keyed provider (TheSportsDB with a Patreon key, or
+  another) -- subclass `TeamProvider`, add to `PROVIDERS`. Not built.
+- [PENDING] Agent-team review of this branch was NOT run (budget ran out);
+  two new read-only GET endpoints, no network, no disk writes at runtime.
+  Run it before merge.
+- State 2026-10-05: suite green, committed, not pushed. Aggregator work is on
+  `feat/aggregator-sportsdb` (Phase 25 there), also unpushed and unmerged.
+
+## Phase 25: Event page -> first three working streams (2026-10-05) [COMPLETED -- see open items]
+
+Branch `feat/aggregator-sportsdb`, since merged. Sponsor request: paste an
+event page that lists many stream links (an "aggregator" page in the code),
+get primary + two backups without hand-checking a dozen links.
+
+- [x] `app/aggregator.py`: fetch page (plain -> browser TLS profile ->
+      optional FlareSolverr via `PVARR_FLARESOLVERR_URL`), extract candidate
+      links by shape only (off-site links with a real path, iframes, m3u8
+      refs, same-site sub-pages below the event path, same-site `?url=`
+      redirects unwrapped), probe up to 20 with 4 workers and a 60s budget,
+      keep the first 3 that work *in page order*. yt-dlp is off for these
+      probes (too slow to spend on dead links; the recorder still uses it on
+      connect).
+- [x] `POST /api/aggregate`; dashboard panel fills the three slots and their
+      Referer/Cookie overrides. Slots get the stream *page*, so failover
+      re-resolves tokens as usual.
+- [x] SSRF: links on private addresses are dropped when the pasted page is
+      public, same rule as the embed walk (63824ab).
+- [x] Interactive captchas are never attempted. A page that needs the
+      operator's own browser session can be given a pasted Cookie +
+      User-Agent, used for the page only.
+- [x] Tests (offline): link extraction/filtering, challenge-page detection,
+      page-order pick with out-of-order completion, challenged and
+      segment-refused links skipped, time budget, browser-TLS and FlareSolverr
+      fallbacks, private links never probed, endpoint wiring + length cap.
+
+### Measured, 2026-10-05
+- One real fetch of a public event-page site: **403 browser-check page to
+  both the plain client and the browser TLS profile.** So for such pages the
+  cookie paste or FlareSolverr is the normal path, not the exception.
+  FlareSolverr was not available locally and is unverified end to end.
+- Nothing else was verified live: no stream link was probed from a real page.
+
+### Agent-team review (Architect, Security, DevOps), 2026-10-05
+Acted on:
+- **Body reads had no wall-clock cap** (Security + DevOps agreed). `_fetch`'s
+  timeout is per socket read, so a server dripping bytes could hold a probe
+  thread for minutes -- and abandoned aggregator probes, and a `docker stop`,
+  with it. `_fetch` now stops reading at 2x the timeout. Shared with the
+  recorder's probe, which benefits the same way. Test: a dripping body
+  returns in under a second.
+- **Stacked runs could starve the default thread pool** that live view and
+  downloads use. One run at a time; a second gets 429.
+- **The dashboard copied the probe's cookie into the slot override**
+  (Architect). The recorder would then pin that cookie jar forever and replay
+  it expired on a failover hours later. Slots now get the URL only.
+- **Budget eaten by blackholed links** (Architect). Per-link probe timeout
+  5s, 6 workers.
+- **Link extraction misses** (Architect): `www.` vs bare host treated as one
+  site; `?ref=<aggregator>` links kept (only links carrying the page *path*
+  are dropped as share buttons); same-site links carrying the event slug kept;
+  `data-href`/`data-url` and `window.open(...)` links found.
+- README: FlareSolverr must be on the compose network, unpublished, ideally
+  without a LAN route (its browser runs the pasted page's JavaScript); proxy
+  read timeouts. Commented env line in `docker-compose.yml`.
+
+Not done here, deliberately -- **pre-existing in the probe, sponsor call**:
+- [COMPLETED] **SSRF via redirects** (Security, medium). Closed by
+  `fix/private-redirects` (Phase 25 in the relay section,
+  `probe.NoPrivateRedirects`), merged 2026-10-07; the aggregator's own page
+  fetch now uses it too. Original note: `_fetch` follows
+  redirects without checking each hop, so a public link that 302s to a LAN
+  address is fetched (GET only; status codes come back in the trace). Same gap
+  already exists in the embed walk and `/api/probe`; the aggregator widens who
+  can trigger it (any listed link). Fix: follow redirects by hand (<=5 hops)
+  with `is_private_url` on each. Touches the recorder's connect path, so it
+  should be its own change and its own live test.
+- [COMPLETED] **Variant and segment URLs are not private-checked** (Security,
+  medium). Closed by `probe.private_playlist_uri` on `fix/private-redirects`,
+  merged 2026-10-07.
+- DNS rebinding between the check and the fetch (Security, low): accepted.
+
+### Pre-merge review, 2026-10-06
+- [COMPLETED] A same-site link to the event page itself with or without a
+  trailing slash (`/event/x/` on page `/event/x`) was kept as a stream
+  candidate, spending a probe slot on the aggregator page. Paths are now
+  compared without the trailing slash; reproduced and guarded by a test.
+
+### Live tests and fixes (2026-10-07 .. 2026-10-08)
+Sites stay unnamed here; site-by-site notes are kept privately, outside this
+repo.
+- [COMPLETED] The sponsor could not tell whether a pasted cookie was used --
+  the failure message was identical with or without one. Now the pasted
+  cookie is normalised (`Cookie:` prefix, DevTools table row, bare
+  `cf_clearance` value; `User-Agent:` prefix), and a page still challenged
+  despite a cookie says whether it held `cf_clearance`, whether a UA was
+  sent, and names IPv6-vs-IPv4 and expiry as causes. Test:
+  `test_pasted_cookie_formats_become_a_header_value`.
+- [COMPLETED] With the cookie the page loaded but none of 20 probed links
+  recorded. The list showed only the host, so the picks could not be told
+  apart; it now shows the full URL. Challenge messages now carry
+  step-by-step cookie copy instructions (sponsor request).
+- [COMPLETED] Cause, found from a saved copy of the page (not committed): the
+  real stream rows (`data-href`) were links 62+ in page order. Ahead of them
+  sat the site menu, made of relative links that the page resolves via
+  `<base href>` -- PVArr ignored `<base>`, so they looked like sub-pages of
+  the event -- and dozens of links to a sister site's league pages. The
+  20-link cap was spent on navigation. Fixed: `<base href>` honoured; an
+  off-site host linked more than 5 times is dropped. On the saved page the 20
+  candidates are now exactly the first 20 stream rows, in the site's order.
+  Test `test_site_menu_does_not_crowd_out_stream_rows` (fails on the old
+  code).
+- [COMPLETED] Released v0.7.1 (sponsor approved, 2026-10-07): the three fixes
+  above. Publish workflow green; image on GHCR as `:0.7.1`/`:latest`.
+- [COMPLETED] Two live runs on v0.7.1 (two events, 2026-10-07): 1 of 20
+  links worked each time -- the first proven event page -> working stream end
+  to end. Two events, same outcome: 1 in 20 is the norm for that kind of
+  page, not bad luck. The failures, by kind:
+  - **A JW Player-based channel embed family.** The playlist sits in an
+    encoded player config. Decodable offline, BUT on the sample the "channel"
+    carried a different event and its playlist 404'd: the channel is fixed,
+    not per-event, so it can serve the wrong game. **Decision: not built** --
+    a working wrong game would be recorded under this game's name.
+  - **Players that get the stream from a runtime API call** made by a script
+    bundle: needs a real browser; not worth reverse-engineering (it rotates).
+  - **Streams delivered over a websocket**, a player written with
+    eval/atob and no iframe, and pages that 403 outright: not handled.
+  - A link whose path names a different event (stale on the page's side).
+  - Messages fixed: a 404 page no longer says "Playlist not found", and the
+    event-page check (yt-dlp off) no longer claims yt-dlp was tried.
+- [COMPLETED] Two of the "404s" were a probe bug. A shared embed player pads
+  itself with ~640 KB of inline script ahead of the stream URL and then
+  writes the URL as a plain JS string with `&amp;` for `&`. The probe read
+  only 512 KB, so it never saw the URL, and fell back to junk `this.m3u8`
+  hits from a player library's script (the 404s). Fix: pages/embeds read up
+  to 2 MB (`PAGE_MAX_BYTES`, playlists stay at 512 KB), and `&amp;`/`\/` are
+  decoded. Proven live: both pages now probe OK (Referer needed, segment
+  206). Test `test_stream_url_behind_640kb_of_padding_is_found_whole` fails
+  on the old code. Both pages carried the same upstream stream (provider B),
+  so as backups they share a failure point.
+- [COMPLETED] Released v0.7.2 (sponsor approved, 2026-10-07): the padding fix
+  above plus d34501c's corrected probe messages.
+  Publish workflow green; image on GHCR as `:0.7.2`/`:latest`.
+- [COMPLETED] Add-recording dialog could not be saved once it grew taller
+  than the window (sponsor, 2026-10-07, after the aggregator filled three
+  slots plus overrides): it was centred in a fixed overlay, so its top and
+  bottom -- including Start -- fell off-screen with no scrollbar. The dialog
+  is now capped at the window height and scrolls inside. Checked in headless
+  Chrome at 500 px tall: dialog scrolls, Start reachable.
+- [COMPLETED] League/team autocomplete hid good matches (sponsor, same day):
+  "hockey" found NHL but "NHL" showed nothing; "COL" worked, "Avalanche" and
+  "Jets" did not. The server's answers were right (checked); the browser's
+  `<datalist>` re-filtered them -- hidden on an exact match, and only options
+  whose value *starts with* the typed text kept. Replaced with a small Alpine
+  dropdown that shows the server's list as-is (arrow keys + Enter, Esc).
+  Checked in headless Chrome: NHL, Avalanche, Jets, COL all list correctly;
+  Enter on a highlighted pick fills the box without submitting.
+- [COMPLETED] Released v0.7.3 (sponsor approved, 2026-10-07): the two
+  dashboard fixes above. Publish workflow green; `:0.7.3`/`:latest` on GHCR.
+- [COMPLETED] A stream page that stores its URL base64-encoded
+  (`atob("aHR0c...")`): the probe now decodes quoted base64 starting `aHR0c`
+  ("http"); anchoring on that keeps it linear next to big base64 blobs. The
+  decoded stream (provider D) was the right event, needed no token and no
+  Referer, and was independent of provider B -- before this fix all three
+  working links were one upstream. Live re-probe OK (segment 206);
+  `test_base64_stream_url_is_decoded` fails on the old code.
+- [COMPLETED] Live recording on v0.7.3 (dev workstation, 2026-10-07), watched
+  read-only: the primary's edge server froze at 00:09:53 UTC; PVArr retried
+  via hls-proxy (timed out), failed over to the first backup at 00:10:20 and
+  ran clean for 1.5 GB+, 0 segments lost.
+- [COMPLETED] Failover gap was ~30-45s: 15s freeze timer + a ~17s hls-proxy
+  retry on the server that had just died (`fix/failover-gap`, 2026-10-08).
+  **What was wrong:** `_recording_loop` (`app/recorder.py`, step 3) sent
+  every non-COMPLETED outcome to the proxy fallback, INTERRUPTED included.
+  That half was added in 5fff4b2 (three-state outcomes) on the theory that
+  "the proxy re-scrapes an expired token". It does not: `start_proxy` hands
+  hls-proxy the already-resolved `m3u8_url` in literal mode, so it asks the
+  same dead edge again and FFmpeg waits out `-rw_timeout`. Re-resolving is
+  already done by `detect_candidate_headers()` on every connect. Nothing in
+  this file or the history shows the proxy ever rescuing a mid-recording
+  freeze; every recorded proxy win (v0.2.3: no-Referer literal mode,
+  `.image` segment extensions) was a candidate that FAILED at connect.
+  **Fix:** INTERRUPTED (delivered, then froze or died) with a backup on hand
+  now fails over immediately and logs "skipping the hls-proxy retry". The
+  proxy is kept for FAILED (never delivered direct) and for an INTERRUPTED
+  single-candidate session. Expected gap: freeze timeout + ~1s pause + the
+  backup's probe and connect, ~20s at the default 15s (the 2026-10-07 log
+  shows ~5s from giving up to the backup running).
+  **Proven:** `TestFreezeFailover` drives the real capture loop with
+  `_FakeProc` (bytes, then silence; backup exits clean) and asserts FFmpeg
+  goes to candidate 2 next with no proxy start; its single-URL twin asserts
+  the proxy is still tried. Plus 2 loop tests in `TestInterruptedFailover`
+  and one updated script. 4 tests fail on the old `recorder.py` (the HEAD
+  copy swapped in); the two "proxy still used" guards pass on both. Full
+  suite green.
+  **Freeze timer (15s), not changed:** FFmpeg with `-c copy` writes in a
+  burst per segment, so on ~6s segments normal silences run up to one
+  segment plus a playlist reload (~6-9s) and more on a slow edge. 15s is
+  ~2.5 segments: lowering it toward ~10s would save ~5s per freeze but
+  starts failing over healthy-but-jittery edges, which then cost a full
+  reconnect. No evidence either way yet; revisit only with logs of normal
+  inter-write gaps. FFmpeg joins a live playlist ~3 segments behind the
+  edge (default `live_start_index`), so when the backup mirrors the same
+  feed part of the wait is refilled -- footage lost can be less than the
+  wall-clock gap.
+- [COMPLETED] Released v0.7.4 (base64 decode, b6fe80a) and v0.7.5 (failover
+  fix 227a4f3), sponsor approved, 2026-10-08; publish workflows green.
+- [COMPLETED] Watchtower note above was wrong: the compose file labels PVArr
+  `com.centurylinklabs.watchtower.enable=false`, so the dev workstation was
+  never auto-updated (it ran v0.7.3 until updated by hand to v0.7.5 on
+  2026-10-08). Sponsor: keep it off Watchtower for now; update by hand while
+  idle.
+- [COMPLETED] Sponsor watched the 2026-10-07 failover live and did not notice
+  the gap; recording caught the whole game (stopped at host shutdown, finalised
+  as .mp4 on next boot by session recovery).
+- [PENDING] Sponsor decision: live with ~1 auto-found stream per event plus
+  manual m3u8 backups, or a headless-browser sidecar (option 3) -- heavy,
+  and it would not fix the wrong-channel problem above.
+- [PENDING] If the cookie paste fails from the container but works in the
+  browser, the `cf_clearance` cookie is likely bound to something the
+  container does not share (IP or TLS client); FlareSolverr is then the only
+  route.
+
+---
+
+## Phase 27: One-shot schedule from an aggregator page (2026-10-08) [IN PROGRESS -- review + live test pending]
+
+Sponsor, verbatim: "let's add a simple schedule component - start at time,
+end at time, then when start time comes, pvarr scans the aggregating page and
+fills in. also lets hide the three manual links to start (option to show them
+ofc always there)." Reverses the 2026-08-30 decline (see Phase 13 Declined).
+
+- [COMPLETED] `app/schedules.py`: one-shot jobs in memory, mirrored to
+  `/config/schedules.json` (one file, atomic mkstemp + os.replace, 0600,
+  best-effort like SessionStore). Pure helpers for the decisions: `decide()`
+  (wait / search / missed), `merge_candidates()`, `miss_reason()`,
+  `public_view()` (cookie + per-URL headers withheld), `prune()` (failed /
+  missed jobs kept 24 h; a started job leaves the list at once -- sponsor,
+  2026-10-08, the recording's own card takes over).
+- [COMPLETED] `server.py`: the body of `/api/recordings/start` moved into
+  `_start_session()`, the one start path for the button and the scheduler.
+  `GET/POST /api/schedules`, `DELETE /api/schedules/{id}`. A loop task
+  started in `lifespan()` after session resume, ticking every 15 s (woken
+  immediately by a new job), cancelled before the recorders are stopped.
+- [COMPLETED] Dashboard: the three manual slots hidden behind "Enter stream
+  links manually", auto-opened when they hold anything (Find filled them,
+  Record again pre-filled them). Primary no longer `required` in HTML (a
+  hidden required input blocks submit); the JS checks there is a page or a
+  link. Start with only a page runs Find first, then starts. Start at / End
+  at (datetime-local -> epoch in the browser); a future Start at makes the
+  button "Schedule". Scheduled list on the Live Recorders tab with Cancel.
+- [COMPLETED] 15 tests: store round-trip/0600/crash recovery, decisions,
+  merge, miss reasons, route validation and cookie redaction, loop paths
+  (started with end_time via the shared helper, retry + notify-once,
+  manual fallback, 507 -> failed, missed without checking, cancel mid-check).
+  Verified in headless Chrome against a local server (toggle hidden by
+  default, opens on click and on prefill, Schedule submit lands in the list).
+
+Design decisions:
+- The page is checked at the start time, not when scheduling: stream links
+  expire within hours and most appear shortly before the event.
+- Candidates: aggregator picks first (page order, the stream *page* URL so
+  failover re-resolves tokens), then manual links, deduped, max 3. Picks
+  that fail `safe_stream_url` are dropped, not fatal.
+- Nothing to record -> stay `waiting`, retry every 120 s until End at.
+  Notify on the first miss and once more when the window closes (`missed`).
+  A refused start (507 disk, etc.) -> `failed` + notify. Notification text is
+  composed from operator-typed names and fixed reasons, never page text.
+- The scheduler waits for `_aggregate_lock` rather than 429ing; a manual
+  Find during a scheduled check still gets 429.
+- Late start: start_at passed while down but window open -> starts late.
+  `searching` at boot -> due again. Past End at -> `missed`.
+- A job's aggregator cookie and per-URL headers are blanked from disk when
+  it finishes. Rebroadcast schedules allowed (two passthrough fields).
+- Cancel never stops a recording the job already started.
+
+Open risks:
+- **cf_clearance expiry between scheduling and start.** Cloudflare's default
+  clearance is 30 minutes. A cookie pasted hours ahead will often be dead at
+  start: the check comes back challenged, the job message says "behind a
+  Cloudflare challenge", it retries every 2 min (a fresh cookie cannot
+  appear on its own, so these retries only help if the page stops
+  challenging) and notifies once. FlareSolverr (`PVARR_FLARESOLVERR_URL`) is
+  the real fallback; otherwise cancel and reschedule with a fresh cookie.
+  Not yet seen live.
+- Shutdown during a scheduled check: the loop task is cancelled at once and
+  the job goes back to `waiting`, but the probe thread runs on (bounded,
+  ~1-2 min) and can hold up interpreter exit past `docker stop`'s 10 s
+  grace -> SIGKILL. Harmless to data (the job is re-run at boot); worth a
+  look if shutdown logs show it.
+- Each retry probes up to 20 links for up to a minute: ~1/3 duty cycle on
+  the network while a window is open with nothing found. Bounded by End at.
+- No per-job lock against two overlapping schedules for the same event; both
+  would start (operator error, visible in the list).
+- [PENDING] Live test on a real event: schedule ~10 min ahead with a fresh
+  cookie, confirm it starts and stops at End at.
+
+### Review, 2026-10-08 (Architect, Security, DevOps) -- nothing blocking; fixed
+
+- [COMPLETED] Sec: no cap on live jobs -> `POST /api/schedules` answers 429
+  once 20 are waiting/searching. Test: `test_live_jobs_are_capped`.
+- [COMPLETED] Sec: one >4096-char link from the page made `_start_session`
+  400 and FAILED the job for good -> such picks are skipped like a bad
+  scheme. Test: `test_an_oversized_pick_is_skipped_not_fatal`.
+- [COMPLETED] Sec: an arbitrary exception's text went into the job message
+  and the notification -> fixed "internal error (see the PVArr log)", full
+  traceback to the log only. HTTPException refusals still say why.
+- [COMPLETED] Sec: when persistence disables itself, the last schedules.json
+  stayed on disk and a since-started job would reload as `waiting` and record
+  twice -> the store unlinks it once when it disables.
+- [COMPLETED] Arch: due jobs ran one after another, so two 19:00 games
+  started 1-2 min apart and manual-only jobs queued behind scans -> each due
+  job is its own tracked task with a per-job in-flight guard; scans stay
+  serialized by `_aggregate_lock`; `_start_session` stays on the loop thread
+  (keeps proxy-port allocation race-free); shutdown cancels and awaits every
+  job task. Test: `test_due_jobs_run_concurrently_and_manual_only_is_not_queued`.
+- [COMPLETED] Arch: restore-on-cancel was untested -> `test_cancel_mid_scan_puts_the_job_back_to_waiting`.
+- [COMPLETED] Arch: a Find refused during a scheduled scan now says so (429
+  "a scheduled recording is checking its aggregator page").
+- [COMPLETED] Arch: retry backoff 120 s for the first 5 attempts, then 300 s.
+- [COMPLETED] DevOps: SIGTERM during a scan took 56 s (exit 137 under the
+  30 s grace) because the to_thread worker and the aggregator's probe pool
+  are joined at interpreter exit. Now the scheduled scan runs on a daemon
+  thread handing back a Future, and `pick_first_working` takes an `abort`
+  event (`cleanup.shutting_down`, set first thing in the SIGTERM handler) that
+  stops the wait and cancels queued probes. Measured on a local server with a
+  page of 20 hanging links, SIGTERM 8 s into the scan: **exit 0 in 3.7 s**,
+  job saved as `waiting`. A manual Find in flight at shutdown still uses
+  to_thread and is not covered (rare; out of scope).
+- [COMPLETED] DevOps: a job could start a capture between SIGTERM and the
+  lifespan cancel (uvicorn drains first) -> `_run_schedule` checks
+  `cleanup.shutting_down` right before `_start_session` and leaves the job
+  waiting. Test: `test_shutdown_flag_blocks_the_start_and_leaves_the_job_due`.
+- [COMPLETED] DevOps: `POST /api/schedules` returns `persistent`; the
+  dashboard warns when it is false.
+- [COMPLETED] README: manual-links-start-at-once (no page recheck), 507 ->
+  failed with no retry, jobs due together start together.
+
+### FlareSolverr live test follow-ups (2026-10-08) [COMPLETED]
+
+Source: live FlareSolverr v3.5.2 test bed on the dev workstation (notes outside the repo).
+Event pages solved in 11-16 s on 3 of 4 runs; one challenge took ~71 s and
+PVArr's fixed 60 s cap failed it every time.
+
+- [COMPLETED] `FLARESOLVERR_TIMEOUT_SEC = 60` -> `PVARR_FLARESOLVERR_TIMEOUT`,
+  default 120 s, bounded 10-300; HTTP read timeout is the cap + 15 s so
+  FlareSolverr's own error arrives instead of a read timeout. Find budget is
+  now up to ~3.5 min with FlareSolverr (README updated).
+- [COMPLETED] A FlareSolverr failure now leads the message ("FlareSolverr did
+  not solve the challenge in 120 s: <its error>"), the cookie hint follows as
+  the fallback. Test: `test_a_flaresolverr_failure_is_named_with_its_error`.
+- [COMPLETED] Scheduled scans: a challenge FlareSolverr fails is a normal
+  miss -> no candidates -> the existing retry loop (2 min, then 5). The miss
+  reason names FlareSolverr (without its error text, which stays in the log
+  and the UI). Test in `test_miss_reason_names_the_cloudflare_challenge`.
+- [COMPLETED] An ad-redirect hop (`/ad/visit.php`) was taken as a stream
+  candidate. `extract_links` now drops links with an ad/click-tracking path
+  segment and nothing stream-like in the URL. Generic vocabulary, no site
+  names. Test: `test_ad_and_click_tracking_hops_are_not_candidates`.
+- [COMPLETED] README: measured RAM/CPU, no session between runs (its cookie
+  does not carry to PVArr's client), and the netns-holder pattern for LAN
+  isolation, with the host-gateway caveat.
+- [PENDING] Consider one immediate FlareSolverr retry inside a manual Find
+  (test bed suggested it; the scheduler already retries).
+
+---
+
+## Phase 28: Public relaunch prep (2026-10-08) [COMPLETED -- sponsor review pending]
+
+Branch `relaunch/clean`. The public repo will be re-created from one squashed
+commit of this tree, so only the final tree has to be clean; history is not
+rewritten here.
+
+- [COMPLETED] Field notes out of `TODO.md`. Every section that named a stream
+  site, an upstream stream id, a decoded player config, or a specific recorded
+  game/broadcast was moved verbatim to the private notes repo, and replaced
+  here by a neutral account that keeps the engineering: what failed, how it
+  was measured, what was built. Personal infrastructure names replaced with
+  "the test server" / "the dev workstation".
+
+- [COMPLETED] Neutral wording in code, UI and tests. Comments, log lines and
+  messages describe behaviour plainly ("browser-compatible TLS client",
+  "non-video segment extension", "lend PVArr your browser session") instead
+  of framing them as defeating or getting round a site. The
+  dashboard says "event page" where it said "aggregator page" (code names
+  and `/api/aggregate` unchanged, so no API break). Test fixtures that
+  replayed real site paths, stream ids or token prefixes now use synthetic
+  ones with the same shape; test names follow the new wording. Kept on
+  purpose: `impersonate`, which is the name of curl_cffi's and yt-dlp's own
+  option and of the `/api/probe` result field.
+- [COMPLETED] Install traps. (a) `TZ` is passed through in
+  `docker-compose.yml` (default `Etc/UTC`): filenames come from
+  `datetime.now()` in `app/naming.py`, and on a UTC container a 7 pm
+  Mountain event was dated the next day. Checked in the v0.7.5 image that
+  `TZ=America/Denver` changes Python's local time; guarded by
+  `test_date_follows_the_container_timezone`. (b) The Dockerfile fetched
+  hls-restream-proxy with an unpinned `git clone ... || true`, so a rebuild
+  could pick up different upstream code or silently ship without it. It now
+  downloads commit `ec57b00` (the one in the current published image, read
+  from its `.git`) and fails the build if the download or the two scripts are
+  missing. Not verified by a full image build in this session (no network
+  builds); CI's image job will exercise it. (c) README now says amd64 only,
+  ~900 MB image (`docker image ls`: 900 MB for v0.7.5).
+- [COMPLETED] `.claude/` (agent worktrees) is gitignored; one `git add -A`
+  would otherwise have published them. Local-only files (agent
+  instructions, personal notes) are no longer listed in `.gitignore`; they
+  are excluded per clone instead. `.dockerignore` now drops every `*.md`,
+  `docs/` and `.claude/`, so a locally built image cannot pick up local notes.
+- [COMPLETED] README restructured for newcomers: what it is, one screenshot,
+  **Intended use** (no DRM ever, no circumvention of access controls on
+  licensed services, no site-specific code, site lists or site support), a
+  Compose quick start with `PUID`/`PGID`/`TZ` and "amd64 only, ~900 MB",
+  first recording, scheduling, media-server setup. Reference material moved
+  to `docs/` (installation and env vars, finding streams, event pages and
+  scheduling, FlareSolverr, tuner, comskip, API, troubleshooting,
+  development, features in detail). Pronunciation is one line. The dead
+  hls-restream-proxy link now points at the upstream the image uses. Fixed
+  on the way: a paragraph sitting inside the env-var table had broken the
+  table's second half. The "fixed in versions before X" entries are grouped
+  under "Fixed in earlier versions" in `docs/troubleshooting.md`.
+- [COMPLETED] `docs/screenshot.png`: a throwaway container of the published
+  image on a spare port with its own empty `/config` and `/recordings`,
+  recording two local `ffmpeg testsrc2` HLS sources, after a forced switch
+  to the backup. No real stream URL or site appears in it.
+- [PENDING] Sponsor: GitHub Releases notes, issue templates, `SECURITY.md`,
+  repo topics (launch strategy week 1) -- not done here.
+- [COMPLETED] Final check: a case-insensitive `git grep` over the branch for
+  every site name, stream id, token prefix, personal host name and loaded
+  phrase in the private liability list returns nothing; the branch's commit
+  messages are clean too. Remaining hits are deliberate: one pronunciation
+  line in the README, "Pittsburgh Pirates" in the team snapshot, and
+  `impersonate` as curl_cffi's/yt-dlp's own option name.

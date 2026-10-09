@@ -1,0 +1,105 @@
+# =============================================================================
+# PVArr - Personal Video Recorder (Docker Production Build)
+# =============================================================================
+
+FROM python:3.12-slim-bookworm
+
+# Prevent Python from writing bytecode and buffer stdout/stderr
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies & FFmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    curl \
+    git \
+    psmisc \
+    gosu \
+    comskip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Install hls-restream-proxy tools (hls-proxy + detect-headers) from a pinned
+# upstream commit, so a rebuild cannot silently pick up different code. A
+# failed download fails the build rather than shipping an image without them.
+# To update: pick a commit from https://github.com/pcruz1905/hls-restream-proxy
+ARG HLS_RESTREAM_PROXY_COMMIT=ec57b0048ab3da8a88e828450cbc09c2f8b057bd
+RUN mkdir -p /opt/hls-restream-proxy && \
+    curl -fsSL "https://codeload.github.com/pcruz1905/hls-restream-proxy/tar.gz/${HLS_RESTREAM_PROXY_COMMIT}" \
+      | tar -xz --strip-components=1 -C /opt/hls-restream-proxy && \
+    test -f /opt/hls-restream-proxy/hls-proxy.py && \
+    test -f /opt/hls-restream-proxy/detect-headers.sh
+
+# Symlink the proxy/detect scripts into PATH so check_deps finds them via `which`
+RUN if [ -f /opt/hls-restream-proxy/hls-proxy.py ]; then \
+        cp /opt/hls-restream-proxy/hls-proxy.py /usr/local/bin/hls-proxy.py && \
+        chmod +x /usr/local/bin/hls-proxy.py && \
+        ln -sf /usr/local/bin/hls-proxy.py /usr/local/bin/hls-proxy; \
+    fi && \
+    if [ -f /opt/hls-restream-proxy/detect-headers-py.py ]; then \
+        cp /opt/hls-restream-proxy/detect-headers-py.py /usr/local/bin/detect-headers-py.py && \
+        chmod +x /usr/local/bin/detect-headers-py.py && \
+        ln -sf /usr/local/bin/detect-headers-py.py /usr/local/bin/detect-headers; \
+    fi && \
+    if [ ! -e /usr/local/bin/detect-headers ] && [ -f /opt/hls-restream-proxy/detect-headers.sh ]; then \
+        cp /opt/hls-restream-proxy/detect-headers.sh /usr/local/bin/detect-headers.sh && \
+        chmod +x /usr/local/bin/detect-headers.sh && \
+        ln -sf /usr/local/bin/detect-headers.sh /usr/local/bin/detect-headers; \
+    fi
+
+# Copy application files
+COPY . .
+
+# Ensure executable permissions
+RUN chmod +x start.sh stream-recorder.py docker-entrypoint.sh && \
+    [ -f scripts/publish.sh ] && chmod +x scripts/publish.sh || true
+
+# Create required volume directories
+RUN mkdir -p /config /recordings /app/logs
+
+# Links this image to the GitHub repository that builds it. Without this the
+# package is a standalone user-owned package, and the Actions GITHUB_TOKEN has
+# no write access to it — pushes from CI are denied even though login succeeds.
+LABEL org.opencontainers.image.source="https://github.com/jlesterak/pvarr" \
+      org.opencontainers.image.description="PVArr - multi-stream HLS failover recorder" \
+      org.opencontainers.image.licenses="Unlicense"
+
+EXPOSE 8999
+
+# Environment defaults.
+# PVARR_RECORDINGS_DIR must point at the mounted volume: the app otherwise
+# defaults to /app/recordings, which lives inside the image layer, so every
+# recording would be written to the container's writable layer and lost on
+# recreate while the mounted ./recordings stayed empty.
+ENV HOST=0.0.0.0 \
+    PORT=8999 \
+    PVARR_NO_VENV=1 \
+    PVARR_RECORDINGS_DIR=/recordings \
+    PVARR_CONFIG_DIR=/config \
+    PVARR_ALLOWED_DIRS=/recordings
+
+# The app user. PUID/PGID at runtime re-point it at the host's uid/gid so files
+# on the far side of a bind mount are owned by the right person.
+ENV PUID=1000 \
+    PGID=1000
+RUN useradd --create-home --shell /bin/bash --uid 1000 pvarr && \
+    chown -R pvarr:pvarr /app /config /recordings
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8999/api/status || exit 1
+
+# Deliberately no `USER pvarr`. The entrypoint starts as root purely to fix the
+# ownership of bind-mounted volumes -- which the image-time chown above cannot
+# do, because a bind mount replaces the image's directory inode with the host's
+# -- and then execs the app under PUID:PGID via gosu. No root process survives
+# into the running container. If `user:` is set in compose the entrypoint is
+# already unprivileged, and it verifies writability and fails fast instead.
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["./start.sh"]

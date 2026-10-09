@@ -1,0 +1,72 @@
+services:
+  pvarr:
+    # Published image. Defaults to the newest release; pin a specific version
+    # by setting PVARR_TAG in .env (e.g. PVARR_TAG=1.0.0) so upgrades are
+    # deliberate and a rollback is a one-line change.
+    # To build from source instead, layer the build override:
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    image: ghcr.io/jlesterak/pvarr:${PVARR_TAG:-latest}
+    container_name: pvarr
+    restart: unless-stopped
+    ports:
+      - "8999:8999"
+    # Docker's default is 10s, which is not enough to reap FFmpeg and let a
+    # remux finish. PVARR_GRACEFUL_TIMEOUT + PVARR_SHUTDOWN_TIMEOUT (5 + 20s by
+    # default) run in sequence and must both stay inside this.
+    stop_grace_period: 30s
+    # Unrotated container logs grow without bound; a crash loop fills the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      # PVArr follows :latest by default and Watchtower recreates containers
+      # unattended. A recreate mid-recording is exactly what you do not want at
+      # 4am. Remove this label (or pin PVARR_TAG) to opt back in.
+      - "com.centurylinklabs.watchtower.enable=false"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8999
+      # Your timezone (e.g. America/Denver). Filenames are dated in local time;
+      # without this the container runs on UTC and an evening recording gets
+      # the next day's date.
+      - TZ=${TZ:-Etc/UTC}
+      # Match your host user so files on the far side of the bind mounts are
+      # owned by you: `id -u` and `id -g`.
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - PLEX_URL=${PLEX_URL:-}
+      - PLEX_TOKEN=${PLEX_TOKEN:-}
+      - EMBY_URL=${EMBY_URL:-}
+      - EMBY_API_KEY=${EMBY_API_KEY:-}
+      # Must match the mounted volume below, or recordings land inside the
+      # container and vanish on recreate.
+      - PVARR_RECORDINGS_DIR=/recordings
+      # Session state lives here so an in-flight recording survives a restart.
+      - PVARR_CONFIG_DIR=/config
+      - PVARR_ALLOWED_DIRS=/recordings
+      - PVARR_LOG_LEVEL=${PVARR_LOG_LEVEL:-INFO}
+      # Shutdown budget. These two run in sequence and must both fit inside
+      # stop_grace_period above, or Docker SIGKILLs mid-shutdown and an
+      # in-flight recording loses its resume marker:
+      #   GRACEFUL (close open connections) + SHUTDOWN (reap FFmpeg, remux)
+      #   5 + 20 = 25s, inside the 30s grace period.
+      - PVARR_GRACEFUL_TIMEOUT=${PVARR_GRACEFUL_TIMEOUT:-5}
+      - PVARR_SHUTDOWN_TIMEOUT=${PVARR_SHUTDOWN_TIMEOUT:-20}
+      # Optional: a FlareSolverr container for event pages that need a real
+      # browser. Must be on this compose network; see docs/flaresolverr.md.
+      # - PVARR_FLARESOLVERR_URL=http://flaresolverr:8191
+      # - PVARR_FLARESOLVERR_TIMEOUT=120   # seconds per solve (10-300)
+    volumes:
+      - ./config:/config
+      - ./recordings:/recordings
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8999/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
