@@ -2074,6 +2074,14 @@ is an accurate diagnosis instead of a misleading one.
 (`PVARR_COMSKIP_INI`). comskip added to the Dockerfile: 333 KB, dependencies
 already present.
 
+- **Default ini tuned (2026-10-09).** `_DEFAULT_INI` gains `detect_method=111`
+  and `logo_threshold=0.75`. Proven on a sweep of 29 configs over four
+  recordings (networks A-D, hand-checked break keys): recall 72->80, 99->99,
+  80->84, 85->95 %; precision 96.8-99.5 %. Best global file is within 1 point
+  of best per-network, so no per-network settings. Caveats: one recording per
+  network (may be overfit); the animated break card is still unmeasured; on
+  network A, 14 of 20 breaks end 17-36 s early, cause unknown.
+
 ### Design
 - **Chapters, not cuts.** A false positive in chapter mode costs a click. In
   cut mode it deletes a play that cannot be re-recorded. `cut` is accepted as a

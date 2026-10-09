@@ -45,8 +45,16 @@ DEFAULT_TIMEOUT_SEC = 3 * 60 * 60
 
 # comskip's own defaults write nothing we can use. These two outputs are the
 # whole point: ffmeta gives chapters ffmpeg can apply directly, and the EDL
-# gives the ranges needed to cut.
-_DEFAULT_INI = "output_edl=1\noutput_ffmeta=1\n"
+# gives the ranges needed to cut. detect_method=111 (black frames + logo +
+# scene change) and logo_threshold=0.75 came from a sweep over four broadcast
+# recordings: recall rose 0-10 points with precision held at ~97-99%, and one
+# global file scored within a point of per-network tuning.
+_DEFAULT_INI = (
+    "output_edl=1\n"
+    "output_ffmeta=1\n"
+    "detect_method=111\n"
+    "logo_threshold=0.75\n"
+)
 
 
 def comskip_path() -> Optional[str]:
