@@ -296,9 +296,14 @@ def fetch_page(
     cookie: Optional[str] = None,
     user_agent: Optional[str] = None,
     timeout: int = probe.DEFAULT_TIMEOUT,
+    abort: Optional[threading.Event] = None,
+    fs_retry: bool = False,
 ) -> Dict[str, Any]:
     """Fetch the event page: plain, then with a browser-compatible TLS client,
     then through FlareSolverr if configured and the page is an anti-bot check.
+    `fs_retry` asks FlareSolverr a second time at once if the first solve
+    timed out or came back still challenged (a manual Find, where nobody
+    retries for you; scheduled scans have their own retry loop).
 
     Returns ``{ok, url, html, via, status, challenged, attempts, message}``;
     ``via`` is ``plain``, ``chrome`` or ``flaresolverr``.
@@ -341,7 +346,10 @@ def fetch_page(
 
     endpoint = flaresolverr_url()
     fs_failure = ""
-    if out["challenged"] and endpoint:
+    for attempt in range(2 if fs_retry else 1):
+        if not (out["challenged"] and endpoint):
+            break
+        fs_failure = ""
         try:
             solution = _flaresolverr_fetch(url, endpoint)
             html = str(solution.get("response") or "")
@@ -352,12 +360,16 @@ def fetch_page(
                 out.update(ok=True, url=solution.get("url") or url, via="flaresolverr",
                            html=html, status=status, challenged=False)
                 return out
-            fs_failure = (f"it returned HTTP {status}" if not 200 <= status < 400
-                          else "its page was still a challenge")
+            if not 200 <= status < 400:
+                fs_failure = f"it returned HTTP {status}"
+                break  # a real HTTP answer will not change on a second ask
+            fs_failure = "its page was still a challenge"
         except (requests.RequestException, ValueError, TypeError) as exc:
             out["attempts"].append({"stage": "aggregator", "via": "flaresolverr",
                                     "error": str(exc)})
             fs_failure = str(exc)[:300]
+        if abort is not None and abort.is_set():
+            break
     # Kept for callers that report the outcome elsewhere (the scheduler's
     # notification), which must say FlareSolverr was tried.
     out["flaresolverr_failed"] = bool(fs_failure)
@@ -493,6 +505,7 @@ def find_streams(
     user_agent: Optional[str] = None,
     probe_fn: Callable[[str], Dict[str, Any]] = _probe_one,
     abort: Optional[threading.Event] = None,
+    fs_retry: bool = False,
 ) -> Dict[str, Any]:
     """The whole job: aggregator URL in, up to three working candidates out."""
     result: Dict[str, Any] = {"ok": False, "page": {}, "links_found": 0,
@@ -504,7 +517,8 @@ def find_streams(
         return result
 
     page = fetch_page(target, cookie=clean_cookie(cookie),
-                      user_agent=clean_user_agent(user_agent))
+                      user_agent=clean_user_agent(user_agent),
+                      abort=abort, fs_retry=fs_retry)
     result["page"] = {k: page[k] for k in ("ok", "url", "via", "status", "challenged", "attempts")}
     result["page"]["flaresolverr_failed"] = bool(page.get("flaresolverr_failed"))
     if not page["ok"]:

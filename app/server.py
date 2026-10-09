@@ -494,21 +494,18 @@ async def aggregate_url(
     for value in (url, cookie or "", user_agent or ""):
         if len(value) > 4096:
             raise HTTPException(status_code=400, detail="Field is too long")
-    # One at a time. Each run holds a worker from the default executor -- the
-    # same pool the live-view and download readers use -- for up to a couple
-    # of minutes, so a few stacked runs (a reloaded tab, a double click) could
-    # stall a rebroadcast. A second request is refused, not queued.
+    # One at a time. Each run holds a thread for up to a few minutes, so a few
+    # stacked runs (a reloaded tab, a double click) would pile up work. A
+    # second request is refused, not queued.
     if _aggregate_lock.locked():
         if _aggregate_holder == "scheduled":
             raise HTTPException(status_code=429, detail=(
                 "A scheduled recording is checking its event page; try again in a minute"))
         raise HTTPException(status_code=429, detail="Already checking an event page; wait for it to finish")
     async with _aggregate_lock:
-        result = await asyncio.to_thread(
-            aggregator.find_streams, url.strip(),
-            cookie=(cookie or "").strip() or None,
-            user_agent=(user_agent or "").strip() or None,
-        )
+        result = await _scan_in_daemon_thread(
+            "find", url.strip(), (cookie or "").strip() or None,
+            (user_agent or "").strip() or None, fs_retry=True)
     return JSONResponse(content=result)
 
 
@@ -1193,10 +1190,11 @@ def _track_schedule_task(job_id: str, coro) -> "asyncio.Task":
     return task
 
 
-def _scan_in_daemon_thread(job: Dict[str, Any]) -> "asyncio.Future":
+def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
+                           user_agent: Optional[str], fs_retry: bool = False) -> "asyncio.Future":
     """Run aggregator.find_streams on a daemon thread; its result as a Future.
 
-    Not asyncio.to_thread: that worker belongs to the default executor, which
+    Used by scheduled scans and the manual Find alike. Not asyncio.to_thread: that worker belongs to the default executor, which
     is joined when the interpreter exits, so a stop during a scan waited out
     the whole scan (measured 56 s, past Docker's grace -> SIGKILL). A daemon
     thread is simply abandoned at exit, and `cleanup.shutting_down` stops the
@@ -1212,10 +1210,10 @@ def _scan_in_daemon_thread(job: Dict[str, Any]) -> "asyncio.Future":
 
     def _run():
         try:
+            extra = {"fs_retry": True} if fs_retry else {}
             outcome = aggregator.find_streams(
-                job["agg_url"], cookie=job.get("agg_cookie") or None,
-                user_agent=job.get("agg_user_agent") or None,
-                abort=cleanup.shutting_down,
+                agg_url, cookie=cookie, user_agent=user_agent,
+                abort=cleanup.shutting_down, **extra,
             )
             setter = future.set_result
         except BaseException as exc:  # handed to the awaiting task, not lost
@@ -1225,7 +1223,7 @@ def _scan_in_daemon_thread(job: Dict[str, Any]) -> "asyncio.Future":
         except RuntimeError:
             pass  # loop already closed: shutting down, nobody is waiting
 
-    threading.Thread(target=_run, name=f"pvarr-sched-{job['id']}", daemon=True).start()
+    threading.Thread(target=_run, name=f"pvarr-scan-{name}", daemon=True).start()
     return future
 
 
@@ -1243,7 +1241,9 @@ async def _run_schedule(job: Dict[str, Any]) -> None:
                     return  # cancelled while queued
                 _aggregate_holder = "scheduled"
                 try:
-                    result = await _scan_in_daemon_thread(job)
+                    result = await _scan_in_daemon_thread(
+                        job_id, job["agg_url"], job.get("agg_cookie") or None,
+                        job.get("agg_user_agent") or None)
                 finally:
                     _aggregate_holder = None
     except asyncio.CancelledError:

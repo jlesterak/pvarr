@@ -3878,8 +3878,8 @@ Open risks:
   event (`cleanup.shutting_down`, set first thing in the SIGTERM handler) that
   stops the wait and cancels queued probes. Measured on a local server with a
   page of 20 hanging links, SIGTERM 8 s into the scan: **exit 0 in 3.7 s**,
-  job saved as `waiting`. A manual Find in flight at shutdown still uses
-  to_thread and is not covered (rare; out of scope).
+  job saved as `waiting`. A manual Find in flight at shutdown used to
+  use to_thread and was not covered; fixed 2026-10-09, see below.
 - [COMPLETED] DevOps: a job could start a capture between SIGTERM and the
   lifespan cancel (uvicorn drains first) -> `_run_schedule` checks
   `cleanup.shutting_down` right before `_start_session` and leaves the job
@@ -3913,8 +3913,14 @@ PVArr's fixed 60 s cap failed it every time.
 - [COMPLETED] README: measured RAM/CPU, no session between runs (its cookie
   does not carry to PVArr's client), and the netns-holder pattern for LAN
   isolation, with the host-gateway caveat.
-- [PENDING] Consider one immediate FlareSolverr retry inside a manual Find
-  (test bed suggested it; the scheduler already retries).
+- [COMPLETED] Manual Find now runs on the same daemon scan thread as scheduled
+  scans (`_scan_in_daemon_thread`, abort = `cleanup.shutting_down`), so a Find
+  in flight at SIGTERM no longer holds the default executor or delays exit.
+- [COMPLETED] Manual Find retries FlareSolverr once, at once, when the first
+  solve timed out or came back still challenged (`fs_retry`; not for a plain
+  HTTP error). Scheduled scans do not: their own retry loop covers it. Worst
+  case Find budget is one more FlareSolverr timeout. Test:
+  `test_manual_find_retries_a_failed_flaresolverr_solve_once`.
 
 ---
 

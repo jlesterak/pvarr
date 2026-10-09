@@ -7716,6 +7716,30 @@ class TestAggregatorFetch(unittest.TestCase):
             "FlareSolverr did not solve the challenge in 120 s: Timeout after 120.0 seconds"))
         self.assertIn("cf_clearance", out["message"])  # the cookie hint stays as fallback
 
+    def test_manual_find_retries_a_failed_flaresolverr_solve_once(self):
+        calls = []
+
+        def solver(url, endpoint):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("Timeout after 120.0 seconds.")
+            return {"status": 200, "url": url, "response": "<html>ok</html>"}
+
+        from unittest.mock import patch
+        resp = type("R", (), {"status_code": 403, "url": "u", "headers": {}, "ok": False})()
+        with patch.object(aggregator, "_plain_session", return_value=object()), \
+                patch.object(aggregator.probe, "_browser_tls_session", return_value=None), \
+                patch.object(aggregator.probe, "_fetch", return_value=(resp, self.CHALLENGE)), \
+                patch.object(aggregator, "_flaresolverr_fetch", side_effect=solver), \
+                patch.dict(os.environ, {"PVARR_FLARESOLVERR_URL": "http://fs:8191"}):
+            once = aggregator.fetch_page("https://agg.example/e")
+            self.assertFalse(once["ok"])
+            self.assertEqual(len(calls), 1)  # scheduled scans: no immediate retry
+            calls.clear()
+            twice = aggregator.fetch_page("https://agg.example/e", fs_retry=True)
+        self.assertTrue(twice["ok"])
+        self.assertEqual(len(calls), 2)
+
     def test_flaresolverr_timeout_is_configurable_and_bounded(self):
         from unittest.mock import patch
         for raw, want in ((None, 120), ("90", 90), ("1", 10), ("9999", 300), ("junk", 120)):
@@ -7793,7 +7817,7 @@ class TestAggregateEndpoint(ServerTestCase):
         from unittest.mock import patch
         seen = {}
 
-        def fake(url, cookie=None, user_agent=None):
+        def fake(url, cookie=None, user_agent=None, **_kw):
             seen.update(url=url, cookie=cookie, user_agent=user_agent)
             return {"ok": False, "message": "x"}
 
