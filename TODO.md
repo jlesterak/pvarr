@@ -4131,4 +4131,20 @@ agreed the same day: automatic re-check plus a button.
   two sources the dead one now current is skipped and retried; and a
   source that failed once since the last check counts as dead even if it
   recovered. Both cost one extra attempt at worst.
-- [PENDING] Live test on a real event.
+- [COMPLETED] Live test, first half (2026-10-11, network football game):
+  two sources died two minutes apart, the automatic re-check fired on the
+  second death as designed, and the recording carried on on its third
+  source without a visible gap. But the re-check (and an earlier manual
+  one) reported "nothing new to swap in". Cause: it asked the page for
+  the first three working links, in page order, and those were exactly the
+  three the recording already held, so dedup threw all of them away.
+  Probing every link on that page showed 35 links, 13 of them working:
+  3 held, 3 more inside the 20-link cap, 7 past it. Fix: the re-check
+  passes the held links to `find_streams(exclude=...)`, which drops them
+  before probing, and the link cap went from 20 to 40 (applied after that
+  filter). Early stopping keeps a normal Find's cost where it was; the
+  cap only matters on pages with few working links. Run against the same
+  page: 3 fresh working links in 23 s, page fetch included. Test:
+  `test_a_recheck_skips_held_links_and_reads_further_down`.
+- [PENDING] Live test of a re-check that actually swaps a slot (needs a
+  restart onto the fixed code, so not during a recording).

@@ -15,7 +15,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Iterable, Optional, List
 
 from fastapi import FastAPI, APIRouter, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response
@@ -1243,7 +1243,8 @@ def _track_schedule_task(job_id: str, coro) -> "asyncio.Task":
 
 
 def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
-                           user_agent: Optional[str], fs_retry: bool = False) -> "asyncio.Future":
+                           user_agent: Optional[str], fs_retry: bool = False,
+                           exclude: Iterable[str] = ()) -> "asyncio.Future":
     """Run aggregator.find_streams on a daemon thread; its result as a Future.
 
     Used by scheduled scans and the manual Find alike. Not asyncio.to_thread: that worker belongs to the default executor, which
@@ -1263,6 +1264,8 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
     def _run():
         try:
             extra = {"fs_retry": True} if fs_retry else {}
+            if exclude:
+                extra["exclude"] = list(exclude)
             outcome = aggregator.find_streams(
                 agg_url, cookie=cookie, user_agent=user_agent,
                 abort=cleanup.shutting_down, **extra,
@@ -1317,9 +1320,13 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
                 return
             _aggregate_holder = "rescan"
             try:
+                # Skip the links already held: the page's first three working
+                # links are usually exactly those, so without this a re-check
+                # found "nothing new" while working links sat further down.
                 result = await _scan_in_daemon_thread(
                     f"rescan-{recording_id}", page["url"], page.get("cookie") or None,
-                    page.get("user_agent") or None)
+                    page.get("user_agent") or None,
+                    exclude=[c.url for c in recorder.candidates])
             finally:
                 _aggregate_holder = None
         urls = []

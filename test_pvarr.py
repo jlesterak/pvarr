@@ -2724,8 +2724,8 @@ class TestStaticRoutes(ServerTestCase):
         self.server.active_recorders["rs2"] = rec
         seen = {}
 
-        def fake_scan(name, url, cookie, user_agent, fs_retry=False):
-            seen.update(url=url, cookie=cookie)
+        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=()):
+            seen.update(url=url, cookie=cookie, exclude=list(exclude))
             fut = asyncio.get_running_loop().create_future()
             fut.set_result({"picked": [{"url": "http://fresh.example/9"}]})
             return fut
@@ -2733,7 +2733,9 @@ class TestStaticRoutes(ServerTestCase):
         with patch.object(self.server, "_scan_in_daemon_thread", side_effect=fake_scan), \
              patch.object(self.server.session_store, "save"):
             asyncio.run(self.server._rescan_event_page("rs2", manual=True))
-        self.assertEqual(seen, {"url": "https://events.example/e", "cookie": "sess=1"})
+        self.assertEqual(seen, {"url": "https://events.example/e", "cookie": "sess=1",
+                                "exclude": ["http://a/1", "http://b/2"]},
+                         "the links already held are skipped, so the page is read further down")
         self.assertEqual(rec.session_record["candidates"], ["http://a/1", "http://fresh.example/9"])
         self.assertEqual(rec.rescan_state, "")
         status = self.client.get("/api/status").text
@@ -8039,6 +8041,27 @@ class TestAggregatorSSRF(unittest.TestCase):
         self.assertEqual(probed, ["https://8.8.8.8/live/1"])
         self.assertEqual(out["skipped_private"], 1)
         self.assertTrue(out["ok"])
+
+    def test_a_recheck_skips_held_links_and_reads_further_down(self):
+        # Field case: the page's first three working links were exactly the
+        # three the recording held, so every re-check found "nothing new"
+        # while more working links sat further down (some past the old cap).
+        from unittest.mock import patch
+        links = [f"https://s{i}.example/live/{i}" for i in range(30)]
+        page = "".join(f'<a href="{u}">x</a>' for u in links)
+        probed = []
+
+        def probe_fn(url):
+            probed.append(url)
+            return dict(GOOD) if url in links[:3] + links[25:] else {"ok": False, "message": "dead"}
+
+        fetched = {"ok": True, "url": "https://1.1.1.1/event/1", "html": page, "via": "plain",
+                   "status": 200, "challenged": False, "attempts": [], "message": ""}
+        with patch.object(aggregator, "fetch_page", return_value=fetched):
+            out = aggregator.find_streams("https://1.1.1.1/event/1", probe_fn=probe_fn,
+                                          exclude=links[:2] + [links[2] + "/"])
+        self.assertEqual([p["url"] for p in out["picked"]], links[25:28])
+        self.assertFalse(set(probed) & set(links[:3]), "held links are not probed again")
 
 
 class TestAggregateEndpoint(ServerTestCase):

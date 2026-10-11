@@ -19,7 +19,7 @@ which runs the same check first when no stream link has been entered. PVArr:
    streams), and obvious ad or click-tracking hops (paths like `/ad/...`,
    `/click/...`, `visit.php` with nothing stream-like in them). No site is
    known by name, so this keeps working when the domains rotate;
-3. runs the normal probe on up to 20 of them, six at a time, and stops
+3. runs the normal probe on up to 40 of them, six at a time, and stops
    after about a minute (plus the page fetch: up to about three and a half
    minutes in all when FlareSolverr is involved, with its default 120 s cap);
 4. puts the first three that work into the three slots, **in page order** —
@@ -66,7 +66,7 @@ re-checking its event page").
 
 ## When sources die mid-recording
 
-A recording started with something in the **Event page** box (whether or not you pressed **Find 3 streams**), or by a schedule, remembers the page, along with the cookie and User-Agent you gave for it. If two of its sources die (or its only source, for a single-link recording), PVArr checks the page again in the background and puts fresh working links into the dead slots. The source currently recording is never touched. It checks automatically at most once every 10 minutes, and skips a turn rather than queue when another page check is running, so it never delays a scheduled start. Every swap is logged on the recording's card.
+A recording started with something in the **Event page** box (whether or not you pressed **Find 3 streams**), or by a schedule, remembers the page, along with the cookie and User-Agent you gave for it. If two of its sources die (or its only source, for a single-link recording), PVArr checks the page again in the background and puts fresh working links into the dead slots. Links the recording already holds are skipped, so it reads further down the page rather than finding the same ones again. The source currently recording is never touched. It checks automatically at most once every 10 minutes, and skips a turn rather than queue when another page check is running, so it never delays a scheduled start. Every swap is logged on the recording's card.
 
 **Re-check event page** on the card does the same thing on demand (no 10-minute limit; one check per recording at a time), for when you can see a source is struggling before PVArr can. A recording started from manually entered links only has no page to re-check, so the button does not appear.
 
