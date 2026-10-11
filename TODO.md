@@ -7,7 +7,7 @@ Sites are never named here. Upstreams are "provider A/B/C/D", pages that list
 several stream links are "event pages" (`app/aggregator.py` in the code), and
 recorded broadcasts are "network A/B". Site-specific field notes live in a
 separate private notes repo and must not be copied into this one, its commit
-messages, tests or screenshots. See README "Intended use".
+messages, tests or screenshots. See README "Scope".
 
 ## Phase 1: Core Failover Engine & Studio Foundations
 - [x] **Task 1: Environment, Project Structure & Dependency Setup**
@@ -3549,9 +3549,8 @@ old teams. If ESPN vanishes, autocomplete keeps working on the last snapshot.
   and guarded by a test.
 
 ### Open
-- [PENDING] Sponsor: try the form after Wednesday; decide whether full names
-  ("Colorado Avalanche") or short ones ("Avalanche") read better in
-  filenames. Today the suggestion is the full name; free text still works.
+- [COMPLETED] Sponsor decision (2026-10-11): full team names in filenames,
+  which is what autocomplete already suggests. No code change.
 - [PENDING] Optional keyed provider (TheSportsDB with a Patreon key, or
   another) -- subclass `TeamProvider`, add to `PROVIDERS`. Not built.
 - [PENDING] Agent-team review of this branch was NOT run (budget ran out);

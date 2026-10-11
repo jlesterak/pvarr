@@ -1,6 +1,6 @@
 # PVArr — a self-hosted DVR for live HLS streams
 
-> **🤖 AI Transparency Notice:** PVArr was designed, architected, and built by AI across multiple LLM sessions with a human in the loop. Google Gemini drew the initial architecture; Anthropic Claude has been the primary architect and maintainer since, and does the ongoing design, implementation, testing, and review. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint).
+> **🤖 Built by AI.** Anthropic's Claude designs, writes, tests and reviews PVArr, from a first architecture by Google's Gemini; a human decides and reviews. See [AI Genesis & Environmental Footprint](#ai-genesis--environmental-footprint).
 
 Pronounced *peevee-ARRRR*, like a pirate, matey.
 
@@ -19,13 +19,12 @@ PVArr records live HLS streams (the "playlist of short video chunks" format most
 
 ---
 
-## Intended use
+## Scope
 
-PVArr records streams you are entitled to watch: your own cameras and encoders, LAN tuners and IPTV boxes, free-to-air and local broadcasters' web streams, public meetings, conferences, and subscription streams whose terms allow it. What you record, and whether you are allowed to, is your responsibility.
+What you record is your responsibility.
 
-- **No DRM, ever.** PVArr does not decrypt DRM (Widevine, FairPlay, PlayReady) and will not support it. It does not circumvent access controls on licensed services: where a page needs a login or a browser session, you supply your own.
-- **No site-specific support.** PVArr contains no site-specific code and ships no stream lists. Site lists or support for specific sites will not be provided or accepted, and issues asking for them will be closed.
-- **Don't post stream URLs in issues.** Use **Copy trace** on the dashboard, which strips tokens from every URL.
+- **No DRM, ever.** PVArr does not decrypt Widevine, FairPlay or PlayReady. Pages that need a login use your own browser session.
+- **No site-specific code or stream lists.** Requests for either are closed. Don't post stream URLs in issues; **Copy trace** on the dashboard strips tokens for you.
 
 PVArr sends no telemetry and contacts nothing except the URLs you give it (and ESPN's public team list, only when a maintainer runs the `--refresh` command).
 
@@ -100,6 +99,19 @@ Support is best effort from a single maintainer. Bug reports are most useful wit
 
 ---
 
+## Credits
+
+PVArr is mostly glue around other people's work:
+
+- [FFmpeg](https://ffmpeg.org) does every byte of the recording and remuxing.
+- [hls-restream-proxy](https://github.com/pcruz1905/hls-restream-proxy) by pcruz1905: the fallback proxy and header detection.
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) resolves pages to playlists; [curl_cffi](https://github.com/lexiforest/curl_cffi) gives the probe a browser-compatible TLS client.
+- [Comskip](https://github.com/erikkaashoek/Comskip) finds the commercials; [Apprise](https://github.com/caronc/apprise) sends the notifications; [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) is the optional event-page helper.
+- [FastAPI](https://github.com/fastapi/fastapi), [Uvicorn](https://github.com/encode/uvicorn), [Jinja](https://github.com/pallets/jinja) and [Requests](https://github.com/psf/requests) run the server; [Alpine.js](https://github.com/alpinejs/alpine), [Tailwind CSS](https://tailwindcss.com), Inter and JetBrains Mono make the dashboard.
+- The *arr projects, whose conventions PVArr borrows, and SiliconDust's HDHomeRun, whose protocol lets Plex, Jellyfin and Emby see PVArr as a tuner.
+
+---
+
 ## License
 
 [The Unlicense](LICENSE) — public domain. Do whatever you want with it; no attribution required.
@@ -108,20 +120,15 @@ Support is best effort from a single maintainer. Bug reports are most useful wit
 
 ## AI Genesis & Environmental Footprint
 
-This program was written by machines. Gemini drew the first architecture; Claude has held the pen since — architecture, code, tests, and the audits that keep finding things wrong with all three — and a human points, decides, and reviews. Stated plainly, because the industry mostly doesn't.
+Machines wrote this. Gemini drew the first architecture; Claude has written the code, tests and audits since; a human points, decides and reviews.
 
-The Luddites are misremembered as people who hated machines. They were skilled workers who broke the specific machines being used to break them. The question was never *machines or no machines* — it was *whose hands are on them, and who eats*. Same question here. These models were trained on an enormous pile of other people's work. Nobody asked, nobody paid. That's a debt, and it has no payment address.
+Those models were trained on a huge pile of other people's work, unasked and unpaid. That debt has no payment address. The Luddites didn't hate machines; they broke the ones being used to break them. The question is still whose hands are on the machine, and who eats.
 
-**What it cost the planet: unknown, and not by accident.** Nobody metered this build, and the firms that could tell you what a token costs in watts and litres decline to publish it. "The cloud" is a shed full of hot metal in somebody's watershed. Treat any precise gram-of-CO₂ figure — including one that could easily have been invented right here — as marketing.
+**Footprint: unknown.** Nobody metered this build, and the companies that could say what a token costs in watts and water don't publish it. Distrust any precise CO₂ figure, including one this README could have made up.
 
-**Offsets are indulgences.** Buying one un-burns nothing, and the voluntary market is thick with fraud. If you want to send money anyway, send it where it does something structural:
+**Offsets don't un-burn anything.** If you want to give anyway, give somewhere structural: [Cool Earth](https://www.coolearth.org) pays forest communities to keep their land, and [Wren](https://www.wren.co) costs less a month than the DVR subscription you just cancelled.
 
-- **[Cool Earth](https://www.coolearth.org)** — hands cash to forest communities to keep their land. No carbon accounting theatre.
-- **[Wren](https://www.wren.co)** — monthly subscription, the buy-me-a-coffee of climate guilt. Cheaper than the DVR subscription you just cancelled.
-
-But the donate button is not the point. The point is that you now own a video recorder. No subscription, no account, no telemetry, nothing phoning home, nobody able to switch it off from a boardroom. That is one small thing clawed back out of the rental economy.
-
-***Go do it again somewhere else.***
+The point isn't the donate button. You now own a video recorder: no subscription, no account, nothing phoning home, nobody who can switch it off. ***Go do it again somewhere else.***
 
 ---
 
