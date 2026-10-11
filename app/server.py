@@ -1712,6 +1712,12 @@ async def list_library(dir_path: Optional[str] = None):
     return {"library": items}
 
 
+@app.get("/api/stats/ads")
+async def ad_stats():
+    """Share of each recording comskip marked as ads, by league and overall."""
+    return commercials.read_stats()
+
+
 @app.post("/api/library/rename")
 async def rename_file(old_name: str = Form(...), new_name: str = Form(...), dir_path: Optional[str] = Form(None)):
     """Rename a recording file in library."""

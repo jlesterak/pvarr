@@ -21,6 +21,7 @@
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |
+| `GET` | `/api/stats/ads` | The **Ad Stats** tab's data, from `/config/comskip-stats.csv`: `total`, `by_league` and `recordings` (newest first), each with `duration_sec`, `ad_sec` and `ad_pct` (share of recorded time, so longer recordings weigh more). Empty when comskip has never run. Read-only. |
 | `POST` | `/api/library/rename` | Rename a recording. A new name with no extension inherits the file's existing one, so a remuxed `.mp4` stays an `.mp4`. Returns `409` if a recording is currently writing to that file. |
 | `DELETE` | `/api/library/{filename}` | Delete a recording. Returns `409` if a recording is currently writing to that file — stop the recording first. |
 | `GET` | `/api/library/download/{filename}` | Download a recording. `Content-Type` follows the container (`.ts`, `.mp4`, `.mkv`). |

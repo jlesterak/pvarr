@@ -15,7 +15,7 @@ PVArr records live HLS streams (the "playlist of short video chunks" format most
 - **Paste and record.** Paste a stream URL or the page that plays it; PVArr finds the playlist, works out the headers it needs, and checks a real segment downloads before you start.
 - **Set it and walk away.** One-shot schedules with a start and end time; recordings survive container restarts and stop cleanly at their end time.
 - **Live TV in your media server.** A virtual HDHomeRun / M3U tuner with a guide that says which source is feeding each recording.
-- **Optional extras.** Commercial chapter marks via comskip, notifications via Apprise (ntfy, Gotify, Discord, Telegram, email and 100+ more), offline league/team autocomplete for tidy filenames.
+- **Optional extras.** Commercial chapter marks via comskip (with an **Ad Stats** tab showing how much of each recording was ads), notifications via Apprise (ntfy, Gotify, Discord, Telegram, email and 100+ more), offline league/team autocomplete for tidy filenames.
 
 ---
 

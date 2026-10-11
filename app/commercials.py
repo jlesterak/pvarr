@@ -30,6 +30,7 @@ obvious signals all miss it.
 import csv
 import logging
 import os
+import re
 import time
 import shutil
 import subprocess
@@ -353,6 +354,62 @@ def keep_original() -> bool:
         "0", "false", "no", "off")
 
 
+def _stats_path(stats_dir: Optional[Path] = None) -> Path:
+    if stats_dir is None:
+        stats_dir = Path(os.getenv("PVARR_CONFIG_DIR", "./config")).expanduser()
+    return stats_dir / STATS_FILE
+
+
+# PVArr's own filenames start DATE_LEAGUE_; anything else is grouped as Other.
+_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_([A-Za-z0-9]+)_")
+
+
+def read_stats(stats_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """The stats CSV summarised for the dashboard: per recording, per league,
+    and overall. Shares are of recorded time, so a long game weighs more than
+    a short one. Unreadable rows are skipped; a missing file is no data."""
+    recordings: List[Dict[str, Any]] = []
+    try:
+        with open(_stats_path(stats_dir), newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    duration, ad = float(row["duration_sec"]), float(row["ad_sec"])
+                    breaks = int(row["breaks"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if duration <= 0:
+                    continue
+                name = row.get("file") or ""
+                m = _NAME_RE.match(name)
+                title = Path(name).stem[m.end():] if m else Path(name).stem
+                title = re.sub(r"_\d{3,4}p$", "", title).replace("_", " ")
+                recordings.append({
+                    "file": name,
+                    "title": title,
+                    "date": m.group(1) if m else (row.get("finished_at") or "")[:10],
+                    "league": m.group(2).upper() if m else "Other",
+                    "duration_sec": round(duration), "ad_sec": round(ad),
+                    "ad_pct": round(100 * ad / duration, 1), "breaks": breaks,
+                })
+    except OSError:
+        pass
+    recordings.sort(key=lambda r: r["date"], reverse=True)
+
+    def summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        duration = sum(r["duration_sec"] for r in rows)
+        ad = sum(r["ad_sec"] for r in rows)
+        return {"count": len(rows), "duration_sec": duration, "ad_sec": ad,
+                "ad_pct": round(100 * ad / duration, 1) if duration else 0.0}
+
+    leagues = sorted({r["league"] for r in recordings})
+    return {
+        "total": summary(recordings),
+        "by_league": [dict(league=lg, **summary([r for r in recordings if r["league"] == lg]))
+                      for lg in leagues],
+        "recordings": recordings,
+    }
+
+
 def record_stats(video_path: str, breaks: List[Tuple[float, float]],
                  run_mode: str, stats_dir: Optional[Path] = None) -> Optional[Path]:
     """Append this recording's ad share to the stats CSV. Never raises.
@@ -364,9 +421,7 @@ def record_stats(video_path: str, breaks: List[Tuple[float, float]],
     if not duration:
         return None
     ad_sec = duration - sum(end - start for start, end in keep_ranges(breaks, duration))
-    if stats_dir is None:
-        stats_dir = Path(os.getenv("PVARR_CONFIG_DIR", "./config")).expanduser()
-    path = stats_dir / STATS_FILE
+    path = _stats_path(stats_dir)
     try:
         new = not path.exists()
         with open(path, "a", newline="", encoding="utf-8") as f:

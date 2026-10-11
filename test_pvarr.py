@@ -2626,6 +2626,14 @@ class TestStaticRoutes(ServerTestCase):
     def test_openapi_docs_available(self):
         self.assertEqual(self.client.get("/openapi.json").status_code, 200)
 
+    def test_ad_stats_route_serves_the_summary(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_CONFIG_DIR": self.tmp}):
+            r = self.client.get("/api/stats/ads")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(set(r.json()), {"total", "by_league", "recordings"})
+        self.assertIn("Ad Stats", self.client.get("/").text)
+
 
 class TestPostProcessingStatus(FailoverLoopTestCase):
     """"Completed" must not be shown while the remux is still running.
@@ -5923,6 +5931,36 @@ class TestComskipStats(unittest.TestCase):
              patch.object(commercials, "media_duration", return_value=None):
             self.assertIsNone(commercials.record_stats("/rec/x.mp4", [(0, 60)], "cut", Path(d)))
             self.assertEqual(os.listdir(d), [])
+
+
+class TestAdStatsSummary(unittest.TestCase):
+    """What the Ad Stats tab shows, read back from the CSV."""
+
+    CSV = ("finished_at,file,duration_sec,ad_sec,ad_pct,breaks,mode\n"
+           "2026-10-11T20:00:00,2026-10-11_NFL_A_vs_B_720p.mp4,10800,2700,25.0,24,chapters\n"
+           "2026-10-12T20:00:00,2026-10-12_nhl_C_vs_D_720p.mp4,7200,1440,20.0,17,chapters\n"
+           "2026-10-13T20:00:00,2026-10-13_NHL_E_vs_F_720p.mp4,3600,360,10.0,8,chapters\n"
+           "2026-10-14T20:00:00,my clip.mp4,600,60,10.0,1,cut\n"
+           "garbage,row\n")
+
+    def test_groups_by_league_weighted_by_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / commercials.STATS_FILE).write_text(self.CSV)
+            out = commercials.read_stats(Path(d))
+        self.assertEqual(out["total"]["count"], 4)
+        by = {lg["league"]: lg for lg in out["by_league"]}
+        self.assertEqual(sorted(by), ["NFL", "NHL", "Other"])
+        # (1440 + 360) / (7200 + 3600) -- not the mean of 20% and 10%.
+        self.assertEqual(by["NHL"]["ad_pct"], 16.7)
+        self.assertEqual(by["Other"]["count"], 1)
+        self.assertEqual(out["recordings"][0]["date"], "2026-10-14", "newest first")
+        self.assertEqual(out["recordings"][-1]["title"], "A vs B")
+        self.assertEqual(out["recordings"][0]["title"], "my clip")
+
+    def test_no_file_is_no_data(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = commercials.read_stats(Path(d))
+        self.assertEqual(out["total"], {"count": 0, "duration_sec": 0, "ad_sec": 0, "ad_pct": 0.0})
 
 
 class TestCommercialsNeverDamageARecording(unittest.TestCase):

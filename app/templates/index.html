@@ -114,6 +114,9 @@
       <button @click="activeTab = 'library'" :class="activeTab === 'library' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Media Library (<span x-text="libraryFiles.length"></span>)
       </button>
+      <button @click="activeTab = 'stats'; fetchAdStats()" :class="activeTab === 'stats' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+        Ad Stats
+      </button>
     </div>
   </div>
 
@@ -381,6 +384,82 @@
           </tbody>
         </table>
       </div>
+    </div>
+
+    <!-- TAB 3: Ad Stats. Read from /config/comskip-stats.csv; plain CSS bars,
+         no chart library. -->
+    <div x-show="activeTab === 'stats'" class="space-y-4" style="display: none;">
+      <template x-if="!adStats || adStats.total.count === 0">
+        <div class="arr-card rounded-xl border border-slate-800 px-6 py-8 text-center text-slate-500 text-sm">
+          No data yet. With commercial detection on (<span class="font-mono">PVARR_COMSKIP=1</span>), every finished recording adds a row here.
+        </div>
+      </template>
+      <template x-if="adStats && adStats.total.count > 0">
+        <div class="space-y-4">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div class="arr-card rounded-xl border border-slate-800 px-5 py-4">
+              <div class="text-xs uppercase text-slate-400">Recordings measured</div>
+              <div class="text-2xl font-bold text-white" x-text="adStats.total.count"></div>
+            </div>
+            <div class="arr-card rounded-xl border border-slate-800 px-5 py-4">
+              <div class="text-xs uppercase text-slate-400">Share of recorded time that is ads</div>
+              <div class="text-2xl font-bold text-white" x-text="adStats.total.ad_pct + '%'"></div>
+            </div>
+            <div class="arr-card rounded-xl border border-slate-800 px-5 py-4">
+              <div class="text-xs uppercase text-slate-400">Ad time found</div>
+              <div class="text-2xl font-bold text-white" x-text="hm(adStats.total.ad_sec)"></div>
+            </div>
+          </div>
+
+          <div class="arr-card rounded-xl border border-slate-800 px-6 py-4 space-y-2">
+            <div class="text-xs uppercase font-semibold text-slate-400">By league</div>
+            <template x-for="lg in adStats.by_league" :key="lg.league">
+              <div class="flex items-center space-x-3 text-sm">
+                <div class="w-20 font-mono text-slate-300" x-text="lg.league"></div>
+                <div class="flex-1 bg-slate-800 rounded h-3">
+                  <div class="bg-arr-blue h-3 rounded" :style="'width:' + Math.min(lg.ad_pct * 2, 100) + '%'"></div>
+                </div>
+                <div class="w-36 text-right font-mono text-slate-300" x-text="lg.ad_pct + '% · ' + lg.count + ' rec.'"></div>
+              </div>
+            </template>
+            <div class="text-xs text-slate-500">Full bar = 50%. comskip's estimate: misses and false hits are both possible.</div>
+          </div>
+
+          <div class="arr-card rounded-xl overflow-hidden border border-slate-800">
+            <table class="w-full text-left text-sm text-slate-300">
+              <thead class="bg-slate-900/90 text-xs uppercase font-semibold text-slate-400 border-b border-slate-800">
+                <tr>
+                  <th class="px-6 py-3">Date</th>
+                  <th class="px-6 py-3">League</th>
+                  <th class="px-6 py-3">Recording</th>
+                  <th class="px-6 py-3">Length</th>
+                  <th class="px-6 py-3">Breaks</th>
+                  <th class="px-6 py-3 w-48">Ads</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-800/80">
+                <template x-for="r in adStats.recordings" :key="r.file + r.date">
+                  <tr>
+                    <td class="px-6 py-2.5 font-mono text-slate-400" x-text="r.date"></td>
+                    <td class="px-6 py-2.5 font-mono" x-text="r.league"></td>
+                    <td class="px-6 py-2.5 text-white truncate max-w-xs" :title="r.file" x-text="r.title"></td>
+                    <td class="px-6 py-2.5 font-mono" x-text="hm(r.duration_sec)"></td>
+                    <td class="px-6 py-2.5 font-mono" x-text="r.breaks"></td>
+                    <td class="px-6 py-2.5">
+                      <div class="flex items-center space-x-2">
+                        <div class="flex-1 bg-slate-800 rounded h-2">
+                          <div class="bg-arr-blue h-2 rounded" :style="'width:' + Math.min(r.ad_pct * 2, 100) + '%'"></div>
+                        </div>
+                        <span class="font-mono w-12 text-right" x-text="r.ad_pct + '%'"></span>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
     </div>
 
   </main>
@@ -672,6 +751,7 @@
         activeSessions: [],
         expandedFinished: {},
         libraryFiles: [],
+        adStats: null,
         sseConnections: {},
         form: {
           // Buccaneers vs Raiders: the only on-theme fixture in sport.
@@ -926,6 +1006,20 @@
             eventSource.close();
             delete this.sseConnections[sessionId];
           };
+        },
+
+        async fetchAdStats() {
+          try {
+            const res = await fetch('/api/stats/ads');
+            if (res.ok) this.adStats = await res.json();
+          } catch (e) {
+            console.error('Ad stats error:', e);
+          }
+        },
+
+        hm(sec) {
+          const m = Math.round(sec / 60);
+          return Math.floor(m / 60) + 'h ' + String(m % 60).padStart(2, '0') + 'm';
         },
 
         async fetchLibrary() {

@@ -4042,6 +4042,13 @@ to compare leagues and regular season against playoffs.
   recording; a write failure is logged and changes nothing else.
   Tests: `TestComskipStats` (header once, merge, row contents; no file when
   ffprobe cannot read the recording).
+- [COMPLETED] **Ad Stats** tab (sponsor, 2026-10-11: "very simple/light
+  graphs & stats"). `commercials.read_stats()` summarises the CSV: total,
+  by league (from the filename's `DATE_LEAGUE_` prefix, else "Other") and
+  per recording, shares weighted by recorded time. `GET /api/stats/ads`,
+  read-only, no parameters. Bars are plain CSS (full bar = 50%), no chart
+  library. Checked in headless Chrome against the four backfilled rows.
+  Tests: `TestAdStatsSummary`, `test_ad_stats_route_serves_the_summary`.
 - [PENDING] Turn comskip on on the dev workstation (`PVARR_COMSKIP=1`) after
   the current recordings finish. Rows only appear once a build with this
   change is running; until then chapters are written and can be summed later.
