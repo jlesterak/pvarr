@@ -2,11 +2,13 @@
 
 All notable changes to PVArr are listed here, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Earlier history is summarised in the README and TODO.
 
-## [Unreleased]
+## [0.9.0]
 
 ### Added
 - Each comskip run appends the recording's length, ad time and ad share to `/config/comskip-stats.csv`.
 - **Ad Stats** dashboard tab: share of recorded time that is ads, overall, by league and per recording (`GET /api/stats/ads`).
+
+Full notes: [docs/release-notes/v0.9.0.md](docs/release-notes/v0.9.0.md).
 
 ## [0.8.3]
 
