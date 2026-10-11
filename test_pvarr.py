@@ -2626,6 +2626,86 @@ class TestStaticRoutes(ServerTestCase):
     def test_openapi_docs_available(self):
         self.assertEqual(self.client.get("/openapi.json").status_code, 200)
 
+    def test_start_keeps_the_event_page_but_never_returns_its_cookie(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8", "agg_url": "https://events.example/e",
+                "agg_cookie": "sess=secret"})
+        self.assertEqual(r.status_code, 200, r.text)
+        rid = next(iter(self.server.active_recorders))
+        self.assertEqual(fake.session_record["event_page"]["cookie"], "sess=secret")
+        self.assertTrue(fake.has_event_page)
+        self.assertNotIn("secret", self.client.get(f"/api/recordings/{rid}/config").text)
+
+    def test_two_dead_sources_queue_a_recheck_from_the_failover(self):
+        import asyncio
+        from unittest.mock import patch
+        from app.sessions import build_record
+        record = build_record("rs3", ["http://a/1", "http://b/2", "http://c/3"],
+                              os.path.join(self.tmp, "o.ts"), time.time(),
+                              event_page={"url": "https://events.example/e"})
+        queued = []
+
+        async def launch():
+            with patch.object(StreamFailoverRecorder, "start_recording"), \
+                 patch.object(self.server.session_store, "save"):
+                return self.server._launch_session(record, 8100)
+
+        with patch.object(self.server.asyncio, "run_coroutine_threadsafe",
+                          side_effect=lambda coro, loop: (queued.append(1), coro.close())):
+            rec = asyncio.run(launch())
+            rec.candidates[0].fail_count = 1
+            rec.on_failover_callback("rs3", "Candidate 2")
+            self.assertEqual(queued, [], "one dead source is not enough")
+            rec.candidates[1].fail_count = 1
+            rec.on_failover_callback("rs3", "Candidate 3")
+            rec.on_failover_callback("rs3", "Candidate 3")
+        self.assertEqual(queued, [1], "queued once, not once per failover")
+        self.assertEqual(rec.rescan_state, "checking")
+
+    def test_rescan_route_refuses_what_it_cannot_do(self):
+        self.assertEqual(self.client.post("/api/recordings/nope/rescan").status_code, 404)
+        rec = StreamFailoverRecorder("rs1", ["http://a/1"], os.path.join(self.tmp, "o.ts"),
+                                     min_free_gb=0)
+        rec.is_running = True
+        self.server.active_recorders["rs1"] = rec
+        r = self.client.post("/api/recordings/rs1/rescan")
+        self.assertEqual(r.status_code, 400, "no event page")
+        rec.has_event_page, rec.rescan_state = True, "checking"
+        self.assertEqual(self.client.post("/api/recordings/rs1/rescan").status_code, 409)
+
+    def test_rescan_swaps_fresh_picks_into_dead_slots(self):
+        import asyncio
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder("rs2", ["http://a/1", "http://b/2"],
+                                     os.path.join(self.tmp, "o.ts"), min_free_gb=0)
+        rec.is_running, rec.has_event_page = True, True
+        rec.candidates[1].fail_count = 1
+        rec.session_record = {"id": "rs2", "candidates": ["http://a/1", "http://b/2"],
+                              "event_page": {"url": "https://events.example/e",
+                                             "cookie": "sess=1", "user_agent": ""}}
+        self.server.active_recorders["rs2"] = rec
+        seen = {}
+
+        def fake_scan(name, url, cookie, user_agent, fs_retry=False):
+            seen.update(url=url, cookie=cookie)
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result({"picked": [{"url": "http://fresh.example/9"}]})
+            return fut
+
+        with patch.object(self.server, "_scan_in_daemon_thread", side_effect=fake_scan), \
+             patch.object(self.server.session_store, "save"):
+            asyncio.run(self.server._rescan_event_page("rs2", manual=True))
+        self.assertEqual(seen, {"url": "https://events.example/e", "cookie": "sess=1"})
+        self.assertEqual(rec.session_record["candidates"], ["http://a/1", "http://fresh.example/9"])
+        self.assertEqual(rec.rescan_state, "")
+        status = self.client.get("/api/status").text
+        self.assertNotIn("sess=1", status, "the page cookie never leaves the server")
+
     def test_ad_stats_route_serves_the_summary(self):
         from unittest.mock import patch
         with patch.dict(os.environ, {"PVARR_CONFIG_DIR": self.tmp}):
@@ -5905,6 +5985,51 @@ class TestCommercialGating(unittest.TestCase):
             out = commercials.process("/tmp/whatever.mp4")
         detect.assert_not_called()
         self.assertFalse(out["ran"])
+
+
+class TestEventPageRescan(unittest.TestCase):
+    """Refilling dead slots from the event page while a recording runs."""
+
+    def make(self, urls):
+        rec = StreamFailoverRecorder("rs-id", urls, os.path.join(tempfile.mkdtemp(), "o.ts"),
+                                     min_free_gb=0)
+        return rec
+
+    def test_dead_slots_refilled_but_never_the_live_one(self):
+        rec = self.make(["http://a/1", "http://b/2", "http://c/3"])
+        for c in rec.candidates:
+            c.fail_count = 1                 # all three have died once
+        rec.current_candidate_index = 2      # ...and the loop is on the third
+        self.assertEqual(rec.dead_since_rescan(), 3)
+        changed = rec.replace_dead_candidates(["http://b/2", "http://x/9", "http://y/8"])
+        self.assertEqual(changed, [(0, "http://x/9"), (1, "http://y/8")],
+                         "a link already in the list is not fresh")
+        self.assertEqual([c.url for c in rec.candidates],
+                         ["http://x/9", "http://y/8", "http://c/3"])
+        self.assertEqual(rec.candidates[0].name, "Candidate 1")
+        self.assertEqual(rec.dead_since_rescan(), 0, "the count starts again after a check")
+
+    def test_healthy_slots_are_left_alone_and_short_lists_topped_up(self):
+        rec = self.make(["http://a/1"])
+        changed = rec.replace_dead_candidates(["http://x/9", "http://y/8", "http://z/7"])
+        self.assertEqual([c.url for c in rec.candidates],
+                         ["http://a/1", "http://x/9", "http://y/8"])
+        self.assertEqual(len(changed), 2)
+
+    def test_rescan_rule(self):
+        due = schedules.rescan_due
+        self.assertFalse(due(dead=1, total=3, last_at=0, now=10_000, busy=False))
+        self.assertTrue(due(dead=2, total=3, last_at=0, now=10_000, busy=False))
+        self.assertTrue(due(dead=1, total=1, last_at=0, now=10_000, busy=False))
+        self.assertFalse(due(dead=3, total=3, last_at=9_700, now=10_000, busy=False),
+                         "at most once per ten minutes")
+        self.assertFalse(due(dead=3, total=3, last_at=0, now=10_000, busy=True))
+
+    def test_record_keeps_the_page_only_when_there_is_one(self):
+        from app.sessions import build_record
+        self.assertIsNone(build_record("i", ["http://a"], "/x.ts", 0.0)["event_page"])
+        page = {"url": "https://events.example/e", "cookie": "c=1", "user_agent": ""}
+        self.assertEqual(build_record("i", ["http://a"], "/x.ts", 0.0, event_page=page)["event_page"], page)
 
 
 class TestComskipStats(unittest.TestCase):

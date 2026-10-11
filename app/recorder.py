@@ -643,6 +643,14 @@ class StreamFailoverRecorder:
             candidate.cookie = override.get("cookie", "") or ""
             if override.get("user_agent"):
                 candidate.user_agent = override["user_agent"]
+        # Re-checking the event page (set by the server when the session came
+        # from one). The snapshot is each URL's fail_count at the last check:
+        # a candidate is "dead since" it when its count has gone up.
+        self.has_event_page: bool = False
+        self.rescan_state: str = ""
+        self.last_rescan_at: float = 0.0
+        self._fail_snapshot: Dict[str, int] = {}
+        self._candidates_lock = threading.Lock()
         self.output_filepath = Path(output_filepath).resolve()
         # Set by the post-processor once the .ts has been remuxed. The original
         # .ts is deleted at that point, so size/name lookups must follow here.
@@ -2147,6 +2155,46 @@ class StreamFailoverRecorder:
             return round(target.stat().st_size / (1024 * 1024), 2)
         return 0.0
 
+    def dead_since_rescan(self) -> int:
+        """How many candidates have failed since the event page was last checked."""
+        return sum(1 for c in self.candidates
+                   if c.fail_count > self._fail_snapshot.get(c.url, 0))
+
+    def replace_dead_candidates(self, urls: List[str],
+                                max_candidates: int = 3) -> List[Tuple[int, str]]:
+        """Put fresh links from the event page into the slots that died.
+
+        Never touches the slot being recorded: the capture loop holds that
+        candidate for the whole attempt, and it is the one thing still
+        working. Other slots are swapped by assignment, which the loop picks
+        up the next time it moves -- it reads candidates[index] fresh on every
+        iteration. A list shorter than max_candidates is topped up. Returns
+        (slot index, url) for every slot that changed.
+        """
+        with self._candidates_lock:
+            have = {c.url for c in self.candidates}
+            fresh = [u for u in urls if u and u.strip() and u not in have]
+            changed: List[Tuple[int, str]] = []
+            for i, c in enumerate(self.candidates):
+                if not fresh:
+                    break
+                if i == self.current_candidate_index:
+                    continue
+                if c.fail_count > self._fail_snapshot.get(c.url, 0):
+                    self.candidates[i] = CandidateStream(fresh.pop(0), name=c.name)
+                    changed.append((i, self.candidates[i].url))
+            while fresh and len(self.candidates) < max_candidates:
+                n = len(self.candidates)
+                self.candidates.append(CandidateStream(fresh.pop(0), name=f"Candidate {n + 1}"))
+                changed.append((n, self.candidates[n].url))
+            self._fail_snapshot = {c.url: c.fail_count for c in self.candidates}
+            if changed:
+                # New sources get a fresh lap budget, as a fresh start would.
+                self.cycles_without_data = 0
+        for i, _ in changed:
+            self._log(f"Event page re-checked: {self.candidates[i].name} now has a fresh link.", "WARN")
+        return changed
+
     def get_status_summary(self) -> Dict[str, Any]:
         return {
             "id": self.recording_id,
@@ -2182,6 +2230,8 @@ class StreamFailoverRecorder:
                 if (remaining := self.seconds_remaining()) is not None else None
             ),
             "total_candidates": len(self.candidates),
+            "has_event_page": self.has_event_page,
+            "rescan_state": self.rescan_state,
             "candidates": [c.to_dict() for c in self.candidates],
             "logs": self.log_history[-30:]
         }

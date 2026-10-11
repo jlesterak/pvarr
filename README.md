@@ -72,7 +72,7 @@ If you have a page that links to several sources for the same event, paste it in
 
 ## Scheduling
 
-Set **Start at** and **End at** on the same form; the button changes to **Schedule**. At the start time PVArr checks the event page (if you gave one), takes the first three working streams, tops up with any links you entered manually, and records until the end time. If nothing plays yet it retries every few minutes until the window closes and notifies you. Schedules survive a restart, and a job leaves the list as soon as its recording starts (the recording's own card takes over). One-shot only; for something recurring, use cron with `curl` against the API. Details: [Event pages and scheduling](docs/event-pages.md#scheduling-a-recording).
+Set **Start at** and **End at** on the same form; the button changes to **Schedule**. At the start time PVArr checks the event page (if you gave one), takes the first three working streams, tops up with any links you entered manually, and records until the end time. If nothing plays yet it retries every few minutes until the window closes and notifies you. If a recording's sources die partway through, PVArr re-checks the event page for fresh links (see [When sources die mid-recording](docs/event-pages.md#when-sources-die-mid-recording)). Schedules survive a restart, and a job leaves the list as soon as its recording starts (the recording's own card takes over). One-shot only; for something recurring, use cron with `curl` against the API. Details: [Event pages and scheduling](docs/event-pages.md#scheduling-a-recording).
 
 ## Watching in Plex, Jellyfin or Emby
 

@@ -62,6 +62,14 @@ Only one event-page check runs at a time; a second one while it is busy gets
 starts can get `429` ("a scheduled recording is checking its event
 page") for a minute or so; the schedule itself waits its turn.
 
+## When sources die mid-recording
+
+A recording started from an event page (with **Find 3 streams**, or by a schedule) remembers the page, along with the cookie and User-Agent you gave for it. If two of its sources die (or its only source, for a single-link recording), PVArr checks the page again in the background and puts fresh working links into the dead slots. The source currently recording is never touched. It checks at most once every 10 minutes, waits its turn behind any other page check, and logs every swap on the recording's card.
+
+**Re-check event page** on the card does the same thing on demand, for when you can see a source is struggling before PVArr can. A recording started from manually entered links only has no page to re-check, so the button does not appear.
+
+The cookie is kept in the session file under `/config` (readable only by PVArr's user) so a restart can carry on; it is never returned by the API. A re-checked link can occasionally be the wrong channel, as with **Find**: it is only used once the current source dies, and the card says when a slot was swapped.
+
 ## Scheduling a recording
 
 Fill in the form as usual with an event page, then set **Start at** and

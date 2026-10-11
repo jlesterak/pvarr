@@ -4082,3 +4082,37 @@ to compare leagues and regular season against playoffs.
 - Not handled: a sport typed with a space ("College Football") becomes
   league "COLLEGE" -- the filename has no separator to tell sport from team.
   Autocomplete offers the short tags, which avoid it.
+
+---
+
+## Phase 31: Re-check the event page when sources die (2026-10-11) [IN PROGRESS -- review pending, branch feat/rescan]
+
+Sponsor, during a live test where both backups' servers went down: "Can we
+re check the source events page in the event we lose backups?" Design
+agreed the same day: automatic re-check plus a button.
+
+- [COMPLETED] Session records carry `event_page` (url, cookie, User-Agent),
+  from a schedule's page or from the start form when the page was used.
+  Session files are already 0600 in a 0700 dir; `/api/status` and
+  `/api/recordings/{id}/config` never return it.
+- [COMPLETED] `StreamFailoverRecorder.replace_dead_candidates()`: fresh,
+  not-already-present links go into slots whose `fail_count` rose since the
+  last check, never the slot being recorded; a short list is topped up to
+  3; the lap budget restarts when anything changed. Safe against the loop
+  because it reads `candidates[index]` fresh each iteration.
+- [COMPLETED] `schedules.rescan_due()`: two dead since the last check (or
+  all, for fewer than two), at most every 10 min, never while one runs.
+  Checked from `_on_failover` on the recorder thread, which claims the
+  "checking" flag there and hands `_rescan_event_page()` to the loop.
+  The scan reuses `_scan_in_daemon_thread` under `_aggregate_lock`.
+- [COMPLETED] `POST /api/recordings/{id}/rescan` and a **Re-check event
+  page** button on the card (shown only when there is a page).
+- [COMPLETED] Fixed on the way: **Force Failover** was disabled on the last
+  source although the API wraps to the first (seen live on 2026-10-11 with
+  the recording on its last source).
+- Tests: `TestEventPageRescan` (live slot untouched, dedup, top-up, rule,
+  record shape), route refusals, a swap through `_rescan_event_page` with
+  the scan faked (cookie passed through, never in `/api/status`), the start
+  form storing the page without `/config` returning the cookie, and the
+  failover callback queueing exactly one check after two deaths.
+- [PENDING] Agent-team review; live test on a real event.
