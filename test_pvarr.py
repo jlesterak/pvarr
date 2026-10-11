@@ -1900,10 +1900,11 @@ class TestFreezeFailover(FailoverLoopTestCase):
     _FakeProc, and its argv records which URL FFmpeg was pointed at.
     """
 
-    def drive(self, urls, procs):
+    def drive(self, urls, procs, end_time=None, on_popen=None):
         from unittest.mock import patch
         rec = StreamFailoverRecorder("test-id", urls, self.out,
-                                     freeze_timeout_sec=0, min_free_gb=0)
+                                     freeze_timeout_sec=0, min_free_gb=0,
+                                     end_time=end_time)
         rec.READ_POLL_SEC = 0.01
         rec.STARTUP_GRACE_SEC = 0
         rec._failover_delay = lambda wrapped: 0.0
@@ -1926,6 +1927,8 @@ class TestFreezeFailover(FailoverLoopTestCase):
 
         def fake_popen(cmd, **kwargs):
             inputs.append(cmd[cmd.index("-i") + 1])
+            if on_popen:
+                on_popen(rec, len(inputs))
             return queue.pop(0) if queue else _FakeProc([], returncode=1)
 
         try:
@@ -1957,6 +1960,23 @@ class TestFreezeFailover(FailoverLoopTestCase):
         self.assertEqual(inputs, ["http://a/1.m3u8",
                                   "http://127.0.0.1:8090/channel/cand_0"])
         self.assertEqual(rec.status, "completed")
+
+    def test_a_clean_exit_inside_the_window_fails_over(self):
+        # 2026-10-11: FFmpeg exited 0 seconds after a reconnect and the
+        # recording ended with ~230 min of its window left.
+        def close_window_on_backup(rec, n):
+            if n == 2:
+                rec.end_time = time.time() - 1
+        first = _FakeProc([b"x" * 4096], returncode=0, close_stdout=True)
+        backup = _FakeProc([b"y" * 4096], returncode=0, close_stdout=True)
+        rec, inputs = self.drive(["http://a/1.m3u8", "http://b/2.m3u8"],
+                                 [first, backup], end_time=time.time() + 3600,
+                                 on_popen=close_window_on_backup)
+        self.assertEqual(inputs, ["http://a/1.m3u8", "http://b/2.m3u8"],
+                         "a clean exit before the end time ended the recording")
+        self.assertTrue(any("ended cleanly" in l for l in rec.log_history))
+        self.assertEqual(rec.bytes_written, 8192)
+        self.assertEqual(rec.proxy_starts, [])
 
 
 class TestStopDuringRecording(FailoverLoopTestCase):

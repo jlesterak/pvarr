@@ -1989,9 +1989,27 @@ class StreamFailoverRecorder:
 
             # A clean finish ends the recording -- unless the operator asked to
             # move, in which case honour that instead.
+            #
+            # Or unless the recording has an explicit end time still ahead.
+            # FFmpeg exits 0 whenever the playlist says it is over (an
+            # ENDLIST, or a reload it reads as the end), and a flaky upstream
+            # does that mid-game: on 2026-10-11 a recording with ~230 min
+            # left ended itself 13s after a reconnect. The end time is the
+            # operator saying when the event ends, so before it a clean exit
+            # is a drop like any other. Local aborts (disk, deleted output)
+            # set an "aborted_*" status and still end it.
             if (outcome is StreamOutcome.COMPLETED
                     and not forced and manual_target is None):
-                break
+                if not (self.end_time and self._within_window()
+                        and not self.status.startswith("aborted")):
+                    break
+                remaining = self.seconds_remaining() or 0
+                self._log(
+                    f"{candidate.name} ended cleanly, but the recording window "
+                    f"is open for another {remaining / 60:.0f} min -- treating "
+                    f"it as a drop.", "WARN",
+                )
+                candidate.fail_count += 1
 
             # Where next? An explicit request wins; otherwise step forward and
             # wrap around the end of the list.

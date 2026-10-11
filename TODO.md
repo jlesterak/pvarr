@@ -3989,3 +3989,40 @@ rewritten here.
   messages are clean too. Remaining hits are deliberate: one pronunciation
   line in the README, "Pittsburgh Pirates" in the team snapshot, and
   `impersonate` as curl_cffi's/yt-dlp's own option name.
+
+---
+
+## Phase 29: A clean FFmpeg exit ended a windowed recording early (2026-10-11) [COMPLETED -- release pending]
+
+**Symptom (live, 2026-10-11, v0.8.2, dev workstation).** A recording with
+~230 min of window left reconnected to candidate 1 after a lap of freezes
+across all three candidates; 13 s later FFmpeg exited 0 and the session went
+to `completed` at 48 MB. No stop was pressed (no `/stop` in the access log).
+The sponsor had to start a second recording by hand.
+
+**Cause.** `_recording_loop` ends the recording on any COMPLETED outcome.
+COMPLETED means "FFmpeg exited 0", which a flaky upstream produces mid-event
+(an ENDLIST, or a playlist reload FFmpeg reads as the end). The window
+logic added for "keep trying until End at" only covered laps with no data,
+not a clean exit.
+
+**Fix.** With an explicit end time still ahead, a clean exit is logged
+("ended cleanly, but the recording window is open ... treating it as a
+drop"), counts against the candidate, and fails over like any other drop.
+Keyed off the explicit window, not the 6 h backstop, matching the existing
+retry rule. Local aborts (`aborted_no_space`, `aborted_output_lost`) still
+end the recording; disk and deadline stops set the stop event and never
+reach this check.
+
+**Proven.** `test_a_clean_exit_inside_the_window_fails_over` drives the real
+capture loop with two `_FakeProc`s that each deliver and exit 0; it fails on
+the old `recorder.py` (FFmpeg never pointed at the backup) and passes now.
+Full suite green (695).
+
+**Also seen the same day, not yet acted on.** (a) Every candidate froze
+~25 s after connecting, lap after lap, for ~5 min before the early end --
+three upstreams going quiet together is consistent with the event's feeds
+being down, but not proven. (b) The replacement recording lost 10 segments
+as "expired before FFmpeg reached them" in its first 90 s at ~0.6 Mbit/s,
+i.e. it was fetching slower than real time. Next: compare against the host
+link while a game runs before blaming PVArr or the upstream.
