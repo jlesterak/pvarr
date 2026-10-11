@@ -650,7 +650,6 @@ class StreamFailoverRecorder:
         self.rescan_state: str = ""
         self.last_rescan_at: float = 0.0
         self._fail_snapshot: Dict[str, int] = {}
-        self._candidates_lock = threading.Lock()
         self.output_filepath = Path(output_filepath).resolve()
         # Set by the post-processor once the .ts has been remuxed. The original
         # .ts is deleted at that point, so size/name lookups must follow here.
@@ -2166,31 +2165,33 @@ class StreamFailoverRecorder:
 
         Never touches the slot being recorded: the capture loop holds that
         candidate for the whole attempt, and it is the one thing still
-        working. Other slots are swapped by assignment, which the loop picks
-        up the next time it moves -- it reads candidates[index] fresh on every
-        iteration. A list shorter than max_candidates is topped up. Returns
-        (slot index, url) for every slot that changed.
+        working. Only ever called by one re-check at a time (rescan_state),
+        so it needs no lock of its own; the list never shrinks, so the
+        loop's index stays valid. Other slots are swapped by assignment,
+        which the loop picks up the next time it moves -- it reads
+        candidates[index] fresh on every iteration. A list shorter than
+        max_candidates is topped up. Returns (slot index, url) for every
+        slot that changed.
         """
-        with self._candidates_lock:
-            have = {c.url for c in self.candidates}
-            fresh = [u for u in urls if u and u.strip() and u not in have]
-            changed: List[Tuple[int, str]] = []
-            for i, c in enumerate(self.candidates):
-                if not fresh:
-                    break
-                if i == self.current_candidate_index:
-                    continue
-                if c.fail_count > self._fail_snapshot.get(c.url, 0):
-                    self.candidates[i] = CandidateStream(fresh.pop(0), name=c.name)
-                    changed.append((i, self.candidates[i].url))
-            while fresh and len(self.candidates) < max_candidates:
-                n = len(self.candidates)
-                self.candidates.append(CandidateStream(fresh.pop(0), name=f"Candidate {n + 1}"))
-                changed.append((n, self.candidates[n].url))
-            self._fail_snapshot = {c.url: c.fail_count for c in self.candidates}
-            if changed:
-                # New sources get a fresh lap budget, as a fresh start would.
-                self.cycles_without_data = 0
+        have = {c.url for c in self.candidates}
+        fresh = [u for u in urls if u and u.strip() and u not in have]
+        changed: List[Tuple[int, str]] = []
+        for i, c in enumerate(self.candidates):
+            if not fresh:
+                break
+            if i == self.current_candidate_index:
+                continue
+            if c.fail_count > self._fail_snapshot.get(c.url, 0):
+                self.candidates[i] = CandidateStream(fresh.pop(0), name=c.name)
+                changed.append((i, self.candidates[i].url))
+        while fresh and len(self.candidates) < max_candidates:
+            n = len(self.candidates)
+            self.candidates.append(CandidateStream(fresh.pop(0), name=f"Candidate {n + 1}"))
+            changed.append((n, self.candidates[n].url))
+        self._fail_snapshot = {c.url: c.fail_count for c in self.candidates}
+        if changed:
+            # New sources get a fresh lap budget, as a fresh start would.
+            self.cycles_without_data = 0
         for i, _ in changed:
             self._log(f"Event page re-checked: {self.candidates[i].name} now has a fresh link.", "WARN")
         return changed

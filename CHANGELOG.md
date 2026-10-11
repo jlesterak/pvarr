@@ -5,7 +5,7 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
-- A recording started from an event page re-checks it when two of its sources die, and swaps fresh working links into the dead slots (never the one recording). At most once per 10 minutes; also on demand with **Re-check event page** on the card (`POST /api/recordings/{id}/rescan`).
+- A recording started from an event page re-checks it when two of its sources die, and swaps fresh working links into the dead slots (never the one recording). Automatically at most once per 10 minutes, never delaying a scheduled start; also on demand with **Re-check event page** on the card (`POST /api/recordings/{id}/rescan`).
 - Each comskip run appends the recording's length, ad time and ad share to `/config/comskip-stats.csv`.
 - **Ad Stats** dashboard tab: share of recorded time that is ads, overall, by league and per recording (`GET /api/stats/ads`).
 

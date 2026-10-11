@@ -2649,15 +2649,14 @@ class TestStaticRoutes(ServerTestCase):
                               os.path.join(self.tmp, "o.ts"), time.time(),
                               event_page={"url": "https://events.example/e"})
         queued = []
-
-        async def launch():
-            with patch.object(StreamFailoverRecorder, "start_recording"), \
-                 patch.object(self.server.session_store, "save"):
-                return self.server._launch_session(record, 8100)
-
-        with patch.object(self.server.asyncio, "run_coroutine_threadsafe",
+        # Launched with no running loop, as a resume at boot is (it runs in a
+        # worker thread): the trigger must still reach the server's loop.
+        with patch.object(StreamFailoverRecorder, "start_recording"), \
+             patch.object(self.server.session_store, "save"), \
+             patch.object(self.server, "_main_loop", object()), \
+             patch.object(self.server.asyncio, "run_coroutine_threadsafe",
                           side_effect=lambda coro, loop: (queued.append(1), coro.close())):
-            rec = asyncio.run(launch())
+            rec = self.server._launch_session(record, 8100)
             rec.candidates[0].fail_count = 1
             rec.on_failover_callback("rs3", "Candidate 2")
             self.assertEqual(queued, [], "one dead source is not enough")
@@ -2666,6 +2665,40 @@ class TestStaticRoutes(ServerTestCase):
             rec.on_failover_callback("rs3", "Candidate 3")
         self.assertEqual(queued, [1], "queued once, not once per failover")
         self.assertEqual(rec.rescan_state, "checking")
+
+    def test_automatic_recheck_does_not_queue_behind_another_page_check(self):
+        import asyncio
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder("rs4", ["http://a/1"], os.path.join(self.tmp, "o.ts"),
+                                     min_free_gb=0)
+        rec.is_running, rec.has_event_page = True, True
+        rec.session_record = {"id": "rs4", "candidates": ["http://a/1"],
+                              "event_page": {"url": "https://events.example/e"}}
+        self.server.active_recorders["rs4"] = rec
+
+        async def run():
+            lock = asyncio.Lock()
+            with patch.object(self.server, "_aggregate_lock", lock), \
+                 patch.object(self.server, "_scan_in_daemon_thread") as scan:
+                async with lock:     # a scheduled scan or a Find holds it
+                    await self.server._rescan_event_page("rs4", manual=False)
+                return scan
+
+        scan = asyncio.run(run())
+        scan.assert_not_called()
+        self.assertEqual(rec.rescan_state, "")
+        self.assertEqual(rec.last_rescan_at, 0.0, "the next failover may try again")
+
+    def test_a_malformed_event_page_does_not_block_the_start(self):
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.get_status_summary.return_value = {}
+        with patch.object(self.server, "StreamFailoverRecorder", return_value=fake), \
+             patch.object(self.server, "notifier", MagicMock()):
+            r = self.client.post("/api/recordings/start", data={
+                "url_primary": "http://a/1.m3u8", "agg_url": "not a url"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(fake.session_record["event_page"])
 
     def test_rescan_route_refuses_what_it_cannot_do(self):
         self.assertEqual(self.client.post("/api/recordings/nope/rescan").status_code, 404)

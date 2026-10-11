@@ -4085,7 +4085,7 @@ to compare leagues and regular season against playoffs.
 
 ---
 
-## Phase 31: Re-check the event page when sources die (2026-10-11) [IN PROGRESS -- review pending, branch feat/rescan]
+## Phase 31: Re-check the event page when sources die (2026-10-11) [IN PROGRESS -- reviewed; live test pending, branch feat/rescan]
 
 Sponsor, during a live test where both backups' servers went down: "Can we
 re check the source events page in the event we lose backups?" Design
@@ -4115,4 +4115,20 @@ agreed the same day: automatic re-check plus a button.
   the scan faked (cookie passed through, never in `/api/status`), the start
   form storing the page without `/config` returning the cookie, and the
   failover callback queueing exactly one check after two deaths.
-- [PENDING] Agent-team review; live test on a real event.
+- [COMPLETED] Agent-team review, 2026-10-11. Nothing from Security.
+  Architect, BLOCKING: a resumed recording never auto-re-checked --
+  `resume_sessions` runs in `asyncio.to_thread`, so the loop captured at
+  launch was None. Now `_main_loop` is set in `lifespan()` before the
+  resume; the trigger test launches outside a loop to prove it. DevOps:
+  automatic checks queued on `_aggregate_lock` and could push a scheduled
+  start back by minutes -> they now skip (and leave `last_rescan_at`, so
+  the next failover retries); Find's 429 names a rescan as the holder;
+  docs corrected (10-min floor is automatic only; the page is kept
+  whenever the box is filled; expired cookies). Also: a malformed page
+  URL on start is dropped, not a 400; the card log no longer carries
+  exception text; the unused candidate lock is gone.
+- Accepted (Architect): the check runs after the index has moved, so with
+  two sources the dead one now current is skipped and retried; and a
+  source that failed once since the last check counts as dead even if it
+  recovered. Both cost one extra attempt at worst.
+- [PENDING] Live test on a real event.

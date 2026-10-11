@@ -73,6 +73,11 @@ async def lifespan(app: FastAPI):
     `docker stop` or Ctrl-C could return before FFmpeg and hls-proxy children
     were terminated, orphaning them.
     """
+    # Captured before the resume: that runs in a worker thread, where there is
+    # no running loop, and a resumed recording needs this to queue re-checks.
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+
     # Reattach to anything that was recording when this process last died.
     # Offloaded: it stats files and may run a remux, and this is the event loop.
     try:
@@ -501,6 +506,9 @@ async def aggregate_url(
         if _aggregate_holder == "scheduled":
             raise HTTPException(status_code=429, detail=(
                 "A scheduled recording is checking its event page; try again in a minute"))
+        if _aggregate_holder == "rescan":
+            raise HTTPException(status_code=429, detail=(
+                "A running recording is re-checking its event page; try again in a minute"))
         raise HTTPException(status_code=429, detail="Already checking an event page; wait for it to finish")
     async with _aggregate_lock:
         result = await _scan_in_daemon_thread(
@@ -647,14 +655,9 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         record["current_candidate_index"] = recorder.current_candidate_index
         session_store.save(record)
 
-    # The loop a failover (on the recorder thread) hands a re-check to. None
-    # outside a running loop, which only happens in tests.
-    try:
-        loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
     def _maybe_rescan():
+        # The loop a failover (on the recorder thread) hands a re-check to.
+        loop = _main_loop
         if loop is None or not record.get("event_page"):
             return
         if schedules.rescan_due(recorder.dead_since_rescan(), len(recorder.candidates),
@@ -888,7 +891,10 @@ def _event_page_from_form(url: Optional[str], cookie: Optional[str],
     try:
         url = probe.clean_url(url)
     except probe.ProbeError as exc:
-        raise HTTPException(status_code=400, detail=f"Event page URL: {exc}")
+        # The links are what get recorded; a typo in the page box should
+        # cost the re-check, not the start.
+        logger.warning("Ignoring an unusable event page URL on start: %s", exc)
+        return None
     return {"url": url, "cookie": (cookie or "").strip(),
             "user_agent": (user_agent or "").strip()}
 
@@ -1275,6 +1281,9 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
 
 # Manual re-checks run as tasks; held here so they are not garbage-collected.
 _rescan_tasks: set = set()
+# The server's event loop, set in lifespan(). Failovers happen on recorder
+# threads and hand automatic re-checks to it.
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 async def _rescan_event_page(recording_id: str, manual: bool) -> None:
@@ -1291,6 +1300,13 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
         return
     try:
         if not page:
+            return
+        if not manual and _aggregate_lock.locked():
+            # Not queued: a scheduled start or a Find may be waiting on the
+            # same lock, and a flaky recording must not push a kickoff back.
+            # last_rescan_at is left alone, so the next failover tries again.
+            logger.info("Event-page re-check for %s skipped: another page check is running.",
+                        recording_id)
             return
         recorder.rescan_state = "checking"
         recorder.last_rescan_at = time.time()
@@ -1327,7 +1343,7 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
         raise
     except Exception as exc:
         logger.error("Event-page re-check for %s failed: %s", recording_id, exc)
-        recorder._log(f"Event page re-check failed: {exc}", "ERROR")
+        recorder._log("Event page re-check failed; see the PVArr log for why.", "ERROR")
     finally:
         recorder.rescan_state = ""
 
