@@ -4060,9 +4060,15 @@ to compare leagues and regular season against playoffs.
   coverage (logo-keyed answer key: 84 min continuous "no logo"; corner crops
   every 5 min confirm wide shots with no bug), then returned. comskip keys on
   that logo, so it could not tell play from ads for half the game: 12 %
-  recall against the logo key. A source quirk, not an ini problem. Possible
-  follow-up: flag a run whose logo coverage is low instead of logging a
-  misleading share.
+  recall against the logo key. A source quirk, not an ini problem.
+- [DECIDED 2026-10-11: not yet] Auto-flag unreliable runs. comskip's verbose
+  log reports "Logo fraction" and says "Logo disabled" when it gives up on
+  the logo. Measured: the bad game 0.24 (disabled); the four good lab games
+  0.32 (disabled, yet 99 % recall vs the hand key), 0.43, 0.49, 0.57. Neither
+  separates bad from good. Breaks per hour does on this data (bad 2.8/h,
+  good 5.6-7.0/h) and so does ad share (7 % vs 21-24 %), but that is one bad
+  example. Revisit at ~15-20 logged games; until then the Ad Stats table
+  shows length and breaks, so an outlier is visible by eye.
 
 ### Review, 2026-10-11 (Architect, Security, DevOps) -- nothing blocking; fixed
 - Security: a `nan`/`inf` duration in the CSV passed the `<= 0` check and
