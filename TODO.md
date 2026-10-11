@@ -3981,8 +3981,9 @@ rewritten here.
   image on a spare port with its own empty `/config` and `/recordings`,
   recording two local `ffmpeg testsrc2` HLS sources, after a forced switch
   to the backup. No real stream URL or site appears in it.
-- [PENDING] Sponsor: GitHub Releases notes, issue templates, `SECURITY.md`,
-  repo topics (launch strategy week 1) -- not done here.
+- [COMPLETED] GitHub Releases for v0.8.1 and v0.8.2, issue templates,
+  `SECURITY.md`, repo topics, Discussions (checked 2026-10-11). No GitHub
+  Release yet for v0.8.3 (tag and image are published).
 - [COMPLETED] Final check: a case-insensitive `git grep` over the branch for
   every site name, stream id, token prefix, personal host name and loaded
   phrase in the private liability list returns nothing; the branch's commit
