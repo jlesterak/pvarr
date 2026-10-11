@@ -29,6 +29,7 @@ obvious signals all miss it.
 
 import csv
 import logging
+import math
 import os
 import re
 import time
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.check_deps import find_executable
+from app.sessions import config_dir
 
 logger = logging.getLogger("PVArrCommercials")
 
@@ -355,13 +357,11 @@ def keep_original() -> bool:
 
 
 def _stats_path(stats_dir: Optional[Path] = None) -> Path:
-    if stats_dir is None:
-        stats_dir = Path(os.getenv("PVARR_CONFIG_DIR", "./config")).expanduser()
-    return stats_dir / STATS_FILE
+    return (stats_dir or config_dir()) / STATS_FILE
 
 
 # PVArr's own filenames start DATE_LEAGUE_; anything else is grouped as Other.
-_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_([A-Za-z0-9]+)_")
+_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_([A-Za-z0-9-]+)_")
 
 
 def read_stats(stats_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -377,12 +377,12 @@ def read_stats(stats_dir: Optional[Path] = None) -> Dict[str, Any]:
                     breaks = int(row["breaks"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if duration <= 0:
+                if not (math.isfinite(duration) and math.isfinite(ad)) or duration <= 0:
                     continue
                 name = row.get("file") or ""
                 m = _NAME_RE.match(name)
                 title = Path(name).stem[m.end():] if m else Path(name).stem
-                title = re.sub(r"_\d{3,4}p$", "", title).replace("_", " ")
+                title = re.sub(r"_(\d{3,4}p\d*|4K)$", "", title).replace("_", " ")
                 recordings.append({
                     "file": name,
                     "title": title,
@@ -390,10 +390,11 @@ def read_stats(stats_dir: Optional[Path] = None) -> Dict[str, Any]:
                     "league": m.group(2).upper() if m else "Other",
                     "duration_sec": round(duration), "ad_sec": round(ad),
                     "ad_pct": round(100 * ad / duration, 1), "breaks": breaks,
+                    "finished_at": row.get("finished_at") or "",
                 })
     except OSError:
         pass
-    recordings.sort(key=lambda r: r["date"], reverse=True)
+    recordings.sort(key=lambda r: (r["date"], r["finished_at"]), reverse=True)
 
     def summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         duration = sum(r["duration_sec"] for r in rows)
@@ -433,7 +434,7 @@ def record_stats(video_path: str, breaks: List[Tuple[float, float]],
                 round(duration), round(ad_sec), round(100 * ad_sec / duration, 1),
                 len(breaks), run_mode,
             ])
-    except OSError as exc:
+    except Exception as exc:    # a stats bug must never cost the chapters
         logger.warning("Could not write %s: %s", path, exc)
         return None
     return path

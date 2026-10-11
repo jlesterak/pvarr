@@ -5941,21 +5941,23 @@ class TestAdStatsSummary(unittest.TestCase):
            "2026-10-12T20:00:00,2026-10-12_nhl_C_vs_D_720p.mp4,7200,1440,20.0,17,chapters\n"
            "2026-10-13T20:00:00,2026-10-13_NHL_E_vs_F_720p.mp4,3600,360,10.0,8,chapters\n"
            "2026-10-14T20:00:00,my clip.mp4,600,60,10.0,1,cut\n"
+           "2026-10-14T21:00:00,2026-10-14_NCAA-F_G_vs_H_720p60.mp4,600,60,10.0,1,cut\n"
+           "2026-10-15T20:00:00,x.mp4,nan,60,10.0,1,cut\n"
            "garbage,row\n")
 
     def test_groups_by_league_weighted_by_time(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / commercials.STATS_FILE).write_text(self.CSV)
             out = commercials.read_stats(Path(d))
-        self.assertEqual(out["total"]["count"], 4)
+        self.assertEqual(out["total"]["count"], 5, "nan and garbage rows skipped")
         by = {lg["league"]: lg for lg in out["by_league"]}
-        self.assertEqual(sorted(by), ["NFL", "NHL", "Other"])
+        self.assertEqual(sorted(by), ["NCAA-F", "NFL", "NHL", "Other"])
         # (1440 + 360) / (7200 + 3600) -- not the mean of 20% and 10%.
         self.assertEqual(by["NHL"]["ad_pct"], 16.7)
         self.assertEqual(by["Other"]["count"], 1)
-        self.assertEqual(out["recordings"][0]["date"], "2026-10-14", "newest first")
+        self.assertEqual(out["recordings"][0]["title"], "G vs H", "newest first, same day too")
         self.assertEqual(out["recordings"][-1]["title"], "A vs B")
-        self.assertEqual(out["recordings"][0]["title"], "my clip")
+        self.assertEqual(out["recordings"][1]["title"], "my clip")
 
     def test_no_file_is_no_data(self):
         with tempfile.TemporaryDirectory() as d:

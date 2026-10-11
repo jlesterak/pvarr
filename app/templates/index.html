@@ -438,7 +438,7 @@
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-800/80">
-                <template x-for="r in adStats.recordings" :key="r.file + r.date">
+                <template x-for="(r, i) in adStats.recordings" :key="i">
                   <tr>
                     <td class="px-6 py-2.5 font-mono text-slate-400" x-text="r.date"></td>
                     <td class="px-6 py-2.5 font-mono" x-text="r.league"></td>

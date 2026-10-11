@@ -4053,3 +4053,22 @@ to compare leagues and regular season against playoffs.
   the current recordings finish. Rows only appear once a build with this
   change is running; until then chapters are written and can be summed later.
 - [PENDING] Backfill the existing recordings with the shipped default ini.
+
+### Review, 2026-10-11 (Architect, Security, DevOps) -- nothing blocking; fixed
+- Security: a `nan`/`inf` duration in the CSV passed the `<= 0` check and
+  500'd the whole endpoint -> `math.isfinite` check. Only someone with write
+  access to `/config` could cause it. XSS, traversal, CSV injection checked
+  and fine (all `x-text`; no parameters; filenames always start with a date).
+- Architect: `record_stats` caught only OSError, so any other bug would
+  skip chapters -> catches everything. League regex now allows `-`
+  (`NCAA-F`); `720p60`/`4K` suffixes stripped from titles; same-day rows
+  sort newest first; table keyed by index. Route is a plain `def` so the
+  CSV read runs in FastAPI's thread pool.
+- DevOps: reuse `sessions.config_dir()` instead of a second copy;
+  `PVARR_CONFIG_DIR` docs now list everything kept there; `finished_at`
+  follows the container's `TZ` (documented).
+- Accepted: two first-ever rows written at once can duplicate the header;
+  the reader skips it. Rows stay after a recording is renamed or deleted.
+- Not handled: a sport typed with a space ("College Football") becomes
+  league "COLLEGE" -- the filename has no separator to tell sport from team.
+  Autocomplete offers the short tags, which avoid it.

@@ -1713,7 +1713,7 @@ async def list_library(dir_path: Optional[str] = None):
 
 
 @app.get("/api/stats/ads")
-async def ad_stats():
+def ad_stats():
     """Share of each recording comskip marked as ads, by league and overall."""
     return commercials.read_stats()
 
