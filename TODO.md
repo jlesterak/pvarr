@@ -4055,9 +4055,14 @@ to compare leagues and regular season against playoffs.
 - [COMPLETED] Backfill with the shipped default ini: six recordings (four
   from the tuning lab's saved frame data, two re-run), seeded into the dev
   workstation's stats CSV. Five sit at 21-24 %. One NHL game came out at
-  7 % with 8 breaks -- almost certainly comskip missing breaks on that
-  broadcast, not a light game. Check it by eye before trusting a league
-  average built on it.
+  7 % with 8 breaks. Checked 2026-10-11: no failover (one source all game),
+  but the source's own corner logo was absent from ~54 to ~139 min of game
+  coverage (logo-keyed answer key: 84 min continuous "no logo"; corner crops
+  every 5 min confirm wide shots with no bug), then returned. comskip keys on
+  that logo, so it could not tell play from ads for half the game: 12 %
+  recall against the logo key. A source quirk, not an ini problem. Possible
+  follow-up: flag a run whose logo coverage is low instead of logging a
+  misleading share.
 
 ### Review, 2026-10-11 (Architect, Security, DevOps) -- nothing blocking; fixed
 - Security: a `nan`/`inf` duration in the CSV passed the `<= 0` check and
