@@ -4029,7 +4029,7 @@ link while a game runs before blaming PVArr or the upstream.
 
 ---
 
-## Phase 30: Ad share per recording (2026-10-11) [IN PROGRESS -- code done, backfill running]
+## Phase 30: Ad share per recording (2026-10-11) [IN PROGRESS -- release + switch-on tonight]
 
 Sponsor request: track the share of each recording comskip marks as ads,
 to compare leagues and regular season against playoffs.
@@ -4052,7 +4052,12 @@ to compare leagues and regular season against playoffs.
 - [PENDING] Turn comskip on on the dev workstation (`PVARR_COMSKIP=1`) after
   the current recordings finish. Rows only appear once a build with this
   change is running; until then chapters are written and can be summed later.
-- [PENDING] Backfill the existing recordings with the shipped default ini.
+- [COMPLETED] Backfill with the shipped default ini: six recordings (four
+  from the tuning lab's saved frame data, two re-run), seeded into the dev
+  workstation's stats CSV. Five sit at 21-24 %. One NHL game came out at
+  7 % with 8 breaks -- almost certainly comskip missing breaks on that
+  broadcast, not a light game. Check it by eye before trusting a league
+  average built on it.
 
 ### Review, 2026-10-11 (Architect, Security, DevOps) -- nothing blocking; fixed
 - Security: a `nan`/`inf` duration in the CSV passed the `<= 0` check and
