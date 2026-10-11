@@ -3845,7 +3845,7 @@ Open risks:
   the network while a window is open with nothing found. Bounded by End at.
 - No per-job lock against two overlapping schedules for the same event; both
   would start (operator error, visible in the list).
-- [PENDING] Live test on a real event: schedule ~10 min ahead with a fresh
+- [COMPLETED 2026-10-09: sponsor ran a live scheduled recording end to end; it worked] Live test on a real event: schedule ~10 min ahead with a fresh
   cookie, confirm it starts and stops at End at.
 
 ### Review, 2026-10-08 (Architect, Security, DevOps) -- nothing blocking; fixed
