@@ -3992,7 +3992,7 @@ rewritten here.
 
 ---
 
-## Phase 29: A clean FFmpeg exit ended a windowed recording early (2026-10-11) [COMPLETED -- release pending]
+## Phase 29: A clean FFmpeg exit ended a windowed recording early (2026-10-11) [COMPLETED -- released in v0.8.3]
 
 **Symptom (live, 2026-10-11, v0.8.2, dev workstation).** A recording with
 ~230 min of window left reconnected to candidate 1 after a lap of freezes

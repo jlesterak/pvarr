@@ -2,10 +2,12 @@
 
 All notable changes to PVArr are listed here, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Earlier history is summarised in the README and TODO.
 
-## [Unreleased]
+## [0.8.3]
 
 ### Fixed
 - A recording with an end time no longer stops early when a stream ends itself mid-event (FFmpeg exits cleanly on a flaky upstream). Before the end time that now counts as a drop and fails over.
+
+Full notes: [docs/release-notes/v0.8.3.md](docs/release-notes/v0.8.3.md).
 
 ## [0.8.1]
 
