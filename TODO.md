@@ -4029,7 +4029,7 @@ link while a game runs before blaming PVArr or the upstream.
 
 ---
 
-## Phase 30: Ad share per recording (2026-10-11) [IN PROGRESS -- release + switch-on tonight]
+## Phase 30: Ad share per recording (2026-10-11) [COMPLETED -- released in v0.9.0]
 
 Sponsor request: track the share of each recording comskip marks as ads,
 to compare leagues and regular season against playoffs.
@@ -4049,8 +4049,8 @@ to compare leagues and regular season against playoffs.
   read-only, no parameters. Bars are plain CSS (full bar = 50%), no chart
   library. Checked in headless Chrome against the four backfilled rows.
   Tests: `TestAdStatsSummary`, `test_ad_stats_route_serves_the_summary`.
-- [PENDING] Turn comskip on on the dev workstation (`PVARR_COMSKIP=1`) after
-  the current recordings finish. Rows only appear once a build with this
+- [COMPLETED] Comskip on on the dev workstation (`PVARR_COMSKIP=1`),
+  2026-10-11, while idle between recordings. Rows only appear once a build with this
   change is running; until then chapters are written and can be summed later.
 - [COMPLETED] Backfill with the shipped default ini: six recordings (four
   from the tuning lab's saved frame data, two re-run), seeded into the dev
