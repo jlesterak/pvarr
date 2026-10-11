@@ -4026,3 +4026,23 @@ being down, but not proven. (b) The replacement recording lost 10 segments
 as "expired before FFmpeg reached them" in its first 90 s at ~0.6 Mbit/s,
 i.e. it was fetching slower than real time. Next: compare against the host
 link while a game runs before blaming PVArr or the upstream.
+
+---
+
+## Phase 30: Ad share per recording (2026-10-11) [IN PROGRESS -- code done, backfill running]
+
+Sponsor request: track the share of each recording comskip marks as ads,
+to compare leagues and regular season against playoffs.
+
+- [COMPLETED] `commercials.record_stats()` appends one row per comskip run to
+  `/config/comskip-stats.csv` (finished_at, file, duration_sec, ad_sec,
+  ad_pct, breaks, mode). Overlapping breaks are merged before summing.
+  Written before any cut, so the share is of the uncut length. No league or
+  season column: both follow from the filename and date. ~100 bytes per
+  recording; a write failure is logged and changes nothing else.
+  Tests: `TestComskipStats` (header once, merge, row contents; no file when
+  ffprobe cannot read the recording).
+- [PENDING] Turn comskip on on the dev workstation (`PVARR_COMSKIP=1`) after
+  the current recordings finish. Rows only appear once a build with this
+  change is running; until then chapters are written and can be summed later.
+- [PENDING] Backfill the existing recordings with the shipped default ini.

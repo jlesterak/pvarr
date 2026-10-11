@@ -5899,6 +5899,32 @@ class TestCommercialGating(unittest.TestCase):
         self.assertFalse(out["ran"])
 
 
+class TestComskipStats(unittest.TestCase):
+    """One CSV row per run, measured against the uncut length."""
+
+    def test_rows_append_with_one_header(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(commercials, "media_duration", return_value=3600.0):
+            # Overlapping breaks are merged, not double-counted: 60-240 is 180 s.
+            commercials.record_stats("/rec/2026-10-11_NFL_A_vs_B.mp4",
+                                     [(60.0, 180.0), (120.0, 240.0)], "chapters", Path(d))
+            path = commercials.record_stats("/rec/2026-10-12_NHL_C_vs_D.mp4",
+                                            [], "chapters", Path(d))
+            lines = path.read_text().splitlines()
+        self.assertEqual(lines[0], "finished_at,file,duration_sec,ad_sec,ad_pct,breaks,mode")
+        self.assertEqual(lines[1].split(",")[1:], ["2026-10-11_NFL_A_vs_B.mp4", "3600",
+                                                   "180", "5.0", "2", "chapters"])
+        self.assertEqual(len(lines), 3)
+
+    def test_unreadable_file_writes_nothing(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(commercials, "media_duration", return_value=None):
+            self.assertIsNone(commercials.record_stats("/rec/x.mp4", [(0, 60)], "cut", Path(d)))
+            self.assertEqual(os.listdir(d), [])
+
+
 class TestCommercialsNeverDamageARecording(unittest.TestCase):
     """The whole point of chapters-by-default.
 

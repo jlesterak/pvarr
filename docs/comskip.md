@@ -6,6 +6,8 @@
 
 Settings: `PVARR_COMSKIP`, `PVARR_COMSKIP_MODE`, `PVARR_COMSKIP_KEEP_ORIGINAL`, `PVARR_COMSKIP_INI` (see [Installation and configuration](installation.md#environment-variables)).
 
+**How much of each recording is ads.** Every comskip run appends one row to `/config/comskip-stats.csv`: `finished_at`, `file`, `duration_sec`, `ad_sec`, `ad_pct`, `breaks`, `mode`. The length is measured before any cut. League and date are already in the filename, so you can compare leagues, or regular season against playoffs, with any spreadsheet. The figures are comskip's guesses, so they are only as accurate as its detection.
+
 **`PVARR_COMSKIP_MODE=cut` did not cut anything.** It refuses rather than guesses. The cut is written beside your recording and only replaces it if `ffprobe` can read it *and* its duration is within 30 seconds of the expected length. A stream-copy concat that silently produced a 30-second file from a three-hour capture would otherwise overwrite the recording with wreckage. The log line says what it expected and what it got. Cuts land on keyframes, so expect a second or two of slop at each boundary — the alternative is hours of CPU re-encoding.
 
 **Commercial detection found nothing, or marked the wrong things.** comskip was built for broadcast TV: it leans on station logos vanishing, black frames at boundaries, aspect-ratio changes and audio silence. A broadcast TV recording gives it all of those and it does well. A stream that fills its breaks with an animated "commercial break in progress" card gives it almost none — that card is not black, not silent, and not a frozen frame — so expect misses there. Point `PVARR_COMSKIP_INI` at a tuned `comskip.ini` for your source; that is where the real gains are.

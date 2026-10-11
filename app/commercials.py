@@ -27,8 +27,10 @@ work with -- such a card is not black, not silent, and not frozen, so the
 obvious signals all miss it.
 """
 
+import csv
 import logging
 import os
+import time
 import shutil
 import subprocess
 import tempfile
@@ -55,6 +57,14 @@ _DEFAULT_INI = (
     "detect_method=111\n"
     "logo_threshold=0.75\n"
 )
+
+
+# One row per comskip run, appended to /config. Lets an operator compare how
+# much of a broadcast is ads across leagues and seasons; the league is in the
+# filename and the season type follows from the date, so neither is a column.
+STATS_FILE = "comskip-stats.csv"
+_STATS_FIELDS = ["finished_at", "file", "duration_sec", "ad_sec", "ad_pct",
+                 "breaks", "mode"]
 
 
 def comskip_path() -> Optional[str]:
@@ -343,6 +353,37 @@ def keep_original() -> bool:
         "0", "false", "no", "off")
 
 
+def record_stats(video_path: str, breaks: List[Tuple[float, float]],
+                 run_mode: str, stats_dir: Optional[Path] = None) -> Optional[Path]:
+    """Append this recording's ad share to the stats CSV. Never raises.
+
+    Must run before a cut: afterwards the file no longer has the ads in it,
+    and the share would be measured against the wrong length.
+    """
+    duration = media_duration(video_path)
+    if not duration:
+        return None
+    ad_sec = duration - sum(end - start for start, end in keep_ranges(breaks, duration))
+    if stats_dir is None:
+        stats_dir = Path(os.getenv("PVARR_CONFIG_DIR", "./config")).expanduser()
+    path = stats_dir / STATS_FILE
+    try:
+        new = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if new:
+                writer.writerow(_STATS_FIELDS)
+            writer.writerow([
+                time.strftime("%Y-%m-%dT%H:%M:%S"), Path(video_path).name,
+                round(duration), round(ad_sec), round(100 * ad_sec / duration, 1),
+                len(breaks), run_mode,
+            ])
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", path, exc)
+        return None
+    return path
+
+
 def process(video_path: str) -> Dict[str, Any]:
     """Detect commercials and mark (or remove) them. Never raises.
 
@@ -363,6 +404,7 @@ def process(video_path: str) -> Dict[str, Any]:
     result["ran"] = True
     result["breaks"] = len(found["breaks"])
     try:
+        record_stats(video_path, found["breaks"], result["mode"])
         if found["ffmeta"]:
             result["applied"] = apply_chapters(video_path, found["ffmeta"])
         if result["mode"] == "cut" and found["breaks"]:

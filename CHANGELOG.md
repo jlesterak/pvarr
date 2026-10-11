@@ -2,6 +2,11 @@
 
 All notable changes to PVArr are listed here, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Earlier history is summarised in the README and TODO.
 
+## [Unreleased]
+
+### Added
+- Each comskip run appends the recording's length, ad time and ad share to `/config/comskip-stats.csv`.
+
 ## [0.8.3]
 
 ### Fixed
