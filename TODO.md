@@ -4146,5 +4146,12 @@ agreed the same day: automatic re-check plus a button.
   cap only matters on pages with few working links. Run against the same
   page: 3 fresh working links in 23 s, page fetch included. Test:
   `test_a_recheck_skips_held_links_and_reads_further_down`.
-- [PENDING] Live test of a re-check that actually swaps a slot (needs a
-  restart onto the fixed code, so not during a recording).
+- [COMPLETED] Live swap, same recording, still on the pre-fix code: when
+  every source went quiet at once (after about 3h12m), the automatic
+  re-check put fresh links into the two dead slots, the card logged both
+  swaps, and failover cycled through them. Nothing was playing anywhere
+  by then, so no data came of it, but the swap path works live. The
+  page's order had changed by then, which is the only reason the
+  pre-fix code found anything.
+- [PENDING] Live re-check with `exclude` on the next event-page recording
+  (container restarted onto 9c96d27 the same evening).
