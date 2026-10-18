@@ -93,7 +93,7 @@ RUN useradd --create-home --shell /bin/bash --uid 1000 pvarr && \
     chown -R pvarr:pvarr /app /config /recordings
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:8999/api/status || exit 1
+    CMD curl -fsS http://localhost:8999/api/health || exit 1
 
 # Deliberately no `USER pvarr`. The entrypoint starts as root purely to fix the
 # ownership of bind-mounted volumes -- which the image-time chown above cannot

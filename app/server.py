@@ -395,6 +395,51 @@ async def get_system_status():
     }
 
 
+# --- /api/health: the container healthcheck -------------------------------
+# /api/status answers 200 while a session sits wedged, so Docker never saw one.
+# A session that says "recording" re-checks its own output every
+# freeze_timeout_sec (15 s by default) and fails over when bytes stop, so bytes
+# that stay frozen for minutes while it still says "recording" mean that watchdog
+# itself is stuck. Retrying, waiting and finished sessions don't count. Progress
+# is tracked between calls, which the healthcheck makes every 30 s.
+def _wedge_seconds() -> float:
+    try:
+        return max(60.0, float(os.environ.get("PVARR_WEDGE_SEC", "300")))
+    except ValueError:
+        return 300.0
+
+
+_health_progress: Dict[str, tuple] = {}  # recording_id -> (bytes_written, unchanged since)
+
+
+def wedged_sessions(recorders, now: float, progress: Dict[str, tuple], limit: float) -> List[str]:
+    """Ids of sessions recording with no new bytes for longer than `limit` seconds. Updates `progress`."""
+    wedged = []
+    seen = set()
+    for rid, r in recorders.items():
+        if not (r.is_running and r.status == "recording"):
+            continue
+        seen.add(rid)
+        last = progress.get(rid)
+        if last is None or last[0] != r.bytes_written:
+            progress[rid] = (r.bytes_written, now)
+        elif now - last[1] > limit:
+            wedged.append(rid)
+    for rid in list(progress):
+        if rid not in seen:
+            del progress[rid]
+    return wedged
+
+
+@app.get("/api/health")
+async def get_health():
+    """200 when every recording session is making progress, 503 naming the ones that are wedged."""
+    wedged = wedged_sessions(active_recorders, time.time(), _health_progress, _wedge_seconds())
+    if wedged:
+        return JSONResponse(status_code=503, content={"ok": False, "wedged": wedged})
+    return {"ok": True, "version": __version__}
+
+
 # Finished sessions are kept so the dashboard can show recent history, but not
 # forever: each holds a 500-line log buffer and candidate state.
 MAX_FINISHED_SESSIONS = 20

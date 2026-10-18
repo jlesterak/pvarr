@@ -5051,6 +5051,26 @@ class TestWindowKeepsRetrying(unittest.TestCase):
         self.assertEqual(rec.status, "failed")
         self.assertEqual(rec.bytes_written, 0)
 
+    def test_a_channel_keeps_trying_past_max_cycles_until_stopped(self):
+        """A rebroadcast channel is meant to stay up: a dead upstream is retried
+        (with backoff) until the operator stops it, not dropped after max_cycles."""
+        rec = self.make()
+        rec.start_time = time.time()
+        attempts = []
+
+        def fail_until_stopped(cmd, cand):
+            attempts.append(cand.name)
+            if len(attempts) >= 12:   # well past max_cycles=2
+                rec._stop_event.set()
+            return StreamOutcome.FAILED
+
+        rec._stream_ffmpeg_process = fail_until_stopped
+        from unittest.mock import patch
+        with patch.object(type(rec), "is_rebroadcast", new=property(lambda self: True)), \
+                patch("app.recorder.time.sleep"):
+            rec._recording_loop()
+        self.assertGreaterEqual(len(attempts), 12, "the channel gave up on its own")
+
     def test_footage_captured_before_the_window_closed_is_kept(self):
         """The realistic failure: it recorded, then every source died."""
         rec = self.make(end_time=time.time() + 3600)
@@ -8280,5 +8300,63 @@ class TestScheduleLoop(ScheduleServerTestCase):
         self.assertIn('"waiting"', self.store.path.read_text())
 
 
+
+class TestHealthSeesAWedgedSession(unittest.TestCase):
+    """/api/status answered 200 for a session frozen for an hour, so the healthcheck never saw it."""
+
+    class Rec:
+        def __init__(self, status="recording", running=True, bytes_written=0):
+            self.status, self.is_running, self.bytes_written = status, running, bytes_written
+
+    def setUp(self):
+        from app.server import wedged_sessions
+        self.wedged = wedged_sessions
+
+    def test_frozen_bytes_while_recording_is_wedged_after_the_limit(self):
+        recs, progress = {"r1": self.Rec(bytes_written=500)}, {}
+        self.assertEqual(self.wedged(recs, 0, progress, 300), [])
+        self.assertEqual(self.wedged(recs, 299, progress, 300), [])
+        self.assertEqual(self.wedged(recs, 301, progress, 300), ["r1"])
+
+    def test_progress_resets_the_clock(self):
+        recs, progress = {"r1": self.Rec(bytes_written=500)}, {}
+        self.wedged(recs, 0, progress, 300)
+        recs["r1"].bytes_written = 900
+        self.assertEqual(self.wedged(recs, 250, progress, 300), [])
+        self.assertEqual(self.wedged(recs, 500, progress, 300), [])
+        self.assertEqual(self.wedged(recs, 551, progress, 300), ["r1"])
+
+    def test_retrying_waiting_and_finished_sessions_never_count(self):
+        recs = {"a": self.Rec(status="failing_over"), "b": self.Rec(status="scheduled"),
+                "c": self.Rec(status="completed", running=False)}
+        progress = {}
+        self.wedged(recs, 0, progress, 300)
+        self.assertEqual(self.wedged(recs, 10_000, progress, 300), [])
+        self.assertEqual(progress, {})
+
+    def test_a_session_that_leaves_recording_is_forgotten(self):
+        recs, progress = {"r1": self.Rec()}, {}
+        self.wedged(recs, 0, progress, 300)
+        recs["r1"].status = "failing_over"
+        self.wedged(recs, 100, progress, 300)
+        recs["r1"].status = "recording"
+        self.assertEqual(self.wedged(recs, 350, progress, 300), [])  # its clock restarted at 350
+
+
+@unittest.skipUnless(HAS_TESTCLIENT, "httpx not installed (see requirements-dev.txt)")
+class TestHealthEndpoint(ServerTestCase):
+    def test_healthy_then_503_naming_the_wedged_session(self):
+        from unittest.mock import patch
+        rec = TestHealthSeesAWedgedSession.Rec(bytes_written=10)
+        self.server.active_recorders["r1"] = rec
+        with patch.object(self.server, "_health_progress", {}), patch.object(self.server.time, "time", return_value=1000.0):
+            self.assertEqual(self.client.get("/api/health").status_code, 200)
+        with patch.object(self.server, "_health_progress", {"r1": (10, 0.0)}), patch.object(self.server.time, "time", return_value=1000.0):
+            r = self.client.get("/api/health")
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.json()["wedged"], ["r1"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

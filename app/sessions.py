@@ -261,10 +261,10 @@ def resume_decision(
         # A channel keeps nothing, so there is no footage to weigh up and no
         # gap that matters -- the buffer is deleted at shutdown by design.
         # Bring it back: the sponsor left a channel running and expects it to
-        # be there. The attempt counter is deliberately not applied either;
-        # a channel whose upstream is genuinely dead ends itself through
-        # max_cycles and is removed that way, so there is no restart loop to
-        # guard against.
+        # be there. The attempt counter is deliberately not applied either: a
+        # channel retries a dead upstream inside its own loop (with backoff)
+        # until the operator stops it, so there is no restart loop to guard
+        # against.
         return "resume"
 
     path = Path(record.get("output_filepath", ""))

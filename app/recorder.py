@@ -975,6 +975,9 @@ class StreamFailoverRecorder:
             f.write(f"{candidate.slug}|{candidate.name}|1||Sports|{conf_url}|{mode}|{conf_referer}|\n")
 
         env = os.environ.copy()
+        # hls-proxy binds 127.0.0.1 unless HLS_PROXY_BIND says otherwise (checked in the pinned source,
+        # hls-proxy.py line 22). Pin it so an inherited variable can't open a second unauthenticated relay.
+        env["HLS_PROXY_BIND"] = "127.0.0.1"
         env["HLS_PROXY_PORT"] = str(port)
         env["CHANNELS_CONF"] = str(conf_file)
         if candidate.referer:
@@ -2043,6 +2046,18 @@ class StreamFailoverRecorder:
                         f"recording window is open for another "
                         f"{remaining / 60:.0f} min -- still trying.", "WARN",
                     )
+                elif self.is_rebroadcast:
+                    # A channel is meant to be there until the operator stops
+                    # it: an upstream that is down now is often back later, and
+                    # nothing is kept, so there is nothing to finalise. The
+                    # backoff (capped at 60 s) keeps dead origins from being
+                    # hammered while it waits.
+                    if self.cycles_without_data == self.max_cycles:
+                        self._log(
+                            f"No data from any candidate in {self.max_cycles} "
+                            f"full attempts; a channel keeps trying until it "
+                            f"is stopped.", "WARN",
+                        )
                 elif self.cycles_without_data >= self.max_cycles:
                     # Giving up after capturing real footage is not the same as
                     # never recording anything. Keeping these distinct is what
@@ -2071,8 +2086,9 @@ class StreamFailoverRecorder:
             if wrapped:
                 self._log(
                     f"Cycling back to Candidate {next_index + 1} ({next_name}) "
-                    f"after {delay:.0f}s (lap {self.cycles_without_data} of "
-                    f"{self.max_cycles})...", "WARN",
+                    f"after {delay:.0f}s (lap {self.cycles_without_data}"
+                    + ("" if self.is_rebroadcast else f" of {self.max_cycles}")
+                    + ")...", "WARN",
                 )
             else:
                 self._log(
