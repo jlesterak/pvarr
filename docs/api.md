@@ -18,6 +18,7 @@
 | `POST` | `/api/recordings/{id}/failover` | Force failover to the next URL, wrapping to the first from the last. Returns `400` if the session is not running, or was started with a single URL — there would be nothing to switch to, and honouring it would end the recording rather than fail it over. |
 | `POST` | `/api/recordings/{id}/switch` | Switch to a specific candidate (`candidate=1..3`, 1-based). The way back to the primary after it recovers. `400` if the session is not running, the number is out of range, or it is already on that candidate. |
 | `GET` | `/api/status` | The running version, every session, its candidates and recent logs, and `segments_lost` (split into `segments_failed` and `segments_expired`) — stream segments the source failed to deliver. Polled by the dashboard. Candidate cookies are **not** included — see below. |
+| `GET` | `/api/health` | The container healthcheck. `200 {"ok": true}`, or `503` with the ids of sessions that say `recording` but have written no new bytes for `PVARR_WEDGE_SEC` (default 300, min 60): the freeze watchdog itself is stuck. Retrying, waiting and finished sessions never count. |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
 | `GET` | `/api/library` | List completed recordings |

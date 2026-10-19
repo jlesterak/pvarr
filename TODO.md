@@ -752,7 +752,7 @@ sponsor.
       files.
 
 ### Still open, deliberately not fixed
-- [ ] **No cap on concurrent sessions or on readers per session.** Every tail
+- [x] **No cap on concurrent sessions or on readers per session.** CLOSED 2026-10-18 (Phase 31): the reads never block. Every tail
       reader goes through `asyncio.to_thread` onto the default executor
       (`min(32, cpu+4)` workers), so ~32 active readers starve `/api/probe` and
       the shutdown hook. Not urgent for a single-sponsor LAN install, and the
@@ -761,12 +761,12 @@ sponsor.
       redaction pass below.
 - [x] **Notifications ship the full primary URL** to Discord/Telegram. Fixed
       2026-08-31; it was a parameter mismatch, not a formatting choice.
-- [ ] **`_failover_delay` and `max_cycles=3` are recording semantics.** A
+- [x] **`_failover_delay` and `max_cycles=3` are recording semantics.** FIXED 2026-10-18 (Phase 31). A
       permanent channel should retry forever, not give up after three laps.
-- [ ] **The healthcheck cannot see a wedged session.** Both the Dockerfile and
+- [x] **The healthcheck cannot see a wedged session.** FIXED 2026-10-18 (Phase 31): `/api/health`. Both the Dockerfile and
       compose healthchecks hit `/api/status`, which returns 200 for a session
       whose `bytes_written` has been frozen for an hour.
-- [ ] **hls-proxy's bind address is unverified.** It is cloned at build time,
+- [x] **hls-proxy's bind address is unverified.** CLOSED 2026-10-18 (Phase 31): verified 127.0.0.1, now pinned. It is cloned at build time,
       not vendored. If it binds 0.0.0.0 it is a second unauthenticated relay on
       8090+. Check before rebroadcast ships.
 
@@ -976,10 +976,10 @@ streaming endpoint is broken.
 - [x] **FIXED (2026-09-05): the failover PTS discontinuity.** See "Phase 14"
       below. The sponsor reported it against mpv on a live .ts, which is the
       report this item was waiting for.
-- [ ] No cap on concurrent channels or on viewers per channel. Each viewer read
+- [x] No cap on concurrent channels or on viewers per channel. CLOSED 2026-10-18 (Phase 31). Each viewer read
       goes through `asyncio.to_thread` onto the default executor
       (`min(32, cpu+4)` workers).
-- [ ] The healthcheck still cannot see a wedged channel.
+- [x] The healthcheck still cannot see a wedged channel. FIXED 2026-10-18 (Phase 31).
 
 
 ## Release v0.2.0 (2026-08-31)  [COMPLETED]
@@ -4088,3 +4088,35 @@ to compare leagues and regular season against playoffs.
 - Not handled: a sport typed with a space ("College Football") becomes
   league "COLLEGE" -- the filename has no separator to tell sport from team.
   Autocomplete offers the short tags, which avoid it.
+
+
+## Phase 31: "Deliberately not fixed" items, fixed or closed (2026-10-18) [COMPLETED -- release with the next version]
+
+The sponsor asked for every "still open, deliberately not fixed" item to be fixed or closed.
+
+- **Healthcheck blind to a wedged session -- FIXED.** `GET /api/health` (app/server.py `wedged_sessions`) returns
+  503 naming any session whose status is `recording` but whose `bytes_written` has not moved for `PVARR_WEDGE_SEC`
+  (default 300 s, floor 60). The freeze watchdog fails over within `freeze_timeout_sec` (15 s), so a session
+  still "recording" with frozen bytes after minutes means the watchdog itself is stuck. `failing_over`, waiting and
+  finished sessions never count, so a long retry inside an open window is not "unhealthy". Progress is tracked
+  between calls; the Dockerfile and compose healthchecks (every 30 s) now hit `/api/health`. Docker only marks the
+  container unhealthy; it does not restart it without an autoheal sidecar, so recordings are never cut by this.
+  Tests: `TestHealthSeesAWedgedSession` (4) and `TestHealthEndpoint`.
+- **`max_cycles` ends a permanent channel -- FIXED.** A rebroadcast channel now retries a dead upstream until the
+  operator stops it, logging once when it passes `max_cycles`; the existing backoff (5, 10, 20 s, capped at 60 s)
+  keeps it from hammering. Recordings are unchanged (`max_cycles`, or the window, still ends them).
+  Test: `test_a_channel_keeps_trying_past_max_cycles_until_stopped` (fails on the old code: 8 attempts, not 12).
+- **hls-proxy bind address -- CLOSED, verified.** At the pinned commit (`ec57b00`), `hls-proxy.py` line 22 is
+  `BIND_ADDR = os.environ.get("HLS_PROXY_BIND", "127.0.0.1")` and line 615 binds `HTTPServer((BIND_ADDR, PORT))`:
+  localhost only. The recorder now sets `HLS_PROXY_BIND=127.0.0.1` itself, so a variable inherited from the
+  container environment can't change that.
+- **No cap on concurrent sessions / readers -- CLOSED, won't fix.** The worry was that every reader holds an
+  `asyncio.to_thread` worker. It doesn't: a channel viewer's `ring.read` is a non-blocking copy from memory
+  (app/ringbuffer.py `read`, returns `b""` at once when current) and a recording tail reads 64 KB from local disk,
+  so each call holds a worker for microseconds and readers queue behind each other only briefly. On a
+  single-sponsor LAN install the real limits are network and CPU, which a reader cap would not change. Reopen if a
+  viewer count ever shows `/api/probe` slowing down.
+
+Verify: `python3 -m pytest -q` -> 705 passed, 1 failed (`test_an_unwritable_directory_raises_rather_than_lying`
+fails only when run as root, as in the cloud sandbox; it fails the same on the unchanged code).
+
