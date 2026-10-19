@@ -3496,7 +3496,7 @@ on PyPI). Released images were never affected (3.12). The matrix is now 3.10 /
   FFmpeg a longer rolling window -- video still goes straight from the CDN.
   Architecture change -> sponsor decision.
 
-## Phase 26: League and team tags with offline autocomplete (2026-10-05) [IN PROGRESS -- sponsor review pending]
+## Phase 26: League and team tags with offline autocomplete (2026-10-05) [COMPLETED]
 
 Branch `feat/sportsdb`, cut from main at 7013b65, independent of the
 aggregator branch. Sponsor request (scope set 2026-10-05): no game scheduling
@@ -3551,9 +3551,9 @@ old teams. If ESPN vanishes, autocomplete keeps working on the last snapshot.
 ### Open
 - [COMPLETED] Sponsor decision (2026-10-11): full team names in filenames,
   which is what autocomplete already suggests. No code change.
-- [PENDING] Optional keyed provider (TheSportsDB with a Patreon key, or
-  another) -- subclass `TeamProvider`, add to `PROVIDERS`. Not built.
-- [PENDING] Agent-team review of this branch was NOT run (budget ran out);
+- [DECLINED 2026-10-19, sponsor] Optional keyed provider (TheSportsDB with a Patreon key, or
+  another) -- ESPN snapshot already covers more; a key adds upkeep for no gain.
+- [CLOSED 2026-10-19] Agent-team review of this branch was NOT run (budget ran out; merged and in use since, no review planned);
   two new read-only GET endpoints, no network, no disk writes at runtime.
   Run it before merge.
 - State 2026-10-05: suite green, committed, not pushed. Aggregator work is on
@@ -3765,8 +3765,8 @@ repo.
 - [COMPLETED] Sponsor watched the 2026-10-07 failover live and did not notice
   the gap; recording caught the whole game (stopped at host shutdown, finalised
   as .mp4 on next boot by session recovery).
-- [PENDING] Sponsor decision: live with ~1 auto-found stream per event plus
-  manual m3u8 backups, or a headless-browser sidecar (option 3) -- heavy,
+- [DECIDED 2026-10-19, sponsor] Live with ~1 auto-found stream per event plus
+  manual m3u8 backups; headless-browser sidecar (option 3) declined -- heavy,
   and it would not fix the wrong-channel problem above.
 - [PENDING] If the cookie paste fails from the container but works in the
   browser, the `cf_clearance` cookie is likely bound to something the
@@ -3775,7 +3775,7 @@ repo.
 
 ---
 
-## Phase 27: One-shot schedule from an aggregator page (2026-10-08) [IN PROGRESS -- review + live test pending]
+## Phase 27: One-shot schedule from an aggregator page (2026-10-08) [COMPLETED -- review 2026-10-08, live test 2026-10-09]
 
 Sponsor, verbatim: "let's add a simple schedule component - start at time,
 end at time, then when start time comes, pvarr scans the aggregating page and
