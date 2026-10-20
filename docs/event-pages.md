@@ -30,8 +30,12 @@ which runs the same check first when no stream link has been entered. PVArr:
    resolution, because it would stall and fail over. When several sites
    relay the same feed, bitrates within 0.5 Mbps count as equal and the
    faster delivery wins. Streams are measured one at a time (together they
-   share your connection and the numbers stop meaning anything), within 20
-   seconds; one not reached in time keeps its page position.
+   share your connection and the numbers stop meaning anything), and all the
+   measuring stops after 20 seconds, even if a server is trickling data: a
+   stream not measured by then ranks below the measured ones that keep up
+   and above the ones that do not. A segment that is not video (an error
+   page served as a 200) does not count as measured, and a resolution
+   ffprobe actually saw beats one the playlist merely claims.
    **Backups come from different real sources where possible.** Several
    sites often relay one origin feed through numbered edge servers; as
    failover those are one source, because they die together. PVArr compares

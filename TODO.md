@@ -4242,6 +4242,27 @@ were not used: site-specific, and possibly paid placement.
   failover across "three sources" mostly covered an edge dying, not the
   feed. -> backups now diversified by source (below).
 
+### Independent validation, 2026-10-19 -- R1 failed, fixed
+- [COMPLETED] HIGH: measuring ran synchronously in the scan thread and its
+  deadline was only checked between segments; `probe._fetch`'s wall clock is
+  only checked between 8 KB chunks, so a segment trickling 1 B/s held Find
+  (and the event-page lock, so every scheduled scan) for hours. A regression:
+  the probe phase was hard-bounded. Fixed: each measurement runs on a daemon
+  thread joined with the remaining budget and abandoned at the deadline
+  (`_measure_all`); `test_a_stalled_measurement_cannot_hold_find`; the
+  validator's fake-origin `budget`/`drip` cases now stop at 20.0 s.
+- [COMPLETED] A segment cut off by the size or time cap was credited its
+  full EXTINF (inflated headroom, understated bitrate). Now: with a
+  Content-Length, only the share that arrived counts; over the size cap
+  without one, the segment is skipped; still arriving at the time cap =
+  too slow. `test_a_cut_off_segment_is_credited_only_its_share`.
+- [COMPLETED] An HTML 200 counted as measured (1501x) and the playlist's
+  RESOLUTION=1x99999 then ranked first. Now a non-media first segment means
+  unmeasured, and a measured resolution always beats a claimed one (claims
+  capped at 2160p). `test_non_video_and_absurd_declared_resolution_do_not_win`.
+- [COMPLETED] Measurement sessions are closed; stale "all at once" comments
+  and the inconsistent time claims in the docs corrected.
+
 ### Backups from different real sources (sponsor, 2026-10-19)
 - [COMPLETED] `quality.source_key`: playlist host with digits removed plus
   path, query dropped; a generic path (`/live/index.m3u8`) keeps the exact

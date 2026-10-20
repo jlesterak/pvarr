@@ -15,7 +15,9 @@ working candidate this module:
   3. runs ffprobe on one segment for the real resolution, frame rate and
      codec. ffprobe reads headers only: no decoding, a few milliseconds of CPU.
 
-Cost per stream: about 2-10 MB of download, typically 1-2 s. Candidates are
+Cost per stream: about 2-10 MB of download, typically 1-2 s; the caller
+bounds the total (aggregator.RANK_BUDGET_SEC) and abandons a stream that
+stalls. Candidates are
 measured one at a time: measured together they compete for the same link
 and the numbers say more about each other than about the stream (measured
 2026-10-19: one stream read 6-11x alone, 1-7x alongside five others). Headroom matters most: a 1080p stream that barely keeps
@@ -86,6 +88,16 @@ def _segments(body: bytes, base: str) -> List[Tuple[str, float]]:
                 out.append((urljoin(base, line), duration))
             duration = None
     return out
+
+
+def _looks_like_media(data: bytes) -> bool:
+    """MPEG-TS (0x47 sync every 188 bytes), fragmented MP4, or ID3-tagged
+    TS/AAC; not an HTML error page served with a 200."""
+    if data[:1] == b"\x47" and (len(data) < 189 or data[188:189] == b"\x47"):
+        return True
+    if data[4:8] in (b"ftyp", b"styp", b"moof", b"sidx", b"moov"):
+        return True
+    return data[:3] == b"ID3"
 
 
 def _ffprobe(data: bytes) -> Dict[str, Any]:
@@ -160,7 +172,8 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             out["note"] = "no segments listed"
             return out
 
-        got_bytes, got_secs, spent, first = 0, 0.0, 0.0, b""
+        got_bytes, got_secs, spent, first, too_slow = 0, 0.0, 0.0, b"", False
+        wall = (SEGMENT_TIMEOUT_SEC // 2) * 2       # probe._fetch's wall-clock cap
         for n, (url, secs) in enumerate(segs):
             if deadline is not None and time.monotonic() > deadline:
                 break
@@ -174,15 +187,36 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             if not (r.ok and data):
                 out["note"] = f"segment answered {r.status_code}"
                 break
-            first = first or data
+            if not first:
+                if not _looks_like_media(data):
+                    out["note"] = "segment is not video"
+                    return out
+                first = data
             if n == 0 and len(segs) > 1:
                 continue        # connection set-up (DNS, TLS) would skew it
+            try:
+                length = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if length and len(data) < length:
+                # Cut off by a cap: credit only the share that arrived.
+                share = len(data) / length
+            elif len(data) >= SEGMENT_MAX_BYTES:
+                continue        # over the size cap, length unknown: no honest number
+            elif took >= wall - 0.5:
+                too_slow = True     # still arriving when the clock ran out
+                continue
+            else:
+                share = 1.0
             got_bytes += len(data)
-            got_secs += secs
+            got_secs += secs * share
             spent += took
         if got_secs and spent > 0:
             out["kbps"] = round(got_bytes * 8 / got_secs / 1000)
             out["headroom"] = round(got_secs / spent, 2)
+            out["measured"] = True
+        if too_slow:
+            out["headroom"] = min(out["headroom"] or 1.0, 1.0)
             out["measured"] = True
         if first:
             out.update({k: v for k, v in _ffprobe(first).items() if v})
@@ -190,6 +224,12 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
         out["note"] = f"could not measure: {type(exc).__name__}"
     except Exception as exc:  # measuring is a bonus; it must never sink a pick
         out["note"] = f"could not measure: {type(exc).__name__}"
+    finally:
+        for session in {id(plain): plain, id(fetcher): fetcher}.values():
+            try:
+                session.close()
+            except Exception:
+                pass
     return out
 
 
@@ -260,10 +300,14 @@ def score(q: Dict[str, Any]) -> Tuple:
         tier = 1
     else:
         tier = 0 if headroom >= MIN_HEADROOM else 2
-    height = q.get("height") or q.get("declared_height") or 0
+    # A resolution ffprobe saw beats one the playlist merely claims
+    # (RESOLUTION=1x99999 must not outrank a measured 1080p); the claim only
+    # orders streams ffprobe could not read, and only within reason.
+    height = q.get("height") or 0
+    claimed = 0 if height else min(q.get("declared_height") or 0, 2160)
     smooth = 1 if (q.get("fps") or 0) >= 48 else 0
-    kbps = q.get("kbps") or q.get("declared_kbps") or 0
-    return (tier, -height, -smooth, -(kbps // 500), -(headroom or 0))
+    kbps = q.get("kbps") or min(q.get("declared_kbps") or 0, 50000)
+    return (tier, -height, -claimed, -smooth, -(kbps // 500), -(headroom or 0))
 
 
 def summary(q: Dict[str, Any]) -> str:

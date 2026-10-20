@@ -8634,6 +8634,44 @@ class TestStreamRanking(unittest.TestCase):
         self.assertNotEqual(quality.source_key("https://tv1.example/live/index.m3u8"),
                             quality.source_key("https://tv2.example/live/index.m3u8"))
 
+    def test_a_stalled_measurement_cannot_hold_find(self):
+        import time as _t
+        def stuck(res, deadline):
+            _t.sleep(30)
+        t0 = _t.monotonic()
+        out = aggregator._measure_all({0: {}, 1: {}}, stuck, budget=0.5)
+        self.assertLess(_t.monotonic() - t0, 2.0)
+        self.assertEqual(out, {})
+
+    def _fake(self, playlist, segment, headers=None):
+        from unittest.mock import MagicMock
+        def fetch(session, url, hdrs, timeout, max_bytes=0):
+            r = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+            r.headers = headers or {}
+            return (r, playlist) if url.endswith(".m3u8") else (r, segment)
+        return fetch
+
+    def test_non_video_and_absurd_declared_resolution_do_not_win(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        with patch.object(quality.probe, "_fetch", side_effect=self._fake(playlist, b"<html>oops</html>")):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["measured"])
+        self.assertEqual(q["note"], "segment is not video")
+        self.assertLess(quality.score({"height": 1080, "headroom": 3.0}),
+                        quality.score({"declared_height": 99999, "headroom": 3.0}))
+
+    def test_a_cut_off_segment_is_credited_only_its_share(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:6.0,\nseg%d.ts\n" % i for i in range(4))
+        ts = b"\x47" + b"\x00" * 187 + b"\x47" + b"\x00" * 999811     # 1,000,000 bytes
+        with patch.object(quality.probe, "_fetch",
+                          side_effect=self._fake(playlist, ts, {"Content-Length": "2000000"})), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        # Half of each 6 s segment arrived: 1 MB per 3 s of video = 2667 kbps.
+        self.assertEqual(q["kbps"], 2667)
+
     def test_score_and_summary(self):
         self.assertLess(quality.score({"height": 720, "headroom": 2.0}),
                         quality.score({"height": 1080, "headroom": 1.2}))

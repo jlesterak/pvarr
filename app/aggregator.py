@@ -53,8 +53,8 @@ logger = logging.getLogger("PVArrAggregator")
 MAX_LINKS = 20
 PICK = 3
 # With ranking on, up to GATHER working links are collected and measured
-# (app/quality.py), and the best PICK of them kept. RANK_BUDGET_SEC bounds the
-# measuring, which runs all candidates at once.
+# (app/quality.py), one at a time, and the best PICK of them kept.
+# RANK_BUDGET_SEC is a hard wall clock for all the measuring together.
 GATHER = 6
 RANK_BUDGET_SEC = 20
 PROBE_WORKERS = 6
@@ -435,8 +435,9 @@ def pick_first_working(
     """Probe links concurrently; keep the first `pick` that work, in link order.
 
     With `measure_fn`, up to `gather` working links are collected the same
-    way, each is measured (all at once, within RANK_BUDGET_SEC), and the best
-    `pick` by quality.score are kept, best first; ties keep page order.
+    way, measured one at a time within RANK_BUDGET_SEC, and the best `pick`
+    kept by quality.score (backups from other sources where possible), best
+    first; ties keep page order.
 
     "First" means page order, not finishing order: a fast link further down
     must not displace a slower one above it. So the search ends only once the
@@ -542,19 +543,38 @@ def pick_first_working(
 
 def _measure_all(candidates: Dict[int, Dict[str, Any]],
                  measure_fn: Callable[[Dict[str, Any], float], Dict[str, Any]],
-                 abort: Optional[threading.Event] = None) -> Dict[int, Dict[str, Any]]:
-    """Measure candidates one at a time, in page order, until the budget runs
-    out; the rest count as unmeasured. One at a time on purpose: measured
-    together they share the link and the numbers stop meaning anything."""
-    deadline = time.monotonic() + RANK_BUDGET_SEC
+                 abort: Optional[threading.Event] = None,
+                 budget: Optional[float] = None) -> Dict[int, Dict[str, Any]]:
+    """Measure candidates one at a time, in page order, under a hard wall
+    clock; the rest count as unmeasured.
+
+    One at a time on purpose: measured together they share the link and the
+    numbers stop meaning anything. Each runs on a daemon thread that is
+    abandoned, not waited for, if the clock runs out: a server trickling a
+    byte a second must not hold the event-page lock (and every Find and
+    scheduled scan behind it). An abandoned measurement ends measuring.
+    """
+    budget = RANK_BUDGET_SEC if budget is None else budget
+    deadline = time.monotonic() + budget
     out: Dict[int, Dict[str, Any]] = {}
     for i in sorted(candidates):
-        if time.monotonic() > deadline or (abort is not None and abort.is_set()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (abort is not None and abort.is_set()):
             break
-        try:
-            out[i] = measure_fn(candidates[i], deadline)
-        except Exception:  # a measuring bug must not sink the pick
-            pass
+        box: Dict[str, Any] = {}
+
+        def run(res=candidates[i], box=box):
+            try:
+                box["q"] = measure_fn(res, deadline)
+            except Exception:  # a measuring bug must not sink the pick
+                pass
+        worker = threading.Thread(target=run, name="pvarr-measure", daemon=True)
+        worker.start()
+        worker.join(remaining)
+        if worker.is_alive():
+            break
+        if "q" in box:
+            out[i] = box["q"]
     return out
 
 
