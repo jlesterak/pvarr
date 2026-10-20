@@ -4301,7 +4301,7 @@ agreed the same day: automatic re-check plus a button.
 - [PENDING] Live re-check with `exclude` on the next event-page recording
   (container restarted onto 9c96d27 the same evening).
 
-## Phase 33: Rank found streams by measured quality (2026-10-19) [IN PROGRESS -- validation pending]
+## Phase 33: Rank found streams by measured quality (2026-10-19) [COMPLETED -- merged to main 2026-10-20, unreleased; live test on pop-os pending]
 
 Sponsor: "would it take way too much time/processing to analyze each stream
 (or the top three) for quality and pick the best one?" Answer: no, if it
