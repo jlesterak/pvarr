@@ -57,6 +57,7 @@ PICK = 3
 # RANK_BUDGET_SEC is a hard wall clock for all the measuring together.
 GATHER = 6
 RANK_BUDGET_SEC = 20
+RANK_SLOT_MIN_SEC = 8   # each stream's share of the budget, at least this
 PROBE_WORKERS = 6
 # Per-request timeout for each link's probe. Shorter than the probe's default:
 # a dead link that blackholes would otherwise spend the whole budget on a few
@@ -553,19 +554,27 @@ def _measure_all(candidates: Dict[int, Dict[str, Any]],
     abandoned, not waited for, if the clock runs out: a server trickling a
     byte a second must not hold the event-page lock (and every Find and
     scheduled scan behind it). An abandoned measurement ends measuring.
+
+    Each candidate gets its own slot -- an even share of what is left, at
+    least RANK_SLOT_MIN_SEC, ending 1 s before the budget -- and quality.measure
+    cuts its downloads short at the slot's end, so a slow stream at the top of
+    the page is measured as slow instead of eating the budget unmeasured.
     """
     budget = RANK_BUDGET_SEC if budget is None else budget
     deadline = time.monotonic() + budget
     out: Dict[int, Dict[str, Any]] = {}
-    for i in sorted(candidates):
-        remaining = deadline - time.monotonic()
+    order = sorted(candidates)
+    for n, i in enumerate(order):
+        now = time.monotonic()
+        remaining = deadline - now
         if remaining <= 0 or (abort is not None and abort.is_set()):
             break
+        slot_end = min(deadline - 1.0, now + max(remaining / (len(order) - n), RANK_SLOT_MIN_SEC))
         box: Dict[str, Any] = {}
 
-        def run(res=candidates[i], box=box):
+        def run(res=candidates[i], box=box, slot_end=slot_end):
             try:
-                box["q"] = measure_fn(res, deadline)
+                box["q"] = measure_fn(res, slot_end)
             except Exception:  # a measuring bug must not sink the pick
                 pass
         worker = threading.Thread(target=run, name="pvarr-measure", daemon=True)

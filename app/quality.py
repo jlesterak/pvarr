@@ -166,7 +166,11 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
         if not safe(playlist):
             out["note"] = "refused: private address"
             return out
-        resp, body = probe._fetch(fetcher, playlist, headers, PLAYLIST_TIMEOUT_SEC)
+        def left() -> float:
+            return float("inf") if deadline is None else deadline - time.monotonic()
+
+        resp, body = probe._fetch(fetcher, playlist, headers,
+                                  max(0.5, min(PLAYLIST_TIMEOUT_SEC, left() / 2)))
         if not (resp.ok and probe._is_playlist_body(body)):
             out["note"] = f"playlist answered {resp.status_code}"
             return out
@@ -176,24 +180,26 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             return out
 
         got_bytes, got_secs, spent, first, too_slow = 0, 0.0, 0.0, b"", False
-        wall = (SEGMENT_TIMEOUT_SEC // 2) * 2       # probe._fetch's wall-clock cap
         for n, (url, secs) in enumerate(segs):
-            if deadline is not None and time.monotonic() > deadline:
+            # Each download is cut short at the deadline (probe._fetch stops
+            # reading at twice its timeout), so a slow stream is caught in the
+            # act rather than abandoned unmeasured.
+            half = min(SEGMENT_TIMEOUT_SEC / 2, left() / 2)
+            if half < 0.5:
                 break
             if not safe(url):
                 out["note"] = "refused: private address"
                 return out
             t0 = time.monotonic()
             try:
-                r, data = probe._fetch(plain, url, headers, SEGMENT_TIMEOUT_SEC // 2,
-                                       max_bytes=SEGMENT_MAX_BYTES)
+                r, data = probe._fetch(plain, url, headers, half, max_bytes=SEGMENT_MAX_BYTES)
             except probe._FETCH_ERRORS as exc:
                 # One bad segment keeps what the others measured. A stall
                 # (before the headers: Timeout; mid-body: a ConnectionError
                 # after a full read timeout) is a stream that does not keep up.
                 out["note"] = f"segment failed: {type(exc).__name__}"
                 too_slow = too_slow or isinstance(exc, requests.Timeout) \
-                    or time.monotonic() - t0 >= SEGMENT_TIMEOUT_SEC // 2
+                    or time.monotonic() - t0 >= half
                 continue
             took = time.monotonic() - t0
             if not (r.ok and data):
@@ -202,28 +208,33 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             if not _looks_like_media(data):
                 out["note"] = "segment is not video"
                 continue        # never credited, whichever segment it is
-            first = first or data
-            if n == 0 and len(segs) > 1:
-                continue        # connection set-up (DNS, TLS) would skew it
             try:
                 length = int(r.headers.get("Content-Length") or 0)
             except (TypeError, ValueError):
                 length = 0
             if length and len(data) < length:
-                # Cut off by a cap: credit only the share that arrived.
-                share = len(data) / length
+                share = len(data) / length      # cut off by a cap: only what arrived
             elif len(data) >= SEGMENT_MAX_BYTES:
-                continue        # over the size cap, length unknown: no honest number
-            elif took >= wall - 0.5:
-                too_slow = True     # still arriving when the clock ran out
-                continue
+                share = None                    # over the size cap, length unknown
+            elif took >= half * 2 - 0.5:
+                share = 0.0                     # still arriving when the clock ran out
             else:
                 share = 1.0
+            if share is not None and share < 1.0 and took >= secs / MIN_HEADROOM:
+                # Unfinished after the time it may take to keep up: too slow,
+                # warm-up segment included.
+                too_slow = True
+            if not share:
+                continue
             if len(data) * 8 / (secs * share) / 1000 < MIN_VIDEO_KBPS:
                 # A few hundred bytes "for" seconds of video is no video feed,
-                # whatever it sniffs as; timing it would inflate headroom.
+                # whatever it sniffs as; timing it would inflate headroom, and
+                # ffprobe would read junk.
                 out["note"] = "too little data to be video"
                 continue
+            first = first or data
+            if n == 0 and len(segs) > 1:
+                continue        # connection set-up (DNS, TLS) would skew it
             got_bytes += len(data)
             got_secs += secs * share
             spent += took
@@ -347,11 +358,12 @@ def score(q: Dict[str, Any]) -> Tuple:
 def summary(q: Dict[str, Any]) -> str:
     """'1080p60 · 6.1 Mbps · 4.2x real-time', or why it could not be measured."""
     parts = []
-    height = q.get("height") or min(q.get("declared_height") or 0, 2160)
+    trusted = bool(q.get("measured"))      # claims count only beside a measurement, as in score()
+    height = q.get("height") or (min(q.get("declared_height") or 0, 2160) if trusted else 0)
     if height:
         fps = q.get("fps")
         parts.append(f"{height}p{round(fps) if fps and fps >= 48 else ''}")
-    kbps = q.get("kbps") or min(q.get("declared_kbps") or 0, 50000)
+    kbps = q.get("kbps") or (min(q.get("declared_kbps") or 0, 50000) if trusted else 0)
     if kbps:
         parts.append(f"{kbps / 1000:.1f} Mbps")
     if q.get("headroom") is not None:
