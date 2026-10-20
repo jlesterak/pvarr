@@ -3998,8 +3998,8 @@ rewritten here.
   the pre-0.8 package versions (sponsor approval: permanent delete).
 - [PENDING] Stale branches on GitHub (`feat/rank`, `feat/rescan`, one agent
   branch): merge or delete, and check their commit messages first.
-- [PENDING] GitHub Releases for v0.9.0 and v0.10.0 (tags and images are
-  published; the Releases page still shows v0.8.3 as latest).
+- [COMPLETED] GitHub Releases for v0.9.0 and v0.10.0, from
+  `docs/release-notes/` (2026-10-20); v0.10.0 is marked latest.
 - [PENDING] Clean-machine install test from the README Quick start.
 - Deferred by decision: arm64 image. Longer CI builds and an untested
   platform; revisit when a user asks.
