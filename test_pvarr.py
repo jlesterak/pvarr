@@ -27,6 +27,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Before any app import: the module-level session/schedule stores read it.
+# The default ./config is the folder a dev container mounts as /config, so a
+# suite run beside a live recording deleted its session record.
+_TEST_CONFIG = tempfile.mkdtemp(prefix="pvarr-test-config-")
+os.environ["PVARR_CONFIG_DIR"] = _TEST_CONFIG
+import atexit
+atexit.register(shutil.rmtree, _TEST_CONFIG, ignore_errors=True)
+
 from app import check_deps, tuner
 from app.naming import (
     StorageManager,

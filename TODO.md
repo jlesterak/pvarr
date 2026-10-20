@@ -4332,6 +4332,12 @@ were not used: site-specific, and possibly paid placement.
   this, an unattended Find kept no record of how it ranked: asked "did it
   rank?" after a scheduled start, the only evidence was the Find's ~70 s
   duration. `test_describe_picks_logs_rank_host_and_measurement_not_the_link`.
+- [COMPLETED] The test suite wrote to `./config`, the folder a dev container
+  mounts as `/config`: a run beside a live recording deleted its session
+  record (no resume after a restart) and left fake sessions a restart would
+  try to resume. Seen 2026-10-20 (session files timestamped mid-run). Now the
+  suite points `PVARR_CONFIG_DIR` at a temp dir before any app import;
+  verified by a full run leaving `config/` untouched.
 - Find went from ~25-30 s to ~40-55 s (FlareSolverr solve included).
 - Every working link was the same 720p ~1.8 Mbps feed relayed by different
   sites, so ranking came down to delivery speed.
