@@ -33,7 +33,7 @@ import subprocess
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -48,6 +48,9 @@ PLAYLIST_TIMEOUT_SEC = 6
 FFPROBE_TIMEOUT_SEC = 10
 
 _EXTINF_RE = re.compile(r"^#EXTINF:\s*([0-9.]+)")
+_GENERIC_PATH_RE = re.compile(
+    r"(?:/(?:hls|live|stream|streams|tv|video|media|playlist))*"
+    r"/(?:index|playlist|master|chunklist|mono|stream|live|video)[\w-]*\.m3u8?")
 
 
 def enabled() -> bool:
@@ -188,6 +191,58 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
     except Exception as exc:  # measuring is a bonus; it must never sink a pick
         out["note"] = f"could not measure: {type(exc).__name__}"
     return out
+
+
+def source_key(m3u8_url: str) -> str:
+    """Which real feed a playlist is, ignoring the edge server and its token.
+
+    Several sites often relay one origin through numbered edge servers
+    (`edge1.cdn.example/hls/abc.m3u8`, `edge4.cdn.example/hls/abc.m3u8?st=...`):
+    as failover these are one source, since they die together when the origin
+    does. Key = host with its digits removed, plus the path; the query (tokens,
+    expiry) is dropped. "" when unknown.
+    """
+    parts = urlsplit(m3u8_url or "")
+    if not parts.hostname:
+        return ""
+    path = parts.path.lower()
+    host = parts.hostname.lower()
+    # Only a path naming a specific stream identifies the feed. A generic one
+    # ("/live/index.m3u8") on tv1.example and tv2.example says nothing about
+    # being the same origin, so then the exact host is kept.
+    if not _GENERIC_PATH_RE.fullmatch(path):
+        host = re.sub(r"\d+", "", host)
+    return f"{host}{path}"
+
+
+def diversify(order: List[int], keys: Dict[int, str], slow: Dict[int, bool], pick: int) -> List[int]:
+    """Choose `pick` of `order` (best first) so the backups are, where possible,
+    different sources from the primary and from each other.
+
+    The primary is always the best. Then: the best stream of each source not
+    yet held, among those that keep up; then the same allowing slow ones (a
+    slow independent backup beats a fast copy of a feed that is already
+    down); then the best of the rest. An unknown key counts as its own source.
+    """
+    if not order:
+        return []
+    chosen = [order[0]]
+    held = {keys.get(order[0]) or f"?{order[0]}"}
+    for allow_slow in (False, True):
+        for i in order[1:]:
+            if len(chosen) >= pick:
+                return chosen
+            key = keys.get(i) or f"?{i}"
+            if i in chosen or key in held or (slow.get(i) and not allow_slow):
+                continue
+            chosen.append(i)
+            held.add(key)
+    for i in order[1:]:
+        if len(chosen) >= pick:
+            break
+        if i not in chosen:
+            chosen.append(i)
+    return chosen
 
 
 def score(q: Dict[str, Any]) -> Tuple:

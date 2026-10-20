@@ -4237,4 +4237,21 @@ were not used: site-specific, and possibly paid placement.
   buckets, headroom as tie-break.
 - After both fixes, two runs: same top two (14.5x, 8.6x), a 0.5-0.9x relay
   correctly ranked below them.
+- Resolving each working link to the playlist it really plays: 6 of 7 were
+  one origin feed on four numbered edge servers, 1 an independent feed. So
+  failover across "three sources" mostly covered an edge dying, not the
+  feed. -> backups now diversified by source (below).
+
+### Backups from different real sources (sponsor, 2026-10-19)
+- [COMPLETED] `quality.source_key`: playlist host with digits removed plus
+  path, query dropped; a generic path (`/live/index.m3u8`) keeps the exact
+  host so unrelated `tv1`/`tv2` hosts are not merged. `quality.diversify`:
+  primary = best; then best of each new source that keeps up; then a slow
+  new source over a copy; then the rest. Only with ranking on.
+- [COMPLETED] Result line: "from N independent sources"; `tried` notes
+  "same source as pick N". Live on the same page: primary an 8.9x edge of
+  the main feed, backup 1 the independent feed, backup 2 another edge.
+- [COMPLETED] Tests: `test_backups_come_from_other_sources`,
+  `test_diversify_prefers_a_slow_independent_backup_over_a_copy`,
+  `test_source_key_ignores_edge_number_and_token`.
 

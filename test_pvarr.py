@@ -8598,6 +8598,42 @@ class TestStreamRanking(unittest.TestCase):
         out = aggregator.pick_first_working(links, probe_fn=self._probe, gather=6, measure_fn=boom)
         self.assertEqual([p["url"] for p in out["picked"]], links)
 
+    def test_backups_come_from_other_sources(self):
+        # Five relays of one origin on numbered edges, one independent feed.
+        links = [f"https://site{i}.example/watch" for i in range(6)]
+        m3u8 = {links[i]: f"https://edge{i}.cdn.example/hls/abc.m3u8?st=t{i}" for i in range(5)}
+        m3u8[links[5]] = "https://other.example/live/game-77/index.m3u8"
+        speed = [14.5, 8.6, 3.0, 2.5, 2.0, 1.8]
+
+        def probe_fn(url):
+            return {"ok": True, "segment_ok": True, "m3u8_url": m3u8[url], "message": "ok"}
+
+        def measure(res, deadline):
+            i = next(n for n, u in enumerate(links) if m3u8[u] == res["m3u8_url"])
+            return {"height": 720, "kbps": 1800, "headroom": speed[i]}
+        out = aggregator.pick_first_working(links, probe_fn=probe_fn, gather=6, measure_fn=measure)
+        self.assertEqual([p["url"] for p in out["picked"]], [links[0], links[5], links[1]])
+        self.assertEqual(out["sources"], 2)
+        notes = {t["url"]: t["note"] for t in out["tried"]}
+        self.assertIn("same source as pick 1", notes[links[1]])
+
+    def test_diversify_prefers_a_slow_independent_backup_over_a_copy(self):
+        order = [0, 1, 2, 3]
+        keys = {0: "a", 1: "a", 2: "a", 3: "b"}
+        self.assertEqual(quality.diversify(order, keys, {3: True}, 3), [0, 3, 1])
+        self.assertEqual(quality.diversify(order, {}, {}, 3), [0, 1, 2])   # unknown = distinct
+        self.assertEqual(quality.diversify([], {}, {}, 3), [])
+
+    def test_source_key_ignores_edge_number_and_token(self):
+        self.assertEqual(quality.source_key("https://edge1.cdn.example/hls/abc.m3u8?st=1"),
+                         quality.source_key("https://EDGE4.cdn.example/hls/abc.m3u8?st=2&e=9"))
+        self.assertNotEqual(quality.source_key("https://edge1.cdn.example/hls/abc.m3u8"),
+                            quality.source_key("https://edge1.cdn.example/hls/xyz.m3u8"))
+        self.assertEqual(quality.source_key(""), "")
+        # A generic path proves nothing: tv1 and tv2 stay distinct.
+        self.assertNotEqual(quality.source_key("https://tv1.example/live/index.m3u8"),
+                            quality.source_key("https://tv2.example/live/index.m3u8"))
+
     def test_score_and_summary(self):
         self.assertLess(quality.score({"height": 720, "headroom": 2.0}),
                         quality.score({"height": 1080, "headroom": 1.2}))

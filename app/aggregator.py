@@ -495,7 +495,14 @@ def pick_first_working(
         measured = _measure_all({i: results[i] for i in working}, measure_fn, abort)
         # Stable sort: equal scores keep page order.
         working.sort(key=lambda i: quality.score(measured.get(i, {})))
-    chosen = working[:pick]
+    keys = {i: quality.source_key(results[i].get("m3u8_url", "")) for i in working}
+    if measured:
+        # Backups from different real sources where possible (several sites
+        # often relay one origin; they die together).
+        slow = {i: quality.score(measured.get(i, {}))[0] == 2 for i in working}
+        chosen = quality.diversify(working, keys, slow, pick)
+    else:
+        chosen = working[:pick]
 
     picked, tried = [], []
     for i in chosen:
@@ -523,10 +530,14 @@ def pick_first_working(
         note = res.get("message", "") if not ok else "works"
         if ok and i in measured:
             rank = chosen.index(i) + 1 if i in chosen else None
+            same = next((n + 1 for n, j in enumerate(chosen)
+                         if j != i and keys.get(j) and keys.get(j) == keys.get(i)), None)
             note = ("works" + (f", pick {rank}" if rank else ", ranked lower")
+                    + (f" (same source as pick {same})" if same else "")
                     + (f": {quality.summary(measured[i])}" if quality.summary(measured[i]) else ""))
         tried.append({"url": url, "ok": ok, "note": note})
-    return {"picked": picked, "tried": tried, "timed_out": timed_out}
+    sources = len({keys.get(i) or f"?{i}" for i in chosen})
+    return {"picked": picked, "tried": tried, "timed_out": timed_out, "sources": sources}
 
 
 def _measure_all(candidates: Dict[int, Dict[str, Any]],
@@ -611,8 +622,10 @@ def find_streams(
     if n:
         result["message"] = (f"{n} working stream{'s' if n != 1 else ''} out of "
                              f"{checked} checked ({len(links)} links on the page)"
-                             + (", best first by measured quality." if any("quality" in p for p in chosen["picked"])
-                                else "."))
+                             + (", best first by measured quality" if any("quality" in p for p in chosen["picked"])
+                                else "")
+                             + (f", from {chosen['sources']} independent source"
+                                f"{'s' if chosen['sources'] != 1 else ''}." if n > 1 else "."))
     else:
         result["message"] = (f"None of the {checked} links checked gave a recordable stream"
                              + (" before the time limit" if chosen["timed_out"] else "") + ".")

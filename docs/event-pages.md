@@ -31,7 +31,18 @@ which runs the same check first when no stream link has been entered. PVArr:
    relay the same feed, bitrates within 0.5 Mbps count as equal and the
    faster delivery wins. Streams are measured one at a time (together they
    share your connection and the numbers stop meaning anything), within 20
-   seconds; one not reached in time keeps its page position. The list under
+   seconds; one not reached in time keeps its page position.
+   **Backups come from different real sources where possible.** Several
+   sites often relay one origin feed through numbered edge servers; as
+   failover those are one source, because they die together. PVArr compares
+   the playlist each link really plays (ignoring the edge server's number and
+   any token; a generic path such as `/live/index.m3u8` keeps the exact
+   host), keeps the best stream as the primary, then takes the best stream of
+   each *other* source, preferring ones that keep up but taking even a slow
+   independent one over another copy of the primary, and only then fills the
+   last slot with another edge of a source already held. The result line
+   says how many independent sources the three picks come from, and the
+   list marks each `same source as pick N`. The list under
    the button shows each measurement, e.g. `works, pick 1: 720p · 1.8 Mbps
    · 8.6x real-time`. `PVARR_RANK_STREAMS=0` turns measuring off: then the
    first three that work fill the slots in page order. Links on private/LAN
