@@ -8672,7 +8672,7 @@ class TestStreamRanking(unittest.TestCase):
         # Half of each 6 s segment arrived: 1 MB per 3 s of video = 2667 kbps.
         self.assertEqual(q["kbps"], 2667)
 
-    TS = (b"\x47" + b"\x00" * 187) * 100      # 18,800 bytes of MPEG-TS
+    TS = (b"\x47" + b"\x00" * 187) * 1000     # 188,000 bytes of MPEG-TS
 
     def _per_url(self, playlist, by_name):
         """Fake fetch: the playlist, then by_name[segment file] (bytes or an exception)."""
@@ -8703,15 +8703,22 @@ class TestStreamRanking(unittest.TestCase):
         with patch.object(quality.probe, "_fetch", side_effect=fake), \
                 patch.object(quality, "_ffprobe", return_value={}):
             q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
-        # seg0 warms up, seg1 is HTML: only seg2's 18,800 B over 2 s counts.
+        # seg0 warms up, seg1 is HTML: only seg2's 188,000 B over 2 s counts.
         self.assertTrue(q["measured"])
-        self.assertEqual(q["kbps"], 75)
+        self.assertEqual(q["kbps"], 752)
         # Nothing but short "G" bodies: never measured.
         fake = self._per_url(playlist, {f"seg{i}.ts": b"GET lost" for i in range(3)})
         with patch.object(quality.probe, "_fetch", side_effect=fake):
             q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
         self.assertFalse(q["measured"])
         self.assertIsNone(q["headroom"])
+        # Sniffs as TS ("G" is 0x47) but 1,000 bytes per 2 s is no video feed.
+        fake = self._per_url(playlist, {f"seg{i}.ts": b"G" * 1000 for i in range(3)})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["measured"])
+        self.assertEqual(q["note"], "too little data to be video")
 
     def test_a_failed_segment_keeps_what_was_measured(self):
         import requests
@@ -8723,7 +8730,7 @@ class TestStreamRanking(unittest.TestCase):
                 patch.object(quality, "_ffprobe", return_value={}):
             q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
         self.assertTrue(q["measured"])
-        self.assertEqual(q["kbps"], 75)
+        self.assertEqual(q["kbps"], 752)
         self.assertIn("ChunkedEncodingError", q["note"])
         # A segment that times out: the stream does not keep up.
         fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
@@ -8733,6 +8740,21 @@ class TestStreamRanking(unittest.TestCase):
             q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
         self.assertTrue(q["measured"])
         self.assertLessEqual(q["headroom"], 1.0)
+        # A stall mid-body surfaces as a ConnectionError after the read
+        # timeout, not a Timeout: still too slow.
+        now = [1000.0]
+        base = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
+                                        "seg2.ts": requests.exceptions.ConnectionError("stalled")})
+
+        def fake(session, url, hdrs, timeout, max_bytes=0):
+            now[0] += 9.0 if url.endswith("seg2.ts") else 0.1
+            return base(session, url, hdrs, timeout, max_bytes)
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}), \
+                patch.object(quality.time, "monotonic", side_effect=lambda: now[0]):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertLessEqual(q["headroom"], 1.0)
+        self.assertEqual(quality.score(q)[0], 2)
 
     def test_source_key_keeps_ips_ports_and_path_case(self):
         k = quality.source_key

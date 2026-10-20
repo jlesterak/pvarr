@@ -4280,9 +4280,16 @@ were not used: site-specific, and possibly paid placement.
 - [COMPLETED] `source_key`: IP hosts kept exact (were collapsed to "..."),
   path case kept, port kept; `summary()` caps claimed height/bitrate like
   `score()`. `test_source_key_keeps_ips_ports_and_path_case`.
+- [COMPLETED] Validator round 3 (R1 failed): a stall mid-body surfaces as a
+  ConnectionError (urllib3 ReadTimeoutError inside), not a Timeout, so it was
+  skipped and the stream ranked as keeping up (387x). Now any segment failing
+  after a full read timeout is too slow. Contrived bodies ("G" x 1000, a
+  3-packet TS) sniffed as video at 47-235x: under 100 kbps is now "too little
+  data to be video", unmeasured.
 - Known limit, left open (same as the probe): a server trickling its
-  response *headers* keeps an abandoned measure thread alive (requests has no
-  total timeout before the body). Bounded: the thread is a daemon, Find is
+  response *headers*, or a body under 8 KB at ~1 B/s, keeps an abandoned
+  measure thread alive (requests has no total timeout before the body, and
+  probe._fetch checks its clock between chunks). Bounded: the thread is a daemon, Find is
   not held, and an abandoned measurement ends measuring for that Find.
 
 ### Backups from different real sources (sponsor, 2026-10-19)

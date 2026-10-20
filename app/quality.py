@@ -49,6 +49,7 @@ SEGMENT_MAX_BYTES = 12 * 1024 * 1024    # ~10 s of 8 Mbps video, with margin
 SEGMENT_TIMEOUT_SEC = 12                # wall clock per segment
 PLAYLIST_TIMEOUT_SEC = 6
 FFPROBE_TIMEOUT_SEC = 10
+MIN_VIDEO_KBPS = 100    # below this it is not a video feed, whatever it sniffs as
 
 _EXTINF_RE = re.compile(r"^#EXTINF:\s*([0-9.]+)")
 _GENERIC_PATH_RE = re.compile(
@@ -187,10 +188,12 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 r, data = probe._fetch(plain, url, headers, SEGMENT_TIMEOUT_SEC // 2,
                                        max_bytes=SEGMENT_MAX_BYTES)
             except probe._FETCH_ERRORS as exc:
-                # One bad segment keeps what the others measured. A timeout
-                # is a stream that stalled: it does not keep up.
+                # One bad segment keeps what the others measured. A stall
+                # (before the headers: Timeout; mid-body: a ConnectionError
+                # after a full read timeout) is a stream that does not keep up.
                 out["note"] = f"segment failed: {type(exc).__name__}"
-                too_slow = too_slow or isinstance(exc, requests.Timeout)
+                too_slow = too_slow or isinstance(exc, requests.Timeout) \
+                    or time.monotonic() - t0 >= SEGMENT_TIMEOUT_SEC // 2
                 continue
             took = time.monotonic() - t0
             if not (r.ok and data):
@@ -221,6 +224,9 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             spent += took
         if not first and not too_slow:
             out["note"] = out["note"] or "segment is not video"
+            return out
+        if got_secs and got_bytes * 8 / got_secs / 1000 < MIN_VIDEO_KBPS and not too_slow:
+            out["note"] = "too little data to be video"
             return out
         if got_secs and spent > 0:
             out["kbps"] = round(got_bytes * 8 / got_secs / 1000)
