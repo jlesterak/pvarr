@@ -3923,7 +3923,7 @@ PVArr's fixed 60 s cap failed it every time.
 
 ---
 
-## Phase 28: Public relaunch prep (2026-10-08) [COMPLETED -- sponsor review pending]
+## Phase 28: Public relaunch prep (2026-10-08) [COMPLETED -- sponsor signed off 2026-10-20]
 
 Branch `relaunch/clean`. The public repo will be re-created from one squashed
 commit of this tree, so only the final tree has to be clean; history is not
@@ -3989,6 +3989,20 @@ rewritten here.
   messages are clean too. Remaining hits are deliberate: one pronunciation
   line in the README, "Pittsburgh Pirates" in the team snapshot, and
   `impersonate` as curl_cffi's/yt-dlp's own option name.
+
+### Follow-ups before announcing (2026-10-20)
+- [PENDING] (low priority) Leak test of old images. GHCR still serves
+  `0.1.0`-`0.7.x` and their `sha-*` tags, built before `.dockerignore`
+  dropped `*.md`, so they may contain the pre-scrub `TODO.md`. Pull one,
+  grep it against the private liability list; if anything turns up, delete
+  the pre-0.8 package versions (sponsor approval: permanent delete).
+- [PENDING] Stale branches on GitHub (`feat/rank`, `feat/rescan`, one agent
+  branch): merge or delete, and check their commit messages first.
+- [PENDING] GitHub Releases for v0.9.0 and v0.10.0 (tags and images are
+  published; the Releases page still shows v0.8.3 as latest).
+- [PENDING] Clean-machine install test from the README Quick start.
+- Deferred by decision: arm64 image. Longer CI builds and an untested
+  platform; revisit when a user asks.
 
 ---
 
