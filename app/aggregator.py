@@ -46,12 +46,17 @@ from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
-from app import eventinfo, probe
+from app import eventinfo, probe, quality
 
 logger = logging.getLogger("PVArrAggregator")
 
 MAX_LINKS = 20
 PICK = 3
+# With ranking on, up to GATHER working links are collected and measured
+# (app/quality.py), and the best PICK of them kept. RANK_BUDGET_SEC bounds the
+# measuring, which runs all candidates at once.
+GATHER = 6
+RANK_BUDGET_SEC = 20
 PROBE_WORKERS = 6
 # Per-request timeout for each link's probe. Shorter than the probe's default:
 # a dead link that blackholes would otherwise spend the whole budget on a few
@@ -424,8 +429,14 @@ def pick_first_working(
     workers: int = PROBE_WORKERS,
     budget: float = PROBE_BUDGET_SEC,
     abort: Optional[threading.Event] = None,
+    gather: Optional[int] = None,
+    measure_fn: Optional[Callable[[Dict[str, Any], float], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Probe links concurrently; keep the first `pick` that work, in link order.
+
+    With `measure_fn`, up to `gather` working links are collected the same
+    way, each is measured (all at once, within RANK_BUDGET_SEC), and the best
+    `pick` by quality.score are kept, best first; ties keep page order.
 
     "First" means page order, not finishing order: a fast link further down
     must not displace a slower one above it. So the search ends only once the
@@ -439,6 +450,7 @@ def pick_first_working(
     interpreter exit -- the executor's workers are joined then -- which held
     a container stop for close to a minute.
     """
+    want = max(pick, gather or pick) if measure_fn else pick
     results: Dict[int, Dict[str, Any]] = {}
     deadline = time.monotonic() + budget
     pool = ThreadPoolExecutor(max_workers=max(1, workers))
@@ -451,7 +463,7 @@ def pick_first_working(
                 return False
             if _works(results[i]):
                 found += 1
-                if found >= pick:
+                if found >= want:
                     return True
         return True
 
@@ -477,7 +489,30 @@ def pick_first_working(
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
+    working = [i for i in range(len(links)) if i in results and _works(results[i])][:want]
+    measured: Dict[int, Dict[str, Any]] = {}
+    if measure_fn and len(working) > 1 and not (abort is not None and abort.is_set()):
+        measured = _measure_all({i: results[i] for i in working}, measure_fn, abort)
+        # Stable sort: equal scores keep page order.
+        working.sort(key=lambda i: quality.score(measured.get(i, {})))
+    chosen = working[:pick]
+
     picked, tried = [], []
+    for i in chosen:
+        res = results[i]
+        q = measured.get(i)
+        message = res.get("message", "")
+        if q:
+            message = f"{quality.summary(q)} -- {message}" if quality.summary(q) else message
+        picked.append({
+            "url": links[i],
+            "m3u8_url": res.get("m3u8_url", ""),
+            "referer": res.get("referer", ""),
+            "user_agent": res.get("user_agent", ""),
+            "impersonate": bool(res.get("impersonate")),
+            "message": message,
+            **({"quality": q} if q else {}),
+        })
     for i, url in enumerate(links):
         res = results.get(i)
         if res is None:
@@ -485,18 +520,31 @@ def pick_first_working(
                           "note": "not checked (time budget)" if timed_out else "not needed"})
             continue
         ok = _works(res)
-        if ok and len(picked) < pick:
-            picked.append({
-                "url": url,
-                "m3u8_url": res.get("m3u8_url", ""),
-                "referer": res.get("referer", ""),
-                "user_agent": res.get("user_agent", ""),
-                "impersonate": bool(res.get("impersonate")),
-                "message": res.get("message", ""),
-            })
-        tried.append({"url": url, "ok": ok,
-                      "note": res.get("message", "") if not ok else "works"})
+        note = res.get("message", "") if not ok else "works"
+        if ok and i in measured:
+            rank = chosen.index(i) + 1 if i in chosen else None
+            note = ("works" + (f", pick {rank}" if rank else ", ranked lower")
+                    + (f": {quality.summary(measured[i])}" if quality.summary(measured[i]) else ""))
+        tried.append({"url": url, "ok": ok, "note": note})
     return {"picked": picked, "tried": tried, "timed_out": timed_out}
+
+
+def _measure_all(candidates: Dict[int, Dict[str, Any]],
+                 measure_fn: Callable[[Dict[str, Any], float], Dict[str, Any]],
+                 abort: Optional[threading.Event] = None) -> Dict[int, Dict[str, Any]]:
+    """Measure candidates one at a time, in page order, until the budget runs
+    out; the rest count as unmeasured. One at a time on purpose: measured
+    together they share the link and the numbers stop meaning anything."""
+    deadline = time.monotonic() + RANK_BUDGET_SEC
+    out: Dict[int, Dict[str, Any]] = {}
+    for i in sorted(candidates):
+        if time.monotonic() > deadline or (abort is not None and abort.is_set()):
+            break
+        try:
+            out[i] = measure_fn(candidates[i], deadline)
+        except Exception:  # a measuring bug must not sink the pick
+            pass
+    return out
 
 
 def find_streams(
@@ -547,14 +595,24 @@ def find_streams(
                              "them after a click or a login, paste the stream pages directly.")
         return result
 
-    chosen = pick_first_working(links, probe_fn=probe_fn, abort=abort)
+    # Ranking: a public page's streams may not lead PVArr onto the LAN, the
+    # same rule as the links themselves.
+    allow_private = probe.is_private_url(target)
+    measure = None
+    if quality.enabled():
+        def measure(res, deadline):
+            return quality.measure(res, allow_private=allow_private, deadline=deadline)
+    chosen = pick_first_working(links, probe_fn=probe_fn, abort=abort,
+                                gather=GATHER, measure_fn=measure)
     result.update(picked=chosen["picked"], tried=chosen["tried"])
     result["ok"] = bool(chosen["picked"])
     n = len(chosen["picked"])
     checked = sum(1 for t in chosen["tried"] if not t["note"].startswith("not "))
     if n:
         result["message"] = (f"{n} working stream{'s' if n != 1 else ''} out of "
-                             f"{checked} checked ({len(links)} links on the page).")
+                             f"{checked} checked ({len(links)} links on the page)"
+                             + (", best first by measured quality." if any("quality" in p for p in chosen["picked"])
+                                else "."))
     else:
         result["message"] = (f"None of the {checked} links checked gave a recordable stream"
                              + (" before the time limit" if chosen["timed_out"] else "") + ".")

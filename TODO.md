@@ -4200,3 +4200,35 @@ LIVE label, link titles), no site's markup, so nothing site-specific ships.
 - Times are shown in the browser's time zone; the page's own text ("Today
   at 6:15 PM") is ignored in favour of the epoch.
 
+## Phase 33: Rank found streams by measured quality (2026-10-19) [IN PROGRESS -- validation pending]
+
+Sponsor: "would it take way too much time/processing to analyze each stream
+(or the top three) for quality and pick the best one?" Answer: no, if it
+stops at headers. Page badges an event page may show (tiers, "featured")
+were not used: site-specific, and possibly paid placement.
+
+### Built
+- [COMPLETED] `app/quality.py`: per working candidate, best variant of the
+  playlist, three recent segments (newest skipped: a relay may still be
+  filling it; first one only warms the connection), timed for headroom;
+  ffprobe on one segment (headers only) for resolution/fps/codec. Private
+  playlist/segment URLs refused for a public page. Never raises.
+- [COMPLETED] `aggregator.pick_first_working(gather=, measure_fn=)`: up to
+  GATHER=6 working links, measured one at a time in page order within
+  RANK_BUDGET_SEC=20, sorted by `quality.score` (keeps up >= 1.5x, then
+  height, >= 48 fps, bitrate in 500 kbps steps, headroom), best 3 kept.
+  `tried` notes carry each measurement. `PVARR_RANK_STREAMS=0` = old order.
+- [COMPLETED] Tests: `TestStreamRanking` (8), incl. ffprobe on a real
+  generated segment; the rest of the suite runs with ranking off.
+
+### Measured live, 2026-10-19 (one event page, Monday night)
+- Find went from ~25-30 s to ~40-55 s (FlareSolverr solve included).
+- Every working link was the same 720p ~1.8 Mbps feed relayed by different
+  sites, so ranking came down to delivery speed.
+- First attempt measured all six at once: one stream read 1-7x. Alone it
+  read 6-11x run after run. They were measuring each other -> now one at a
+  time. Bitrate 1.7 vs 1.8 Mbps was noise deciding the order -> 500 kbps
+  buckets, headroom as tie-break.
+- After both fixes, two runs: same top two (14.5x, 8.6x), a 0.5-0.9x relay
+  correctly ranked below them.
+

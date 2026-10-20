@@ -22,9 +22,21 @@ which runs the same check first when no stream link has been entered. PVArr:
 3. runs the normal probe on up to 20 of them, six at a time, and stops
    after about a minute (plus the page fetch: up to about three and a half
    minutes in all when FlareSolverr is involved, with its default 120 s cap);
-4. puts the first three that work into the three slots, **in page order** —
-   such pages usually list their best links first. Links on private/LAN
-   addresses are never followed from a public page.
+4. collects up to six that work (in page order), **measures each one** —
+   real resolution and frame rate (ffprobe on one segment, headers only),
+   bitrate, and *headroom*: how much faster than real time its segments
+   download — and puts the best three into the slots, best first. A stream
+   under 1.5× real time ranks below every stream that keeps up, whatever its
+   resolution, because it would stall and fail over. When several sites
+   relay the same feed, bitrates within 0.5 Mbps count as equal and the
+   faster delivery wins. Streams are measured one at a time (together they
+   share your connection and the numbers stop meaning anything), within 20
+   seconds; one not reached in time keeps its page position. The list under
+   the button shows each measurement, e.g. `works, pick 1: 720p · 1.8 Mbps
+   · 8.6x real-time`. `PVARR_RANK_STREAMS=0` turns measuring off: then the
+   first three that work fill the slots in page order. Links on private/LAN
+   addresses are never followed from a public page, and neither are
+   playlists or segments that point there.
 
 Each slot gets the stream *page* (not its m3u8) and no headers, so failover
 re-resolves a fresh token and fresh headers exactly as if you had pasted the

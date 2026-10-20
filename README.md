@@ -68,7 +68,7 @@ To build from source, pin a version, or run without Docker, see [Installation an
 
 The card shows which source is live, how much has been captured, and any segments the source failed to deliver. Click a source to switch to it, or **Force Failover** to move on. When the recording stops it is remuxed to `.mp4` and appears in the **Library** tab. If the probe goes red, [Finding the stream URL](docs/finding-streams.md) explains what each result means.
 
-If you have a page that links to several sources for the same event, paste it into **Event page** and press **Find 3 streams**: PVArr checks the links on it and fills the three slots with the first three that actually play. **Read game** fills in the teams, league and start/end times from that page instead, or lists the games on a page that links to many, to pick one and schedule it. See [Event pages](docs/event-pages.md).
+If you have a page that links to several sources for the same event, paste it into **Event page** and press **Find 3 streams**: PVArr checks the links on it, measures the ones that play (resolution, bitrate, how fast they arrive) and fills the three slots with the best three. **Read game** fills in the teams, league and start/end times from that page instead, or lists the games on a page that links to many, to pick one and schedule it. See [Event pages](docs/event-pages.md).
 
 ## Scheduling
 
