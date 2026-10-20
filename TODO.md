@@ -4171,6 +4171,15 @@ LIVE label, link titles), no site's markup, so nothing site-specific ships.
 - [COMPLETED] A malformed link (`http://[::1`) made `urljoin` raise: skipped.
 - [COMPLETED] "Python vs JavaScript: which to learn" gave the sport
   ": which to learn": leading punctuation stripped from the label.
+- [COMPLETED] Second round (fresh validator, 2026-10-19), E1 failed again:
+  `str.isdigit()` accepts "²" and 5,000-digit strings that `int()` refuses,
+  so a schema.org startDate or a long `data-timestamp` raised out of
+  `parse()` (Read game answered 500; Find survived); the end-of-title regex
+  went quadratic on a whitespace run in `og:title` (40k spaces: 50 s); and a
+  400k-item JSON-LD list took 22 s (`list.pop(0)`). Fixed: ASCII digits
+  only and a length cap on times, meta content collapsed and capped, every
+  regexed text capped, a deque, and `parse()` / `read_event` both guard the
+  page-level read. Same test, extended.
 - Accepted: a link like "Home - About" laid out as two text pieces, or
   "Tabs vs Spaces", can appear in the pick list, and a finished game is
   listed with no time. The operator picks from the list, so this costs a

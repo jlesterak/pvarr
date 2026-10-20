@@ -588,7 +588,11 @@ def read_event(
     if not page["ok"]:
         result["message"] = page["message"]
         return result
-    found = eventinfo.parse(page["html"], page["url"])
+    try:
+        found = eventinfo.parse(page["html"], page["url"])
+    except Exception:
+        logger.exception("Could not read the game from %s", page["url"])
+        found = {"event": None, "events": []}
     result.update(found)
     result["ok"] = bool(found["event"] or found["events"])
     if found["events"]:

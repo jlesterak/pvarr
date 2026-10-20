@@ -8459,6 +8459,22 @@ class TestEventInfo(unittest.TestCase):
         eventinfo.parse("<h1>" + "a - " * 20000 + "</h1>" + ("<a href='/x' title='" + "a - " * 2000 + "'>y</a>") * 5,
                         "https://x.example/")
         self.assertLess(_t.monotonic() - t0, 2.0)
+        # Second validation round: digits int() rejects, whitespace runs in
+        # meta content, a huge JSON-LD list, an oversized timestamp mid-page.
+        for page in (
+            '<script type="application/ld+json">{"@type":"SportsEvent","name":"A vs B","startDate":"\u00b2"}</script>',
+            '<script type="application/ld+json">{"@type":"SportsEvent","name":"A vs B","startDate":"' + "9" * 5000 + '"}</script>',
+        ):
+            eventinfo.parse(page, "https://x.example/")
+        t0 = _t.monotonic()
+        eventinfo.parse('<h1>Colorado Avalanche vs Philadelphia Flyers</h1><meta property="og:title" content="A'
+                        + " " * 200000 + 'x">', "https://x.example/")
+        eventinfo.parse('<script type="application/ld+json">[' + ",".join(["1"] * 400000) + ']</script>',
+                        "https://x.example/")
+        self.assertLess(_t.monotonic() - t0, 3.0)
+        ev = eventinfo.parse('<div data-timestamp="' + "9" * 5000 + '"></div><h1>Colorado Avalanche vs Philadelphia Flyers</h1>',
+                             "https://x.example/")["event"]
+        self.assertEqual(ev["team_a"], "Colorado Avalanche")
 
     def test_find_streams_survives_an_unreadable_event(self):
         from unittest.mock import patch

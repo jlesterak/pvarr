@@ -22,6 +22,7 @@ as before.
 import json
 import re
 import time
+from collections import deque
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,12 +56,14 @@ _SKIP_CHUNK = re.compile(r"^(?:live|\||vs\.?|v|@|-|\d+|streams?|watch.*)$", re.I
 def _epoch(value: str) -> Optional[float]:
     """A plausible event time from an attribute: Unix seconds or ms, or ISO 8601."""
     v = (value or "").strip()
-    if v.isdigit():
+    if len(v) > 40:
+        return None
+    if v.isascii() and v.isdigit():     # isdigit alone accepts "²"
         n = int(v) / (1000 if len(v) == 13 else 1)
         return float(n) if _EARLIEST <= n <= _LATEST else None
     try:
         n = datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         return None
     # A bare date or a time without an offset is ambiguous; ignore it.
     return n if "T" in v and ("+" in v[10:] or v.endswith("Z") or "-" in v[10:]) \
@@ -103,7 +106,9 @@ class _Scan(HTMLParser):
         elif tag == "meta":
             name = (a.get("property") or a.get("name") or "").lower()
             if name in ("og:title", "og:description", "description"):
-                self.meta.setdefault(name, a.get("content", ""))
+                # Collapsed and capped: the regexes below must never see a
+                # 40,000-space run (quadratic backtracking).
+                self.meta.setdefault(name, " ".join(a.get("content", "")[:2000].split()))
         elif tag in ("title", "h1") and not self._in:
             self._in, self._buf = tag, []
         elif tag == "a" and a.get("href") and self._link is None:
@@ -200,12 +205,12 @@ def _from_ld(blocks: List[str]) -> Optional[Dict[str, Any]]:
             data = json.loads(raw)
         except (ValueError, RecursionError):   # junk, or nested past the stack
             continue
-        stack = data if isinstance(data, list) else [data]
+        stack = deque(data if isinstance(data, list) else [data])
         while stack:
-            item = stack.pop(0)
+            item = stack.popleft()
             if not isinstance(item, dict):
                 continue
-            stack += item.get("@graph", []) if isinstance(item.get("@graph"), list) else []
+            stack.extend(item["@graph"] if isinstance(item.get("@graph"), list) else [])
             kind = item.get("@type")
             kinds = kind if isinstance(kind, list) else [kind]
             if not any(k in ("SportsEvent", "Event", "BroadcastEvent") for k in kinds):
@@ -278,7 +283,7 @@ def _label_after(chunks: List[str], teams: Tuple[str, str]) -> str:
     except ValueError:
         start = 0
     for c in chunks[start:]:
-        if c not in teams and not _SKIP_CHUNK.match(c) and len(c) <= 40:
+        if len(c) <= 40 and c not in teams and not _SKIP_CHUNK.match(c):
             return c
     return ""
 
@@ -303,7 +308,10 @@ def _page_event(scan: _Scan, page_url: str) -> Optional[Dict[str, Any]]:
     if not label:
         # "A vs B <League> Live Stream": what follows team B in the title.
         for text in (scan.meta.get("og:title"), scan.meta.get("title")):
-            text = _TAIL_RE.sub("", (text or "").split(" | ")[0])
+            text = (text or "").split(" | ")[0]
+            if len(text) > MAX_VS_TEXT:
+                continue
+            text = _TAIL_RE.sub("", text)
             if teams[1] in text:
                 label = text.split(teams[1], 1)[1].strip(" -|:–")
                 if label:
@@ -353,7 +361,11 @@ def parse(html: str, page_url: str) -> Dict[str, Any]:
         if len(events) >= MAX_EVENTS:
             break
     events.sort(key=lambda e: (not e["live"], e["start_at"] or 0))
-    return {"event": _page_event(scan, page_url), "events": events}
+    try:
+        event = _page_event(scan, page_url)
+    except Exception:   # never let odd markup cost the caller anything
+        event = None
+    return {"event": event, "events": events}
 
 
 def window(event: Dict[str, Any], now: Optional[float] = None) -> Tuple[float, float]:
