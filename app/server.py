@@ -559,6 +559,8 @@ async def aggregate_url(
         result = await _scan_in_daemon_thread(
             "find", url.strip(), (cookie or "").strip() or None,
             (user_agent or "").strip() or None, fs_retry=True)
+    if not (result or {}).get("error"):
+        logger.info("Find picks: %s", schedules.describe_picks(result))
     return JSONResponse(content=result)
 
 

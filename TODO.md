@@ -4327,7 +4327,7 @@ were not used: site-specific, and possibly paid placement.
   generated segment; the rest of the suite runs with ranking off.
 
 ### Measured live, 2026-10-19 (one event page, Monday night)
-- [COMPLETED] Scheduled starts and re-checks log the picks and their
+- [COMPLETED] Find, scheduled starts and re-checks log the picks and their
   measurements (`schedules.describe_picks`), host only (2026-10-20). Before
   this, an unattended Find kept no record of how it ranked: asked "did it
   rank?" after a scheduled start, the only evidence was the Find's ~70 s
