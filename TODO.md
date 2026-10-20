@@ -4090,7 +4090,7 @@ to compare leagues and regular season against playoffs.
   Autocomplete offers the short tags, which avoid it.
 
 
-## Phase 31: "Deliberately not fixed" items, fixed or closed (2026-10-18) [COMPLETED -- release with the next version]
+## Phase 31: "Deliberately not fixed" items, fixed or closed (2026-10-18) [COMPLETED -- released in v0.10.0]
 
 The sponsor asked for every "still open, deliberately not fixed" item to be fixed or closed.
 
@@ -4120,7 +4120,7 @@ The sponsor asked for every "still open, deliberately not fixed" item to be fixe
 Verify: `python3 -m pytest -q` -> 705 passed, 1 failed (`test_an_unwritable_directory_raises_rather_than_lying`
 fails only when run as root, as in the cloud sandbox; it fails the same on the unchanged code).
 
-## Phase 32: Read the game from the event page (2026-10-19) [COMPLETED -- release with the next version]
+## Phase 32: Read the game from the event page (2026-10-19) [COMPLETED -- released in v0.10.0]
 
 Sponsor request: match events more easily, either from an event database or
 by reading the event/stream pages themselves.
