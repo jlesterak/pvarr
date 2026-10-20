@@ -9,7 +9,7 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 - **Find 3 streams** ranks what it finds: up to six working streams are measured (real resolution, frame rate, bitrate, download speed against real time) and the best three fill the slots, best first; a stream that cannot keep up ranks last. Backups are taken from different real sources where possible: links that relay the same origin feed through different edge servers count as one source, since they fail together. `PVARR_RANK_STREAMS=0` keeps the old page order.
 
 ### Changed
-- **Find 3 streams** probes up to 40 links on an event page, up from 20. It still stops at the first three that work.
+- **Find 3 streams** probes up to 40 links on an event page, up from 20. It stops once it has enough working ones: three, or up to six to rank when ranking is on.
 
 ### Fixed
 - **Force Failover** stayed greyed out once a recording reached its last source, although the server wraps back to the first. It is now disabled only for a single-source recording.
