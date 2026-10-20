@@ -6,6 +6,7 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ### Added
 - A recording started from an event page re-checks it when two of its sources die, and swaps fresh working links into the dead slots (never the one recording), skipping the links it already holds. Automatically at most once per 10 minutes, never delaying a scheduled start; also on demand with **Re-check event page** on the card (`POST /api/recordings/{id}/rescan`).
+- **Find 3 streams** ranks what it finds: up to six working streams are measured (real resolution, frame rate, bitrate, download speed against real time) and the best three fill the slots, best first; a stream that cannot keep up ranks last. Backups are taken from different real sources where possible: links that relay the same origin feed through different edge servers count as one source, since they fail together. `PVARR_RANK_STREAMS=0` keeps the old page order.
 
 ### Changed
 - **Find 3 streams** probes up to 40 links on an event page, up from 20. It still stops at the first three that work.

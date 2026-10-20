@@ -4292,3 +4292,103 @@ agreed the same day: automatic re-check plus a button.
   pre-fix code found anything.
 - [PENDING] Live re-check with `exclude` on the next event-page recording
   (container restarted onto 9c96d27 the same evening).
+
+## Phase 33: Rank found streams by measured quality (2026-10-19) [IN PROGRESS -- validation pending]
+
+Sponsor: "would it take way too much time/processing to analyze each stream
+(or the top three) for quality and pick the best one?" Answer: no, if it
+stops at headers. Page badges an event page may show (tiers, "featured")
+were not used: site-specific, and possibly paid placement.
+
+### Built
+- [COMPLETED] `app/quality.py`: per working candidate, best variant of the
+  playlist, three recent segments (newest skipped: a relay may still be
+  filling it; first one only warms the connection), timed for headroom;
+  ffprobe on one segment (headers only) for resolution/fps/codec. Private
+  playlist/segment URLs refused for a public page. Never raises.
+- [COMPLETED] `aggregator.pick_first_working(gather=, measure_fn=)`: up to
+  GATHER=6 working links, measured one at a time in page order within
+  RANK_BUDGET_SEC=20, sorted by `quality.score` (keeps up >= 1.5x, then
+  height, >= 48 fps, bitrate in 500 kbps steps, headroom), best 3 kept.
+  `tried` notes carry each measurement. `PVARR_RANK_STREAMS=0` = old order.
+- [COMPLETED] Tests: `TestStreamRanking` (19), incl. ffprobe on a real
+  generated segment; the rest of the suite runs with ranking off.
+
+### Measured live, 2026-10-19 (one event page, Monday night)
+- Find went from ~25-30 s to ~40-55 s (FlareSolverr solve included).
+- Every working link was the same 720p ~1.8 Mbps feed relayed by different
+  sites, so ranking came down to delivery speed.
+- First attempt measured all six at once: one stream read 1-7x. Alone it
+  read 6-11x run after run. They were measuring each other -> now one at a
+  time. Bitrate 1.7 vs 1.8 Mbps was noise deciding the order -> 500 kbps
+  buckets, headroom as tie-break.
+- After both fixes, two runs: same top two (14.5x, 8.6x), a 0.5-0.9x relay
+  correctly ranked below them.
+- Resolving each working link to the playlist it really plays: 6 of 7 were
+  one origin feed on four numbered edge servers, 1 an independent feed. So
+  failover across "three sources" mostly covered an edge dying, not the
+  feed. -> backups now diversified by source (below).
+
+### Independent validation, 2026-10-19 -- R1 failed, fixed
+- [COMPLETED] HIGH: measuring ran synchronously in the scan thread and its
+  deadline was only checked between segments; `probe._fetch`'s wall clock is
+  only checked between 8 KB chunks, so a segment trickling 1 B/s held Find
+  (and the event-page lock, so every scheduled scan) for hours. A regression:
+  the probe phase was hard-bounded. Fixed: each measurement runs on a daemon
+  thread joined with the remaining budget and abandoned at the deadline
+  (`_measure_all`); `test_a_stalled_measurement_cannot_hold_find`; the
+  validator's fake-origin `budget`/`drip` cases now stop at 20.0 s.
+- [COMPLETED] A segment cut off by the size or time cap was credited its
+  full EXTINF (inflated headroom, understated bitrate). Now: with a
+  Content-Length, only the share that arrived counts; over the size cap
+  without one, the segment is skipped; still arriving at the time cap =
+  too slow. `test_a_cut_off_segment_is_credited_only_its_share`.
+- [COMPLETED] An HTML 200 counted as measured (1501x) and the playlist's
+  RESOLUTION=1x99999 then ranked first. Now a non-media first segment means
+  unmeasured, and a measured resolution always beats a claimed one (claims
+  capped at 2160p). `test_non_video_and_absurd_declared_resolution_do_not_win`.
+- [COMPLETED] Measurement sessions are closed; stale "all at once" comments
+  and the inconsistent time claims in the docs corrected.
+
+### Independent validation round 2, 2026-10-19 -- R1 failed, fixed 2026-10-20
+- [COMPLETED] HIGH: any body under 189 bytes starting "G" sniffed as MPEG-TS,
+  and only the first segment was sniffed at all, so HTML 200s on later
+  segments were timed as video. Now TS needs 0x47 at 0/188/376, every
+  segment is sniffed and a non-media one is never credited; no media at all =
+  unmeasured. `test_media_sniff_needs_three_sync_bytes`,
+  `test_only_media_segments_are_credited`.
+- [COMPLETED] A ChunkedEncodingError/ReadTimeout on segment 2 or 3 threw
+  away the whole measurement. Now caught per segment: the rest still count,
+  and a timeout marks the stream too slow.
+  `test_a_failed_segment_keeps_what_was_measured`.
+- [COMPLETED] `_measure_all` ignored `abort` while waiting on a measurement
+  (up to 20 s at shutdown); now polled every 0.25 s.
+  `test_abort_ends_a_measurement_wait_at_once`.
+- [COMPLETED] `source_key`: IP hosts kept exact (were collapsed to "..."),
+  path case kept, port kept; `summary()` caps claimed height/bitrate like
+  `score()`. `test_source_key_keeps_ips_ports_and_path_case`.
+- [COMPLETED] Validator round 3 (R1 failed): a stall mid-body surfaces as a
+  ConnectionError (urllib3 ReadTimeoutError inside), not a Timeout, so it was
+  skipped and the stream ranked as keeping up (387x). Now any segment failing
+  after a full read timeout is too slow. Contrived bodies ("G" x 1000, a
+  3-packet TS) sniffed as video at 47-235x: under 100 kbps is now "too little
+  data to be video", unmeasured.
+- Known limit, left open (same as the probe): a server trickling its
+  response *headers*, or a body under 8 KB at ~1 B/s, keeps an abandoned
+  measure thread alive (requests has no total timeout before the body, and
+  probe._fetch checks its clock between chunks). Bounded: the thread is a daemon, Find is
+  not held, and an abandoned measurement ends measuring for that Find.
+
+### Backups from different real sources (sponsor, 2026-10-19)
+- [COMPLETED] `quality.source_key`: playlist host with digits removed plus
+  path, query dropped; a generic path (`/live/index.m3u8`) keeps the exact
+  host so unrelated `tv1`/`tv2` hosts are not merged. `quality.diversify`:
+  primary = best; then best of each new source that keeps up; then a slow
+  new source over a copy; then the rest. Only with ranking on.
+- [COMPLETED] Result line: "from N independent sources"; `tried` notes
+  "same source as pick N". Live on the same page: primary an 8.9x edge of
+  the main feed, backup 1 the independent feed, backup 2 another edge.
+- [COMPLETED] Tests: `test_backups_come_from_other_sources`,
+  `test_diversify_prefers_a_slow_independent_backup_over_a_copy`,
+  `test_source_key_ignores_edge_number_and_token`.
+

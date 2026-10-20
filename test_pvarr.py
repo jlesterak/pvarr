@@ -57,6 +57,9 @@ from app.recorder import (
 
 # The modules log at INFO on import; silence it so test output stays readable.
 logging.disable(logging.CRITICAL)
+# Stream ranking downloads real segments; off for every test that does not
+# ask for it (TestStreamRanking turns it back on with fakes).
+os.environ["PVARR_RANK_STREAMS"] = "0"
 
 HAS_FFMPEG = bool(check_deps.find_executable("ffmpeg"))
 
@@ -8725,6 +8728,295 @@ class TestEventInfoEndpoint(ServerTestCase):
             lock.release()
         r = self.client.post("/api/event-info", data={"url": "https://a/" + "x" * 5000})
         self.assertEqual(r.status_code, 400)
+
+
+
+# --------------------------------------------------------------------------
+# app.quality + ranking in aggregator.pick_first_working
+# --------------------------------------------------------------------------
+from app import quality  # noqa: E402
+
+
+class TestStreamRanking(unittest.TestCase):
+    def _probe(self, url):
+        return {"ok": True, "segment_ok": True, "m3u8_url": url + "/index.m3u8", "message": "ok"}
+
+    def test_best_quality_first_and_slow_streams_last(self):
+        links = [f"https://s{i}.example/live" for i in range(5)]
+        q = {
+            links[0]: {"height": 720, "fps": 30, "kbps": 3000, "headroom": 4.0},
+            links[1]: {"height": 1080, "fps": 60, "kbps": 6000, "headroom": 1.1},   # too slow
+            links[2]: {"height": 1080, "fps": 30, "kbps": 5000, "headroom": 3.0},
+            links[3]: {"height": 1080, "fps": 60, "kbps": 6000, "headroom": 2.5},
+            links[4]: {"height": None, "headroom": None, "note": "could not measure"},
+        }
+        out = aggregator.pick_first_working(
+            links, probe_fn=self._probe, gather=6,
+            measure_fn=lambda res, deadline: q[res["m3u8_url"][:-len("/index.m3u8")]])
+        self.assertEqual([p["url"] for p in out["picked"]], [links[3], links[2], links[0]])
+        self.assertIn("1080p60", out["picked"][0]["message"])
+        notes = {t["url"]: t["note"] for t in out["tried"]}
+        self.assertIn("ranked lower", notes[links[1]])
+        self.assertIn("too slow", notes[links[1]])
+        self.assertIn("pick 1", notes[links[3]])
+
+    def test_without_measuring_page_order_and_first_three(self):
+        links = [f"https://s{i}.example/live" for i in range(5)]
+        seen = []
+
+        def probe_fn(url):
+            seen.append(url)
+            return self._probe(url)
+        out = aggregator.pick_first_working(links, probe_fn=probe_fn, gather=6, measure_fn=None)
+        self.assertEqual([p["url"] for p in out["picked"]], links[:3])
+        self.assertNotIn("quality", out["picked"][0])
+
+    def test_a_measuring_crash_keeps_page_order(self):
+        links = [f"https://s{i}.example/live" for i in range(3)]
+
+        def boom(res, deadline):
+            raise RuntimeError("x")
+        out = aggregator.pick_first_working(links, probe_fn=self._probe, gather=6, measure_fn=boom)
+        self.assertEqual([p["url"] for p in out["picked"]], links)
+
+    def test_backups_come_from_other_sources(self):
+        # Five relays of one origin on numbered edges, one independent feed.
+        links = [f"https://site{i}.example/watch" for i in range(6)]
+        m3u8 = {links[i]: f"https://edge{i}.cdn.example/hls/abc.m3u8?st=t{i}" for i in range(5)}
+        m3u8[links[5]] = "https://other.example/live/game-77/index.m3u8"
+        speed = [14.5, 8.6, 3.0, 2.5, 2.0, 1.8]
+
+        def probe_fn(url):
+            return {"ok": True, "segment_ok": True, "m3u8_url": m3u8[url], "message": "ok"}
+
+        def measure(res, deadline):
+            i = next(n for n, u in enumerate(links) if m3u8[u] == res["m3u8_url"])
+            return {"height": 720, "kbps": 1800, "headroom": speed[i]}
+        out = aggregator.pick_first_working(links, probe_fn=probe_fn, gather=6, measure_fn=measure)
+        self.assertEqual([p["url"] for p in out["picked"]], [links[0], links[5], links[1]])
+        self.assertEqual(out["sources"], 2)
+        notes = {t["url"]: t["note"] for t in out["tried"]}
+        self.assertIn("same source as pick 1", notes[links[1]])
+
+    def test_diversify_prefers_a_slow_independent_backup_over_a_copy(self):
+        order = [0, 1, 2, 3]
+        keys = {0: "a", 1: "a", 2: "a", 3: "b"}
+        self.assertEqual(quality.diversify(order, keys, {3: True}, 3), [0, 3, 1])
+        self.assertEqual(quality.diversify(order, {}, {}, 3), [0, 1, 2])   # unknown = distinct
+        self.assertEqual(quality.diversify([], {}, {}, 3), [])
+
+    def test_source_key_ignores_edge_number_and_token(self):
+        self.assertEqual(quality.source_key("https://edge1.cdn.example/hls/abc.m3u8?st=1"),
+                         quality.source_key("https://EDGE4.cdn.example/hls/abc.m3u8?st=2&e=9"))
+        self.assertNotEqual(quality.source_key("https://edge1.cdn.example/hls/abc.m3u8"),
+                            quality.source_key("https://edge1.cdn.example/hls/xyz.m3u8"))
+        self.assertEqual(quality.source_key(""), "")
+        # A generic path proves nothing: tv1 and tv2 stay distinct.
+        self.assertNotEqual(quality.source_key("https://tv1.example/live/index.m3u8"),
+                            quality.source_key("https://tv2.example/live/index.m3u8"))
+
+    def test_a_stalled_measurement_cannot_hold_find(self):
+        import time as _t
+        def stuck(res, deadline):
+            _t.sleep(30)
+        t0 = _t.monotonic()
+        out = aggregator._measure_all({0: {}, 1: {}}, stuck, budget=0.5)
+        self.assertLess(_t.monotonic() - t0, 2.0)
+        self.assertEqual(out, {})
+
+    def _fake(self, playlist, segment, headers=None):
+        from unittest.mock import MagicMock
+        def fetch(session, url, hdrs, timeout, max_bytes=0):
+            r = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+            r.headers = headers or {}
+            return (r, playlist) if url.endswith(".m3u8") else (r, segment)
+        return fetch
+
+    def test_non_video_and_absurd_declared_resolution_do_not_win(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        with patch.object(quality.probe, "_fetch", side_effect=self._fake(playlist, b"<html>oops</html>")):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["measured"])
+        self.assertEqual(q["note"], "segment is not video")
+        self.assertLess(quality.score({"height": 1080, "headroom": 3.0}),
+                        quality.score({"declared_height": 99999, "headroom": 3.0}))
+
+    def test_a_cut_off_segment_is_credited_only_its_share(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:6.0,\nseg%d.ts\n" % i for i in range(4))
+        ts = (b"\x47" + b"\x00" * 187) * 5319 + b"\x00" * 28     # 1,000,000 bytes
+        with patch.object(quality.probe, "_fetch",
+                          side_effect=self._fake(playlist, ts, {"Content-Length": "2000000"})), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        # Half of each 6 s segment arrived: 1 MB per 3 s of video = 2667 kbps.
+        self.assertEqual(q["kbps"], 2667)
+
+    TS = (b"\x47" + b"\x00" * 187) * 1000     # 188,000 bytes of MPEG-TS
+
+    def _per_url(self, playlist, by_name):
+        """Fake fetch: the playlist, then by_name[segment file] (bytes or an exception)."""
+        from unittest.mock import MagicMock
+        def fetch(session, url, hdrs, timeout, max_bytes=0):
+            r = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+            r.headers = {}
+            if url.endswith(".m3u8"):
+                return r, playlist
+            got = by_name[url.rsplit("/", 1)[1]]
+            if isinstance(got, Exception):
+                raise got
+            return r, got
+        return fetch
+
+    def test_media_sniff_needs_three_sync_bytes(self):
+        self.assertTrue(quality._looks_like_media(self.TS))
+        self.assertFalse(quality._looks_like_media(b"G"))
+        self.assertFalse(quality._looks_like_media(b"Gone. Try again later."))
+        self.assertFalse(quality._looks_like_media(b"\x47" + b"\x00" * 187 + b"\x47" + b"<html>" * 40))
+        self.assertTrue(quality._looks_like_media(b"\x00\x00\x00\x18ftypiso5"))
+
+    def test_only_media_segments_are_credited(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": b"<html>oops</html>",
+                                        "seg2.ts": self.TS})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        # seg0 warms up, seg1 is HTML: only seg2's 188,000 B over 2 s counts.
+        self.assertTrue(q["measured"])
+        self.assertEqual(q["kbps"], 752)
+        # Nothing but short "G" bodies: never measured.
+        fake = self._per_url(playlist, {f"seg{i}.ts": b"GET lost" for i in range(3)})
+        with patch.object(quality.probe, "_fetch", side_effect=fake):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["measured"])
+        self.assertIsNone(q["headroom"])
+        # Sniffs as TS ("G" is 0x47) but 1,000 bytes per 2 s is no video feed.
+        fake = self._per_url(playlist, {f"seg{i}.ts": b"G" * 1000 for i in range(3)})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["measured"])
+        self.assertEqual(q["note"], "too little data to be video")
+
+    def test_a_failed_segment_keeps_what_was_measured(self):
+        import requests
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
+                                        "seg2.ts": requests.exceptions.ChunkedEncodingError("cut")})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertTrue(q["measured"])
+        self.assertEqual(q["kbps"], 752)
+        self.assertIn("ChunkedEncodingError", q["note"])
+        # A segment that times out: the stream does not keep up.
+        fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
+                                        "seg2.ts": requests.exceptions.ReadTimeout("slow")})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertTrue(q["measured"])
+        self.assertLessEqual(q["headroom"], 1.0)
+        # A stall mid-body surfaces as a ConnectionError after the read
+        # timeout, not a Timeout: still too slow.
+        now = [1000.0]
+        base = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
+                                        "seg2.ts": requests.exceptions.ConnectionError("stalled")})
+
+        def fake(session, url, hdrs, timeout, max_bytes=0):
+            now[0] += 9.0 if url.endswith("seg2.ts") else 0.1
+            return base(session, url, hdrs, timeout, max_bytes)
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}), \
+                patch.object(quality.time, "monotonic", side_effect=lambda: now[0]):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertLessEqual(q["headroom"], 1.0)
+        self.assertEqual(quality.score(q)[0], 2)
+
+    def test_source_key_keeps_ips_ports_and_path_case(self):
+        k = quality.source_key
+        self.assertNotEqual(k("http://10.0.0.1/hls/abc.m3u8"), k("http://10.0.0.2/hls/abc.m3u8"))
+        self.assertEqual(k("http://10.0.0.1/hls/abc.m3u8"), "10.0.0.1/hls/abc.m3u8")
+        self.assertNotEqual(k("http://[2001:db8::1]/hls/a.m3u8"), k("http://[2001:db8::2]/hls/a.m3u8"))
+        self.assertNotEqual(k("https://cdn.example/hls/AbC.m3u8"), k("https://cdn.example/hls/abc.m3u8"))
+        self.assertNotEqual(k("https://cdn.example:8080/hls/a.m3u8"), k("https://cdn.example:9090/hls/a.m3u8"))
+        self.assertEqual(k("https://cdn.example:notaport/hls/a.m3u8"), "")
+
+    def test_abort_ends_a_measurement_wait_at_once(self):
+        import threading, time as _t
+        abort = threading.Event()
+        def stuck(res, deadline):
+            _t.sleep(30)
+        threading.Timer(0.2, abort.set).start()
+        t0 = _t.monotonic()
+        out = aggregator._measure_all({0: {}, 1: {}}, stuck, abort=abort, budget=20)
+        self.assertLess(_t.monotonic() - t0, 1.5)
+        self.assertEqual(out, {})
+
+    def test_score_and_summary(self):
+        self.assertLess(quality.score({"height": 720, "headroom": 2.0}),
+                        quality.score({"height": 1080, "headroom": 1.2}))
+        self.assertLess(quality.score({"height": 480, "headroom": None}),
+                        quality.score({"height": 1080, "headroom": 1.0}))
+        # Relays of one feed: 0.1 Mbps apart is noise, the faster one wins.
+        self.assertLess(quality.score({"height": 720, "kbps": 1700, "headroom": 6.7}),
+                        quality.score({"height": 720, "kbps": 1800, "headroom": 4.4}))
+        self.assertEqual(quality.summary({"height": 1080, "fps": 59.94, "kbps": 6100, "headroom": 4.24}),
+                         "1080p60 · 6.1 Mbps · 4.2x real-time")
+        self.assertEqual(quality.summary({"note": "no segments listed"}), "no segments listed")
+        self.assertEqual(quality.summary({"declared_height": 99999, "declared_kbps": 10 ** 9}),
+                         "2160p · 50.0 Mbps")
+
+    def test_env_switch(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_RANK_STREAMS": "0"}):
+            self.assertFalse(quality.enabled())
+        with patch.dict(os.environ, {"PVARR_RANK_STREAMS": "1"}):
+            self.assertTrue(quality.enabled())
+
+    def test_segments_parsing_and_best_variant(self):
+        body = b"#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n#EXTINF:abc,\nbad.ts\n#EXTINF:4.5,\n/abs/seg2.ts\n"
+        self.assertEqual(quality._segments(body, "https://cdn.example/live/index.m3u8"),
+                         [("https://cdn.example/live/seg1.ts", 6.0), ("https://cdn.example/abs/seg2.ts", 4.5)])
+        v = quality._best_variant([{"url": "a", "bandwidth": 800000, "resolution": "640x360"},
+                                   {"url": "b", "bandwidth": 6000000, "resolution": "1920x1080"}])
+        self.assertEqual(v["url"], "b")
+
+    def test_measure_refuses_private_segments_for_a_public_page(self):
+        from unittest.mock import MagicMock, patch
+        resp = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+        body = b"#EXTM3U\n" + b"".join(b"#EXTINF:6.0,\nhttp://192.168.1.5/seg%d.ts\n" % i for i in range(4))
+        with patch.object(quality.probe, "_fetch", return_value=(resp, body)) as fetch:
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"}, allow_private=False)
+        self.assertEqual(q["note"], "refused: private address")
+        self.assertEqual(fetch.call_count, 1)   # the playlist only, never the LAN segment
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_measure_a_real_segment_end_to_end(self):
+        import subprocess, tempfile
+        from unittest.mock import MagicMock, patch
+        ffmpeg = check_deps.find_executable("ffmpeg")
+        with tempfile.TemporaryDirectory() as d:
+            seg = os.path.join(d, "s.ts")
+            subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30",
+                            "-t", "2", "-c:v", "mpeg2video", "-f", "mpegts", seg], check=True, timeout=60)
+            with open(seg, "rb") as fh:
+                data = fh.read()
+        # Four segments: the newest is skipped, the first fetched only warms up.
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        ok = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+
+        def fake_fetch(session, url, headers, timeout, max_bytes=0):
+            return (ok, playlist) if url.endswith(".m3u8") else (ok, data)
+        with patch.object(quality.probe, "_fetch", side_effect=fake_fetch):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertTrue(q["measured"])
+        self.assertEqual((q["height"], q["fps"]), (720, 30.0))
+        self.assertGreater(q["headroom"], 1.5)
 
 
 
