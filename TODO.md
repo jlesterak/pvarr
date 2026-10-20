@@ -4316,6 +4316,16 @@ were not used: site-specific, and possibly paid placement.
   unmeasured slow ones. A warm-up can now prove a stream keeps up but never
   that it does not (below 1.5x it stays unknown), and an unfinished warm-up
   gets 1 s set-up allowance before it counts as too slow.
+- [COMPLETED] Validator round 8 (R1 failed): late in a slot the segment
+  timeout is short (0.5-0.8 s), so a server with a slow first byte on every
+  request (no keep-alive) timed out there and the stream, already timed at
+  2.86x, was marked too slow. A failed segment now counts as too slow only
+  after the time it may take to keep up (EXTINF/1.5, + set-up on the
+  warm-up). The validator's per-request-delay grid: 0 misranked at 3 s and
+  8 s slots.
+- Known limit: per-request first-byte delay is inside every segment's
+  timing, so a relay without keep-alive reads up to ~10% slower than it
+  delivers; one near 1.5-1.65x can rank as too slow.
 - Known limit, by design: when the budget runs out, unmeasured streams keep
   page order among themselves (nothing to sort them on), so an unmeasured
   slow stream can sit above an unmeasured fast one. Both still rank above

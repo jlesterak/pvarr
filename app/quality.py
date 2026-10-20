@@ -194,16 +194,19 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             if not safe(url):
                 out["note"] = "refused: private address"
                 return out
+            # The time a segment may take and still keep up, plus connection
+            # set-up on the warm-up.
+            allowed = secs / MIN_HEADROOM + (SETUP_ALLOWANCE_SEC if n == 0 else 0.0)
             t0 = time.monotonic()
             try:
                 r, data = probe._fetch(plain, url, headers, half, max_bytes=SEGMENT_MAX_BYTES)
             except probe._FETCH_ERRORS as exc:
                 # One bad segment keeps what the others measured. A stall
-                # (before the headers: Timeout; mid-body: a ConnectionError
-                # after a full read timeout) is a stream that does not keep up.
+                # (Timeout before the headers, ConnectionError mid-body) is too
+                # slow only past `allowed`: late in a slot the timeout is short,
+                # and a slow first byte there proves nothing.
                 out["note"] = f"segment failed: {type(exc).__name__}"
-                too_slow = too_slow or isinstance(exc, requests.Timeout) \
-                    or time.monotonic() - t0 >= half
+                too_slow = too_slow or time.monotonic() - t0 >= allowed
                 continue
             took = time.monotonic() - t0
             if not (r.ok and data):
@@ -226,7 +229,6 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 share = 0.0                     # still arriving when the clock ran out
             else:
                 share = 1.0
-            allowed = secs / MIN_HEADROOM + (SETUP_ALLOWANCE_SEC if n == 0 else 0.0)
             if share is not None and share < 1.0 and took >= allowed:
                 # Unfinished after the time it may take to keep up (plus
                 # connection set-up on the warm-up): too slow.

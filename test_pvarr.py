@@ -8833,14 +8833,23 @@ class TestStreamRanking(unittest.TestCase):
         self.assertTrue(q["measured"])
         self.assertEqual(q["kbps"], 752)
         self.assertIn("ChunkedEncodingError", q["note"])
-        # A segment that times out: the stream does not keep up.
-        fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
-                                        "seg2.ts": requests.exceptions.ReadTimeout("slow")})
-        with patch.object(quality.probe, "_fetch", side_effect=fake), \
-                patch.object(quality, "_ffprobe", return_value={}):
-            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
-        self.assertTrue(q["measured"])
-        self.assertLessEqual(q["headroom"], 1.0)
+        # A segment that times out after longer than it may take (2 s / 1.5):
+        # the stream does not keep up. One that times out sooner (a short
+        # timeout late in a slot) proves nothing: the earlier timing stands.
+        for waited, slow in ((1.5, True), (0.8, False)):
+            now = [1000.0]
+            base = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
+                                            "seg2.ts": requests.exceptions.ReadTimeout("slow")})
+
+            def fake(session, url, hdrs, timeout, max_bytes=0, base=base, waited=waited):
+                now[0] += waited if url.endswith("seg2.ts") else 0.1
+                return base(session, url, hdrs, timeout, max_bytes)
+            with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                    patch.object(quality, "_ffprobe", return_value={}), \
+                    patch.object(quality.time, "monotonic", side_effect=lambda: now[0]):
+                q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+            self.assertTrue(q["measured"])
+            self.assertEqual(q["headroom"] <= 1.0, slow, (waited, q))
         # A stall mid-body surfaces as a ConnectionError after the read
         # timeout, not a Timeout: still too slow.
         now = [1000.0]
