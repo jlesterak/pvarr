@@ -222,6 +222,8 @@ def find_team(name: str) -> List[tuple]:
     """[(league_id, canonical name), ...] for a full team name as a page
     spells it, in catalogue order; [] if the snapshot does not know it.
     Exact after folding, not a prefix search: "Philadelphia" is not a team."""
+    if not name or len(name) > 100:   # no team name is this long
+        return []
     return list(_names_by_fold().get(_fold(name), []))
 
 

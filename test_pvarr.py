@@ -8472,6 +8472,12 @@ class TestEventInfo(unittest.TestCase):
         eventinfo.parse('<script type="application/ld+json">[' + ",".join(["1"] * 400000) + ']</script>',
                         "https://x.example/")
         self.assertLess(_t.monotonic() - t0, 3.0)
+        # Third round: ~9,000 links with 200-character junk titles (2 MB) took 16 s.
+        t0 = _t.monotonic()
+        for title in (("a - " * 50)[:199], "a" + " " * 197 + "b"):
+            eventinfo.parse("".join(f'<a href="/e{i}" title="{title}">x</a>' for i in range(9000)),
+                            "https://x.example/")
+        self.assertLess(_t.monotonic() - t0, 3.0)
         ev = eventinfo.parse('<div data-timestamp="' + "9" * 5000 + '"></div><h1>Colorado Avalanche vs Philadelphia Flyers</h1>',
                              "https://x.example/")["event"]
         self.assertEqual(ev["team_a"], "Colorado Avalanche")

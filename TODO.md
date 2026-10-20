@@ -4180,6 +4180,13 @@ LIVE label, link titles), no site's markup, so nothing site-specific ships.
   only and a length cap on times, meta content collapsed and capped, every
   regexed text capped, a deque, and `parse()` / `read_event` both guard the
   page-level read. Same test, extended.
+- [COMPLETED] Third round (fresh validator): a 2 MB page of ~9,000 links
+  with 200-character junk titles took 16 s (each title tried ~100 word
+  prefixes as team names; uncollapsed whitespace in link titles fed the
+  tail regex). Fixed: link titles collapsed, team trimming tries at most 6
+  words, at most 2,000 links and the first 1 MB of a page are read, names
+  over 100 characters are not looked up. 0.2 s now; the validator's 61
+  hostile cases all finish under 3 s.
 - Accepted: a link like "Home - About" laid out as two text pieces, or
   "Tabs vs Spaces", can appear in the pick list, and a finished game is
   listed with no time. The operator picks from the list, so this costs a

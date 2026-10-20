@@ -41,6 +41,12 @@ DURATION_HOURS = {
 SOCCER_HOURS = 2.25
 FALLBACK_HOURS = 3.0
 MAX_EVENTS = 200
+# Bounds for hostile pages. Real event and listing pages are 60-250 KB with a
+# few hundred links; Python's HTML parser alone needs ~2 s per MB of dense
+# markup, so only the first MAX_HTML characters are read.
+MAX_HTML = 1_000_000
+MAX_LINKS = 2000
+MAX_TEAM_WORDS = 6
 # "A vs B" text longer than this is not a game title; the cap also keeps the
 # lazy regex below from going quadratic on a hostile page.
 MAX_VS_TEXT = 200
@@ -112,7 +118,8 @@ class _Scan(HTMLParser):
         elif tag in ("title", "h1") and not self._in:
             self._in, self._buf = tag, []
         elif tag == "a" and a.get("href") and self._link is None:
-            self._link = {"href": a["href"].strip(), "title": a.get("title", ""), "chunks": []}
+            self._link = {"href": a["href"].strip(), "chunks": [],
+                          "title": " ".join(a.get("title", "")[:1000].split())}
         stamps = [a[k] for k in _EPOCH_ATTRS if k in a]
         if tag == "time" and "datetime" in a:
             stamps.append(a["datetime"])
@@ -179,7 +186,7 @@ def _trim_to_team(name: str) -> Tuple[str, str]:
     """('Philadelphia Flyers', 'Hockey') from 'Philadelphia Flyers Hockey' when
     the shorter form is a known team; otherwise (name, '')."""
     words = name.split()
-    for n in range(len(words), 0, -1):
+    for n in range(min(len(words), MAX_TEAM_WORDS), 0, -1):
         if tags.find_team(" ".join(words[:n])):
             return " ".join(words[:n]), " ".join(words[n:])
     return name, ""
@@ -327,7 +334,7 @@ def parse(html: str, page_url: str) -> Dict[str, Any]:
     """
     scan = _Scan()
     try:
-        scan.feed(html or "")
+        scan.feed((html or "")[:MAX_HTML])
         scan.close()
     except Exception:  # malformed markup: keep what was read so far
         pass
@@ -337,7 +344,7 @@ def parse(html: str, page_url: str) -> Dict[str, Any]:
     except ValueError:
         base = page_url
     events, seen = [], {page_url.rstrip("/")}
-    for link in scan.links:
+    for link in scan.links[:MAX_LINKS]:
         try:
             url = urljoin(base, link["href"])
         except ValueError:   # e.g. "http://[::1": not a link anyone can follow
