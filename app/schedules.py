@@ -5,7 +5,7 @@ PVArr one-shot schedules: "at 7pm, find streams on this page and record until 10
 A schedule is a recording that has not started yet. It holds an aggregator
 page (and/or up to three stream links pasted by hand), the naming fields, and
 a window. When the window opens, the loop in `server.py` checks the aggregator
-page, takes the first three working streams, fills any spare slots with the
+page, takes the best three working streams (`quality.py`), fills any spare slots with the
 hand-pasted links, and starts an ordinary recording through the same code path
 as the Start button, ending at the window's end.
 
@@ -37,7 +37,9 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit
 
+from app import quality
 from app.sessions import config_dir
 
 logger = logging.getLogger("PVArrSchedules")
@@ -121,9 +123,28 @@ def decide(job: Dict[str, Any], now: float) -> str:
     return "search" if now >= due_at else "wait"
 
 
+def describe_picks(result: Optional[Dict[str, Any]]) -> str:
+    """One log line on what a scan picked and why, e.g.
+    '#1 a.example 720p · 1.8 Mbps · 14.5x real-time; #2 b.example ...'.
+
+    A scan's measurements otherwise reach only the dashboard's Find result, so
+    an unattended recording left no record of how its streams were ranked.
+    Host only, never the full link: page paths can carry tokens.
+    """
+    parts = []
+    for n, pick in enumerate((result or {}).get("picked") or [], 1):
+        host = urlsplit(str(pick.get("url") or "")).hostname or "?"
+        q = pick.get("quality")
+        parts.append(f"#{n} {host} {quality.summary(q) if q else 'unranked'}".rstrip())
+    if not parts:
+        return "no working streams"
+    skipped = sum(1 for t in (result or {}).get("tried") or [] if t.get("note") == "not checked (time budget)")
+    return "; ".join(parts) + (f" ({skipped} not checked: time budget)" if skipped else "")
+
+
 def merge_candidates(picks: Iterable[Dict[str, Any]], manual: Iterable[Optional[str]],
                      limit: int = MAX_CANDIDATES) -> List[str]:
-    """Aggregator picks first (page order), then hand-pasted links, deduplicated.
+    """Aggregator picks first (ranked order), then hand-pasted links, deduplicated.
 
     The pick's page URL is used, not its resolved m3u8: the recorder re-probes
     the page on every connect, which is what keeps a failover hours later from

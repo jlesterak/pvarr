@@ -8196,6 +8196,19 @@ class TestScheduleDecisions(unittest.TestCase):
                          ["https://p/1", "https://m/1", "https://m/2"])
         self.assertEqual(schedules.merge_candidates([], ["https://m/1", " "]), ["https://m/1"])
 
+    def test_describe_picks_logs_rank_host_and_measurement_not_the_link(self):
+        result = {"picked": [
+            {"url": "https://a.example/ev/123?tok=secret",
+             "quality": {"measured": True, "height": 720, "kbps": 1800, "headroom": 14.5}},
+            {"url": "https://b.example/ev/9"},
+        ], "tried": [{"url": "https://c.example/", "ok": False, "note": "not checked (time budget)"}]}
+        line = schedules.describe_picks(result)
+        self.assertEqual(line, "#1 a.example 720p · 1.8 Mbps · 14.5x real-time; "
+                               "#2 b.example unranked (1 not checked: time budget)")
+        self.assertNotIn("secret", line)
+        self.assertEqual(schedules.describe_picks({"picked": []}), "no working streams")
+        self.assertEqual(schedules.describe_picks(None), "no working streams")
+
     def test_miss_reason_names_the_cloudflare_challenge(self):
         challenged = {"page": {"challenged": True, "status": 403}, "links_found": 0}
         self.assertIn("Cloudflare", schedules.miss_reason(challenged))

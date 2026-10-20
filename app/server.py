@@ -1404,6 +1404,8 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
                     exclude=[c.url for c in recorder.candidates])
             finally:
                 _aggregate_holder = None
+        if (result or {}).get("picked"):
+            logger.info("[%s] Re-check picks: %s", recording_id, schedules.describe_picks(result))
         urls = []
         for url in schedules.merge_candidates((result or {}).get("picked") or [], []):
             if len(url) > 4096:
@@ -1485,6 +1487,8 @@ async def _run_schedule(job: Dict[str, Any]) -> None:
         logger.info("Schedule %s was cancelled during its event-page check.", job_id)
         return
 
+    if not (result or {}).get("error"):
+        logger.info("Schedule %s picks: %s", job_id, schedules.describe_picks(result))
     picks = (result or {}).get("picked") or []
     manual = [job.get("url_primary"), job.get("url_backup1"), job.get("url_backup2")]
     candidates = []

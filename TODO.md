@@ -4327,6 +4327,11 @@ were not used: site-specific, and possibly paid placement.
   generated segment; the rest of the suite runs with ranking off.
 
 ### Measured live, 2026-10-19 (one event page, Monday night)
+- [COMPLETED] Scheduled starts and re-checks log the picks and their
+  measurements (`schedules.describe_picks`), host only (2026-10-20). Before
+  this, an unattended Find kept no record of how it ranked: asked "did it
+  rank?" after a scheduled start, the only evidence was the Find's ~70 s
+  duration. `test_describe_picks_logs_rank_host_and_measurement_not_the_link`.
 - Find went from ~25-30 s to ~40-55 s (FlareSolverr solve included).
 - Every working link was the same 720p ~1.8 Mbps feed relayed by different
   sites, so ranking came down to delivery speed.
