@@ -8918,6 +8918,62 @@ class TestStreamRanking(unittest.TestCase):
         self.assertAlmostEqual(q["headroom"], 1.0, places=2)
         self.assertEqual(quality.score(q)[0], 2)
 
+    def _paced(self, playlist, rate, sizes=None):
+        """Fake fetch on a fake clock: segments arrive at `rate` x real time
+        (2 s of video each), cut off at probe._fetch's wall cap (2 x timeout)."""
+        from unittest.mock import MagicMock
+        now = [1000.0]
+        sizes = sizes or {}
+
+        def fetch(session, url, hdrs, timeout, max_bytes=0):
+            r = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+            if url.endswith(".m3u8"):
+                r.headers = {}
+                now[0] += 0.05
+                return r, playlist
+            body = sizes.get(url.rsplit("/", 1)[1], self.TS)
+            need = 2.0 / rate
+            took = min(need, timeout * 2)
+            now[0] += took
+            r.headers = {"Content-Length": str(len(body))}
+            return r, body[:int(len(body) * took / need)]
+        return fetch, (lambda: now[0])
+
+    def test_a_slow_stream_is_caught_within_its_slot(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        for rate, tier in ((0.3, 2), (1.2, 2), (5.0, 0)):
+            fetch, clock = self._paced(playlist, rate)
+            with patch.object(quality.probe, "_fetch", side_effect=fetch), \
+                    patch.object(quality, "_ffprobe", return_value={}), \
+                    patch.object(quality.time, "monotonic", side_effect=clock):
+                start = clock()
+                q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"},
+                                    deadline=start + 3.0)
+                self.assertLessEqual(clock() - start, 3.0 + 0.1, rate)
+            self.assertEqual(quality.score(q)[0], tier, (rate, q))
+
+    def test_each_stream_gets_its_own_slot(self):
+        import time as _t
+        got = []
+
+        def record(res, slot_end):
+            got.append(slot_end - _t.monotonic())
+            return {}
+        aggregator._measure_all({i: {} for i in range(6)}, record, budget=20)
+        self.assertAlmostEqual(got[0], 8.0, delta=0.2)      # 20/6 < 8: the floor
+        self.assertTrue(all(g <= 19.0 for g in got))
+
+    def test_a_tiny_first_segment_does_not_hide_the_resolution(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        tiny = (b"\x47" + b"\x00" * 187) * 3
+        fake = self._per_url(playlist, {"seg0.ts": tiny, "seg1.ts": self.TS, "seg2.ts": self.TS})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={"height": 720}) as ffprobe:
+            quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertEqual(ffprobe.call_args[0][0], self.TS)
+
     def test_claims_alone_do_not_reorder(self):
         from unittest.mock import patch
         links = ["https://a.example/w", "https://b.example/w"]
@@ -8999,8 +9055,10 @@ class TestStreamRanking(unittest.TestCase):
         self.assertEqual(quality.summary({"height": 1080, "fps": 59.94, "kbps": 6100, "headroom": 4.24}),
                          "1080p60 · 6.1 Mbps · 4.2x real-time")
         self.assertEqual(quality.summary({"note": "no segments listed"}), "no segments listed")
-        self.assertEqual(quality.summary({"declared_height": 99999, "declared_kbps": 10 ** 9}),
-                         "2160p · 50.0 Mbps")
+        self.assertEqual(quality.summary({"measured": True, "declared_height": 99999,
+                                          "declared_kbps": 10 ** 9}), "2160p · 50.0 Mbps")
+        self.assertEqual(quality.summary({"declared_height": 99999, "note": "segment answered 500"}),
+                         "segment answered 500")     # an unmeasured claim is not shown
 
     def test_env_switch(self):
         from unittest.mock import patch
