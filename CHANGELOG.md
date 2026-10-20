@@ -10,9 +10,10 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 - **Find 3 streams**, a scheduled start, and a mid-recording re-check log one line naming each picked stream's host and what it measured (`Find picks: #1 … 720p · 1.8 Mbps · 14.5x real-time; …`), so an unattended recording shows why it chose its streams.
 
 ### Changed
-- **Find 3 streams** probes up to 40 links on an event page, up from 20. It stops once it has enough working ones: three, or up to six to rank when ranking is on.
+- **Find 3 streams** probes up to 40 links on an event page, up from 20. It stops once it has enough working ones: three, or up to six to rank when ranking is on. If those six all play one feed (several sites relaying one origin), it keeps probing, up to ten working links, for one that plays a different feed, so a backup can come from it; only that extra link is measured.
 
 ### Fixed
+- A re-check that found working links but had no failed source to replace said "nothing new to swap in". It now says how many it found and that no source has failed.
 - **Force Failover** stayed greyed out once a recording reached its last source, although the server wraps back to the first. It is now disabled only for a single-source recording.
 
 ## [0.10.0]

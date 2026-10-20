@@ -60,6 +60,10 @@ PICK = 3
 # RANK_BUDGET_SEC is a hard wall clock for all the measuring together.
 GATHER = 6
 RANK_BUDGET_SEC = 20
+# When all GATHER are one source (several sites relaying one origin: 6 of 7
+# on a real page), probing goes on down the page for a different one, up to
+# GATHER_MAX working links. Only links that add a source are measured on top.
+GATHER_MAX = 10
 RANK_SLOT_MIN_SEC = 8   # each stream's share of the budget, at least this
 PROBE_WORKERS = 6
 # Per-request timeout for each link's probe. Shorter than the probe's default:
@@ -436,13 +440,16 @@ def pick_first_working(
     abort: Optional[threading.Event] = None,
     gather: Optional[int] = None,
     measure_fn: Optional[Callable[[Dict[str, Any], float], Dict[str, Any]]] = None,
+    gather_max: int = GATHER_MAX,
 ) -> Dict[str, Any]:
     """Probe links concurrently; keep the first `pick` that work, in link order.
 
     With `measure_fn`, up to `gather` working links are collected the same
     way, measured one at a time within RANK_BUDGET_SEC, and the best `pick`
     kept by quality.score (backups from other sources where possible), best
-    first; ties keep page order.
+    first; ties keep page order. If those `gather` are all one source,
+    probing goes on (up to `gather_max` working links) for a different one,
+    and only links adding a source are measured on top.
 
     "First" means page order, not finishing order: a fast link further down
     must not displace a slower one above it. So the search ends only once the
@@ -457,19 +464,26 @@ def pick_first_working(
     a container stop for close to a minute.
     """
     want = max(pick, gather or pick) if measure_fn else pick
+    want_max = max(want, gather_max) if measure_fn else want
     results: Dict[int, Dict[str, Any]] = {}
+
+    def key(i: int) -> str:
+        return quality.source_key(results[i].get("m3u8_url", "")) or f"?{i}"
+
+    def enough(found: List[int]) -> bool:
+        return len(found) >= want and (len(found) >= want_max or len({key(j) for j in found}) > 1)
     deadline = time.monotonic() + budget
     pool = ThreadPoolExecutor(max_workers=max(1, workers))
     futures = {pool.submit(probe_fn, url): i for i, url in enumerate(links)}
 
     def settled() -> bool:
-        found = 0
+        found: List[int] = []
         for i in range(len(links)):
             if i not in results:
                 return False
             if _works(results[i]):
-                found += 1
-                if found >= want:
+                found.append(i)
+                if enough(found):
                     return True
         return True
 
@@ -495,7 +509,19 @@ def pick_first_working(
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
-    working = [i for i in range(len(links)) if i in results and _works(results[i])][:want]
+    # Cut where the search may stop, not at whatever else finished probing
+    # meanwhile: past `want`, that is at most the one link adding a source.
+    found: List[int] = []
+    for i in range(len(links)):
+        if i in results and _works(results[i]):
+            found.append(i)
+            if enough(found):
+                break
+    working, seen = found[:want], {key(i) for i in found[:want]}
+    for i in found[want:]:      # past `gather`: only a source not yet seen
+        if key(i) not in seen:
+            working.append(i)
+            seen.add(key(i))
     measured: Dict[int, Dict[str, Any]] = {}
     if measure_fn and len(working) > 1 and not (abort is not None and abort.is_set()):
         measured = _measure_all({i: results[i] for i in working}, measure_fn, abort)

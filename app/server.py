@@ -1423,8 +1423,12 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
             record["candidates"] = [c.url for c in recorder.candidates]
             session_store.save(record)
         else:
-            reason = "no working links on it" if not urls else "nothing new to swap in"
-            recorder._log(f"Event page re-checked: {reason}.", "WARN")
+            if not urls:
+                recorder._log("Event page re-checked: no working links on it.", "WARN")
+            else:
+                # Only a source that failed is replaced, never a working one.
+                recorder._log(f"Event page re-checked: {len(urls)} working link(s) found, "
+                              "but no source has failed since the last check; nothing replaced.")
     except asyncio.CancelledError:
         raise
     except Exception as exc:

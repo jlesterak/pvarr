@@ -8781,6 +8781,52 @@ class TestStreamRanking(unittest.TestCase):
         self.assertIn("too slow", notes[links[1]])
         self.assertIn("pick 1", notes[links[3]])
 
+    def _relay_probe(self, independent):
+        # Links whose index is in `independent` play their own feed; the rest
+        # relay one origin through numbered edge servers (one source).
+        def probe_fn(url):
+            n = int(url.rsplit("/", 1)[1])
+            m3u8 = (f"https://own{n}.example/hls/feed{n}.m3u8" if n in independent
+                    else f"https://edge{n}.cdn.example/hls/abc.m3u8?st=tok{n}")
+            return {"ok": True, "segment_ok": True, "m3u8_url": m3u8, "message": "ok"}
+        return probe_fn
+
+    def test_one_source_keeps_probing_for_a_different_one(self):
+        links = [f"https://s.example/ev/{i}" for i in range(14)]
+        measured = []
+
+        def measure(res, deadline):
+            measured.append(res["m3u8_url"])
+            return {"measured": True, "height": 720, "kbps": 1800, "headroom": 5.0}
+        out = aggregator.pick_first_working(links, probe_fn=self._relay_probe({8}),
+                                            gather=6, measure_fn=measure)
+        # Links 0-5 are one feed, so probing goes on to link 8, a backup now.
+        self.assertIn(links[8], [p["url"] for p in out["picked"]])
+        self.assertEqual(out["sources"], 2)
+        self.assertEqual(len(measured), 7)       # the first six + the new source only
+
+    def test_different_sources_stop_at_gather_and_one_source_stops_at_the_cap(self):
+        links = [f"https://s.example/ev/{i}" for i in range(14)]
+        measured = []
+
+        def measure(res, deadline):
+            measured.append(res["m3u8_url"])
+            return {"measured": True, "height": 720, "headroom": 5.0}
+        # Two sources in the first six: nothing past them is measured, even
+        # an independent link 8 that finished probing meanwhile.
+        aggregator.pick_first_working(links, probe_fn=self._relay_probe({1, 8}),
+                                      gather=6, measure_fn=measure)
+        self.assertEqual(len(measured), 6)
+        self.assertFalse(any("own8" in m for m in measured))
+        # One source all the way: the search gives up at 10 working links, so
+        # an independent link 11 is never reached.
+        measured.clear()
+        out = aggregator.pick_first_working(links, probe_fn=self._relay_probe({11}),
+                                            gather=6, gather_max=10, measure_fn=measure)
+        self.assertEqual(len(measured), 6)
+        self.assertEqual(out["sources"], 1)
+        self.assertNotIn(links[11], [p["url"] for p in out["picked"]])
+
     def test_without_measuring_page_order_and_first_three(self):
         links = [f"https://s{i}.example/live" for i in range(5)]
         seen = []

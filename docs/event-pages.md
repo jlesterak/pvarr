@@ -22,7 +22,10 @@ which runs the same check first when no stream link has been entered. PVArr:
 3. runs the normal probe on up to 40 of them, six at a time, and stops
    after about a minute (plus the page fetch: up to about three and a half
    minutes in all when FlareSolverr is involved, with its default 120 s cap);
-4. collects up to six that work (in page order), **measures each one** —
+4. collects up to six that work (in page order) — or, if those six all
+   play one feed relayed by different sites, keeps probing down the page
+   (up to ten working links) for one that plays a different feed —
+   **measures each one** —
    real resolution and frame rate (ffprobe on one segment, headers only),
    bitrate, and *headroom*: how much faster than real time its segments
    download — and puts the best three into the slots, best first. A stream
@@ -98,7 +101,7 @@ re-checking its event page").
 
 A recording started with something in the **Event page** box (whether or not you pressed **Find 3 streams**), or by a schedule, remembers the page, along with the cookie and User-Agent you gave for it. If two of its sources die (or its only source, for a single-link recording), PVArr checks the page again in the background and puts fresh working links into the dead slots. Links the recording already holds are skipped, so it reads further down the page rather than finding the same ones again. The source currently recording is never touched. It checks automatically at most once every 10 minutes, and skips a turn rather than queue when another page check is running, so it never delays a scheduled start. Every swap is logged on the recording's card.
 
-**Re-check event page** on the card does the same thing on demand (no 10-minute limit; one check per recording at a time), for when you can see a source is struggling before PVArr can. A recording started from manually entered links only has no page to re-check, so the button does not appear.
+**Re-check event page** on the card does the same thing on demand (no 10-minute limit; one check per recording at a time), for when you can see a source is struggling before PVArr can. It only replaces a source that has failed since the last check, never a working one: when none has, the card log says how many working links it found and that nothing was replaced. A recording started from manually entered links only has no page to re-check, so the button does not appear.
 
 A cookie that has expired since you pasted it (Cloudflare's last hours, not days) means the re-check falls back to FlareSolverr if you run it, or finds nothing; the card log says so. The cookie is kept in the session file under `/config` (readable only by PVArr's user) so a restart can carry on; it is never returned by the API. A re-checked link can occasionally be the wrong channel, as with **Find**: it is only used once the current source dies, and the card says when a slot was swapped.
 

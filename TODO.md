@@ -4338,6 +4338,22 @@ were not used: site-specific, and possibly paid placement.
   try to resume. Seen 2026-10-20 (session files timestamped mid-run). Now the
   suite points `PVARR_CONFIG_DIR` at a temp dir before any app import;
   verified by a full run leaving `config/` untouched.
+- [COMPLETED] Find keeps probing past the six it ranks when all six are one
+  source, up to GATHER_MAX=10 working links; only a link adding a source is
+  measured on top, so the measuring budget is unchanged (2026-10-20). Why: on
+  a real page 6 of 7 working links were one origin, and the independent feed
+  sat further down. A first cut took whatever had finished probing meanwhile
+  (the pool runs ahead), so a stray link could be measured; selection now
+  stops by the same rule as the search. `test_one_source_keeps_probing_for_a_different_one`,
+  `test_different_sources_stop_at_gather_and_one_source_stops_at_the_cap`.
+- [COMPLETED] Re-check that found working links but had no failed source now
+  says so ("N working link(s) found, but no source has failed since the last
+  check; nothing replaced"), not "nothing new to swap in" (2026-10-20).
+- Dropped by decision (2026-10-20): start recording on the first working link
+  and re-rank afterwards. Saves ~30-60 s; a better primary would mean a
+  mid-recording feed switch, and measuring beside a recording skews the
+  numbers. Start schedules a few minutes early instead. Revisit only if one
+  page offers different resolutions (switch once, for a higher measured one).
 - Find went from ~25-30 s to ~40-55 s (FlareSolverr solve included).
 - Every working link was the same 720p ~1.8 Mbps feed relayed by different
   sites, so ranking came down to delivery speed.
