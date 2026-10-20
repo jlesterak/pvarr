@@ -4401,6 +4401,16 @@ were not used: site-specific, and possibly paid placement.
   warm-up's timing is used when it is all there is. A download complete at
   the cutoff counts; a stream that got no time says "out of time to
   measure", not "segment is not video". `test_only_the_warm_up_fits_long_segments`.
+- [COMPLETED] Validator round 7 (R1 failed): the warm-up's timing includes
+  connection set-up (0.3-0.6 s to a distant relay), a large share of a 3 s
+  slot, so a 1.7x stream read 1.37-1.45 and ranked "too slow" under
+  unmeasured slow ones. A warm-up can now prove a stream keeps up but never
+  that it does not (below 1.5x it stays unknown), and an unfinished warm-up
+  gets 1 s set-up allowance before it counts as too slow.
+- Known limit, by design: when the budget runs out, unmeasured streams keep
+  page order among themselves (nothing to sort them on), so an unmeasured
+  slow stream can sit above an unmeasured fast one. Both still rank above
+  measured-slow and below measured-fast streams.
 - Known limit, left open (same as the probe): a server trickling its
   response *headers*, or a body at ~1 B/s (iter_content waits for 8 KB), keeps an abandoned
   measure thread alive (requests has no total timeout before the body, and

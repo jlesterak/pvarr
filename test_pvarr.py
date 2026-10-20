@@ -8955,9 +8955,10 @@ class TestStreamRanking(unittest.TestCase):
 
     def test_only_the_warm_up_fits_long_segments(self):
         from unittest.mock import patch
-        # 10 s segments at 1.4x in an 8 s slot: the warm-up (7.1 s) is all there is.
+        # 10 s segments in an 8 s slot: the warm-up is all there is. It can
+        # prove fast (3.0x) but, set-up included, not slow (1.4x: unknown).
         playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:10.0,\nseg%d.ts\n" % i for i in range(4))
-        for rate, tier in ((1.4, 2), (3.0, 0)):
+        for rate, tier in ((1.4, 1), (3.0, 0)):
             fetch, clock = self._paced(playlist, rate / 5)      # _paced assumes 2 s segments
             with patch.object(quality.probe, "_fetch", side_effect=fetch), \
                     patch.object(quality, "_ffprobe", return_value={}), \

@@ -49,6 +49,7 @@ SEGMENT_MAX_BYTES = 12 * 1024 * 1024    # ~10 s of 8 Mbps video, with margin
 SEGMENT_TIMEOUT_SEC = 12                # wall clock per segment
 PLAYLIST_TIMEOUT_SEC = 6
 FFPROBE_TIMEOUT_SEC = 10
+SETUP_ALLOWANCE_SEC = 1.0   # DNS + TCP + TLS + first byte, paid on the warm-up segment
 MIN_VIDEO_KBPS = 100    # below this it is not a video feed, whatever it sniffs as
 
 _EXTINF_RE = re.compile(r"^#EXTINF:\s*([0-9.]+)")
@@ -225,9 +226,10 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 share = 0.0                     # still arriving when the clock ran out
             else:
                 share = 1.0
-            if share is not None and share < 1.0 and took >= secs / MIN_HEADROOM:
-                # Unfinished after the time it may take to keep up: too slow,
-                # warm-up segment included.
+            allowed = secs / MIN_HEADROOM + (SETUP_ALLOWANCE_SEC if n == 0 else 0.0)
+            if share is not None and share < 1.0 and took >= allowed:
+                # Unfinished after the time it may take to keep up (plus
+                # connection set-up on the warm-up): too slow.
                 too_slow = True
             if not share:
                 continue
@@ -245,9 +247,13 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             got_secs += secs * share
             spent += took
         if not got_secs and warm and not too_slow:
-            # Only the warm-up fitted in the time (long segments): its timing,
-            # set-up included, reads a little slow but is far better than none.
-            got_bytes, got_secs, spent = warm
+            # Only the warm-up fitted in the time (long segments). Its timing
+            # includes connection set-up, so it can prove a stream keeps up
+            # but not that it does not: below MIN_HEADROOM it stays unknown.
+            if warm[2] > 0 and warm[1] / warm[2] >= MIN_HEADROOM:
+                got_bytes, got_secs, spent = warm
+            else:
+                out["note"] = out["note"] or "only a warm-up fitted in the time"
         if not first and not too_slow:
             out["note"] = out["note"] or ("out of time to measure" if out_of_time else "segment is not video")
             return out
