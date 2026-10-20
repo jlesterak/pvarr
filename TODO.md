@@ -3991,11 +3991,15 @@ rewritten here.
   `impersonate` as curl_cffi's/yt-dlp's own option name.
 
 ### Follow-ups before announcing (2026-10-20)
-- [PENDING] (low priority) Leak test of old images. GHCR still serves
-  `0.1.0`-`0.7.x` and their `sha-*` tags, built before `.dockerignore`
-  dropped `*.md`, so they may contain the pre-scrub `TODO.md`. Pull one,
-  grep it against the private liability list; if anything turns up, delete
-  the pre-0.8 package versions (sponsor approval: permanent delete).
+- [COMPLETED] Leak test of old images (2026-10-20). Fetched only the
+  app (`COPY`) layers of all 24 version tags from the registry (3 MB, no
+  full pull) and grepped them against the private site list plus personal
+  host names. No site name in any image; `TODO.md` was never in an image
+  (only `README.md`). Found: `0.1.0` ships a stray agent permissions file
+  with the maintainer's email and home path; `0.2.1`-`0.8.0` have a code
+  comment naming the test server. `0.8.3` onward are clean.
+- [PENDING] Delete the `0.1.0` image version (and its `sha-` tag); the
+  rest are low-value and may stay (sponsor's call: permanent delete).
 - [PENDING] Stale branches on GitHub (`feat/rank`, `feat/rescan`, one agent
   branch): merge or delete, and check their commit messages first.
 - [COMPLETED] GitHub Releases for v0.9.0 and v0.10.0, from
