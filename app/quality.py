@@ -221,8 +221,13 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 length = 0
             if length and len(data) >= length:
                 share = 1.0                     # all of it, even right at the cutoff
+            elif length and len(data) >= SEGMENT_MAX_BYTES:
+                share = len(data) / length      # cut off by the size cap: only what arrived
             elif length:
-                share = len(data) / length      # cut off by a cap: only what arrived
+                # Cut off by the clock: a short tail that still holds the whole
+                # first-byte delay reads far too slow. It may prove the stream
+                # too slow (below); otherwise it earns no credit.
+                share = 0.0
             elif len(data) >= SEGMENT_MAX_BYTES:
                 share = None                    # over the size cap, length unknown
             elif took >= half * 2 - 0.5:
@@ -359,7 +364,7 @@ def score(q: Dict[str, Any]) -> Tuple:
     """
     headroom = q.get("headroom")
     if headroom is None:
-        tier = 1
+        return (1, 0, 0, 0, 0, 0)   # unknown: nothing to sort on, page order stands
     else:
         tier = 0 if headroom >= MIN_HEADROOM else 2
     # A resolution ffprobe saw beats one the playlist merely claims
