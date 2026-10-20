@@ -8720,6 +8720,37 @@ class TestStreamRanking(unittest.TestCase):
         self.assertFalse(q["measured"])
         self.assertEqual(q["note"], "too little data to be video")
 
+    def test_a_tiny_timed_segment_is_not_credited(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:4.0,\nseg%d.ts\n" % i for i in range(4))
+        tiny = (b"\x47" + b"\x00" * 187) * 3          # 564 bytes, sniffs as TS
+        now = [1000.0]
+        base = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS, "seg2.ts": tiny})
+
+        def fake(session, url, hdrs, timeout, max_bytes=0):
+            now[0] += 0.001 if url.endswith("seg2.ts") else 4.0    # seg1 arrives at 1.0x
+            return base(session, url, hdrs, timeout, max_bytes)
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={"height": 1080}), \
+                patch.object(quality.time, "monotonic", side_effect=lambda: now[0]):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertAlmostEqual(q["headroom"], 1.0, places=2)
+        self.assertEqual(quality.score(q)[0], 2)
+
+    def test_claims_alone_do_not_reorder(self):
+        from unittest.mock import patch
+        links = ["https://a.example/w", "https://b.example/w"]
+
+        def probe_fn(url):
+            return {"ok": True, "segment_ok": True, "m3u8_url": url + ".m3u8", "message": "ok"}
+
+        def measure(res, deadline):     # every segment failed; only claims left
+            liar = res["m3u8_url"].startswith("https://b.")
+            return {"measured": False, "declared_height": 99999 if liar else 360,
+                    "declared_kbps": 9 * 10 ** 6 if liar else 800, "note": "segment answered 500"}
+        out = aggregator.pick_first_working(links, probe_fn=probe_fn, gather=6, measure_fn=measure)
+        self.assertEqual([p["url"] for p in out["picked"]], links)
+
     def test_a_failed_segment_keeps_what_was_measured(self):
         import requests
         from unittest.mock import patch

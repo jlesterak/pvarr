@@ -4224,7 +4224,7 @@ were not used: site-specific, and possibly paid placement.
   RANK_BUDGET_SEC=20, sorted by `quality.score` (keeps up >= 1.5x, then
   height, >= 48 fps, bitrate in 500 kbps steps, headroom), best 3 kept.
   `tried` notes carry each measurement. `PVARR_RANK_STREAMS=0` = old order.
-- [COMPLETED] Tests: `TestStreamRanking` (19), incl. ffprobe on a real
+- [COMPLETED] Tests: `TestStreamRanking` (21), incl. ffprobe on a real
   generated segment; the rest of the suite runs with ranking off.
 
 ### Measured live, 2026-10-19 (one event page, Monday night)
@@ -4286,6 +4286,13 @@ were not used: site-specific, and possibly paid placement.
   after a full read timeout is too slow. Contrived bodies ("G" x 1000, a
   3-packet TS) sniffed as video at 47-235x: under 100 kbps is now "too little
   data to be video", unmeasured.
+- [COMPLETED] Validator round 4 (R1 failed): one timed segment a 564-byte
+  body (sniffs as TS) was credited its full EXTINF, so a 1.0x stream read
+  2.0x; the 100 kbps floor now applies per segment. With every segment
+  failing, playlist claims (1x99999 at 9 Gbps) still reordered picks; claims
+  now count only for a stream whose delivery was timed, so a failed
+  measurement keeps page order. `test_a_tiny_timed_segment_is_not_credited`,
+  `test_claims_alone_do_not_reorder`.
 - Known limit, left open (same as the probe): a server trickling its
   response *headers*, or a body under 8 KB at ~1 B/s, keeps an abandoned
   measure thread alive (requests has no total timeout before the body, and
