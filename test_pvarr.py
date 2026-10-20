@@ -8942,7 +8942,7 @@ class TestStreamRanking(unittest.TestCase):
     def test_a_slow_stream_is_caught_within_its_slot(self):
         from unittest.mock import patch
         playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
-        for rate, tier in ((0.3, 2), (1.2, 2), (5.0, 0)):
+        for rate, tier in ((0.3, 2), (1.2, 2), (1.4, 2), (5.0, 0)):
             fetch, clock = self._paced(playlist, rate)
             with patch.object(quality.probe, "_fetch", side_effect=fetch), \
                     patch.object(quality, "_ffprobe", return_value={}), \
@@ -8951,6 +8951,19 @@ class TestStreamRanking(unittest.TestCase):
                 q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"},
                                     deadline=start + 3.0)
                 self.assertLessEqual(clock() - start, 3.0 + 0.1, rate)
+            self.assertEqual(quality.score(q)[0], tier, (rate, q))
+
+    def test_only_the_warm_up_fits_long_segments(self):
+        from unittest.mock import patch
+        # 10 s segments at 1.4x in an 8 s slot: the warm-up (7.1 s) is all there is.
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:10.0,\nseg%d.ts\n" % i for i in range(4))
+        for rate, tier in ((1.4, 2), (3.0, 0)):
+            fetch, clock = self._paced(playlist, rate / 5)      # _paced assumes 2 s segments
+            with patch.object(quality.probe, "_fetch", side_effect=fetch), \
+                    patch.object(quality, "_ffprobe", return_value={}), \
+                    patch.object(quality.time, "monotonic", side_effect=clock):
+                q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"},
+                                    deadline=clock() + 8.0)
             self.assertEqual(quality.score(q)[0], tier, (rate, q))
 
     def test_each_stream_gets_its_own_slot(self):

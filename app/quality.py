@@ -180,12 +180,15 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             return out
 
         got_bytes, got_secs, spent, first, too_slow = 0, 0.0, 0.0, b"", False
+        warm = None     # (bytes, seconds of video, took) of the warm-up segment
+        out_of_time = False
         for n, (url, secs) in enumerate(segs):
             # Each download is cut short at the deadline (probe._fetch stops
             # reading at twice its timeout), so a slow stream is caught in the
             # act rather than abandoned unmeasured.
             half = min(SEGMENT_TIMEOUT_SEC / 2, left() / 2)
             if half < 0.5:
+                out_of_time = True
                 break
             if not safe(url):
                 out["note"] = "refused: private address"
@@ -212,7 +215,9 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 length = int(r.headers.get("Content-Length") or 0)
             except (TypeError, ValueError):
                 length = 0
-            if length and len(data) < length:
+            if length and len(data) >= length:
+                share = 1.0                     # all of it, even right at the cutoff
+            elif length:
                 share = len(data) / length      # cut off by a cap: only what arrived
             elif len(data) >= SEGMENT_MAX_BYTES:
                 share = None                    # over the size cap, length unknown
@@ -234,12 +239,17 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 continue
             first = first or data
             if n == 0 and len(segs) > 1:
+                warm = (len(data), secs * share, took)
                 continue        # connection set-up (DNS, TLS) would skew it
             got_bytes += len(data)
             got_secs += secs * share
             spent += took
+        if not got_secs and warm and not too_slow:
+            # Only the warm-up fitted in the time (long segments): its timing,
+            # set-up included, reads a little slow but is far better than none.
+            got_bytes, got_secs, spent = warm
         if not first and not too_slow:
-            out["note"] = out["note"] or "segment is not video"
+            out["note"] = out["note"] or ("out of time to measure" if out_of_time else "segment is not video")
             return out
         if got_secs and spent > 0:
             out["kbps"] = round(got_bytes * 8 / got_secs / 1000)
@@ -248,6 +258,8 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
         if too_slow:
             out["headroom"] = min(out["headroom"] or 1.0, 1.0)
             out["measured"] = True
+        if out_of_time and not out["measured"]:
+            out["note"] = out["note"] or "out of time to measure"
         if first:
             out.update({k: v for k, v in _ffprobe(first).items() if v})
     except probe._FETCH_ERRORS as exc:
