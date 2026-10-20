@@ -8667,6 +8667,7 @@ class TestStreamRanking(unittest.TestCase):
         ts = (b"\x47" + b"\x00" * 187) * 5319 + b"\x00" * 28     # 1,000,000 bytes
         with patch.object(quality.probe, "_fetch",
                           side_effect=self._fake(playlist, ts, {"Content-Length": "2000000"})), \
+                patch.object(quality, "SEGMENT_MAX_BYTES", 1000000), \
                 patch.object(quality, "_ffprobe", return_value={}):
             q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
         # Half of each 6 s segment arrived: 1 MB per 3 s of video = 2667 kbps.
@@ -8768,8 +8769,8 @@ class TestStreamRanking(unittest.TestCase):
                     patch.object(quality.time, "monotonic", side_effect=clock):
                 start = clock()
                 q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"},
-                                    deadline=start + 3.0)
-                self.assertLessEqual(clock() - start, 3.0 + 0.1, rate)
+                                    deadline=start + 4.0)
+                self.assertLessEqual(clock() - start, 4.0 + 0.1, rate)
             self.assertEqual(quality.score(q)[0], tier, (rate, q))
 
     def test_only_the_warm_up_fits_long_segments(self):
@@ -8806,6 +8807,11 @@ class TestStreamRanking(unittest.TestCase):
                 patch.object(quality, "_ffprobe", return_value={"height": 720}) as ffprobe:
             quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
         self.assertEqual(ffprobe.call_args[0][0], self.TS)
+
+    def test_unknowns_keep_page_order(self):
+        # An unknown with an ffprobe height must not jump an earlier unknown.
+        self.assertEqual(quality.score({"height": 1080, "note": "only a warm-up fitted in the time"}),
+                         quality.score({"note": "segment answered 500"}))
 
     def test_claims_alone_do_not_reorder(self):
         from unittest.mock import patch

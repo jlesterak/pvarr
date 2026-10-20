@@ -4224,7 +4224,7 @@ were not used: site-specific, and possibly paid placement.
   RANK_BUDGET_SEC=20, sorted by `quality.score` (keeps up >= 1.5x, then
   height, >= 48 fps, bitrate in 500 kbps steps, headroom), best 3 kept.
   `tried` notes carry each measurement. `PVARR_RANK_STREAMS=0` = old order.
-- [COMPLETED] Tests: `TestStreamRanking` (25), incl. ffprobe on a real
+- [COMPLETED] Tests: `TestStreamRanking` (26), incl. ffprobe on a real
   generated segment; the rest of the suite runs with ranking off.
 
 ### Measured live, 2026-10-19 (one event page, Monday night)
@@ -4323,6 +4323,13 @@ were not used: site-specific, and possibly paid placement.
   after the time it may take to keep up (EXTINF/1.5, + set-up on the
   warm-up). The validator's per-request-delay grid: 0 misranked at 3 s and
   8 s slots.
+- [COMPLETED] Validator round 9 (R1 failed): a Content-Length segment cut
+  off by the slot's clock was credited its share, but that short tail holds
+  the whole first-byte delay: 12 s segments at an effective 1.85x read 1.19x
+  (chunked read 1.85x). A clock-cut segment now earns no credit (it can only
+  prove "too slow"; the size cap still credits its share). Unknown streams
+  ignore ffprobe height, so they keep page order. Re-ran the validator's
+  216-case grid: 0 misranked; `test_unknowns_keep_page_order`.
 - Known limit: per-request first-byte delay is inside every segment's
   timing, so a relay without keep-alive reads up to ~10% slower than it
   delivers; one near 1.5-1.65x can rank as too slow.
