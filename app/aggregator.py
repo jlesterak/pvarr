@@ -733,6 +733,21 @@ def read_event(
     except Exception:
         logger.exception("Could not read the game from %s", page["url"])
         found = {"event": None, "events": []}
+    # The find_streams rule for links a stranger's page names: none into the
+    # LAN unless the operator pasted a LAN page. A game link is scheduled as
+    # an event page, whose scan then trusts private streams. One lookup per
+    # host, not per game.
+    if found["events"] and not probe.is_private_url(target):
+        private: Dict[str, bool] = {}
+        kept = []
+        for ev in found["events"]:
+            host = urlsplit(ev.get("url") or "").hostname or ""
+            if host not in private:
+                private[host] = probe.is_private_url(ev.get("url") or "")
+            if not private[host]:
+                kept.append(ev)
+        result["skipped_private"] = len(found["events"]) - len(kept)
+        found["events"] = kept
     result.update(found)
     result["ok"] = bool(found["event"] or found["events"])
     if found["events"]:

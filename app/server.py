@@ -56,6 +56,7 @@ from app.ringbuffer import RingBuffer
 from app import commercials
 from app.sessions import SessionStore, attempts_so_far, build_record, resume_decision
 from app import schedules
+from app import eventlists
 from app.schedules import ScheduleStore
 from app.logging_config import configure_logging
 
@@ -120,6 +121,7 @@ app = FastAPI(
 notifier = NotificationManager()
 session_store = SessionStore()
 schedule_store = ScheduleStore()
+list_page_store = eventlists.ListPageStore()
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -1262,6 +1264,33 @@ async def cancel_schedule(schedule_id: str):
     """
     if not schedule_store.remove(schedule_id):
         raise HTTPException(status_code=404, detail="No such schedule")
+    return {"status": "success"}
+
+
+@app.get("/api/event-lists")
+async def list_event_lists():
+    """Saved list pages for the Events tab, oldest first."""
+    return {"pages": list_page_store.all(), "persistent": list_page_store.enabled}
+
+
+@app.post("/api/event-lists")
+async def add_event_list(url: str = Form(...), name: Optional[str] = Form(None)):
+    """Save a page that links many games. Saving the same link twice returns
+    the page already saved. Nothing is fetched here: the Events tab reads the
+    page through /api/event-info, which applies its usual rules."""
+    try:
+        page = list_page_store.add(url, name or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except OverflowError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"page": page, "persistent": list_page_store.enabled}
+
+
+@app.delete("/api/event-lists/{page_id}")
+async def remove_event_list(page_id: str):
+    if not list_page_store.remove(page_id):
+        raise HTTPException(status_code=404, detail="No such saved page")
     return {"status": "success"}
 
 

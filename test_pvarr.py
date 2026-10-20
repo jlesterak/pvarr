@@ -9224,6 +9224,124 @@ class TestStreamRanking(unittest.TestCase):
 
 
 
+# --------------------------------------------------------------------------
+# app.eventlists + /api/event-lists + private game links on listing pages
+# --------------------------------------------------------------------------
+from app import eventlists  # noqa: E402
+
+
+class TestListPages(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.path = Path(self.tmp) / "event-lists.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_pages_persist_private_and_reload(self):
+        store = eventlists.ListPageStore(self.path)
+        page = store.add("https://list.example/today", "  Hockey   tonight ")
+        self.assertEqual(page["name"], "Hockey tonight")
+        self.assertEqual(oct(self.path.stat().st_mode & 0o777), "0o600")
+        again = eventlists.ListPageStore(self.path)
+        self.assertEqual([p["url"] for p in again.all()], ["https://list.example/today"])
+        self.assertTrue(again.remove(page["id"]))
+        self.assertEqual(eventlists.ListPageStore(self.path).all(), [])
+
+    def test_name_defaults_to_host_and_a_duplicate_is_not_added(self):
+        store = eventlists.ListPageStore(self.path)
+        a = store.add("https://list.example/today")
+        b = store.add("https://list.example/today/")
+        self.assertEqual(a["id"], b["id"])
+        self.assertEqual(a["name"], "list.example")
+        self.assertEqual(len(store.all()), 1)
+
+    def test_bad_input_and_the_cap(self):
+        store = eventlists.ListPageStore(self.path)
+        for url in ("ftp://list.example/", "javascript:alert(1)", "https://", "https://a.example/" + "x" * 5000):
+            with self.assertRaises(ValueError):
+                store.add(url)
+        with self.assertRaises(ValueError):
+            store.add("https://list.example/", "n" * 81)
+        for i in range(eventlists.MAX_LIST_PAGES):
+            store.add(f"https://list.example/{i}")
+        with self.assertRaises(OverflowError):
+            store.add("https://list.example/one-more")
+
+    def test_unknown_schema_is_set_aside_not_overwritten(self):
+        self.path.write_text(json.dumps({"schema": 99, "pages": [{"id": "x", "url": "https://n.example/"}]}))
+        store = eventlists.ListPageStore(self.path)
+        self.assertEqual(store.all(), [])
+        self.assertTrue(self.path.with_suffix(".json.bak").exists())
+        store.add("https://list.example/")
+        self.assertIn('"schema": 99', self.path.with_suffix(".json.bak").read_text())
+
+    def test_unwritable_dir_keeps_pages_in_memory(self):
+        from unittest.mock import patch
+        store = eventlists.ListPageStore(self.path)
+        with patch("app.eventlists.tempfile.mkstemp", side_effect=PermissionError("ro")):
+            page = store.add("https://list.example/")
+        self.assertFalse(store.enabled)
+        self.assertEqual(store.all(), [page])
+
+
+class TestListPageRoutes(ServerTestCase):
+    def setUp(self):
+        super().setUp()
+        from unittest.mock import patch
+        self.store = eventlists.ListPageStore(Path(self.tmp) / "event-lists.json")
+        self._lp_patch = patch.object(self.server, "list_page_store", self.store)
+        self._lp_patch.start()
+
+    def tearDown(self):
+        self._lp_patch.stop()
+        super().tearDown()
+
+    def test_add_list_and_remove(self):
+        r = self.client.post("/api/event-lists", data={"url": "https://list.example/nhl", "name": "NHL"})
+        self.assertEqual(r.status_code, 200, r.text)
+        pid = r.json()["page"]["id"]
+        self.assertTrue(r.json()["persistent"])
+        pages = self.client.get("/api/event-lists").json()["pages"]
+        self.assertEqual([(p["name"], p["url"]) for p in pages], [("NHL", "https://list.example/nhl")])
+        self.assertEqual(self.client.delete(f"/api/event-lists/{pid}").status_code, 200)
+        self.assertEqual(self.client.delete(f"/api/event-lists/{pid}").status_code, 404)
+        self.assertEqual(self.client.delete("/api/event-lists/..%2F..%2Fetc").status_code, 404)
+
+    def test_bad_link_is_400_and_the_cap_is_409(self):
+        self.assertEqual(self.client.post("/api/event-lists", data={"url": "file:///etc/passwd"}).status_code, 400)
+        for i in range(eventlists.MAX_LIST_PAGES):
+            self.store.add(f"https://list.example/{i}")
+        self.assertEqual(self.client.post("/api/event-lists", data={"url": "https://list.example/x"}).status_code, 409)
+
+
+class TestListingPrivateLinks(unittest.TestCase):
+    HTML = ('<a href="https://ev.example/game/1" title="Avalanche - Stars">Avalanche - Stars</a>'
+            '<a href="http://192.168.1.5/game/2" title="Oilers - Flames">Oilers - Flames</a>')
+
+    def _read(self, url):
+        from unittest.mock import patch
+        page = {"ok": True, "url": url, "via": "direct", "status": 200, "challenged": False,
+                "attempts": [], "html": self.HTML}
+        fake = {"event": None, "events": [
+            {"url": "https://ev.example/game/1", "team_a": "Avalanche", "team_b": "Stars"},
+            {"url": "http://192.168.1.5/game/2", "team_a": "Oilers", "team_b": "Flames"}]}
+        with patch.object(aggregator, "fetch_page", return_value=page), \
+                patch.object(aggregator.eventinfo, "parse", return_value=fake), \
+                patch.object(aggregator.probe, "is_private_url",
+                             side_effect=lambda u: "192.168." in u or "10.0." in u):
+            return aggregator.read_event(url)
+
+    def test_a_public_listing_page_cannot_name_a_lan_game(self):
+        out = self._read("https://list.example/today")
+        self.assertEqual([e["url"] for e in out["events"]], ["https://ev.example/game/1"])
+        self.assertEqual(out["skipped_private"], 1)
+
+    def test_a_lan_listing_page_keeps_its_lan_games(self):
+        out = self._read("http://10.0.0.2/today")
+        self.assertEqual(len(out["events"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

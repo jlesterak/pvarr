@@ -322,3 +322,4 @@ class ScheduleStore:
 
     def all(self) -> List[Dict[str, Any]]:
         return sorted(self.jobs.values(), key=lambda j: float(j.get("start_at") or 0))
+
