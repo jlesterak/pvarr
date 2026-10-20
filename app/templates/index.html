@@ -91,15 +91,21 @@
       </div>
 
       <!-- Header Action Buttons -->
-      <div class="flex items-center space-x-4">
-        <div class="px-3 py-1 rounded-md text-xs font-medium flex items-center space-x-2 bg-slate-800 border border-slate-700">
+      <div class="flex items-center space-x-2 sm:space-x-4">
+        <!-- Phones: the pill hides and the buttons keep only their icons. -->
+        <div class="hidden sm:flex px-3 py-1 rounded-md text-xs font-medium items-center space-x-2 bg-slate-800 border border-slate-700">
           <span class="w-2 h-2 rounded-full" :class="liveSessions.length > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
           <span x-text="liveSessions.length > 0 ? liveSessions.length + ' Active Stream(s)' : 'System Idle'"></span>
         </div>
 
-        <button @click="openNewModal = true" class="bg-arr-blue hover:bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-blue/20 transition flex items-center space-x-2">
+        <button @click="openEvents()" title="Events" class="px-3 sm:px-4 py-2 rounded-lg text-sm font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition flex items-center space-x-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+          <span class="hidden sm:inline">Events</span>
+        </button>
+
+        <button @click="openNewModal = true" title="Add Recording" class="bg-arr-blue hover:bg-blue-600 text-white px-3 sm:px-4 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-blue/20 transition flex items-center space-x-2">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-          <span>Add Recording</span>
+          <span class="hidden sm:inline">Add Recording</span>
         </button>
       </div>
     </div>
@@ -113,6 +119,9 @@
       </button>
       <button @click="activeTab = 'library'" :class="activeTab === 'library' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Media Library (<span x-text="libraryFiles.length"></span>)
+      </button>
+      <button @click="openEvents()" :class="activeTab === 'events' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+        Events
       </button>
       <button @click="activeTab = 'stats'; fetchAdStats()" :class="activeTab === 'stats' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Ad Stats
@@ -390,6 +399,80 @@
 
     <!-- TAB 3: Ad Stats. Read from /config/comskip-stats.csv; plain CSS bars,
          no chart library. -->
+    <!-- Events: saved pages that list many games; tick games, schedule them.
+         Reads a page through /api/event-info and schedules through
+         /api/schedules, one call per game, so every server check applies. -->
+    <div x-show="activeTab === 'events'" class="space-y-4" style="display: none;">
+      <div class="arr-card rounded-xl border border-slate-800 p-4 space-y-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <template x-for="p in lists.pages" :key="p.id">
+            <span class="inline-flex items-center rounded-full border text-xs"
+                  :class="lists.current === p.id ? 'border-arr-blue bg-arr-blue/15 text-arr-accent' : 'border-slate-700 text-slate-300 hover:border-slate-500'">
+              <button type="button" class="pl-3 pr-1 py-1 font-semibold" @click="loadEvents(p)" :title="p.url" x-text="p.name"></button>
+              <button type="button" class="px-2 py-1 text-slate-500 hover:text-rose-400" @click="removeListPage(p)" :title="'Forget ' + p.name">&times;</button>
+            </span>
+          </template>
+          <button type="button" @click="lists.adding = !lists.adding"
+                  class="px-3 py-1 rounded-full text-xs border border-dashed border-slate-600 text-slate-400 hover:text-slate-200 hover:border-slate-400">
+            + Add page
+          </button>
+          <span x-show="!lists.pages.length && !lists.adding" class="text-xs text-slate-500">
+            Save a page that lists many games (a day's or a league's fixtures) to pick from them here.
+          </span>
+        </div>
+        <form x-show="lists.adding" @submit.prevent="addListPage()" class="flex flex-col sm:flex-row gap-2" style="display:none;">
+          <input type="url" x-model="lists.newUrl" required placeholder="https://events.example/today"
+                 class="flex-1 px-3 py-2 rounded-lg text-sm arr-input font-mono text-slate-200">
+          <input type="text" x-model="lists.newName" maxlength="80" placeholder="Name (optional)"
+                 class="sm:w-48 px-3 py-2 rounded-lg text-sm arr-input text-slate-200">
+          <button type="submit" class="px-4 py-2 rounded-lg text-xs font-semibold bg-arr-blue hover:bg-blue-600 text-white">Save &amp; load</button>
+        </form>
+        <p x-show="lists.message" x-text="lists.message" class="text-xs"
+           :class="lists.state === 'fail' ? 'text-rose-400' : (lists.state === 'working' ? 'text-slate-400' : 'text-emerald-400')"></p>
+      </div>
+
+      <template x-if="lists.games.length">
+        <div class="arr-card rounded-xl border border-slate-800 overflow-hidden">
+          <template x-for="group in eventGroups()" :key="group.label">
+            <div>
+              <div class="px-4 py-2 bg-slate-900/70 border-b border-slate-800 text-[11px] font-bold uppercase tracking-wider"
+                   :class="group.live ? 'text-rose-400' : 'text-slate-400'" x-text="group.label"></div>
+              <ul class="divide-y divide-slate-800/70">
+                <template x-for="g in group.games" :key="g.url">
+                  <li class="px-4 py-2.5 flex items-center gap-3 text-sm"
+                      :class="gameStatus(g).tickable ? 'hover:bg-slate-800/40 cursor-pointer' : 'opacity-60'"
+                      @click="gameStatus(g).tickable && toggleGame(g)">
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-700 bg-slate-900 text-arr-blue"
+                           :checked="!!lists.selected[g.url]" :disabled="!gameStatus(g).tickable" @click.stop="toggleGame(g)">
+                    <span class="shrink-0 w-24 text-xs font-semibold" :class="g.live ? 'text-rose-400' : 'text-slate-300'"
+                          x-text="g.live ? ('LIVE' + (g.status ? ' ' + g.status : '')) : (g.start_at ? clockLocal(g.start_at) : '—')"></span>
+                    <span class="flex-1 min-w-0 truncate text-slate-100" x-text="g.team_a + ' vs ' + g.team_b"></span>
+                    <span class="hidden sm:inline shrink-0 text-xs text-slate-500" x-text="g.sport"></span>
+                    <span class="hidden sm:inline shrink-0 w-10 text-right text-xs text-slate-600" x-text="g.duration_hours ? g.duration_hours + ' h' : ''"></span>
+                    <span class="shrink-0 w-28 text-right text-[11px]" :class="gameStatus(g).tone" x-text="lists.results[g.url] || gameStatus(g).label"></span>
+                    <button type="button" @click.stop="editGame(g)" class="shrink-0 text-[11px] text-slate-500 hover:text-arr-accent">Edit</button>
+                  </li>
+                </template>
+              </ul>
+            </div>
+          </template>
+          <div class="px-4 py-3 border-t border-slate-800 bg-slate-900/50 space-y-2">
+            <div class="flex flex-wrap items-center gap-3">
+              <label class="text-xs text-slate-400">Start
+                <select x-model.number="lists.lead" class="mx-1 px-2 py-1 rounded arr-input text-xs text-slate-200">
+                  <option value="5">5</option><option value="10">10</option><option value="15">15</option>
+                </select>min early
+              </label>
+              <button type="button" @click="scheduleSelected()" :disabled="!selectedGames().length || lists.state === 'working'"
+                      class="ml-auto px-4 py-2 rounded-lg text-sm font-semibold bg-arr-blue hover:bg-blue-600 text-white disabled:opacity-40"
+                      x-text="'Schedule selected (' + selectedGames().length + ')'"></button>
+            </div>
+            <p x-show="selectedGames().length" class="text-[11px] text-slate-500" x-text="selectionNote()"></p>
+          </div>
+        </div>
+      </template>
+    </div>
+
     <div x-show="activeTab === 'stats'" class="space-y-4" style="display: none;">
       <template x-if="!adStats || adStats.total.count === 0">
         <div class="arr-card rounded-xl border border-slate-800 px-6 py-8 text-center text-slate-500 text-sm">
@@ -816,6 +899,9 @@
           { field: 'team_a', model: 'team_a', label: 'Team A / Event', placeholder: 'Buccaneers' },
           { field: 'team_b', model: 'team_b', label: 'Team B / Rival', placeholder: 'Raiders' }
         ],
+        // Events tab: saved list pages (server-side) and the games of the one shown.
+        lists: { pages: [], current: null, games: [], selected: {}, results: {}, lead: 5,
+                 adding: false, newUrl: '', newName: '', state: 'idle', message: '' },
         agg: { url: '', cookie: '', user_agent: '', showHeaders: false,
                state: 'idle', message: '', tried: [], events: [] },
         probes: { url_primary: null, url_backup1: null, url_backup2: null },
@@ -903,6 +989,225 @@
             alert('Cancel error: ' + e);
           }
           this.refreshSchedules();
+        },
+
+        // ---- Events tab -------------------------------------------------
+        async openEvents() {
+          this.activeTab = 'events';
+          this.refreshSchedules();
+          try {
+            const data = await (await fetch('/api/event-lists')).json();
+            this.lists.pages = data.pages || [];
+            if (data.persistent === false) {
+              this.lists.state = 'fail';
+              this.lists.message = 'PVArr cannot write to its config folder: saved pages are lost on restart. Check the /config mount ownership (PUID/PGID).';
+            }
+          } catch (e) {
+            this.lists.state = 'fail';
+            this.lists.message = 'Could not load saved pages: ' + e;
+            return;
+          }
+          if (!this.lists.games.length) {
+            let last = null;
+            try { last = localStorage.getItem('pvarr.eventList'); } catch (e) { /* private window */ }
+            const page = this.lists.pages.find(p => p.id === last) || this.lists.pages[0];
+            if (page) this.loadEvents(page);
+          }
+        },
+
+        async addListPage() {
+          const body = new FormData();
+          body.append('url', (this.lists.newUrl || '').trim());
+          if (this.lists.newName.trim()) body.append('name', this.lists.newName.trim());
+          try {
+            const res = await fetch('/api/event-lists', { method: 'POST', body });
+            const data = await res.json();
+            if (!res.ok) {
+              this.lists.state = 'fail';
+              this.lists.message = typeof data.detail === 'string' ? data.detail : 'Could not save that page';
+              return;
+            }
+            if (!this.lists.pages.some(p => p.id === data.page.id)) this.lists.pages.push(data.page);
+            this.lists.adding = false;
+            this.lists.newUrl = '';
+            this.lists.newName = '';
+            this.loadEvents(data.page);
+          } catch (e) {
+            this.lists.state = 'fail';
+            this.lists.message = 'Request failed: ' + e;
+          }
+        },
+
+        async removeListPage(page) {
+          if (!confirm('Forget ' + page.name + '? Games already scheduled from it stay scheduled.')) return;
+          try {
+            await fetch(`/api/event-lists/${page.id}`, { method: 'DELETE' });
+          } catch (e) { /* the refresh below shows what is left */ }
+          this.lists.pages = this.lists.pages.filter(p => p.id !== page.id);
+          if (this.lists.current === page.id) {
+            this.lists.current = null;
+            this.lists.games = [];
+            this.lists.selected = {};
+            this.lists.message = '';
+          }
+        },
+
+        // One page fetch, no stream probing; shares the server's event-page
+        // lock, so it answers 429 while a Find or a scheduled check runs.
+        async loadEvents(page) {
+          this.lists.current = page.id;
+          try { localStorage.setItem('pvarr.eventList', page.id); } catch (e) { /* fine */ }
+          this.lists.games = [];
+          this.lists.selected = {};
+          this.lists.results = {};
+          this.lists.state = 'working';
+          this.lists.message = 'Reading ' + page.name + '...';
+          const body = new FormData();
+          body.append('url', page.url);
+          try {
+            const res = await fetch('/api/event-info', { method: 'POST', body });
+            const data = await res.json();
+            if (this.lists.current !== page.id) return;     // another page was chosen meanwhile
+            if (!res.ok || !data.ok) {
+              this.lists.state = 'fail';
+              this.lists.message = (typeof data.detail === 'string' && data.detail) || data.message || 'Could not read that page';
+              return;
+            }
+            const games = (data.events && data.events.length) ? data.events : (data.event ? [data.event] : []);
+            this.lists.games = games;
+            this.lists.state = 'ok';
+            this.lists.message = games.length + ' game' + (games.length === 1 ? '' : 's') + ' on ' + page.name
+              + (data.skipped_private ? ' (' + data.skipped_private + ' link(s) into the local network ignored)' : '') + '.';
+            this.refreshSchedules();
+          } catch (e) {
+            this.lists.state = 'fail';
+            this.lists.message = 'Request failed: ' + e;
+          }
+        },
+
+        sameLink(a, b) {
+          return (a || '').trim().replace(/\/+$/, '') === (b || '').trim().replace(/\/+$/, '');
+        },
+
+        gameEnd(g) {
+          return g.start_at ? g.start_at + (g.duration_hours || 3) * 3600 : null;
+        },
+
+        // tickable: may be scheduled from here. Edit (the New Recording form)
+        // stays open for every game.
+        gameStatus(g) {
+          const now = Date.now() / 1000;
+          if (this.scheduleList.some(j => ['waiting', 'searching'].includes(j.state) && this.sameLink(j.agg_url, g.url)))
+            return { tickable: false, label: 'Scheduled', tone: 'text-emerald-400' };
+          if (!g.live && !g.start_at) return { tickable: false, label: 'No time listed', tone: 'text-slate-500' };
+          const end = this.gameEnd(g);
+          if (!g.live && end && end <= now) return { tickable: false, label: 'Finished', tone: 'text-slate-500' };
+          if (g.live || g.start_at <= now) return { tickable: true, label: 'Started', tone: 'text-rose-400' };
+          return { tickable: true, label: '', tone: 'text-slate-500' };
+        },
+
+        eventGroups() {
+          const now = Date.now() / 1000;
+          const live = [], later = {}, order = [], untimed = [], done = [];
+          for (const g of this.lists.games) {
+            const st = this.gameStatus(g);
+            if (st.label === 'Finished') { done.push(g); continue; }
+            if (g.live || (g.start_at && g.start_at <= now)) { live.push(g); continue; }
+            if (!g.start_at) { untimed.push(g); continue; }
+            const day = new Date(g.start_at * 1000).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
+            if (!later[day]) { later[day] = []; order.push(day); }
+            later[day].push(g);
+          }
+          const groups = [];
+          if (live.length) groups.push({ label: 'Live now', live: true, games: live });
+          for (const day of order) groups.push({ label: day, games: later[day].sort((a, b) => a.start_at - b.start_at) });
+          if (untimed.length) groups.push({ label: 'Time not listed (use Edit)', games: untimed });
+          if (done.length) groups.push({ label: 'Finished', games: done });
+          return groups;
+        },
+
+        clockLocal(epoch) {
+          return new Date(epoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        },
+
+        toggleGame(g) {
+          if (!this.gameStatus(g).tickable) return;
+          this.lists.selected[g.url] = !this.lists.selected[g.url];
+          delete this.lists.results[g.url];
+        },
+
+        selectedGames() {
+          return this.lists.games.filter(g => this.lists.selected[g.url] && this.gameStatus(g).tickable);
+        },
+
+        selectionNote() {
+          const games = this.selectedGames();
+          const n = games.length;
+          const parts = [n + ' recording' + (n === 1 ? '' : 's') + ': about ' + (n * 2) + ' Mbps while they overlap, ~0.8 GB per hour each.'];
+          const starts = games.map(g => g.live ? 0 : g.start_at).sort((a, b) => a - b);
+          let crowd = 0;
+          for (let i = 0; i < starts.length; i++) {
+            crowd = Math.max(crowd, starts.filter(t => t >= starts[i] && t - starts[i] <= 600).length);
+          }
+          if (crowd >= 3) parts.push(crowd + ' start within 10 minutes of each other; PVArr finds their streams one at a time (up to a minute each), so starting 10 or 15 min early is safer.');
+          const waiting = this.scheduleList.filter(j => ['waiting', 'searching'].includes(j.state)).length;
+          if (waiting + n > 20) parts.push('Only ' + Math.max(0, 20 - waiting) + ' more can be scheduled (20 at a time).');
+          return parts.join(' ');
+        },
+
+        // One POST per game, in order, so the server's own checks (20 waiting
+        // at most, sane times) apply to each; every game gets its own result.
+        async scheduleSelected() {
+          const games = this.selectedGames();
+          const waiting = this.scheduleList.filter(j => ['waiting', 'searching'].includes(j.state)).length;
+          if (waiting + games.length > 20) {
+            this.lists.state = 'fail';
+            this.lists.message = 'That is ' + games.length + ' games, but only ' + Math.max(0, 20 - waiting)
+              + ' more can be scheduled (20 waiting at most). Untick some.';
+            return;
+          }
+          this.lists.state = 'working';
+          let ok = 0;
+          for (const g of games) {
+            const now = Date.now() / 1000;
+            const started = g.live || g.start_at <= now;
+            const start = started ? now : Math.max(g.start_at - this.lists.lead * 60, now);
+            const end = this.gameEnd(g) || now + (g.duration_hours || 3) * 3600;
+            this.lists.message = 'Scheduling ' + g.team_a + ' vs ' + g.team_b + '...';
+            const body = new FormData();
+            body.append('sport', g.sport || 'Sports');
+            body.append('team_a', g.team_a || 'TeamA');
+            body.append('team_b', g.team_b || 'TeamB');
+            ['resolution', 'freeze_timeout', 'output_dir'].forEach(k => {
+              if (this.form[k] !== undefined && this.form[k] !== null) body.append(k, this.form[k]);
+            });
+            body.append('start_at', start);
+            body.append('end_time', end);
+            body.append('agg_url', g.url);
+            try {
+              const res = await fetch('/api/schedules', { method: 'POST', body });
+              const data = await res.json();
+              if (res.ok) {
+                ok++;
+                this.lists.selected[g.url] = false;
+                this.lists.results[g.url] = started ? 'Recording soon' : 'Scheduled ' + this.clockLocal(start);
+              } else {
+                const d = data.detail;
+                this.lists.results[g.url] = 'Failed: ' + (Array.isArray(d) ? d.map(x => x.msg).join('; ') : (d || res.status));
+              }
+            } catch (e) {
+              this.lists.results[g.url] = 'Failed: ' + e;
+            }
+          }
+          await this.refreshSchedules();
+          this.lists.state = ok === games.length ? 'ok' : 'fail';
+          this.lists.message = ok + ' of ' + games.length + ' scheduled.'
+            + (ok < games.length ? ' See the reason beside each game.' : '');
+        },
+
+        editGame(g) {
+          this.openNewModal = true;
+          this.pickEvent(g);
         },
 
         async refreshSchedules() {

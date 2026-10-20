@@ -79,7 +79,7 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PVARR_RECORDINGS_DIR` | `./recordings` | Where recordings are written. The container sets this to `/recordings` so captures land on the mounted volume rather than inside the image. |
 | `PVARR_ALLOWED_DIRS` | unset | Extra directories the library API and `output_dir` may write to, `:`-separated. By default only the recordings dir is reachable. |
 | `PVARR_LOG_LEVEL` | `INFO` | Root log level. |
-| `PVARR_CONFIG_DIR` | `./config` | Where PVArr keeps its state: in-flight sessions (so a restart can resume them), schedules, and the comskip ad-share log. The container sets this to `/config`. |
+| `PVARR_CONFIG_DIR` | `./config` | Where PVArr keeps its state: in-flight sessions (so a restart can resume them), schedules, saved Events-tab pages (`event-lists.json`), and the comskip ad-share log. Back it up with your other app config. The container sets this to `/config`. |
 | `PVARR_MAX_RESUME_GAP` | `300` | Seconds a recording's file may sit untouched before a restart finalises it instead of reconnecting. Measured from the file's last write, not from when the recording started. |
 | `PVARR_MAX_RESUME_ATTEMPTS` | `3` | How many restarts in a row may resume a session before it is finalised instead. Stops a reproducibly broken recording from restart-looping forever. A resume that keeps recording for 10 minutes starts the count over. |
 | `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |

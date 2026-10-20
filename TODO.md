@@ -4360,6 +4360,21 @@ were not used: site-specific, and possibly paid placement.
   recording healthy for 10 min, finalised it mid-event. Now `resumed_at` is
   stamped at each resume and a resume that kept writing RESUME_SETTLED_SEC
   (600 s) starts the count over. `test_a_resume_that_kept_recording_resets_the_attempt_count`.
+- [COMPLETED] Events tab (2026-10-20, sponsor request): saved list pages on
+  the server (`app/eventlists.py`, `/config/event-lists.json`), games grouped
+  live/by day, tick several and schedule all (one POST /api/schedules each;
+  lead 5/10/15 min; end = start + league length). Design reviewed by
+  Architect/Security/DevOps agents. Adopted: drop LAN game links from public
+  listing pages (Security: a game is scheduled as an event page whose scan
+  trusts private streams); up-front 20-job check, untimed/finished games not
+  tickable, started games end at start + length (Architect); `.bak` for an
+  unknown-schema file, docs mention the file (DevOps). Disagreement: DevOps
+  wanted start times staggered automatically, Architect not to shift times
+  silently; settled on a lead choice plus a note when 3+ start within 10 min.
+  Verified in headless Chrome against a synthetic listing page (4 of 4
+  scheduled, times right, badges after reload, no phone-width overflow).
+  Not done: a saved page cannot carry a browser cookie (use the New
+  Recording form for such pages); no cap on simultaneous recordings.
 - Find went from ~25-30 s to ~40-55 s (FlareSolverr solve included).
 - Every working link was the same 720p ~1.8 Mbps feed relayed by different
   sites, so ranking came down to delivery speed.

@@ -133,6 +133,31 @@ page it checks (not the times). Nothing here is site-specific: pages without
 these details simply fill in nothing. Read game counts as an event-page
 check for the one-at-a-time rule below.
 
+### The Events tab: schedule several games from a listing page
+
+**Events** (header button, or the tab) keeps the listing pages you use often,
+so you do not paste them again. **+ Add page** saves one (a link and an
+optional name; up to 20, kept in `/config/event-lists.json`, no cookie).
+Click a saved page to list its games, grouped **Live now**, then by day, with
+the local start time, league and usual length. Tick games and press
+**Schedule selected**; each becomes an ordinary schedule:
+
+- **Start** is the page's start time minus the lead you choose (5, 10 or
+  15 min early); a game already under way starts now.
+- **End** is the start time plus the league's usual length (as above).
+- A game already scheduled shows **Scheduled**; one with no time listed,
+  or long over, cannot be ticked. **Edit** opens the New Recording form
+  filled in from that game, for anything else.
+
+Each game gets its own result beside it, and the 20-waiting-schedules limit
+is checked before anything is sent. When three or more ticked games start
+within 10 minutes of each other the tab says so: their event pages are
+checked one at a time (up to about a minute each), so the last one starts
+later than the first, and a longer lead covers that. Listing a page is an
+event-page check too, so doing it right at a kick-off delays that game's
+check by up to a minute. A listing page on the internet cannot list a game
+whose link points into your local network; such links are left out.
+
 ## Scheduling a recording
 
 Fill in the form as usual with an event page, then set **Start at** and

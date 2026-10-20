@@ -5,6 +5,7 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Events** tab (and header button): save the listing pages you use (on the server, so every device sees them), list a page's games grouped live / by day, tick several and schedule them all at once, each starting 5, 10 or 15 min before its listed time and ending after the league's usual length. Already-scheduled, untimed and finished games are marked and cannot be ticked. API: `GET/POST /api/event-lists`, `DELETE /api/event-lists/{id}`.
 - A recording started from an event page re-checks it when two of its sources die, and swaps fresh working links into the dead slots (never the one recording), skipping the links it already holds. Automatically at most once per 10 minutes, never delaying a scheduled start; also on demand with **Re-check event page** on the card (`POST /api/recordings/{id}/rescan`).
 - **Find 3 streams** ranks what it finds: up to six working streams are measured (real resolution, frame rate, bitrate, download speed against real time) and the best three fill the slots, best first; a stream that cannot keep up ranks last. Backups are taken from different real sources where possible: links that relay the same origin feed through different edge servers count as one source, since they fail together. `PVARR_RANK_STREAMS=0` keeps the old page order.
 - **Find 3 streams**, a scheduled start, and a mid-recording re-check log one line naming each picked stream's host and what it measured (`Find picks: #1 … 720p · 1.8 Mbps · 14.5x real-time; …`), so an unattended recording shows why it chose its streams. A backup that relays the same feed as an earlier pick is marked `[same source as #N]`, with the number of distinct sources at the end.
@@ -13,6 +14,8 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 - **Find 3 streams** probes up to 40 links on an event page, up from 20. It stops once it has enough working ones: three, or up to six to rank when ranking is on. If those six all play one feed (several sites relaying one origin), it keeps probing, up to ten working links, for one that plays a different feed, so a backup can come from it; only that extra link is measured.
 
 ### Fixed
+- A listing page on the internet could name a game link into the local network, and scheduling it made PVArr fetch it and trust private streams there. Such links are now left out (a listing page on your own network keeps them).
+- At phone width the header pushed the page sideways; the buttons now show just their icons there.
 - A recording was finalised mid-event after its third restart in total, however long it had run fine since the last one: `PVARR_MAX_RESUME_ATTEMPTS` counted for the recording's whole life. Now a resume that keeps recording for 10 minutes starts the count over, so only a real restart loop is stopped.
 - A re-check that found working links but had no failed source to replace said "nothing new to swap in". It now says how many it found and that no source has failed.
 - **Force Failover** stayed greyed out once a recording reached its last source, although the server wraps back to the first. It is now disabled only for a single-source recording.
