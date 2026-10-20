@@ -219,14 +219,16 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 continue
             else:
                 share = 1.0
+            if len(data) * 8 / (secs * share) / 1000 < MIN_VIDEO_KBPS:
+                # A few hundred bytes "for" seconds of video is no video feed,
+                # whatever it sniffs as; timing it would inflate headroom.
+                out["note"] = "too little data to be video"
+                continue
             got_bytes += len(data)
             got_secs += secs * share
             spent += took
         if not first and not too_slow:
             out["note"] = out["note"] or "segment is not video"
-            return out
-        if got_secs and got_bytes * 8 / got_secs / 1000 < MIN_VIDEO_KBPS and not too_slow:
-            out["note"] = "too little data to be video"
             return out
         if got_secs and spent > 0:
             out["kbps"] = round(got_bytes * 8 / got_secs / 1000)
@@ -331,11 +333,14 @@ def score(q: Dict[str, Any]) -> Tuple:
         tier = 0 if headroom >= MIN_HEADROOM else 2
     # A resolution ffprobe saw beats one the playlist merely claims
     # (RESOLUTION=1x99999 must not outrank a measured 1080p); the claim only
-    # orders streams ffprobe could not read, and only within reason.
+    # orders streams whose delivery was timed but ffprobe could not read, and
+    # only within reason. Nothing measured: claims count for nothing, so a
+    # failed measurement keeps page order.
+    trusted = bool(q.get("measured"))
     height = q.get("height") or 0
-    claimed = 0 if height else min(q.get("declared_height") or 0, 2160)
+    claimed = 0 if height or not trusted else min(q.get("declared_height") or 0, 2160)
     smooth = 1 if (q.get("fps") or 0) >= 48 else 0
-    kbps = q.get("kbps") or min(q.get("declared_kbps") or 0, 50000)
+    kbps = q.get("kbps") or (min(q.get("declared_kbps") or 0, 50000) if trusted else 0)
     return (tier, -height, -claimed, -smooth, -(kbps // 500), -(headroom or 0))
 
 
