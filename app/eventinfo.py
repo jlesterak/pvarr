@@ -47,6 +47,7 @@ MAX_EVENTS = 200
 MAX_HTML = 1_000_000
 MAX_LINKS = 2000
 MAX_TEAM_WORDS = 6
+MAX_LD_ITEMS = 200      # schema.org objects examined across all blocks
 # "A vs B" text longer than this is not a game title; the cap also keeps the
 # lazy regex below from going quadratic on a hostile page.
 MAX_VS_TEXT = 200
@@ -205,16 +206,25 @@ def _live(chunks: List[str]) -> Tuple[bool, str]:
     return False, ""
 
 
+def _clean(value: Any) -> str:
+    """A schema.org text field as one line of at most 1,000 characters."""
+    return " ".join(str(value)[:1000].split())
+
+
 def _from_ld(blocks: List[str]) -> Optional[Dict[str, Any]]:
     """Teams and start from the first schema.org SportsEvent, if any."""
+    seen = 0
     for raw in blocks:
+        if seen >= MAX_LD_ITEMS:
+            break
         try:
             data = json.loads(raw)
         except (ValueError, RecursionError):   # junk, or nested past the stack
             continue
         stack = deque(data if isinstance(data, list) else [data])
-        while stack:
+        while stack and seen < MAX_LD_ITEMS:
             item = stack.popleft()
+            seen += 1
             if not isinstance(item, dict):
                 continue
             stack.extend(item["@graph"] if isinstance(item.get("@graph"), list) else [])
@@ -226,12 +236,12 @@ def _from_ld(blocks: List[str]) -> Optional[Dict[str, Any]]:
             for key in ("homeTeam", "awayTeam"):
                 team = item.get(key)
                 if isinstance(team, dict) and team.get("name"):
-                    names.append(str(team["name"]))
+                    names.append(_clean(team["name"]))
             if len(names) < 2 and isinstance(item.get("competitor"), list):
-                names = [str(c.get("name")) for c in item["competitor"]
+                names = [_clean(c.get("name")) for c in item["competitor"]
                          if isinstance(c, dict) and c.get("name")][:2]
             if len(names) < 2:
-                pair = _split_vs(str(item.get("name", "")), backed=True)
+                pair = _split_vs(_clean(item.get("name", "")), backed=True)
                 names = list(pair) if pair else []
             if len(names) == 2:
                 return {"teams": names, "ts": _epoch(str(item.get("startDate", "")))}

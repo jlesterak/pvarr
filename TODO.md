@@ -4187,6 +4187,12 @@ LIVE label, link titles), no site's markup, so nothing site-specific ships.
   words, at most 2,000 links and the first 1 MB of a page are read, names
   over 100 characters are not looked up. 0.2 s now; the validator's 61
   hostile cases all finish under 3 s.
+- [COMPLETED] Fourth round: schema.org `name` fields were not whitespace-
+  collapsed, so many items named "watch" + 194 spaces + "x" took 39 ms each
+  in the "A vs B" regex (130 items, 30 KB: 6 s; 4,000 items: 206 s). Fixed:
+  schema.org text fields collapsed and capped like the rest, and at most
+  200 schema.org objects are examined. 0.00 s; all 80 hostile cases from
+  rounds three and four finish under 3 s.
 - Accepted: a link like "Home - About" laid out as two text pieces, or
   "Tabs vs Spaces", can appear in the pick list, and a finished game is
   listed with no time. The operator picks from the list, so this costs a

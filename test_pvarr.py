@@ -8478,6 +8478,12 @@ class TestEventInfo(unittest.TestCase):
             eventinfo.parse("".join(f'<a href="/e{i}" title="{title}">x</a>' for i in range(9000)),
                             "https://x.example/")
         self.assertLess(_t.monotonic() - t0, 3.0)
+        # Fourth round: whitespace-padded names in many schema.org items (30 KB: 6 s).
+        t0 = _t.monotonic()
+        item = '{"@type":"Event","name":"watch' + " " * 194 + 'x"}'
+        eventinfo.parse('<script type="application/ld+json">{"@graph":[' + ",".join([item] * 4000) + "]}</script>",
+                        "https://x.example/")
+        self.assertLess(_t.monotonic() - t0, 3.0)
         ev = eventinfo.parse('<div data-timestamp="' + "9" * 5000 + '"></div><h1>Colorado Avalanche vs Philadelphia Flyers</h1>',
                              "https://x.example/")["event"]
         self.assertEqual(ev["team_a"], "Colorado Avalanche")
