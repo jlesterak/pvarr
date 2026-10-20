@@ -28,8 +28,10 @@ added later by subclassing `TeamProvider` and registering it in `PROVIDERS`.
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -199,6 +201,28 @@ def suggest_teams(query: str, league: str = "", limit: int = MAX_SUGGESTIONS) ->
         seen.add(name)
         hits.append((score, order, name.lower(), {"value": name, "label": label}))
     return [h[3] for h in sorted(hits, key=lambda h: h[:3])][:limit]
+
+
+def _fold(text: str) -> str:
+    """Case, accents and punctuation folded away: "CF Montréal" -> "cf montreal"."""
+    plain = unicodedata.normalize("NFKD", text or "")
+    plain = "".join(ch for ch in plain if not unicodedata.combining(ch)).lower()
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", plain).split())
+
+
+@lru_cache(maxsize=1)
+def _names_by_fold() -> Dict[str, List[tuple]]:
+    index: Dict[str, List[tuple]] = {}
+    for _order, league_id, name, _codes, _fields, _label in _team_index():
+        index.setdefault(_fold(name), []).append((league_id, name))
+    return index
+
+
+def find_team(name: str) -> List[tuple]:
+    """[(league_id, canonical name), ...] for a full team name as a page
+    spells it, in catalogue order; [] if the snapshot does not know it.
+    Exact after folding, not a prefix search: "Philadelphia" is not a team."""
+    return list(_names_by_fold().get(_fold(name), []))
 
 
 # --------------------------------------------------------------------------

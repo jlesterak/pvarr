@@ -4120,3 +4120,48 @@ The sponsor asked for every "still open, deliberately not fixed" item to be fixe
 Verify: `python3 -m pytest -q` -> 705 passed, 1 failed (`test_an_unwritable_directory_raises_rather_than_lying`
 fails only when run as root, as in the cloud sandbox; it fails the same on the unchanged code).
 
+## Phase 32: Read the game from the event page (2026-10-19) [COMPLETED -- release with the next version]
+
+Sponsor request: match events more easily, either from an event database or
+by reading the event/stream pages themselves.
+
+### Decision: read the page, no event database
+Four real pages were checked (one listing, three event pages; kept in the
+private field notes, not here). Every one already carried both team names,
+the league or sport, and either a Unix start time or a LIVE label, and the
+listing page carried the same per game. An external event database (the
+ESPN scoreboard was the candidate) would add a runtime network dependency
+for data the page already has, so it was dropped. Only generic signals are
+read (schema.org event data, "A vs B" text, epoch/`<time>` attributes, a
+LIVE label, link titles), no site's markup, so nothing site-specific ships.
+
+### Built
+- [COMPLETED] `app/eventinfo.py`: pure parser, no network. `parse(html, url)`
+  gives `event` (this page's game) and `events` (games a listing links to).
+  Teams matched exactly (case/accent folded) against the snapshot via new
+  `tags.find_team`; league from a shared league of both teams, or the page's
+  label when it names a catalogue league. Default window per league.
+  A plain "A - B" counts as a game only when a time, a LIVE label, a known
+  team, or both names as separate text back it up: a site title like
+  "Site - Your guide to..." otherwise read as a game.
+- [COMPLETED] `aggregator.read_event` + `POST /api/event-info`: one page
+  fetch (plain -> browser TLS -> FlareSolverr as usual), no probing, shares
+  the event-page lock (429 while a scan runs). `find_streams` also returns
+  `event`.
+- [COMPLETED] Dashboard: **Read game** button; listing pages show a pick
+  list; picking or reading fills Sport/teams/Start at/End at (Find fills
+  Sport/teams only).
+- [COMPLETED] Tests: `TestEventInfo`, `TestEventInfoEndpoint` (11) on
+  synthetic pages; suite 717 green. Real pages checked locally: all 3 event
+  pages and all 13 listing games read correctly (teams, league, start time,
+  live status). UI driven in headless Chrome against a dev server: listing
+  -> pick -> form filled and the submit turned into Schedule.
+
+### Notes
+- A pasted browser cookie with that browser's User-Agent worked against an
+  anti-bot check on 2026-10-19 with every client PVArr has; the 2026-10-08
+  failure (Phase 25) was FlareSolverr's own cookie, whose User-Agent and TLS
+  fingerprint did not match PVArr's clients.
+- Times are shown in the browser's time zone; the page's own text ("Today
+  at 6:15 PM") is ignored in favour of the epoch.
+

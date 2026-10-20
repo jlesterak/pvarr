@@ -62,6 +62,34 @@ Only one event-page check runs at a time; a second one while it is busy gets
 starts can get `429` ("a scheduled recording is checking its event
 page") for a minute or so; the schedule itself waits its turn.
 
+### Reading the game from the page
+
+**Read game** (next to Find) fetches the page once, checks no links, and
+fills in the form from what the page says about the game:
+
+- **Sport, Team A, Team B.** Read from schema.org event data when the page
+  has it, otherwise from an "A vs B" heading, description or title. Names
+  are matched against the offline team list, so they come out spelt the
+  same way every time and the league is filled in (a hockey page with two
+  NHL teams gives `NHL`). A team the list does not know keeps the page's
+  spelling, and the sport is whatever label the page gives (for example a
+  foreign soccer league).
+- **Start at / End at.** From a machine-readable start time on the page (a
+  `data-timestamp`-style Unix time, `<time datetime>`, or the event data).
+  End at is the start plus a usual game length for the league (NFL 3.5 h,
+  NHL 3 h, NBA 2.75 h, soccer 2.25 h, 3 h otherwise). A game already marked
+  LIVE records from now. With a future start the button turns into
+  **Schedule**.
+- **A listing page** (one page linking to many games) shows those games
+  instead, live ones first, then by start time. Click one: its own page
+  becomes the event page and the form is filled in from the listing.
+
+Everything filled in stays editable, and anything the page does not say is
+left as it was. **Find 3 streams** also fills in Sport and the teams from the
+page it checks (not the times). Nothing here is site-specific: pages without
+these details simply fill in nothing. Read game counts as an event-page
+check for the one-at-a-time rule below.
+
 ## Scheduling a recording
 
 Fill in the form as usual with an event page, then set **Start at** and

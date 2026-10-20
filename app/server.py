@@ -554,6 +554,35 @@ async def aggregate_url(
     return JSONResponse(content=result)
 
 
+@app.post("/api/event-info")
+async def event_info(
+    url: str = Form(...),
+    cookie: Optional[str] = Form(None),
+    user_agent: Optional[str] = Form(None),
+):
+    """Read the game(s) a page describes, to fill in the schedule form.
+
+    One page fetch, no stream probing: seconds, or up to a minute when the
+    page goes through FlareSolverr. Shares the event-page lock with Find, so
+    it never runs alongside a scan. An event page answers `event`; a listing
+    page answers `events`.
+    """
+    for value in (url, cookie or "", user_agent or ""):
+        if len(value) > 4096:
+            raise HTTPException(status_code=400, detail="Field is too long")
+    if _aggregate_lock.locked():
+        if _aggregate_holder == "scheduled":
+            raise HTTPException(status_code=429, detail=(
+                "A scheduled recording is checking its event page; try again in a minute"))
+        raise HTTPException(status_code=429, detail="Already checking an event page; wait for it to finish")
+    async with _aggregate_lock:
+        result = await _scan_in_daemon_thread(
+            "event-info", url.strip(), (cookie or "").strip() or None,
+            (user_agent or "").strip() or None, fs_retry=True,
+            scan=aggregator.read_event)
+    return JSONResponse(content=result)
+
+
 def buffer_dir() -> Path:
     """Where rebroadcast ring buffers live.
 
@@ -1236,8 +1265,10 @@ def _track_schedule_task(job_id: str, coro) -> "asyncio.Task":
 
 
 def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
-                           user_agent: Optional[str], fs_retry: bool = False) -> "asyncio.Future":
-    """Run aggregator.find_streams on a daemon thread; its result as a Future.
+                           user_agent: Optional[str], fs_retry: bool = False,
+                           scan=None) -> "asyncio.Future":
+    """Run aggregator.find_streams (or `scan`, same signature) on a daemon
+    thread; its result as a Future.
 
     Used by scheduled scans and the manual Find alike. Not asyncio.to_thread: that worker belongs to the default executor, which
     is joined when the interpreter exits, so a stop during a scan waited out
@@ -1256,7 +1287,7 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
     def _run():
         try:
             extra = {"fs_retry": True} if fs_retry else {}
-            outcome = aggregator.find_streams(
+            outcome = (scan or aggregator.find_streams)(
                 agg_url, cookie=cookie, user_agent=user_agent,
                 abort=cleanup.shutting_down, **extra,
             )

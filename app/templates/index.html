@@ -603,7 +603,28 @@
                       class="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-50">
                 <span x-text="agg.state === 'working' ? 'Checking links...' : 'Find 3 streams'"></span>
               </button>
+              <!-- One page fetch, no probing: fills sport, teams and the
+                   start/end times from the page, or lists the games on a
+                   listing page to pick from. -->
+              <button type="button" @click="readEvent()" :disabled="agg.state === 'working' || !agg.url"
+                      title="Fill in teams, league and times from the page (a listing page shows its games)"
+                      class="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-50">
+                Read game
+              </button>
             </div>
+            <ul x-show="agg.events.length" class="max-h-56 overflow-y-auto divide-y divide-slate-800 rounded border border-slate-800" style="display:none;">
+              <template x-for="(ev, i) in agg.events" :key="ev.url">
+                <li>
+                  <button type="button" @click="pickEvent(ev)"
+                          class="w-full text-left px-2 py-1.5 text-xs hover:bg-slate-800 flex gap-2 items-baseline">
+                    <span class="shrink-0 w-24 font-semibold" :class="ev.live ? 'text-rose-400' : 'text-slate-400'"
+                          x-text="ev.live ? ('LIVE' + (ev.status ? ' ' + ev.status : '')) : (ev.start_at ? timeLocal(ev.start_at) : '')"></span>
+                    <span class="truncate text-slate-200" x-text="ev.team_a + ' vs ' + ev.team_b"></span>
+                    <span class="ml-auto shrink-0 text-slate-500" x-text="ev.sport"></span>
+                  </button>
+                </li>
+              </template>
+            </ul>
             <button type="button" @click="agg.showHeaders = !agg.showHeaders"
                     class="text-[11px] text-slate-500 hover:text-arr-accent"
                     x-text="agg.showHeaders ? 'Hide browser cookie' : 'Page needs your browser session? Paste its cookie'"></button>
@@ -794,7 +815,7 @@
           { field: 'team_b', model: 'team_b', label: 'Team B / Rival', placeholder: 'Raiders' }
         ],
         agg: { url: '', cookie: '', user_agent: '', showHeaders: false,
-               state: 'idle', message: '', tried: [] },
+               state: 'idle', message: '', tried: [], events: [] },
         probes: { url_primary: null, url_backup1: null, url_backup2: null },
         advanced: { url_primary: false, url_backup1: false, url_backup2: false },
         overrides: {
@@ -1200,6 +1221,78 @@
           if (o) { event.preventDefault(); this.pick(f, o); }
         },
 
+        // datetime-local wants local "YYYY-MM-DDTHH:MM".
+        localInput(epoch) {
+          const d = new Date(epoch * 1000);
+          const pad = n => String(n).padStart(2, '0');
+          return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        },
+
+        // Teams and league from the page. The form's defaults are samples,
+        // so the page wins; everything stays editable.
+        applyEventTags(ev) {
+          if (!ev) return;
+          if (ev.sport) this.form.sport = ev.sport;
+          this.form.team_a = ev.team_a;
+          this.form.team_b = ev.team_b;
+        },
+
+        // Tags plus the window: an upcoming game gets its start and a default
+        // end for its league; a game already on records from now.
+        applyEvent(ev) {
+          this.applyEventTags(ev);
+          const now = Date.now() / 1000;
+          const start = ev.live || !ev.start_at ? null : ev.start_at;
+          this.sched.start = start && start > now ? this.localInput(start) : '';
+          this.sched.end = this.localInput(Math.max(start || now, now) + ev.duration_hours * 3600);
+        },
+
+        pickEvent(ev) {
+          this.agg.url = ev.url;
+          this.agg.events = [];
+          this.applyEvent(ev);
+          this.agg.state = 'ok';
+          this.agg.message = 'Filled in ' + ev.team_a + ' vs ' + ev.team_b
+            + (this.sched.start ? ', scheduled for its start time.' : ', recording from now.');
+        },
+
+        async readEvent() {
+          const url = (this.agg.url || '').trim();
+          if (!/^https?:\/\//i.test(url)) {
+            this.agg.state = 'fail';
+            this.agg.message = 'URL must start with http:// or https://';
+            return;
+          }
+          this.agg.state = 'working';
+          this.agg.message = 'Reading the page...';
+          this.agg.tried = [];
+          this.agg.events = [];
+          const body = new FormData();
+          body.append('url', url);
+          if (this.agg.cookie) body.append('cookie', this.agg.cookie);
+          if (this.agg.user_agent) body.append('user_agent', this.agg.user_agent);
+          try {
+            const res = await fetch('/api/event-info', { method: 'POST', body });
+            const data = await res.json();
+            this.agg.message = data.message || data.detail || '';
+            if (!data.ok) {
+              this.agg.state = 'fail';
+              if (data.page && data.page.challenged) this.agg.showHeaders = true;
+              return;
+            }
+            this.agg.state = 'ok';
+            if (data.events && data.events.length && !data.event) {
+              this.agg.events = data.events;
+              this.agg.message += ' Pick one.';
+            } else if (data.event) {
+              this.applyEvent(data.event);
+            }
+          } catch (e) {
+            this.agg.state = 'fail';
+            this.agg.message = 'Request failed: ' + e;
+          }
+        },
+
         async findStreams() {
           const url = (this.agg.url || '').trim();
           if (!/^https?:\/\//i.test(url)) {
@@ -1225,6 +1318,7 @@
               return;
             }
             this.agg.state = 'ok';
+            this.applyEventTags(data.event);
             // Fill the slots in order; any slot without a pick is cleared so a
             // stale URL from an earlier paste cannot ride along as a backup.
             // Only the URL is filled, never the headers the probe found: the
@@ -1289,6 +1383,7 @@
           this.agg.state = 'idle';
           this.agg.message = '';
           this.agg.tried = [];
+          this.agg.events = [];
           this.showManual = false;
         },
 

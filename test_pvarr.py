@@ -8357,6 +8357,146 @@ class TestHealthEndpoint(ServerTestCase):
         self.assertEqual(r.json()["wedged"], ["r1"])
 
 
+# --------------------------------------------------------------------------
+# app.eventinfo: teams, league and start time read from a page
+# --------------------------------------------------------------------------
+from app import eventinfo  # noqa: E402
+
+# Synthetic pages in the shapes seen in the wild: a header with both teams and
+# an epoch start, a live header, a listing of links, schema.org data.
+EVENT_PAGE = """<html><head><title>Washington Commanders vs San Francisco 49ers Football Live Stream | Events</title>
+<meta property="og:description" content="Watch Washington Commanders vs San Francisco 49ers live online.">
+<base href="https://events.example/"></head><body>
+<nav><a href="/">Home</a><a href="watch-nfl/">NFL</a></nav>
+<section><div>NFL</div><div><span>Washington Commanders</span></div>
+<div>VS <span class="t" data-timestamp="1792455300">Today at 6:15 PM</span></div>
+<div><span>San Francisco 49ers</span></div>
+<h1>Washington Commanders vs San Francisco 49ers</h1></section>
+<a href="https://streams.example/1">Stream 1</a></body></html>"""
+
+LIVE_PAGE = """<html><head><title>Corinthians vs Vitória Brazilian Série A Live Stream | Soccer Events</title></head>
+<body><h1>Corinthians vs Vitória</h1><span>LIVE</span><span>|</span><span>HT</span></body></html>"""
+
+LISTING_PAGE = """<html><head><title>Events - Your Guide to Live Sports</title><base href="https://events.example/"></head>
+<body><h1>Events - Your Guide to Live Sports</h1>
+<a href="watch-1-hockey-colorado-avalanche-philadelphia-flyers/" title="Colorado Avalanche - Philadelphia Flyers">
+ <span>Colorado Avalanche</span><span>Philadelphia Flyers</span><div>Hockey</div>
+ <span>LIVE</span><span>|</span><span>End of 1st Period</span><span>18 Streams</span></a>
+<a href="watch-2-nfl-x/" title="Washington Commanders - San Francisco 49ers">
+ <span>Washington Commanders</span><span>San Francisco 49ers</span><div>NFL</div>
+ <span data-timestamp="1792455300">6:15 PM</span></a>
+<a href="https://soccer.example/watch-3-unknown/" title="Club Uno - Club Dos">
+ <span>Club Uno</span><span>Club Dos</span><div>Some Soccer League</div><span>FT</span></a>
+<a href="watch-2-nfl-x/" title="Washington Commanders - San Francisco 49ers">duplicate</a>
+<a href="about/" title="About - Contact">About</a>
+</body></html>"""
+
+LD_PAGE = """<html><head><script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SportsEvent","name":"Avs at Flyers",
+ "startDate":"2026-10-20T01:00:00Z","homeTeam":{"name":"Philadelphia Flyers"},
+ "awayTeam":{"name":"Colorado Avalanche"}}</script></head><body><h1>Game night</h1></body></html>"""
+
+
+class TestEventInfo(unittest.TestCase):
+    def test_event_page_gives_teams_league_and_start(self):
+        ev = eventinfo.parse(EVENT_PAGE, "https://events.example/watch-9/")["event"]
+        self.assertEqual((ev["sport"], ev["team_a"], ev["team_b"]),
+                         ("NFL", "Washington Commanders", "San Francisco 49ers"))
+        self.assertEqual(ev["start_at"], 1792455300.0)
+        self.assertEqual(ev["end_at"], 1792455300.0 + 3.5 * 3600)
+        self.assertFalse(ev["live"])
+
+    def test_live_page_with_unknown_teams_keeps_page_text(self):
+        ev = eventinfo.parse(LIVE_PAGE, "https://soccer.example/watch-3/")["event"]
+        self.assertEqual((ev["team_a"], ev["team_b"]), ("Corinthians", "Vitória"))
+        self.assertEqual(ev["sport"], "Brazilian Série A")   # label after team B in the title
+        self.assertFalse(ev["league_known"])
+        self.assertTrue(ev["live"])
+        self.assertEqual(ev["status"], "HT")
+        self.assertIsNone(ev["start_at"])
+        self.assertEqual(ev["duration_hours"], eventinfo.SOCCER_HOURS)   # "soccer" in the URL
+
+    def test_listing_page_lists_games_not_slogans(self):
+        out = eventinfo.parse(LISTING_PAGE, "https://events.example/live/")
+        self.assertIsNone(out["event"])        # "Events - Your Guide..." is not a game
+        evs = out["events"]
+        self.assertEqual([(e["team_a"], e["sport"]) for e in evs], [
+            ("Colorado Avalanche", "NHL"),            # live first
+            ("Club Uno", "Some Soccer League"),       # no time: before timed ones
+            ("Washington Commanders", "NFL"),
+        ])
+        self.assertEqual(evs[0]["status"], "End of 1st Period")
+        self.assertEqual(evs[0]["url"], "https://events.example/watch-1-hockey-colorado-avalanche-philadelphia-flyers/")
+        self.assertEqual(evs[2]["start_at"], 1792455300.0)
+        self.assertEqual(evs[1]["url"], "https://soccer.example/watch-3-unknown/")
+
+    def test_schema_org_event_data_wins(self):
+        ev = eventinfo.parse(LD_PAGE, "https://events.example/g")["event"]
+        self.assertEqual((ev["team_a"], ev["team_b"], ev["sport"]),
+                         ("Philadelphia Flyers", "Colorado Avalanche", "NHL"))
+        self.assertEqual(ev["start_at"], 1792458000.0)
+
+    def test_nothing_found_and_garbage_are_harmless(self):
+        self.assertEqual(eventinfo.parse("<html><h1>Hello</h1>", "https://x.example/"),
+                         {"event": None, "events": []})
+        self.assertEqual(eventinfo.parse("", "https://x.example/"), {"event": None, "events": []})
+        eventinfo.parse("<a href='x' title='A vs B'><span data-timestamp='99'>", "https://x.example/")
+
+    def test_implausible_times_are_ignored(self):
+        self.assertIsNone(eventinfo._epoch("12"))
+        self.assertIsNone(eventinfo._epoch("2026-10-20"))           # date only
+        self.assertIsNone(eventinfo._epoch("2026-10-20T01:00:00"))  # no offset
+        self.assertEqual(eventinfo._epoch("1792455300000"), 1792455300.0)  # ms
+        self.assertEqual(eventinfo._epoch("2026-10-20T01:00:00Z"), 1792458000.0)
+
+    def test_window_for_a_live_game_starts_now(self):
+        ev = {"start_at": None, "live": True, "duration_hours": 3.0}
+        self.assertEqual(eventinfo.window(ev, now=1000.0), (1000.0, 1000.0 + 10800))
+        ev = {"start_at": 5000.0, "live": False, "duration_hours": 2.0}
+        self.assertEqual(eventinfo.window(ev, now=1000.0), (5000.0, 5000.0 + 7200))
+
+    def test_find_team_is_exact_after_folding(self):
+        self.assertEqual(tags.find_team("colorado  AVALANCHE")[0], ("NHL", "Colorado Avalanche"))
+        self.assertEqual(tags.find_team("Colorado"), [])
+
+
+class TestEventInfoEndpoint(ServerTestCase):
+    def test_reads_the_page_without_probing(self):
+        from unittest.mock import patch
+        fetched = {"ok": True, "url": "https://events.example/watch-9/", "html": EVENT_PAGE,
+                   "via": "plain", "status": 200, "challenged": False, "attempts": [], "message": ""}
+        with patch.object(self.server.aggregator, "fetch_page", return_value=fetched), \
+                patch.object(self.server.aggregator, "pick_first_working") as picker:
+            r = self.client.post("/api/event-info", data={"url": "https://events.example/watch-9/"})
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["event"]["team_b"], "San Francisco 49ers")
+        picker.assert_not_called()
+
+    def test_find_also_returns_the_event(self):
+        from unittest.mock import patch
+        fetched = {"ok": True, "url": "https://events.example/watch-9/", "html": EVENT_PAGE,
+                   "via": "plain", "status": 200, "challenged": False, "attempts": [], "message": ""}
+        with patch.object(aggregator, "fetch_page", return_value=fetched):
+            out = aggregator.find_streams("https://events.example/watch-9/",
+                                          probe_fn=lambda u: {"ok": False, "message": "no"})
+        self.assertEqual(out["event"]["sport"], "NFL")
+
+    def test_refused_while_a_scan_runs_and_caps_length(self):
+        import asyncio
+        lock = self.server._aggregate_lock
+        asyncio.run(lock.acquire())
+        try:
+            r = self.client.post("/api/event-info", data={"url": "https://events.example/e"})
+            self.assertEqual(r.status_code, 429)
+        finally:
+            lock.release()
+        r = self.client.post("/api/event-info", data={"url": "https://a/" + "x" * 5000})
+        self.assertEqual(r.status_code, 400)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

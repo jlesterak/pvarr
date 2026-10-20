@@ -46,7 +46,7 @@ from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
-from app import probe
+from app import eventinfo, probe
 
 logger = logging.getLogger("PVArrAggregator")
 
@@ -525,6 +525,9 @@ def find_streams(
         result["message"] = page["message"]
         return result
 
+    # Who is playing and when, read from the page already in hand.
+    result["event"] = eventinfo.parse(page["html"], page["url"])["event"]
+
     links = extract_links(page["html"], page["url"])
     # The SSRF guard from the embed walk, applied the same way: a link a
     # stranger's page names may not point PVArr into the LAN, unless the
@@ -550,4 +553,45 @@ def find_streams(
     else:
         result["message"] = (f"None of the {checked} links checked gave a recordable stream"
                              + (" before the time limit" if chosen["timed_out"] else "") + ".")
+    return result
+
+
+def read_event(
+    url: str,
+    cookie: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    abort: Optional[threading.Event] = None,
+    fs_retry: bool = False,
+) -> Dict[str, Any]:
+    """Fetch a page and read the game(s) it describes; no stream probing.
+
+    An event page gives `event` (teams, league, start); a listing page gives
+    `events`, one per game it links. Returns ``{ok, page, event, events,
+    message}``; the event URLs are only returned, never fetched.
+    """
+    result: Dict[str, Any] = {"ok": False, "page": {}, "event": None,
+                              "events": [], "message": ""}
+    try:
+        target = probe.clean_url(url)
+    except probe.ProbeError as exc:
+        result["message"] = str(exc)
+        return result
+    page = fetch_page(target, cookie=clean_cookie(cookie),
+                      user_agent=clean_user_agent(user_agent),
+                      abort=abort, fs_retry=fs_retry)
+    result["page"] = {k: page[k] for k in ("ok", "url", "via", "status", "challenged", "attempts")}
+    if not page["ok"]:
+        result["message"] = page["message"]
+        return result
+    found = eventinfo.parse(page["html"], page["url"])
+    result.update(found)
+    result["ok"] = bool(found["event"] or found["events"])
+    if found["events"]:
+        n = len(found["events"])
+        result["message"] = f"{n} game{'s' if n != 1 else ''} listed on that page."
+    elif found["event"]:
+        result["message"] = "Read the game from the page."
+    else:
+        result["message"] = ("No teams or games found on that page; "
+                             "fill in the details by hand.")
     return result
