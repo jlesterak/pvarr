@@ -4224,7 +4224,7 @@ were not used: site-specific, and possibly paid placement.
   RANK_BUDGET_SEC=20, sorted by `quality.score` (keeps up >= 1.5x, then
   height, >= 48 fps, bitrate in 500 kbps steps, headroom), best 3 kept.
   `tried` notes carry each measurement. `PVARR_RANK_STREAMS=0` = old order.
-- [COMPLETED] Tests: `TestStreamRanking` (24), incl. ffprobe on a real
+- [COMPLETED] Tests: `TestStreamRanking` (25), incl. ffprobe on a real
   generated segment; the rest of the suite runs with ranking off.
 
 ### Measured live, 2026-10-19 (one event page, Monday night)
@@ -4304,8 +4304,14 @@ were not used: site-specific, and possibly paid placement.
   label. `test_a_slow_stream_is_caught_within_its_slot`,
   `test_each_stream_gets_its_own_slot`,
   `test_a_tiny_first_segment_does_not_hide_the_resolution`.
+- [COMPLETED] Validator round 6 (R1 failed): with long segments (10 s at
+  1.4x) only the warm-up fitted in an 8 s slot; its timing was dropped, the
+  stream came out unmeasured and stayed pick 1 over 3.0x streams. Now the
+  warm-up's timing is used when it is all there is. A download complete at
+  the cutoff counts; a stream that got no time says "out of time to
+  measure", not "segment is not video". `test_only_the_warm_up_fits_long_segments`.
 - Known limit, left open (same as the probe): a server trickling its
-  response *headers*, or a body under 8 KB at ~1 B/s, keeps an abandoned
+  response *headers*, or a body at ~1 B/s (iter_content waits for 8 KB), keeps an abandoned
   measure thread alive (requests has no total timeout before the body, and
   probe._fetch checks its clock between chunks). Bounded: the thread is a daemon, Find is
   not held, and an abandoned measurement ends measuring for that Find.
