@@ -140,6 +140,21 @@ def merge_candidates(picks: Iterable[Dict[str, Any]], manual: Iterable[Optional[
     return out
 
 
+RESCAN_MIN_INTERVAL_SEC = 600.0
+
+
+def rescan_due(dead: int, total: int, last_at: float, now: float, busy: bool) -> bool:
+    """Should a running recording re-check its event page now?
+
+    When two sources have died since the last check (or every source, for a
+    session with fewer than two), at most once per RESCAN_MIN_INTERVAL_SEC,
+    and never while a check for it is already running.
+    """
+    if busy or total <= 0 or now - last_at < RESCAN_MIN_INTERVAL_SEC:
+        return False
+    return dead >= min(2, total)
+
+
 def miss_reason(result: Optional[Dict[str, Any]]) -> str:
     """Why an event-page check produced nothing, in words fit for a notification.
 

@@ -41,7 +41,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -50,7 +50,10 @@ from app import eventinfo, probe
 
 logger = logging.getLogger("PVArrAggregator")
 
-MAX_LINKS = 20
+# Measured on a real event page: 35 links, 13 of them working, 7 of those
+# past link 20. Early stopping (first PICK that work) keeps the usual cost
+# where it was; the cap only matters on pages with few working links.
+MAX_LINKS = 40
 PICK = 3
 PROBE_WORKERS = 6
 # Per-request timeout for each link's probe. Shorter than the probe's default:
@@ -181,6 +184,7 @@ def extract_links(html: str, page_url: str) -> List[str]:
         times (a sister site's menu);
       - obvious ad / click-tracking hops (`/ad/visit.php` and the like), which
         otherwise use up a probe slot.
+    Uncapped: find_streams() caps the list at MAX_LINKS after its own filters.
     """
     page = urlsplit(page_url)
     page_site = _site(page_url)
@@ -231,7 +235,7 @@ def extract_links(html: str, page_url: str) -> List[str]:
     per_host = Counter(urlsplit(u).hostname for u in kept)
     kept = [u for u in kept
             if _site(u) == page_site or per_host[urlsplit(u).hostname] <= MAX_LINKS_PER_HOST]
-    return kept[:MAX_LINKS]
+    return kept
 
 
 def _plain_session():
@@ -506,8 +510,13 @@ def find_streams(
     probe_fn: Callable[[str], Dict[str, Any]] = _probe_one,
     abort: Optional[threading.Event] = None,
     fs_retry: bool = False,
+    exclude: Iterable[str] = (),
 ) -> Dict[str, Any]:
-    """The whole job: aggregator URL in, up to three working candidates out."""
+    """The whole job: aggregator URL in, up to three working candidates out.
+
+    `exclude` skips links already in hand, so a re-check during a recording
+    looks further down the page instead of finding the same three again.
+    """
     result: Dict[str, Any] = {"ok": False, "page": {}, "links_found": 0,
                               "picked": [], "tried": [], "message": ""}
     try:
@@ -541,6 +550,8 @@ def find_streams(
         public = [u for u in links if not probe.is_private_url(u)]
         result["skipped_private"] = len(links) - len(public)
         links = public
+    held = {u.rstrip("/") for u in exclude}
+    links = [u for u in links if u.rstrip("/") not in held][:MAX_LINKS]
     result["links_found"] = len(links)
     if not links:
         result["message"] = ("No stream links found on that page. If it only shows "

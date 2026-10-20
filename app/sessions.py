@@ -200,6 +200,7 @@ def build_record(
     end_time: Optional[float] = None,
     max_hours: Optional[float] = None,
     naming: Optional[Dict[str, Any]] = None,
+    event_page: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """The shape written to disk. Everything needed to rebuild the recorder.
 
@@ -210,6 +211,10 @@ def build_record(
     return {
         "id": recording_id,
         "candidates": list(candidates),
+        # The page the links came from, with the cookie/User-Agent it needed,
+        # so a running recording can re-check it for fresh links. The cookie
+        # is why session files are 0600; it is never returned by the API.
+        "event_page": dict(event_page) if event_page and event_page.get("url") else None,
         "output_filepath": str(output_filepath),
         "started_at": started_at,
         "current_candidate_index": int(current_candidate_index),

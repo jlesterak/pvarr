@@ -15,7 +15,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Iterable, Optional, List
 
 from fastapi import FastAPI, APIRouter, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response
@@ -73,6 +73,11 @@ async def lifespan(app: FastAPI):
     `docker stop` or Ctrl-C could return before FFmpeg and hls-proxy children
     were terminated, orphaning them.
     """
+    # Captured before the resume: that runs in a worker thread, where there is
+    # no running loop, and a resumed recording needs this to queue re-checks.
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+
     # Reattach to anything that was recording when this process last died.
     # Offloaded: it stats files and may run a remux, and this is the event loop.
     try:
@@ -546,6 +551,9 @@ async def aggregate_url(
         if _aggregate_holder == "scheduled":
             raise HTTPException(status_code=429, detail=(
                 "A scheduled recording is checking its event page; try again in a minute"))
+        if _aggregate_holder == "rescan":
+            raise HTTPException(status_code=429, detail=(
+                "A running recording is re-checking its event page; try again in a minute"))
         raise HTTPException(status_code=429, detail="Already checking an event page; wait for it to finish")
     async with _aggregate_lock:
         result = await _scan_in_daemon_thread(
@@ -711,11 +719,28 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
 
     def _on_failover(rec_id, next_name):
         notifier.notify_failover_triggered(rec_id, next_name)
+        try:
+            _maybe_rescan()
+        except Exception as exc:    # a re-check must never disturb a failover
+            logger.warning("Could not queue an event-page re-check for %s: %s", rec_id, exc)
         # A state transition, and one of the few things worth re-persisting:
         # a resume should reattach to the candidate that was actually working,
         # not start again from the primary that had already failed.
         record["current_candidate_index"] = recorder.current_candidate_index
         session_store.save(record)
+
+    def _maybe_rescan():
+        # The loop a failover (on the recorder thread) hands a re-check to.
+        loop = _main_loop
+        if loop is None or not record.get("event_page"):
+            return
+        if schedules.rescan_due(recorder.dead_since_rescan(), len(recorder.candidates),
+                                recorder.last_rescan_at, time.time(),
+                                busy=bool(recorder.rescan_state)):
+            # Claimed here, on the recorder thread, so the next failover does
+            # not queue a second check before the first one starts.
+            recorder.rescan_state = "checking"
+            asyncio.run_coroutine_threadsafe(_rescan_event_page(recording_id, manual=False), loop)
 
     recorder = StreamFailoverRecorder(
         recording_id=recording_id,
@@ -734,6 +759,7 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
     )
     if record.get("started_at"):
         recorder.start_time = record["started_at"]
+    recorder.has_event_page = bool(record.get("event_page"))
 
     # Reattach to the candidate that was actually working. _on_failover has
     # been writing this to the record all along, with a comment saying exactly
@@ -885,6 +911,9 @@ async def start_recording(
     channel_name: Optional[str] = Form(None),
     duration_minutes: Optional[float] = Form(None),
     end_time: Optional[float] = Form(None),
+    agg_url: Optional[str] = Form(None),
+    agg_cookie: Optional[str] = Form(None),
+    agg_user_agent: Optional[str] = Form(None),
 ):
     """Create and start a new failover recording session.
 
@@ -901,6 +930,7 @@ async def start_recording(
         header_overrides=_parse_stream_headers(stream_headers),
         rebroadcast=rebroadcast, channel_name=channel_name,
         duration_minutes=duration_minutes, end_time=end_time,
+        event_page=_event_page_from_form(agg_url, agg_cookie, agg_user_agent),
     )
 
     # Runs in the threadpool after the response is sent. Called inline this
@@ -923,6 +953,26 @@ async def start_recording(
     })
 
 
+def _event_page_from_form(url: Optional[str], cookie: Optional[str],
+                          user_agent: Optional[str]) -> Optional[Dict[str, str]]:
+    """The event page a recording's links came from, validated, or None."""
+    for value in (url, cookie, user_agent):
+        if value and len(value) > 4096:
+            raise HTTPException(status_code=400, detail="Field is too long")
+    url = (url or "").strip()
+    if not url:
+        return None
+    try:
+        url = probe.clean_url(url)
+    except probe.ProbeError as exc:
+        # The links are what get recorded; a typo in the page box should
+        # cost the re-check, not the start.
+        logger.warning("Ignoring an unusable event page URL on start: %s", exc)
+        return None
+    return {"url": url, "cookie": (cookie or "").strip(),
+            "user_agent": (user_agent or "").strip()}
+
+
 def _start_session(
     *,
     sport: str,
@@ -937,6 +987,7 @@ def _start_session(
     channel_name: Optional[str],
     duration_minutes: Optional[float],
     end_time: Optional[float],
+    event_page: Optional[Dict[str, str]] = None,
 ):
     """Validate, reserve an output name, and launch one recording.
 
@@ -1052,6 +1103,7 @@ def _start_session(
             or _default_channel_name(sport, team_a, team_b),
             end_time=resolved_end,
             max_hours=session_max_hours,
+            event_page=event_page,
             naming={
                 # str() is not decoration. SessionStore.save() catches TypeError
                 # from json.dump and responds by disabling persistence for the
@@ -1266,9 +1318,9 @@ def _track_schedule_task(job_id: str, coro) -> "asyncio.Task":
 
 def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
                            user_agent: Optional[str], fs_retry: bool = False,
-                           scan=None) -> "asyncio.Future":
+                           scan=None, exclude: Iterable[str] = ()) -> "asyncio.Future":
     """Run aggregator.find_streams (or `scan`, same signature) on a daemon
-    thread; its result as a Future.
+    thread; its result as a Future. `exclude` is passed on to find_streams.
 
     Used by scheduled scans and the manual Find alike. Not asyncio.to_thread: that worker belongs to the default executor, which
     is joined when the interpreter exits, so a stop during a scan waited out
@@ -1287,6 +1339,8 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
     def _run():
         try:
             extra = {"fs_retry": True} if fs_retry else {}
+            if exclude:
+                extra["exclude"] = list(exclude)
             outcome = (scan or aggregator.find_streams)(
                 agg_url, cookie=cookie, user_agent=user_agent,
                 abort=cleanup.shutting_down, **extra,
@@ -1301,6 +1355,101 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
 
     threading.Thread(target=_run, name=f"pvarr-scan-{name}", daemon=True).start()
     return future
+
+
+# Manual re-checks run as tasks; held here so they are not garbage-collected.
+_rescan_tasks: set = set()
+# The server's event loop, set in lifespan(). Failovers happen on recorder
+# threads and hand automatic re-checks to it.
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+async def _rescan_event_page(recording_id: str, manual: bool) -> None:
+    """Re-check a running recording's event page and refill its dead slots.
+
+    Queued behind any Find or scheduled scan (one page check at a time). The
+    slot being recorded is never touched; see replace_dead_candidates().
+    """
+    global _aggregate_holder
+    recorder = active_recorders.get(recording_id)
+    record = getattr(recorder, "session_record", None) if recorder else None
+    page = (record or {}).get("event_page")
+    if not recorder:
+        return
+    try:
+        if not page:
+            return
+        if not manual and _aggregate_lock.locked():
+            # Not queued: a scheduled start or a Find may be waiting on the
+            # same lock, and a flaky recording must not push a kickoff back.
+            # last_rescan_at is left alone, so the next failover tries again.
+            logger.info("Event-page re-check for %s skipped: another page check is running.",
+                        recording_id)
+            return
+        recorder.rescan_state = "checking"
+        recorder.last_rescan_at = time.time()
+        recorder._log("Re-checking the event page for fresh links ("
+                      + ("requested" if manual else "sources have died") + ")...", "WARN")
+        async with _aggregate_lock:
+            if not recorder.is_running:
+                return
+            _aggregate_holder = "rescan"
+            try:
+                # Skip the links already held: the page's first three working
+                # links are usually exactly those, so without this a re-check
+                # found "nothing new" while working links sat further down.
+                result = await _scan_in_daemon_thread(
+                    f"rescan-{recording_id}", page["url"], page.get("cookie") or None,
+                    page.get("user_agent") or None,
+                    exclude=[c.url for c in recorder.candidates])
+            finally:
+                _aggregate_holder = None
+        urls = []
+        for url in schedules.merge_candidates((result or {}).get("picked") or [], []):
+            if len(url) > 4096:
+                continue
+            try:
+                urls.append(safe_stream_url(url))
+            except ValueError:
+                continue
+        if not recorder.is_running:
+            return
+        changed = recorder.replace_dead_candidates(urls)
+        if changed:
+            record["candidates"] = [c.url for c in recorder.candidates]
+            session_store.save(record)
+        else:
+            reason = "no working links on it" if not urls else "nothing new to swap in"
+            recorder._log(f"Event page re-checked: {reason}.", "WARN")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Event-page re-check for %s failed: %s", recording_id, exc)
+        recorder._log("Event page re-check failed; see the PVArr log for why.", "ERROR")
+    finally:
+        recorder.rescan_state = ""
+
+
+@app.post("/api/recordings/{recording_id}/rescan")
+async def rescan_event_page(recording_id: str):
+    """Re-check the event page this recording came from, now, and refill
+    any slot that has failed. Runs in the background; the card log says what
+    changed. 400 if it has no event page or is not running, 409 if a check
+    for it is already under way."""
+    recorder = active_recorders.get(recording_id)
+    if not recorder:
+        raise HTTPException(status_code=404, detail="Recording session not found")
+    if not recorder.is_running:
+        raise HTTPException(status_code=400, detail="That recording is not running")
+    if not recorder.has_event_page:
+        raise HTTPException(status_code=400, detail="That recording was not started from an event page")
+    if recorder.rescan_state:
+        raise HTTPException(status_code=409, detail="Already re-checking its event page")
+    recorder.rescan_state = "checking"
+    task = asyncio.create_task(_rescan_event_page(recording_id, manual=True))
+    _rescan_tasks.add(task)
+    task.add_done_callback(_rescan_tasks.discard)
+    return {"status": "checking"}
 
 
 async def _run_schedule(job: Dict[str, Any]) -> None:
@@ -1396,6 +1545,9 @@ async def _run_schedule(job: Dict[str, Any]) -> None:
             rebroadcast=bool(job.get("rebroadcast")),
             channel_name=job.get("channel_name") or None,
             duration_minutes=None, end_time=float(job["end_time"]),
+            event_page=({"url": job["agg_url"], "cookie": job.get("agg_cookie") or "",
+                         "user_agent": job.get("agg_user_agent") or ""}
+                        if job.get("agg_url") else None),
         )
     except HTTPException as exc:
         # A refusal (507 disk floor, bad output dir) is final: retrying would

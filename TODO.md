@@ -4220,3 +4220,75 @@ LIVE label, link titles), no site's markup, so nothing site-specific ships.
 - Times are shown in the browser's time zone; the page's own text ("Today
   at 6:15 PM") is ignored in favour of the epoch.
 
+---
+
+## Phase 31-rescan: Re-check the event page when sources die (2026-10-11) [COMPLETED -- merged to main 2026-10-20, unreleased; exclude path still to test live]
+
+Sponsor, during a live test where both backups' servers went down: "Can we
+re check the source events page in the event we lose backups?" Design
+agreed the same day: automatic re-check plus a button.
+
+- [COMPLETED] Session records carry `event_page` (url, cookie, User-Agent),
+  from a schedule's page or from the start form when the page was used.
+  Session files are already 0600 in a 0700 dir; `/api/status` and
+  `/api/recordings/{id}/config` never return it.
+- [COMPLETED] `StreamFailoverRecorder.replace_dead_candidates()`: fresh,
+  not-already-present links go into slots whose `fail_count` rose since the
+  last check, never the slot being recorded; a short list is topped up to
+  3; the lap budget restarts when anything changed. Safe against the loop
+  because it reads `candidates[index]` fresh each iteration.
+- [COMPLETED] `schedules.rescan_due()`: two dead since the last check (or
+  all, for fewer than two), at most every 10 min, never while one runs.
+  Checked from `_on_failover` on the recorder thread, which claims the
+  "checking" flag there and hands `_rescan_event_page()` to the loop.
+  The scan reuses `_scan_in_daemon_thread` under `_aggregate_lock`.
+- [COMPLETED] `POST /api/recordings/{id}/rescan` and a **Re-check event
+  page** button on the card (shown only when there is a page).
+- [COMPLETED] Fixed on the way: **Force Failover** was disabled on the last
+  source although the API wraps to the first (seen live on 2026-10-11 with
+  the recording on its last source).
+- Tests: `TestEventPageRescan` (live slot untouched, dedup, top-up, rule,
+  record shape), route refusals, a swap through `_rescan_event_page` with
+  the scan faked (cookie passed through, never in `/api/status`), the start
+  form storing the page without `/config` returning the cookie, and the
+  failover callback queueing exactly one check after two deaths.
+- [COMPLETED] Agent-team review, 2026-10-11. Nothing from Security.
+  Architect, BLOCKING: a resumed recording never auto-re-checked --
+  `resume_sessions` runs in `asyncio.to_thread`, so the loop captured at
+  launch was None. Now `_main_loop` is set in `lifespan()` before the
+  resume; the trigger test launches outside a loop to prove it. DevOps:
+  automatic checks queued on `_aggregate_lock` and could push a scheduled
+  start back by minutes -> they now skip (and leave `last_rescan_at`, so
+  the next failover retries); Find's 429 names a rescan as the holder;
+  docs corrected (10-min floor is automatic only; the page is kept
+  whenever the box is filled; expired cookies). Also: a malformed page
+  URL on start is dropped, not a 400; the card log no longer carries
+  exception text; the unused candidate lock is gone.
+- Accepted (Architect): the check runs after the index has moved, so with
+  two sources the dead one now current is skipped and retried; and a
+  source that failed once since the last check counts as dead even if it
+  recovered. Both cost one extra attempt at worst.
+- [COMPLETED] Live test, first half (2026-10-11, network football game):
+  two sources died two minutes apart, the automatic re-check fired on the
+  second death as designed, and the recording carried on on its third
+  source without a visible gap. But the re-check (and an earlier manual
+  one) reported "nothing new to swap in". Cause: it asked the page for
+  the first three working links, in page order, and those were exactly the
+  three the recording already held, so dedup threw all of them away.
+  Probing every link on that page showed 35 links, 13 of them working:
+  3 held, 3 more inside the 20-link cap, 7 past it. Fix: the re-check
+  passes the held links to `find_streams(exclude=...)`, which drops them
+  before probing, and the link cap went from 20 to 40 (applied after that
+  filter). Early stopping keeps a normal Find's cost where it was; the
+  cap only matters on pages with few working links. Run against the same
+  page: 3 fresh working links in 23 s, page fetch included. Test:
+  `test_a_recheck_skips_held_links_and_reads_further_down`.
+- [COMPLETED] Live swap, same recording, still on the pre-fix code: when
+  every source went quiet at once (after about 3h12m), the automatic
+  re-check put fresh links into the two dead slots, the card logged both
+  swaps, and failover cycled through them. Nothing was playing anywhere
+  by then, so no data came of it, but the swap path works live. The
+  page's order had changed by then, which is the only reason the
+  pre-fix code found anything.
+- [PENDING] Live re-check with `exclude` on the next event-page recording
+  (container restarted onto 9c96d27 the same evening).
