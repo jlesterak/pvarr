@@ -4004,8 +4004,12 @@ rewritten here.
   Checked afterwards: `0.1.0` returns 404, `0.10.0` and `latest` still
   resolve. `sha-be14933` (same commit) is clean and stays. The test-server
   comment in `0.2.1`-`0.8.0` is left as harmless.
-- [PENDING] Stale branches on GitHub (`feat/rank`, `feat/rescan`, one agent
-  branch): merge or delete, and check their commit messages first.
+- [COMPLETED] Stale branches on GitHub (`feat/rank`, `feat/rescan`, one agent
+  branch): `feat/rank` merged with Phase 33, all three gone from GitHub
+  (checked 2026-10-20). `main` and its commit messages grep clean for the
+  private site list; the only personal-name hit is the dev workstation's
+  host name in one commit message (`736099e`), left as is (fixing it needs a
+  history rewrite).
 - [COMPLETED] GitHub Releases for v0.9.0 and v0.10.0, from
   `docs/release-notes/` (2026-10-20); v0.10.0 is marked latest.
 - [PENDING] Clean-machine install test from the README Quick start.
@@ -4301,7 +4305,7 @@ agreed the same day: automatic re-check plus a button.
 - [PENDING] Live re-check with `exclude` on the next event-page recording
   (container restarted onto 9c96d27 the same evening).
 
-## Phase 33: Rank found streams by measured quality (2026-10-19) [COMPLETED -- merged to main 2026-10-20, unreleased; live test on pop-os pending]
+## Phase 33: Rank found streams by measured quality (2026-10-19) [COMPLETED -- merged to main 2026-10-20, unreleased; live test on the dev workstation pending]
 
 Sponsor: "would it take way too much time/processing to analyze each stream
 (or the top three) for quality and pick the best one?" Answer: no, if it
