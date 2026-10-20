@@ -8664,13 +8664,95 @@ class TestStreamRanking(unittest.TestCase):
     def test_a_cut_off_segment_is_credited_only_its_share(self):
         from unittest.mock import patch
         playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:6.0,\nseg%d.ts\n" % i for i in range(4))
-        ts = b"\x47" + b"\x00" * 187 + b"\x47" + b"\x00" * 999811     # 1,000,000 bytes
+        ts = (b"\x47" + b"\x00" * 187) * 5319 + b"\x00" * 28     # 1,000,000 bytes
         with patch.object(quality.probe, "_fetch",
                           side_effect=self._fake(playlist, ts, {"Content-Length": "2000000"})), \
                 patch.object(quality, "_ffprobe", return_value={}):
             q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
         # Half of each 6 s segment arrived: 1 MB per 3 s of video = 2667 kbps.
         self.assertEqual(q["kbps"], 2667)
+
+    TS = (b"\x47" + b"\x00" * 187) * 100      # 18,800 bytes of MPEG-TS
+
+    def _per_url(self, playlist, by_name):
+        """Fake fetch: the playlist, then by_name[segment file] (bytes or an exception)."""
+        from unittest.mock import MagicMock
+        def fetch(session, url, hdrs, timeout, max_bytes=0):
+            r = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+            r.headers = {}
+            if url.endswith(".m3u8"):
+                return r, playlist
+            got = by_name[url.rsplit("/", 1)[1]]
+            if isinstance(got, Exception):
+                raise got
+            return r, got
+        return fetch
+
+    def test_media_sniff_needs_three_sync_bytes(self):
+        self.assertTrue(quality._looks_like_media(self.TS))
+        self.assertFalse(quality._looks_like_media(b"G"))
+        self.assertFalse(quality._looks_like_media(b"Gone. Try again later."))
+        self.assertFalse(quality._looks_like_media(b"\x47" + b"\x00" * 187 + b"\x47" + b"<html>" * 40))
+        self.assertTrue(quality._looks_like_media(b"\x00\x00\x00\x18ftypiso5"))
+
+    def test_only_media_segments_are_credited(self):
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": b"<html>oops</html>",
+                                        "seg2.ts": self.TS})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        # seg0 warms up, seg1 is HTML: only seg2's 18,800 B over 2 s counts.
+        self.assertTrue(q["measured"])
+        self.assertEqual(q["kbps"], 75)
+        # Nothing but short "G" bodies: never measured.
+        fake = self._per_url(playlist, {f"seg{i}.ts": b"GET lost" for i in range(3)})
+        with patch.object(quality.probe, "_fetch", side_effect=fake):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["measured"])
+        self.assertIsNone(q["headroom"])
+
+    def test_a_failed_segment_keeps_what_was_measured(self):
+        import requests
+        from unittest.mock import patch
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:2.0,\nseg%d.ts\n" % i for i in range(4))
+        fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
+                                        "seg2.ts": requests.exceptions.ChunkedEncodingError("cut")})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertTrue(q["measured"])
+        self.assertEqual(q["kbps"], 75)
+        self.assertIn("ChunkedEncodingError", q["note"])
+        # A segment that times out: the stream does not keep up.
+        fake = self._per_url(playlist, {"seg0.ts": self.TS, "seg1.ts": self.TS,
+                                        "seg2.ts": requests.exceptions.ReadTimeout("slow")})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertTrue(q["measured"])
+        self.assertLessEqual(q["headroom"], 1.0)
+
+    def test_source_key_keeps_ips_ports_and_path_case(self):
+        k = quality.source_key
+        self.assertNotEqual(k("http://10.0.0.1/hls/abc.m3u8"), k("http://10.0.0.2/hls/abc.m3u8"))
+        self.assertEqual(k("http://10.0.0.1/hls/abc.m3u8"), "10.0.0.1/hls/abc.m3u8")
+        self.assertNotEqual(k("http://[2001:db8::1]/hls/a.m3u8"), k("http://[2001:db8::2]/hls/a.m3u8"))
+        self.assertNotEqual(k("https://cdn.example/hls/AbC.m3u8"), k("https://cdn.example/hls/abc.m3u8"))
+        self.assertNotEqual(k("https://cdn.example:8080/hls/a.m3u8"), k("https://cdn.example:9090/hls/a.m3u8"))
+        self.assertEqual(k("https://cdn.example:notaport/hls/a.m3u8"), "")
+
+    def test_abort_ends_a_measurement_wait_at_once(self):
+        import threading, time as _t
+        abort = threading.Event()
+        def stuck(res, deadline):
+            _t.sleep(30)
+        threading.Timer(0.2, abort.set).start()
+        t0 = _t.monotonic()
+        out = aggregator._measure_all({0: {}, 1: {}}, stuck, abort=abort, budget=20)
+        self.assertLess(_t.monotonic() - t0, 1.5)
+        self.assertEqual(out, {})
 
     def test_score_and_summary(self):
         self.assertLess(quality.score({"height": 720, "headroom": 2.0}),
@@ -8683,6 +8765,8 @@ class TestStreamRanking(unittest.TestCase):
         self.assertEqual(quality.summary({"height": 1080, "fps": 59.94, "kbps": 6100, "headroom": 4.24}),
                          "1080p60 · 6.1 Mbps · 4.2x real-time")
         self.assertEqual(quality.summary({"note": "no segments listed"}), "no segments listed")
+        self.assertEqual(quality.summary({"declared_height": 99999, "declared_kbps": 10 ** 9}),
+                         "2160p · 50.0 Mbps")
 
     def test_env_switch(self):
         from unittest.mock import patch

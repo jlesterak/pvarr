@@ -28,6 +28,7 @@ Off with PVARR_RANK_STREAMS=0 (metered connections): candidates then keep
 page order, as before.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -91,9 +92,10 @@ def _segments(body: bytes, base: str) -> List[Tuple[str, float]]:
 
 
 def _looks_like_media(data: bytes) -> bool:
-    """MPEG-TS (0x47 sync every 188 bytes), fragmented MP4, or ID3-tagged
-    TS/AAC; not an HTML error page served with a 200."""
-    if data[:1] == b"\x47" and (len(data) < 189 or data[188:189] == b"\x47"):
+    """MPEG-TS (0x47 sync every 188 bytes, three packets seen), fragmented
+    MP4, or ID3-tagged TS/AAC; not an HTML error page served with a 200, nor
+    a short body that merely starts with "G"."""
+    if len(data) >= 377 and data[0:1] == data[188:189] == data[376:377] == b"\x47":
         return True
     if data[4:8] in (b"ftyp", b"styp", b"moof", b"sidx", b"moov"):
         return True
@@ -181,17 +183,23 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 out["note"] = "refused: private address"
                 return out
             t0 = time.monotonic()
-            r, data = probe._fetch(plain, url, headers, SEGMENT_TIMEOUT_SEC // 2,
-                                   max_bytes=SEGMENT_MAX_BYTES)
+            try:
+                r, data = probe._fetch(plain, url, headers, SEGMENT_TIMEOUT_SEC // 2,
+                                       max_bytes=SEGMENT_MAX_BYTES)
+            except probe._FETCH_ERRORS as exc:
+                # One bad segment keeps what the others measured. A timeout
+                # is a stream that stalled: it does not keep up.
+                out["note"] = f"segment failed: {type(exc).__name__}"
+                too_slow = too_slow or isinstance(exc, requests.Timeout)
+                continue
             took = time.monotonic() - t0
             if not (r.ok and data):
                 out["note"] = f"segment answered {r.status_code}"
                 break
-            if not first:
-                if not _looks_like_media(data):
-                    out["note"] = "segment is not video"
-                    return out
-                first = data
+            if not _looks_like_media(data):
+                out["note"] = "segment is not video"
+                continue        # never credited, whichever segment it is
+            first = first or data
             if n == 0 and len(segs) > 1:
                 continue        # connection set-up (DNS, TLS) would skew it
             try:
@@ -211,6 +219,9 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             got_bytes += len(data)
             got_secs += secs * share
             spent += took
+        if not first and not too_slow:
+            out["note"] = out["note"] or "segment is not video"
+            return out
         if got_secs and spent > 0:
             out["kbps"] = round(got_bytes * 8 / got_secs / 1000)
             out["headroom"] = round(got_secs / spent, 2)
@@ -233,26 +244,38 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
     return out
 
 
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def source_key(m3u8_url: str) -> str:
     """Which real feed a playlist is, ignoring the edge server and its token.
 
     Several sites often relay one origin through numbered edge servers
     (`edge1.cdn.example/hls/abc.m3u8`, `edge4.cdn.example/hls/abc.m3u8?st=...`):
     as failover these are one source, since they die together when the origin
-    does. Key = host with its digits removed, plus the path; the query (tokens,
-    expiry) is dropped. "" when unknown.
+    does. Key = host with its digits removed, plus any port and the path (case
+    kept: paths are case-sensitive); the query (tokens, expiry) is dropped.
+    An IP address is kept exact. "" when unknown.
     """
     parts = urlsplit(m3u8_url or "")
-    if not parts.hostname:
+    try:
+        host, port = (parts.hostname or "").lower(), parts.port
+    except ValueError:      # a port that is not a number
         return ""
-    path = parts.path.lower()
-    host = parts.hostname.lower()
+    if not host:
+        return ""
+    path = parts.path
     # Only a path naming a specific stream identifies the feed. A generic one
     # ("/live/index.m3u8") on tv1.example and tv2.example says nothing about
     # being the same origin, so then the exact host is kept.
-    if not _GENERIC_PATH_RE.fullmatch(path):
+    if not _is_ip(host) and not _GENERIC_PATH_RE.fullmatch(path.lower()):
         host = re.sub(r"\d+", "", host)
-    return f"{host}{path}"
+    return f"{host}{f':{port}' if port else ''}{path}"
 
 
 def diversify(order: List[int], keys: Dict[int, str], slow: Dict[int, bool], pick: int) -> List[int]:
@@ -313,11 +336,11 @@ def score(q: Dict[str, Any]) -> Tuple:
 def summary(q: Dict[str, Any]) -> str:
     """'1080p60 · 6.1 Mbps · 4.2x real-time', or why it could not be measured."""
     parts = []
-    height = q.get("height") or q.get("declared_height")
+    height = q.get("height") or min(q.get("declared_height") or 0, 2160)
     if height:
         fps = q.get("fps")
         parts.append(f"{height}p{round(fps) if fps and fps >= 48 else ''}")
-    kbps = q.get("kbps") or q.get("declared_kbps")
+    kbps = q.get("kbps") or min(q.get("declared_kbps") or 0, 50000)
     if kbps:
         parts.append(f"{kbps / 1000:.1f} Mbps")
     if q.get("headroom") is not None:

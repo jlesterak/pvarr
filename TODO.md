@@ -4224,7 +4224,7 @@ were not used: site-specific, and possibly paid placement.
   RANK_BUDGET_SEC=20, sorted by `quality.score` (keeps up >= 1.5x, then
   height, >= 48 fps, bitrate in 500 kbps steps, headroom), best 3 kept.
   `tried` notes carry each measurement. `PVARR_RANK_STREAMS=0` = old order.
-- [COMPLETED] Tests: `TestStreamRanking` (8), incl. ffprobe on a real
+- [COMPLETED] Tests: `TestStreamRanking` (19), incl. ffprobe on a real
   generated segment; the rest of the suite runs with ranking off.
 
 ### Measured live, 2026-10-19 (one event page, Monday night)
@@ -4262,6 +4262,28 @@ were not used: site-specific, and possibly paid placement.
   capped at 2160p). `test_non_video_and_absurd_declared_resolution_do_not_win`.
 - [COMPLETED] Measurement sessions are closed; stale "all at once" comments
   and the inconsistent time claims in the docs corrected.
+
+### Independent validation round 2, 2026-10-19 -- R1 failed, fixed 2026-10-20
+- [COMPLETED] HIGH: any body under 189 bytes starting "G" sniffed as MPEG-TS,
+  and only the first segment was sniffed at all, so HTML 200s on later
+  segments were timed as video. Now TS needs 0x47 at 0/188/376, every
+  segment is sniffed and a non-media one is never credited; no media at all =
+  unmeasured. `test_media_sniff_needs_three_sync_bytes`,
+  `test_only_media_segments_are_credited`.
+- [COMPLETED] A ChunkedEncodingError/ReadTimeout on segment 2 or 3 threw
+  away the whole measurement. Now caught per segment: the rest still count,
+  and a timeout marks the stream too slow.
+  `test_a_failed_segment_keeps_what_was_measured`.
+- [COMPLETED] `_measure_all` ignored `abort` while waiting on a measurement
+  (up to 20 s at shutdown); now polled every 0.25 s.
+  `test_abort_ends_a_measurement_wait_at_once`.
+- [COMPLETED] `source_key`: IP hosts kept exact (were collapsed to "..."),
+  path case kept, port kept; `summary()` caps claimed height/bitrate like
+  `score()`. `test_source_key_keeps_ips_ports_and_path_case`.
+- Known limit, left open (same as the probe): a server trickling its
+  response *headers* keeps an abandoned measure thread alive (requests has no
+  total timeout before the body). Bounded: the thread is a daemon, Find is
+  not held, and an abandoned measurement ends measuring for that Find.
 
 ### Backups from different real sources (sponsor, 2026-10-19)
 - [COMPLETED] `quality.source_key`: playlist host with digits removed plus

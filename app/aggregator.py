@@ -570,7 +570,10 @@ def _measure_all(candidates: Dict[int, Dict[str, Any]],
                 pass
         worker = threading.Thread(target=run, name="pvarr-measure", daemon=True)
         worker.start()
-        worker.join(remaining)
+        while worker.is_alive() and time.monotonic() < deadline:
+            if abort is not None and abort.is_set():
+                return out      # shutting down: abandon it now
+            worker.join(min(0.25, max(0.0, deadline - time.monotonic())))
         if worker.is_alive():
             break
         if "q" in box:
