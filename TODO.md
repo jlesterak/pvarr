@@ -3998,8 +3998,12 @@ rewritten here.
   (only `README.md`). Found: `0.1.0` ships a stray agent permissions file
   with the maintainer's email and home path; `0.2.1`-`0.8.0` have a code
   comment naming the test server. `0.8.3` onward are clean.
-- [PENDING] Delete the `0.1.0` image version (and its `sha-` tag); the
-  rest are low-value and may stay (sponsor's call: permanent delete).
+- [COMPLETED] Deleted (sponsor-approved, 2026-10-20) the `0.1.0` image
+  and 13 untagged versions that carried the same stray agent files (one
+  was `0.1.0`'s own amd64 image; none was referenced by another tag).
+  Checked afterwards: `0.1.0` returns 404, `0.10.0` and `latest` still
+  resolve. `sha-be14933` (same commit) is clean and stays. The test-server
+  comment in `0.2.1`-`0.8.0` is left as harmless.
 - [PENDING] Stale branches on GitHub (`feat/rank`, `feat/rescan`, one agent
   branch): merge or delete, and check their commit messages first.
 - [COMPLETED] GitHub Releases for v0.9.0 and v0.10.0, from
