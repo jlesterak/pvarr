@@ -8226,6 +8226,14 @@ class TestScheduleDecisions(unittest.TestCase):
                                "#2 b.example unranked (1 not checked: time budget)")
         self.assertNotIn("secret", line)
         self.assertEqual(schedules.describe_picks({"picked": []}), "no working streams")
+        relayed = {"sources": 2, "picked": [
+            {"url": "https://a.example/1", "m3u8_url": "https://edge1.cdn.example/hls/abc.m3u8?st=x"},
+            {"url": "https://b.example/2", "m3u8_url": "https://edge7.cdn.example/hls/abc.m3u8?st=y"},
+            {"url": "https://c.example/3", "m3u8_url": "https://own.example/hls/other.m3u8"},
+        ]}
+        self.assertEqual(schedules.describe_picks(relayed),
+                         "#1 a.example unranked; #2 b.example unranked [same source as #1]; "
+                         "#3 c.example unranked -- 2 source(s)")
         self.assertEqual(schedules.describe_picks(None), "no working streams")
 
     def test_miss_reason_names_the_cloudflare_challenge(self):

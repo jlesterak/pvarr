@@ -125,21 +125,32 @@ def decide(job: Dict[str, Any], now: float) -> str:
 
 def describe_picks(result: Optional[Dict[str, Any]]) -> str:
     """One log line on what a scan picked and why, e.g.
-    '#1 a.example 720p · 1.8 Mbps · 14.5x real-time; #2 b.example ...'.
+    '#1 a.example 720p · 1.8 Mbps · 14.5x real-time; #2 b.example ...
+    [same source as #1] -- 1 source(s)'.
 
     A scan's measurements otherwise reach only the dashboard's Find result, so
     an unattended recording left no record of how its streams were ranked.
     Host only, never the full link: page paths can carry tokens.
     """
-    parts = []
+    parts, first_of = [], {}
     for n, pick in enumerate((result or {}).get("picked") or [], 1):
         host = urlsplit(str(pick.get("url") or "")).hostname or "?"
         q = pick.get("quality")
-        parts.append(f"#{n} {host} {quality.summary(q) if q else 'unranked'}".rstrip())
+        text = f"#{n} {host} {quality.summary(q) if q else 'unranked'}".rstrip()
+        # Same real feed as an earlier pick (quality.source_key): that backup
+        # dies with it.
+        key = quality.source_key(pick.get("m3u8_url") or "")
+        if key and key in first_of:
+            text += f" [same source as #{first_of[key]}]"
+        elif key:
+            first_of[key] = n
+        parts.append(text)
     if not parts:
         return "no working streams"
+    sources = (result or {}).get("sources")
     skipped = sum(1 for t in (result or {}).get("tried") or [] if t.get("note") == "not checked (time budget)")
-    return "; ".join(parts) + (f" ({skipped} not checked: time budget)" if skipped else "")
+    return ("; ".join(parts) + (f" -- {sources} source(s)" if sources else "")
+            + (f" ({skipped} not checked: time budget)" if skipped else ""))
 
 
 def merge_candidates(picks: Iterable[Dict[str, Any]], manual: Iterable[Optional[str]],
