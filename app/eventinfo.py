@@ -40,6 +40,9 @@ DURATION_HOURS = {
 SOCCER_HOURS = 2.25
 FALLBACK_HOURS = 3.0
 MAX_EVENTS = 200
+# "A vs B" text longer than this is not a game title; the cap also keeps the
+# lazy regex below from going quadratic on a hostile page.
+MAX_VS_TEXT = 200
 
 _EPOCH_ATTRS = {"data-timestamp", "data-time", "data-start", "data-start-time",
                 "data-starttime", "data-unix", "data-epoch", "data-date"}
@@ -152,7 +155,10 @@ def _split_vs(text: str, backed: bool = False) -> Optional[Tuple[str, str]]:
     to..."), so "A - B" counts only when `backed` (a start time or LIVE label
     goes with it) or one side is a known team.
     """
-    text = _TAIL_RE.sub("", (text or "").split(" | ")[0])
+    text = (text or "").split(" | ")[0]
+    if len(text) > MAX_VS_TEXT:
+        return None
+    text = _TAIL_RE.sub("", text)
     m = _VS_RE.match(text)
     if not m:
         return None
@@ -192,7 +198,7 @@ def _from_ld(blocks: List[str]) -> Optional[Dict[str, Any]]:
     for raw in blocks:
         try:
             data = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):   # junk, or nested past the stack
             continue
         stack = data if isinstance(data, list) else [data]
         while stack:
@@ -299,7 +305,7 @@ def _page_event(scan: _Scan, page_url: str) -> Optional[Dict[str, Any]]:
         for text in (scan.meta.get("og:title"), scan.meta.get("title")):
             text = _TAIL_RE.sub("", (text or "").split(" | ")[0])
             if teams[1] in text:
-                label = text.split(teams[1], 1)[1].strip(" -|")
+                label = text.split(teams[1], 1)[1].strip(" -|:–")
                 if label:
                     break
     return _event(teams[0], teams[1], label, ts, scan.page["chunks"], page_url)
@@ -318,10 +324,16 @@ def parse(html: str, page_url: str) -> Dict[str, Any]:
     except Exception:  # malformed markup: keep what was read so far
         pass
 
-    base = urljoin(page_url, scan.base) if scan.base else page_url
+    try:
+        base = urljoin(page_url, scan.base) if scan.base else page_url
+    except ValueError:
+        base = page_url
     events, seen = [], {page_url.rstrip("/")}
     for link in scan.links:
-        url = urljoin(base, link["href"])
+        try:
+            url = urljoin(base, link["href"])
+        except ValueError:   # e.g. "http://[::1": not a link anyone can follow
+            continue
         if not url.startswith(("http://", "https://")) or url.rstrip("/") in seen:
             continue
         chunks = link["chunks"]

@@ -4157,6 +4157,25 @@ LIVE label, link titles), no site's markup, so nothing site-specific ships.
   live status). UI driven in headless Chrome against a dev server: listing
   -> pick -> form filled and the submit turned into Schedule.
 
+### Independent validation, 2026-10-19 -- E1 failed, fixed
+- [COMPLETED] A page with ~100k nested `[` in its schema.org block raised
+  RecursionError out of `parse()`, and `find_streams` (Find and scheduled
+  scans) now called it unguarded: a scan that used to work crashed. Fixed:
+  RecursionError caught in the event-data reader, and `find_streams` treats
+  any failure to read the game as "no event" (logged). Tests:
+  `test_hostile_pages_neither_crash_nor_stall`,
+  `test_find_streams_survives_an_unreadable_event`.
+- [COMPLETED] The "A vs B" regex went quadratic on long text (80 KB heading:
+  201 s, holding the event-page lock). Text over 200 characters is no longer
+  treated as a game title (same test, now well under a second).
+- [COMPLETED] A malformed link (`http://[::1`) made `urljoin` raise: skipped.
+- [COMPLETED] "Python vs JavaScript: which to learn" gave the sport
+  ": which to learn": leading punctuation stripped from the label.
+- Accepted: a link like "Home - About" laid out as two text pieces, or
+  "Tabs vs Spaces", can appear in the pick list, and a finished game is
+  listed with no time. The operator picks from the list, so this costs a
+  glance, not a wrong recording.
+
 ### Notes
 - A pasted browser cookie with that browser's User-Agent worked against an
   anti-bot check on 2026-10-19 with every client PVArr has; the 2026-10-08

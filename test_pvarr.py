@@ -8449,6 +8449,28 @@ class TestEventInfo(unittest.TestCase):
         self.assertEqual(eventinfo._epoch("1792455300000"), 1792455300.0)  # ms
         self.assertEqual(eventinfo._epoch("2026-10-20T01:00:00Z"), 1792458000.0)
 
+    def test_hostile_pages_neither_crash_nor_stall(self):
+        import time as _t
+        deep = "<script type='application/ld+json'>" + "[" * 100000 + "]" * 100000 + "</script>"
+        self.assertIsNone(eventinfo.parse(deep, "https://x.example/")["event"])
+        bad_link = "<a href='http://[::1' title='Club Uno vs Club Dos'>x</a>"
+        self.assertEqual(eventinfo.parse(bad_link, "https://x.example/")["events"], [])
+        t0 = _t.monotonic()
+        eventinfo.parse("<h1>" + "a - " * 20000 + "</h1>" + ("<a href='/x' title='" + "a - " * 2000 + "'>y</a>") * 5,
+                        "https://x.example/")
+        self.assertLess(_t.monotonic() - t0, 2.0)
+
+    def test_find_streams_survives_an_unreadable_event(self):
+        from unittest.mock import patch
+        fetched = {"ok": True, "url": "https://events.example/e", "html": "<iframe src='https://s.example/1'>",
+                   "via": "plain", "status": 200, "challenged": False, "attempts": [], "message": ""}
+        with patch.object(aggregator, "fetch_page", return_value=fetched), \
+                patch.object(eventinfo, "parse", side_effect=RuntimeError("boom")):
+            out = aggregator.find_streams("https://events.example/e",
+                                          probe_fn=lambda u: {"ok": False, "message": "no"})
+        self.assertIsNone(out["event"])
+        self.assertEqual(out["links_found"], 1)
+
     def test_window_for_a_live_game_starts_now(self):
         ev = {"start_at": None, "live": True, "duration_hours": 3.0}
         self.assertEqual(eventinfo.window(ev, now=1000.0), (1000.0, 1000.0 + 10800))

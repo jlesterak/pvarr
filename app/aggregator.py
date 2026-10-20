@@ -526,7 +526,12 @@ def find_streams(
         return result
 
     # Who is playing and when, read from the page already in hand.
-    result["event"] = eventinfo.parse(page["html"], page["url"])["event"]
+    # Optional extra: a page it cannot read must never cost the stream scan.
+    try:
+        result["event"] = eventinfo.parse(page["html"], page["url"])["event"]
+    except Exception:
+        logger.exception("Could not read the game from %s", page["url"])
+        result["event"] = None
 
     links = extract_links(page["html"], page["url"])
     # The SSRF guard from the embed walk, applied the same way: a link a
