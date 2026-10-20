@@ -4354,6 +4354,12 @@ were not used: site-specific, and possibly paid placement.
   mid-recording feed switch, and measuring beside a recording skews the
   numbers. Start schedules a few minutes early instead. Revisit only if one
   page offers different resolutions (switch once, for a higher measured one).
+- [COMPLETED] HIGH: the resume attempt limit (3) never reset, so it counted
+  restarts over a recording's whole life. Seen 2026-10-20: a reboot that went
+  through three boots used all three, and one later container swap, with the
+  recording healthy for 10 min, finalised it mid-event. Now `resumed_at` is
+  stamped at each resume and a resume that kept writing RESUME_SETTLED_SEC
+  (600 s) starts the count over. `test_a_resume_that_kept_recording_resets_the_attempt_count`.
 - Find went from ~25-30 s to ~40-55 s (FlareSolverr solve included).
 - Every working link was the same 720p ~1.8 Mbps feed relayed by different
   sites, so ranking came down to delivery speed.

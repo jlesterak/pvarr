@@ -81,7 +81,7 @@ All configuration is environment-based; recordings are configured per-job from t
 | `PVARR_LOG_LEVEL` | `INFO` | Root log level. |
 | `PVARR_CONFIG_DIR` | `./config` | Where PVArr keeps its state: in-flight sessions (so a restart can resume them), schedules, and the comskip ad-share log. The container sets this to `/config`. |
 | `PVARR_MAX_RESUME_GAP` | `300` | Seconds a recording's file may sit untouched before a restart finalises it instead of reconnecting. Measured from the file's last write, not from when the recording started. |
-| `PVARR_MAX_RESUME_ATTEMPTS` | `3` | How many times a session may be resumed before it is finalised instead. Stops a reproducibly broken recording from restart-looping forever. |
+| `PVARR_MAX_RESUME_ATTEMPTS` | `3` | How many restarts in a row may resume a session before it is finalised instead. Stops a reproducibly broken recording from restart-looping forever. A resume that keeps recording for 10 minutes starts the count over. |
 | `PUID` / `PGID` | `1000` | User and group the app runs as inside the container. The entrypoint aligns the `pvarr` user to these and takes ownership of the three mount roots, so recordings land owned by you on the host. Set them to your own `id -u` / `id -g`. |
 | `PVARR_GRACEFUL_TIMEOUT` | `5` | Seconds PVArr may spend closing open HTTP connections before it stops the recorders. Open dashboard tabs and live stream clients hold connections indefinitely, so without a bound a `docker stop` waits on them and never gets to the recorders at all. |
 | `PVARR_SHUTDOWN_TIMEOUT` | `20` | Seconds a stop may spend finishing in-flight recordings — remux, rename, notify — before the process exits anyway. Raise it if you routinely remux very large files. |

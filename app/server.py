@@ -54,7 +54,7 @@ from app.post_processor import remux_recording
 from app.cleanup import _shutdown_timeout
 from app.ringbuffer import RingBuffer
 from app import commercials
-from app.sessions import SessionStore, build_record, resume_decision
+from app.sessions import SessionStore, attempts_so_far, build_record, resume_decision
 from app import schedules
 from app.schedules import ScheduleStore
 from app.logging_config import configure_logging
@@ -835,7 +835,9 @@ def resume_sessions() -> Dict[str, int]:
                 counts["finalised"] += 1
                 continue
 
-            record["resume_attempts"] = int(record.get("resume_attempts", 0)) + 1
+            last_write = Path(record["output_filepath"]).stat().st_mtime
+            record["resume_attempts"] = attempts_so_far(record, last_write) + 1
+            record["resumed_at"] = time.time()
             _launch_session(record, _allocate_proxy_port())
             logger.info(
                 "Resumed session %s, appending to %s (attempt %s).",

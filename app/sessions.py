@@ -53,6 +53,10 @@ DEFAULT_MAX_RESUME_GAP_SEC = 300.0
 # A session that dies, resumes, and dies again is not having bad luck -- it is
 # reproducibly broken. Finalise rather than restart-loop forever.
 DEFAULT_MAX_RESUME_ATTEMPTS = 3
+# A resumed recording that went on writing this long was not restart-looping:
+# its attempt count starts over. Without this the limit was for life, so a
+# triple-boot plus one later restart finalised a healthy recording mid-game.
+RESUME_SETTLED_SEC = 600.0
 
 
 def config_dir() -> Path:
@@ -65,6 +69,16 @@ def max_resume_gap() -> float:
         return max(0.0, float(os.getenv("PVARR_MAX_RESUME_GAP", DEFAULT_MAX_RESUME_GAP_SEC)))
     except (TypeError, ValueError):
         return DEFAULT_MAX_RESUME_GAP_SEC
+
+
+def attempts_so_far(record: Dict[str, Any], last_write: float) -> int:
+    """Resume attempts that count against the limit: none once the last
+    resume went on writing for RESUME_SETTLED_SEC (`resumed_at` is stamped
+    at each resume; `last_write` is the output file's mtime)."""
+    resumed_at = record.get("resumed_at")
+    if resumed_at and last_write - float(resumed_at) >= RESUME_SETTLED_SEC:
+        return 0
+    return int(record.get("resume_attempts", 0))
 
 
 def max_resume_attempts() -> int:
@@ -283,7 +297,7 @@ def resume_decision(
     if stat.st_size <= 0:
         return "discard"
 
-    if int(record.get("resume_attempts", 0)) >= attempt_limit:
+    if attempts_so_far(record, stat.st_mtime) >= attempt_limit:
         return "finalise"
 
     # An exact answer, where the gap heuristic below is a guess. If the window

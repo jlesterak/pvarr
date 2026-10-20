@@ -1504,6 +1504,17 @@ class TestResumeDecision(unittest.TestCase):
         r = self.record(resume_attempts=sessions.DEFAULT_MAX_RESUME_ATTEMPTS)
         self.assertEqual(sessions.resume_decision(r), "finalise")
 
+    def test_a_resume_that_kept_recording_resets_the_attempt_count(self):
+        # Seen live: a triple boot used all three attempts, then one later
+        # restart, with the recording healthy for 10+ min, finalised it.
+        self.write(age=5)
+        limit = sessions.DEFAULT_MAX_RESUME_ATTEMPTS
+        settled = self.record(resume_attempts=limit,
+                              resumed_at=time.time() - 5 - sessions.RESUME_SETTLED_SEC - 60)
+        self.assertEqual(sessions.resume_decision(settled), "resume")
+        looping = self.record(resume_attempts=limit, resumed_at=time.time() - 30)
+        self.assertEqual(sessions.resume_decision(looping), "finalise")
+
     def test_limits_are_configurable(self):
         self.write(age=100)
         self.assertEqual(
