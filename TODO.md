@@ -4010,6 +4010,7 @@ rewritten here.
   private site list; the only personal-name hit is the dev workstation's
   host name in one commit message (`736099e`), left as is (fixing it needs a
   history rewrite).
+- [COMPLETED] v0.11.0 released 2026-10-20 (ranking, re-checks, Events tab, resume-limit and LAN-link fixes): tag, GHCR `:0.11.0`/`:latest`, GitHub Release from `docs/release-notes/v0.11.0.md`.
 - [COMPLETED] GitHub Releases for v0.9.0 and v0.10.0, from
   `docs/release-notes/` (2026-10-20); v0.10.0 is marked latest.
 - [PENDING] Clean-machine install test from the README Quick start.
@@ -4305,7 +4306,7 @@ agreed the same day: automatic re-check plus a button.
 - [PENDING] Live re-check with `exclude` on the next event-page recording
   (container restarted onto 9c96d27 the same evening).
 
-## Phase 33: Rank found streams by measured quality (2026-10-19) [COMPLETED -- merged to main 2026-10-20, unreleased; live test on the dev workstation pending]
+## Phase 33: Rank found streams by measured quality (2026-10-19) [COMPLETED -- released in v0.11.0, 2026-10-20; tested live on the dev workstation]
 
 Sponsor: "would it take way too much time/processing to analyze each stream
 (or the top three) for quality and pick the best one?" Answer: no, if it
