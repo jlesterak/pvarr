@@ -4,6 +4,8 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-20
+
 ### Added
 - **Events** tab (and header button): save the listing pages you use (on the server, so every device sees them), list a page's games grouped live / by day, tick several and schedule them all at once, each starting 5, 10 or 15 min before its listed time and ending after the league's usual length. Already-scheduled, untimed and finished games are marked and cannot be ticked. API: `GET/POST /api/event-lists`, `DELETE /api/event-lists/{id}`.
 - A recording started from an event page re-checks it when two of its sources die, and swaps fresh working links into the dead slots (never the one recording), skipping the links it already holds. Automatically at most once per 10 minutes, never delaying a scheduled start; also on demand with **Re-check event page** on the card (`POST /api/recordings/{id}/rescan`).
