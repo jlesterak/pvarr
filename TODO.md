@@ -330,8 +330,13 @@ Provider survey, done 2026-08-31:
       that particular provider stays up.
 
 *From "Commercial detection (comskip)  [COMPLETED — needs field validation":*
-- [ ] Investigate the network B tail miss: which logo comskip learned (verbose
-      log / `.logo.txt`), and whether pinning the logo area fixes the ends.
+- [ ] **Network A breaks end 17-36 s early** (14 of 20 non-halftime breaks;
+      starts are within 6 s). Cause not established: either the learned logo,
+      or the answer key counting a promo tail. Re-run one recording from its
+      saved frame CSV with `verbose=10` and read the log and `.logo.txt`.
+      Worth up to ~10 points of recall on that network. The earlier "network B
+      tail miss" was an artifact of a scorebug-derived key: against the
+      hand-checked key network B's breaks end within 1 s, so it is closed.
 
 *From "Phase 25: Event page -> first three working streams (2026-10-05) [C":*
 - [PENDING] If the cookie paste fails from the container but works in the
