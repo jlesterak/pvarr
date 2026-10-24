@@ -350,9 +350,6 @@ Provider survey, done 2026-08-31:
   container does not share (IP or TLS client); FlareSolverr is then the only
   route.
 
-*From "Phase 28: Public relaunch prep (2026-10-08) [COMPLETED -- sponsor s":*
-- [PENDING] Clean-machine install test from the README Quick start.
-
 *From "Phase 31-rescan: Re-check the event page when sources die (2026-10-":*
 - [PENDING] Live re-check with `exclude` on the next event-page recording
   (container restarted onto 9c96d27 the same evening).

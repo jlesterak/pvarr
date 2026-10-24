@@ -49,7 +49,7 @@ Rolling back is then a one-line edit. Unset it to follow `latest` again.
 
 ### Requirements
 
-- **Linux on amd64 (x86-64).** The published image is amd64 only (~900 MB on disk); there is no ARM build for Raspberry Pi or ARM NAS boxes yet.
+- **Linux on amd64 (x86-64).** The published image is amd64 only (~1.1 GB on disk); there is no ARM build for Raspberry Pi or ARM NAS boxes yet.
 - **FFmpeg** — required. Does the actual recording.
 - **Python 3.10+** and the packages in `requirements.txt` (FastAPI, uvicorn, yt-dlp and others). yt-dlp is what sets the floor: its current releases need 3.10. The container image uses 3.12.
 - **yt-dlp** + **curl_cffi** — installed from `requirements.txt`, ~16 MB together. Resolves pages whose player fetches its manifest over XHR, which PVArr's own scraper cannot see, and gives it a browser-compatible HTTPS client. Optional at runtime: if `yt-dlp` is not on `PATH`, that step is skipped and everything else works.

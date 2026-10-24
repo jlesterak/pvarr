@@ -32,7 +32,7 @@ PVArr sends no telemetry and contacts nothing except the URLs you give it (and E
 
 ## Quick start
 
-**Requirements:** Docker with Compose, on **Linux amd64** (x86-64). The image is amd64 only and about **900 MB**; there is no ARM build for a Raspberry Pi or ARM NAS yet.
+**Requirements:** Docker with Compose, on **Linux amd64** (x86-64). The image is amd64 only and about **1.1 GB** on disk; there is no ARM build for a Raspberry Pi or ARM NAS yet.
 
 1. Save [`docker-compose.yml`](docker-compose.yml) in an empty folder, and next to it a `.env` with your user, group and timezone:
 
