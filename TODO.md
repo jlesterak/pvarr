@@ -30,92 +30,6 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
   if this is ever exposed — note that adding Basic auth would break the Plex and
   Emby tuner fetches unless `/live/*` is exempted or given a token parameter.
 
-## Phase 13: Session Durability & Bounded Recordings  (ACCEPTED, not started)
-
-Agreed with the sponsor 2026-08-30. Build in this order -- each step needs the
-one before it.
-
-- [COMPLETED] **1. Disk-space guard (`recorder.py`, `server.py`).** Mandated by the project
-      directives and never implemented; the unused `import shutil` in
-      `recorder.py` is where it was meant to go. Without it, pointing PVArr at a
-      24/7 channel fills the disk until the host breaks -- and the recordings
-      volume is usually the same filesystem as everything else. Every active
-      recorder checks free space and aborts cleanly below a configured floor.
-      Smallest of these items and the only one that prevents damage, so it went
-      first.
-
-      Checked on the write path, rate-limited to one `statvfs` every 15s.
-      A breach ends the recording rather than failing over -- the problem is
-      local, so another candidate cannot help -- and the footage captured so
-      far is kept and post-processed exactly as an operator stop would be.
-      Status `aborted_no_space` survives the completion block so the reason is
-      not hidden behind "completed". `PVARR_MIN_FREE_GB` (default 5) sets the
-      floor; `0` disables it. `POST /api/recordings/start` refuses with `507`
-      when the volume is already below the floor, rather than starting a
-      capture the guard would abort seconds later.
-
-      **Found on the first run:** the dev box was at 100% -- 152 MB free of
-      225 GB -- so the guard fired immediately and took several unrelated tests
-      down with it. Two real defects came out of that: the test suite depended
-      on the host's free space (fixed -- fixtures disable the guard, and the
-      guard's own tests stub `free_bytes`), and `server._min_free_gb()` read
-      its default off `StreamFailoverRecorder`, which tests routinely replace
-      with a `MagicMock` (fixed -- `DEFAULT_MIN_FREE_GB` is now a module-level
-      constant imported by name).
-
-      Verified live: real recorder, real subprocess, real writes, with only the
-      free-space reading stubbed. Dropped the volume below the floor mid-capture
-      -- stopped in 3.5s, kept 3.81 MB, did not fail over, logged the reason.
-
-- [COMPLETED] **2. Session state persisted to `/config`.** All session state lives
-      in the in-memory `active_recorders` dict, so a `docker restart` or
-      `docker compose up -d` destroys every in-flight recording: the FFmpeg
-      child dies, the `.ts` survives on the volume but is orphaned -- no remux,
-      no notification, no library entry, and the Plex channel vanishes.
-      One small JSON per session (URLs, detected headers, output path, timings,
-      active candidate), written **on state transitions only** -- not on a timer
-      -- so ongoing disk writes stay near zero. Progress is recovered by
-      `stat()`ing the `.ts` at resume, not by persisting counters.
-
-      *Note:* `./config:/config` is already mounted and the Dockerfile creates
-      it, but **nothing writes there yet**, and the host `config/` is owned by
-      root while the container runs as uid 1000 -- so the first write will fail
-      with permission denied until it is chowned. Fix and document with this.
-
-- [COMPLETED] **3. Resume on restart/recreate.** On boot, read the session files
-      and reconnect, appending to the same `.ts` (which is how failover already
-      works). Bounded by a maximum gap -- past it, finalise instead of
-      reconnecting -- and by a resume-attempt counter, so a recording that dies
-      immediately cannot loop against `restart: unless-stopped`. Token expiry is
-      already handled: the recorder re-probes each candidate at connect time.
-
-- [COMPLETED] **4. Recording windows and duration caps.** A recording may carry an
-      end time or a maximum duration; at the deadline it stops cleanly and
-      post-processes normally. This is what makes resume *exact* -- `now < end`
-      means reconnect, `now >= end` means finalise -- reducing the gap heuristic
-      above to a fallback for recordings with no window.
-      - **Sponsor decision:** when a window is set and every candidate fails
-        before it closes, keep retrying until the window ends. The cycling and
-        backoff this needs landed in Phase 14; what remains is lifting the
-        `max_cycles` cap while a window is still open.
-      - **Sponsor decision:** global backstop `PVARR_MAX_HOURS`, default **6**.
-        4 was proposed and revised to 6 on the observation that 4h truncates NFL
-        overtime and extra-innings baseball -- the most likely things being
-        recorded. Per-recording limits override the backstop.
-      - Timezone: the dashboard sends absolute timestamps and renders them back
-        in local time, so the container's TZ (UTC, unset in compose) never
-        matters. This holds only for one-shot windows.
-
-### Declined
-- **Deferred start / scheduled recordings ("start at 1400").** Sponsor declined
-  2026-08-30. It needs a pending-job store, a scheduler, and pending-job UI, and
-  `cron` + `curl` against the existing API covers it at zero cost. Recurring
-  schedules would additionally need real timezone and DST handling.
-  **Reversed 2026-10-08:** the sponsor asked for a simple one-shot schedule
-  that checks an aggregator page at the start time -- something cron + curl
-  cannot do, because the stream links do not exist yet when the job is set
-  up. Built as Phase 27 (below). Recurring schedules remain declined.
-
 ## Still open
 
 ### Longer-term candidates
@@ -227,48 +141,7 @@ Provider survey, done 2026-08-31:
 - **Sportradar / Stats Perform** — enterprise pricing. Not for a self-hosted
   tool.
 
-## Phase 16: Host Instrumentation
-
-- [x] **`scripts/watch-host.sh` — measure a recording host instead of guessing.**
-      The sponsor's question before a live capture was whether the target host
-      could take the disk I/O and general load. There was no way to answer it
-      from the workspace: PVArr reports what *it* thinks it captured, and
-      nothing recorded what the machine underneath was doing. The script
-      samples load, CPU idle, available memory, free space on the recordings
-      volume, per-device read/write KB/s and I/O busy time from
-      `/proc/diskstats`, FFmpeg process count / CPU / RSS, and captured MB from
-      `/api/status`, into a CSV plus a summary on exit.
-
-      Runs on the host being measured, unattended if wanted
-      (`--duration 5h`). Dependencies are coreutils and `/proc`; the
-      `/api/status` columns need `curl` + `python3` and degrade to `NA`
-      without them. System metrics only — it never reads the video and never
-      takes a frame grab.
-
-      Device resolution handles the awkward cases: a partition with no
-      `/proc/diskstats` row of its own falls back to the parent whole disk,
-      and `/dev/mapper` LVM/crypt paths resolve through `readlink -f` to their
-      `dm-N` name. Verified against a live recording on the workstation
-      (`dm-1`, an LVM volume): four samples, plausible throughput, FFmpeg
-      correctly counted at one process.
-
-      **Expected shape for a 1080p sports HLS capture**, for comparison when
-      reading a real run: FFmpeg is `-c copy`, so there is no transcode — CPU
-      should sit near idle, and a few percent is already suspicious. Writes are
-      a sequential append flushed per 64KB chunk to the page cache, never
-      `fsync`ed, so the kernel batches them; sustained write rate is simply the
-      stream bitrate (~5 Mbps ≈ 625 KB/s ≈ 2.2 GB/hour). Disk busy time should
-      be low single-digit percent on anything that is not a heavily contended
-      spindle. The floor that stops a capture is `PVARR_MIN_FREE_GB`, default
-      5.0 GB, re-checked every 15s during recording
-      (`Recorder.DISK_CHECK_INTERVAL_SEC`), and it aborts rather than failing
-      over — a local problem is not fixed by another stream.
-
-### Not done, and why
-- **Remote monitoring of the test host.** Out of bounds by Directive 6 and
-  architecturally wrong anyway: the measurement has to run on the host being
-  measured, not be pulled across a network by a process that is not awake when
-  the capture is.
+## Segment loss investigation
 
 ### Live session 66954d39, 2026-10-04 (local container, v:latest) -- cause 2 confirmed  [PENDING]
 - Source: provider B, direct mode, 720p, ran 20:22-00:01 UTC.
@@ -328,15 +201,6 @@ Provider survey, done 2026-08-31:
 - [ ] Whether candidate 1 *records* for the sponsor now. This proves the
       mechanism against a synthetic origin of the same shape; it does not prove
       that particular provider stays up.
-
-*From "Commercial detection (comskip)  [COMPLETED — needs field validation":*
-- [ ] **Network A breaks end 17-36 s early** (14 of 20 non-halftime breaks;
-      starts are within 6 s). Cause not established: either the learned logo,
-      or the answer key counting a promo tail. Re-run one recording from its
-      saved frame CSV with `verbose=10` and read the log and `.logo.txt`.
-      Worth up to ~10 points of recall on that network. The earlier "network B
-      tail miss" was an artifact of a scorebug-derived key: against the
-      hand-checked key network B's breaks end within 1 s, so it is closed.
 
 *From "Phase 25: Event page -> first three working streams (2026-10-05) [C":*
 - [PENDING] If the cookie paste fails from the container but works in the
