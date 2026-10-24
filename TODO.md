@@ -298,6 +298,15 @@ Provider survey, done 2026-08-31:
   playlist, or reloads landing on out-of-sync edge servers). Then a segment
   rotates in and out between two fetches and **never appears in any playlist
   FFmpeg reads** -- "expired", zero failures, exactly this pattern.
+- **Playlist probe, 2026-10-24 (sponsor-approved, on a different source from
+  the 10-04 session, whose provider was not confirmed to match):** polled the
+  playlist every 1s for 2 min through the running container's own headers.
+  117 of 117 requests OK, media-sequence advanced 31 in 120s (one per 4s, no
+  jumps or reversals), **window = 15 segments (60s)**, `s-maxage=1`, no `Age`
+  header, ~0.5s median fetch. The same recording had 0 lost segments after an
+  hour. So the "3-segment window plus stale playlist" hypothesis does **not**
+  hold for this source; it is still untested for the source that lost 16%.
+  Next: repeat the probe whenever a game uses that source class.
 - Decisive test, next live game: poll the playlist every 1s for 2 min, log
   media-sequence, window length, `Cache-Control`/`Age`, and which edge
   answered. Two minutes settles it.
@@ -319,15 +328,6 @@ Provider survey, done 2026-08-31:
 - [ ] Whether candidate 1 *records* for the sponsor now. This proves the
       mechanism against a synthetic origin of the same shape; it does not prove
       that particular provider stays up.
-
-*From "Commercial detection (comskip)  [COMPLETED — needs field validation":*
-- [ ] **Detecting an animated break card.** freezedetect is out. Candidate
-      signals: an abnormally long gap with no scene cuts (live sport cuts
-      constantly, a card does not), and the very low encoded bitrate of a
-      simple loop. **Needs a real sample to measure against** -- building a
-      detector from my guess about what these cards look like would repeat the
-      `-allowed_extensions ALL` mistake exactly. A 60-second clip spanning one
-      break would settle it.
 
 *From "Commercial detection (comskip)  [COMPLETED — needs field validation":*
 - [ ] Investigate the network B tail miss: which logo comskip learned (verbose
