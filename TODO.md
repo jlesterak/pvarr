@@ -330,17 +330,6 @@ Provider survey, done 2026-08-31:
       break would settle it.
 
 *From "Commercial detection (comskip)  [COMPLETED — needs field validation":*
-- [ ] **Tune a sports ini against this answer key.** Each run is ~18 min on
-      one core; several can run in parallel. The harness (logo track -> truth,
-      EDL -> score) is small and should live in `scripts/` so any tuning claim
-      is a number, not an impression. Do not ship a tuned ini as the default
-      until it beats 73% recall without raising game-marked-as-ad time.
-      **Harness built** (`scripts/score-comskip.py`, 84fd96b). Sweep below.
-
-*From "Commercial detection (comskip)  [COMPLETED — needs field validation":*
-- [ ] **Sponsor decision: ship `detect_method=111` in the default ini?**
-
-*From "Commercial detection (comskip)  [COMPLETED — needs field validation":*
 - [ ] Investigate the network B tail miss: which logo comskip learned (verbose
       log / `.logo.txt`), and whether pinning the logo area fixes the ends.
 
