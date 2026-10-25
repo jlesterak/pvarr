@@ -96,6 +96,14 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   waited behind it. Restarts also spend a session's resume allowance, so three
   restarts in an hour finalised a live recording instead of resuming it.
 
+## Quality ranking ignores byte ranges  [PENDING]
+Find / re-check log "segment is not video" for every source whose playlist
+packs segments with EXT-X-BYTERANGE inside a non-video file: `quality.measure`
+fetches the whole file and sees the wrapper's header (an image) instead of the
+MPEG-TS at the offset. Those sources still get picked, but unmeasured, so the
+ranking cannot tell a good one from a bad one. Fix: honour the byte range when
+fetching the sample segment. Seen live 2026-10-25 on every pick of a re-check.
+
 ## Segment loss investigation
 
 ### Live session 66954d39, 2026-10-04 (local container, v:latest) -- cause 2 confirmed  [PENDING]
