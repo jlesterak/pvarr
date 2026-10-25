@@ -13,6 +13,9 @@ messages, tests or screenshots. See README "Scope".
 
 Everything finished is in the private notes log (phases 1-33, through v0.11.0) and the release notes (`docs/release-notes/`, `CHANGELOG.md`). Only open work and standing decisions stay here.
 
+- [PENDING] Retake `docs/screenshot.png` (README) against a synthetic test
+  stream: it still shows the old blue theme, replaced by the brass/wood one.
+
 ## Closed by decision (not open work)
 - **Quantified AI footprint figures — will not add.** The build was never
   instrumented, and providers do not publish per-token energy for frontier

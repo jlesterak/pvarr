@@ -9,7 +9,7 @@
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Pirata+One&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -21,15 +21,39 @@
           fontFamily: {
             sans: ['Inter', 'sans-serif'],
             mono: ['JetBrains Mono', 'monospace'],
+            pirate: ['Pirata One', 'serif'],
           },
+          // Pirate theme: the stock palettes are re-pointed here rather than
+          // rewritten in every class. slate = tarred wood and parchment,
+          // blue = brass, sky = verdigris, cyan = sand.
           colors: {
             arr: {
-              blue: '#0084ff',
-              dark: '#1e293b',
-              sidebar: '#0f172a',
-              card: '#1e293b',
-              accent: '#38bdf8',
-            }
+              brass: '#a87420',
+              dark: '#241c14',
+              sidebar: '#1a140e',
+              card: '#241c14',
+              accent: '#e0b55a',
+            },
+            slate: {
+              50: '#f7f1e3', 100: '#efe5cf', 200: '#ddd0b3', 300: '#c4b392',
+              400: '#a08f70', 500: '#7d6d54', 600: '#5c4f3c', 700: '#44392b',
+              800: '#2e261c', 900: '#1f1912', 950: '#140f0a',
+            },
+            blue: {
+              50: '#fbf3e0', 100: '#f5e2b8', 200: '#ebc97f', 300: '#e0b55a',
+              400: '#cf9a38', 500: '#b8862b', 600: '#8c5f17', 700: '#6f4a12',
+              800: '#53370e', 900: '#3a260a', 950: '#241705',
+            },
+            sky: {
+              50: '#eef6f3', 100: '#d5e9e2', 200: '#b0d4c8', 300: '#8dbfb0',
+              400: '#6fa89a', 500: '#558f81', 600: '#437368', 700: '#365c53',
+              800: '#2b4842', 900: '#213833', 950: '#132320',
+            },
+            cyan: {
+              50: '#faf5ea', 100: '#f3e8cf', 200: '#e9d6ad', 300: '#dfc796',
+              400: '#d6b98c', 500: '#c2a070', 600: '#a2825a', 700: '#816647',
+              800: '#614c36', 900: '#433526', 950: '#2a2118',
+            },
           }
         }
       }
@@ -41,35 +65,35 @@
 
   <style>
     body {
-      background-color: #0b1120;
-      color: #f1f5f9;
+      background-color: #120d08;
+      color: #f1e8d4;
     }
     .arr-navbar {
-      background: #0f172a;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: #1a140e;
+      border-bottom: 1px solid rgba(255, 230, 180, 0.08);
     }
     .arr-card {
-      background: #1e293b;
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: #241c14;
+      border: 1px solid rgba(255, 230, 180, 0.08);
     }
     .arr-input {
-      background: #0f172a;
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: #1a140e;
+      border: 1px solid rgba(255, 230, 180, 0.12);
     }
     .arr-input:focus {
-      border-color: #0084ff;
+      border-color: #b8862b;
       outline: none;
-      box-shadow: 0 0 10px rgba(0, 132, 255, 0.3);
+      box-shadow: 0 0 10px rgba(184, 134, 43, 0.3);
     }
     ::-webkit-scrollbar {
       width: 6px;
       height: 6px;
     }
     ::-webkit-scrollbar-track {
-      background: #0f172a;
+      background: #1a140e;
     }
     ::-webkit-scrollbar-thumb {
-      background: #334155;
+      background: #5c4f3c;
       border-radius: 4px;
     }
   </style>
@@ -81,12 +105,12 @@
     <div class="max-w-7xl mx-auto flex items-center justify-between">
       <div class="flex items-center space-x-4">
         <!-- Logo -->
-        <div class="w-9 h-9 rounded-lg bg-arr-blue flex items-center justify-center font-black text-xl text-white shadow-lg shadow-arr-blue/30">
+        <div class="w-9 h-9 rounded-lg bg-arr-brass flex items-center justify-center font-pirate text-2xl text-white shadow-lg shadow-arr-brass/30">
           P
         </div>
         <div class="flex items-baseline space-x-2">
-          <span class="text-xl font-bold tracking-tight text-white">PV<span class="text-arr-accent">Arr</span></span>
-          <span class="text-xs font-semibold px-2 py-0.5 rounded bg-arr-blue/20 text-arr-accent border border-arr-blue/30">v{{ pvarr_version }}</span>
+          <span class="font-pirate text-2xl tracking-wide text-white">PV<span class="text-arr-accent">Arr</span></span>
+          <span class="text-xs font-semibold px-2 py-0.5 rounded bg-arr-brass/20 text-arr-accent border border-arr-brass/30">v{{ pvarr_version }}</span>
         </div>
       </div>
 
@@ -103,7 +127,7 @@
           <span class="hidden sm:inline">Events</span>
         </button>
 
-        <button @click="openNewModal = true" title="Add Recording" class="bg-arr-blue hover:bg-blue-600 text-white px-3 sm:px-4 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-blue/20 transition flex items-center space-x-2">
+        <button @click="openNewModal = true" title="Add Recording" class="bg-arr-brass hover:bg-blue-600 text-white px-3 sm:px-4 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-brass/20 transition flex items-center space-x-2">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
           <span class="hidden sm:inline">Add Recording</span>
         </button>
@@ -114,16 +138,16 @@
   <!-- Sub-header Navigation Tabs -->
   <div class="bg-slate-900/80 border-b border-slate-800 px-6 py-2">
     <div class="max-w-7xl mx-auto flex space-x-6 text-sm font-medium text-slate-400">
-      <button @click="activeTab = 'active'" :class="activeTab === 'active' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+      <button @click="activeTab = 'active'" :class="activeTab === 'active' ? 'text-arr-accent border-b-2 border-arr-brass pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Live Recorders (<span x-text="liveSessions.length"></span>)
       </button>
-      <button @click="activeTab = 'library'" :class="activeTab === 'library' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+      <button @click="activeTab = 'library'" :class="activeTab === 'library' ? 'text-arr-accent border-b-2 border-arr-brass pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Media Library (<span x-text="libraryFiles.length"></span>)
       </button>
-      <button @click="openEvents()" :class="activeTab === 'events' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+      <button @click="openEvents()" :class="activeTab === 'events' ? 'text-arr-accent border-b-2 border-arr-brass pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Events
       </button>
-      <button @click="activeTab = 'stats'; fetchAdStats()" :class="activeTab === 'stats' ? 'text-arr-accent border-b-2 border-arr-blue pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
+      <button @click="activeTab = 'stats'; fetchAdStats()" :class="activeTab === 'stats' ? 'text-arr-accent border-b-2 border-arr-brass pb-1 font-semibold' : 'hover:text-slate-200 pb-1'">
         Ad Stats
       </button>
     </div>
@@ -185,7 +209,7 @@
             <div class="flex items-start justify-between flex-wrap gap-4 border-b border-slate-700/60 pb-4">
               <div class="space-y-1">
                 <div class="flex items-center space-x-3">
-                  <span class="font-mono text-xs font-bold px-2 py-0.5 rounded bg-arr-blue/15 text-arr-accent border border-arr-blue/30" x-text="session.id"></span>
+                  <span class="font-mono text-xs font-bold px-2 py-0.5 rounded bg-arr-brass/15 text-arr-accent border border-arr-brass/30" x-text="session.id"></span>
                   <div class="flex items-center space-x-2 min-w-0">
                     <h3 class="text-base font-bold text-white truncate max-w-lg"
                         x-text="session.is_rebroadcast ? session.channel_name : session.output_filename"></h3>
@@ -267,13 +291,13 @@
                 <button type="button"
                      @click="switchCandidate(session.id, idx + 1)"
                      :disabled="!session.is_running || (idx + 1) === session.current_candidate"
-                     class="px-3 py-1.5 rounded-lg text-xs flex items-center space-x-2 border shrink-0 transition enabled:hover:border-arr-blue/60 enabled:cursor-pointer disabled:cursor-default"
+                     class="px-3 py-1.5 rounded-lg text-xs flex items-center space-x-2 border shrink-0 transition enabled:hover:border-arr-brass/60 enabled:cursor-pointer disabled:cursor-default"
                      :title="(idx + 1) === session.current_candidate
                                ? 'Currently recording this stream'
                                : (session.is_running ? 'Switch to ' + cand.name : '')
                              + (cand.detect_note ? ' — ' + cand.detect_note : '')
                              + (cand.referer ? ' Referer: ' + cand.referer : '')"
-                     :class="(idx + 1) === session.current_candidate ? 'bg-arr-blue/20 text-arr-accent border-arr-blue/40 font-semibold' : 'bg-slate-900/60 text-slate-400 border-slate-800'">
+                     :class="(idx + 1) === session.current_candidate ? 'bg-arr-brass/20 text-arr-accent border-arr-brass/40 font-semibold' : 'bg-slate-900/60 text-slate-400 border-slate-800'">
                   <span class="w-2 h-2 rounded-full" :class="(idx + 1) === session.current_candidate ? 'bg-emerald-400 animate-ping' : 'bg-slate-600'"></span>
                   <span x-text="cand.name + ': ' + (cand.url.length > 40 ? cand.url.slice(0, 40) + '...' : cand.url)"></span>
                   <span x-show="cand.fail_count > 0" class="text-amber-500/80"
@@ -374,7 +398,7 @@
             <template x-for="item in libraryFiles" :key="item.dir + '/' + item.filename">
               <tr class="hover:bg-slate-800/50 transition">
                 <td class="px-6 py-3.5 font-mono font-medium text-white flex items-center space-x-2">
-                  <svg class="w-4 h-4 text-arr-blue shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"></path></svg>
+                  <svg class="w-4 h-4 text-arr-brass shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"></path></svg>
                   <span x-text="item.filename" :title="item.dir"></span>
                 </td>
                 <td class="px-6 py-3.5 font-mono text-cyan-400" x-text="item.size_mb + ' MB'"></td>
@@ -407,7 +431,7 @@
         <div class="flex flex-wrap items-center gap-2">
           <template x-for="p in lists.pages" :key="p.id">
             <span class="inline-flex items-center rounded-full border text-xs"
-                  :class="lists.current === p.id ? 'border-arr-blue bg-arr-blue/15 text-arr-accent' : 'border-slate-700 text-slate-300 hover:border-slate-500'">
+                  :class="lists.current === p.id ? 'border-arr-brass bg-arr-brass/15 text-arr-accent' : 'border-slate-700 text-slate-300 hover:border-slate-500'">
               <button type="button" class="pl-3 pr-1 py-1 font-semibold" @click="loadEvents(p)" :title="p.url" x-text="p.name"></button>
               <button type="button" class="px-2 py-1 text-slate-500 hover:text-rose-400" @click="removeListPage(p)" :title="'Forget ' + p.name">&times;</button>
             </span>
@@ -425,7 +449,7 @@
                  class="flex-1 px-3 py-2 rounded-lg text-sm arr-input font-mono text-slate-200">
           <input type="text" x-model="lists.newName" maxlength="80" placeholder="Name (optional)"
                  class="sm:w-48 px-3 py-2 rounded-lg text-sm arr-input text-slate-200">
-          <button type="submit" class="px-4 py-2 rounded-lg text-xs font-semibold bg-arr-blue hover:bg-blue-600 text-white">Save &amp; load</button>
+          <button type="submit" class="px-4 py-2 rounded-lg text-xs font-semibold bg-arr-brass hover:bg-blue-600 text-white">Save &amp; load</button>
         </form>
         <p x-show="lists.message" x-text="lists.message" class="text-xs"
            :class="lists.state === 'fail' ? 'text-rose-400' : (lists.state === 'working' ? 'text-slate-400' : 'text-emerald-400')"></p>
@@ -442,7 +466,7 @@
                   <li class="px-4 py-2.5 flex items-center gap-3 text-sm"
                       :class="gameStatus(g).tickable ? 'hover:bg-slate-800/40 cursor-pointer' : 'opacity-60'"
                       @click="gameStatus(g).tickable && toggleGame(g)">
-                    <input type="checkbox" class="w-4 h-4 rounded border-slate-700 bg-slate-900 text-arr-blue"
+                    <input type="checkbox" class="w-4 h-4 rounded border-slate-700 bg-slate-900 text-arr-brass"
                            :checked="!!lists.selected[g.url]" :disabled="!gameStatus(g).tickable" @click.stop="toggleGame(g)">
                     <span class="shrink-0 w-24 text-xs font-semibold" :class="g.live ? 'text-rose-400' : 'text-slate-300'"
                           x-text="g.live ? ('LIVE' + (g.status ? ' ' + g.status : '')) : (g.start_at ? clockLocal(g.start_at) : '—')"></span>
@@ -464,7 +488,7 @@
                 </select>min early
               </label>
               <button type="button" @click="scheduleSelected()" :disabled="!selectedGames().length || lists.state === 'working'"
-                      class="ml-auto px-4 py-2 rounded-lg text-sm font-semibold bg-arr-blue hover:bg-blue-600 text-white disabled:opacity-40"
+                      class="ml-auto px-4 py-2 rounded-lg text-sm font-semibold bg-arr-brass hover:bg-blue-600 text-white disabled:opacity-40"
                       x-text="'Schedule selected (' + selectedGames().length + ')'"></button>
             </div>
             <p x-show="selectedGames().length" class="text-[11px] text-slate-500" x-text="selectionNote()"></p>
@@ -502,7 +526,7 @@
               <div class="flex items-center space-x-3 text-sm">
                 <div class="w-20 font-mono text-slate-300" x-text="lg.league"></div>
                 <div class="flex-1 bg-slate-800 rounded h-3">
-                  <div class="bg-arr-blue h-3 rounded" :style="'width:' + Math.min(lg.ad_pct * 2, 100) + '%'"></div>
+                  <div class="bg-arr-brass h-3 rounded" :style="'width:' + Math.min(lg.ad_pct * 2, 100) + '%'"></div>
                 </div>
                 <div class="w-36 text-right font-mono text-slate-300" x-text="lg.ad_pct + '% · ' + lg.count + ' rec.'"></div>
               </div>
@@ -533,7 +557,7 @@
                     <td class="px-6 py-2.5">
                       <div class="flex items-center space-x-2">
                         <div class="flex-1 bg-slate-800 rounded h-2">
-                          <div class="bg-arr-blue h-2 rounded" :style="'width:' + Math.min(r.ad_pct * 2, 100) + '%'"></div>
+                          <div class="bg-arr-brass h-2 rounded" :style="'width:' + Math.min(r.ad_pct * 2, 100) + '%'"></div>
                         </div>
                         <span class="font-mono w-12 text-right" x-text="r.ad_pct + '%'"></span>
                       </div>
@@ -554,7 +578,7 @@
     <div class="arr-card rounded-xl w-full max-w-2xl max-h-full overflow-y-auto p-6 space-y-6 border border-slate-700 shadow-2xl">
       <div class="flex items-center justify-between border-b border-slate-800 pb-4">
         <h3 class="text-base font-bold text-white flex items-center space-x-2">
-          <span class="w-3 h-3 rounded-full bg-arr-blue"></span>
+          <span class="w-3 h-3 rounded-full bg-arr-brass"></span>
           <span>Add PVArr Recording Session</span>
         </h3>
         <button @click="openNewModal = false" class="text-slate-400 hover:text-white">
@@ -653,7 +677,7 @@
         <div class="pt-2">
           <label class="flex items-start space-x-3 cursor-pointer group">
             <input type="checkbox" x-model="form.rebroadcast"
-                   class="mt-0.5 w-4 h-4 rounded border-slate-700 bg-slate-900 text-arr-blue focus:ring-arr-blue/40 cursor-pointer">
+                   class="mt-0.5 w-4 h-4 rounded border-slate-700 bg-slate-900 text-arr-brass focus:ring-arr-brass/40 cursor-pointer">
             <span class="text-sm">
               <span class="text-slate-200 group-hover:text-white transition">Rebroadcast only — don't save to disk</span>
               <span class="block text-[11px] text-slate-500 mt-0.5">
@@ -841,7 +865,7 @@
         <div class="pt-4 flex justify-end space-x-3 border-t border-slate-800">
           <button type="button" @click="openNewModal = false" class="px-4 py-2 rounded-lg text-sm text-slate-400 hover:text-white">Cancel</button>
           <button type="submit" :disabled="submitting"
-                  class="bg-arr-blue hover:bg-blue-600 text-white px-5 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-blue/20 disabled:opacity-50"
+                  class="bg-arr-brass hover:bg-blue-600 text-white px-5 py-2 rounded-lg text-sm font-semibold shadow-md shadow-arr-brass/20 disabled:opacity-50"
                   x-text="isScheduled ? 'Schedule' : (submitting ? 'Finding streams...' : 'Start Recording Session')">
           </button>
         </div>
