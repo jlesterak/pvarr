@@ -4,6 +4,16 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Organise finished recordings** (`PVARR_LIBRARY_DIR`, off by default): after the remux a recording moves to `<dir>/<Sport>/Season <year>/<Sport> - S<year>E<NN> - <A> vs <B>.mp4`, a layout Plex reads as a show per sport. The episode number is found by scanning the season folder, so hand edits cannot desync it. A library on a separate mount is refused rather than copied; a failed move leaves the file in `recordings/` with the reason in the recording's log. The library listing now covers both folders and each row carries its folder.
+
+### Changed
+- Finishing a recording is one code path for a normal stop and for a recording finalised at boot. The boot path now also warns about lost segments and runs commercial detection, and a crash between the remux and the announcement no longer leaves an `.mp4` that is never announced or organised.
+- Library delete, rename and download now refuse symbolic links, and a file is protected while it is being remuxed, organised or scanned for ads, not only while it records.
+- A session file whose output path is outside the permitted folders is dropped at boot instead of finalised.
+- Team and sport names in filenames are capped at 60 characters.
+- The commercial-detection cut backup is now hidden (`.<name>.original.mp4`), so Plex and the library list do not mistake it for a second copy.
+
 ## [0.11.0] - 2026-10-20
 
 ### Added

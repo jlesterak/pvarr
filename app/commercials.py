@@ -328,7 +328,9 @@ def cut_breaks(
             return False
 
         if keep_original():
-            backup = source.with_name(f"{source.stem}.original{source.suffix}")
+            # Dot-prefixed so neither the library listing nor Plex sees it as a
+            # second copy of the episode it sits beside.
+            backup = source.with_name(f".{source.stem}.original{source.suffix}")
             shutil.copy2(source, backup)
             logger.info("Kept the uncut recording as %s", backup.name)
 
@@ -362,6 +364,8 @@ def _stats_path(stats_dir: Optional[Path] = None) -> Path:
 
 # PVArr's own filenames start DATE_LEAGUE_; anything else is grouped as Other.
 _NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_([A-Za-z0-9-]+)_")
+# ...or, once organised into the library, `LEAGUE - S2026E07 - Title`.
+_ORGANISED_RE = re.compile(r"^(?P<league>[A-Za-z0-9 -]+?) - S\d{4}E\d+ - (?P<title>.+)$")
 
 
 def read_stats(stats_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -381,13 +385,16 @@ def read_stats(stats_dir: Optional[Path] = None) -> Dict[str, Any]:
                     continue
                 name = row.get("file") or ""
                 m = _NAME_RE.match(name)
-                title = Path(name).stem[m.end():] if m else Path(name).stem
+                org = None if m else _ORGANISED_RE.match(Path(name).stem)
+                title = (Path(name).stem[m.end():] if m
+                         else org.group("title") if org else Path(name).stem)
                 title = re.sub(r"_(\d{3,4}p\d*|4K)$", "", title).replace("_", " ")
                 recordings.append({
                     "file": name,
                     "title": title,
                     "date": m.group(1) if m else (row.get("finished_at") or "")[:10],
-                    "league": m.group(2).upper() if m else "Other",
+                    "league": (m.group(2).upper() if m
+                               else org.group("league").upper() if org else "Other"),
                     "duration_sec": round(duration), "ad_sec": round(ad),
                     "ad_pct": round(100 * ad / duration, 1), "breaks": breaks,
                     "finished_at": row.get("finished_at") or "",

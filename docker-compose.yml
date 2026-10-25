@@ -49,6 +49,9 @@ services:
       # Session state lives here so an in-flight recording survives a restart.
       - PVARR_CONFIG_DIR=/config
       - PVARR_ALLOWED_DIRS=/recordings
+      # Optional: move finished recordings into Plex-style Sport/Season folders
+      # (see docs/installation.md). Keep it inside the recordings volume.
+      # - PVARR_LIBRARY_DIR=/recordings/Sports
       - PVARR_LOG_LEVEL=${PVARR_LOG_LEVEL:-INFO}
       # Shutdown budget. These two run in sequence and must both fit inside
       # stop_grace_period above, or Docker SIGKILLs mid-shutdown and an

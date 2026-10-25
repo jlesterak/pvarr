@@ -40,106 +40,26 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
 
 ---
 
-## Phase 17: Tagging & Library Organisation  (ACCEPTED, not started — future feature)
+## Phase 17: Library organisation  (BUILT 2026-10-24, unreleased)
 
-humantodo line 3. Scoped with the sponsor 2026-08-31. **Do not start this
-without a fresh go-ahead** — it is a deliberate later feature, parked here so
-the analysis is not re-derived from scratch.
+`PVARR_LIBRARY_DIR` moves a finished recording to
+`<dir>/<Sport>/Season <year>/<Sport> - S<year>E<NN> - <A> vs <B>.mp4`. See
+README "Organising finished recordings" and CHANGELOG [Unreleased]. Season is
+the recording's calendar year (sponsor decision), so an NFL season splits across
+two folders.
 
-### The asymmetry that makes this hard
-The *arr tools make naming look easy because the file is a known entity
-*before* it exists: Sonarr requests episode 7 of TVDB:81189 and derives the
-name from an id it already holds. Renaming is a lookup.
+Proven by: unit and HTTP tests (traversal, symlink, sibling-prefix, concurrency,
+cross-mount refusal, ordering of the finish pipeline; the guard tests were
+mutation-checked to fail when the guard is removed), and a real-ffmpeg run in a
+scratch folder (two remuxed games organised as E01/E02, a crash-recovery record
+finalised as E03, nothing left marked as finishing).
 
-PVArr is the inverse. An operator pastes an HLS URL for a game happening now.
-There is no id — only what was typed into three text boxes, possibly "Pack"
-and "Bears" at 4:58 because kickoff was at 5:00. Matching that to a sports
-database is *fuzzy matching*, not lookup, and that is where these features
-usually die.
-
-The one redeeming signal: PVArr knows the wall clock. A live game is pinned to
-a moment, so "something like Bears vs something like Packers, starting
-2026-08-31T19:05Z" is close to a unique key against a schedule API. That is
-what would make L4 tractable *if* it is ever revisited.
-
-### The Plex constraint (drove the whole design)
-Plex has **no sports metadata agent**. Library types are Movies, TV Shows,
-Music, Photos, Other Videos; there is no TVDB for last night's game. Anything
-fetched from an external DB is invisible unless written in a form Plex reads,
-which for personal media means the naming convention itself.
-
-The pattern that works is sport-as-series under Plex's *Personal Media Shows*
-agent:
-
-    Sports/NFL/Season 2026/NFL - S2026E07 - Bears vs Packers.mp4
-
-Critically, **this needs no external database at all** — sport, teams, date and
-a counter are already in hand. That is why L3/L4 were cut: they buy canonical
-team names and logos, and carry essentially all of the fragility.
-
-### Sponsor decisions (2026-08-31)
-1. **Record flat, then move into a separate configurable library root.** Not
-   organise `recordings/` in place. Keeps the capture path dumb and the path
-   guard simple. Same-filesystem by default.
-2. **`NFL - S2026E07 - Bears vs Packers` is acceptable.** Ugly, but it is what
-   Plex actually understands.
-3. **L1 and L2 only. L3 (.nfo sidecars) and L4 (sports DB) are cut** from the
-   first pass. Ship the offline half, live with it, then judge.
-4. **Retro-tagging the existing library is out of scope.** A sweep that
-   reorganises everything already recorded is a file manager, it is the
-   highest-risk code in the feature, and it is a one-time job better done with
-   `mv` and a shell loop a human can watch.
-
-Also declined: becoming a metadata server (artwork cache, browse UI). Plex
-already is one.
-
-### Scope, as accepted
-- **L1 — Path templates + category routing.** Optional Sports/News/Sitcoms
-  folders, nested by sport and season. Offline, deterministic, testable.
-- **L2 — Plex-friendly `SxxExx` numbering.** The episode counter must be
-  derived by scanning the season folder, **not** kept in a state file. A
-  counter file drifts the moment someone moves a file by hand, and it drifts
-  silently.
-
-### Four blockers already in the code (costed before any work starts)
-1. **The library is flat.** `naming.py:146` uses `iterdir()`, one level deep.
-   The moment a recording lives in `Sports/NFL/` the library UI goes blind —
-   the same class of bug as the `.ts`-only one commented at `naming.py:140`.
-2. **The path guard will refuse.** `_safe_filename` (`server.py:172`) rejects
-   any filename carrying a directory component. That is correct and deliberate:
-   it is the path-traversal defence on endpoints that are unauthenticated by
-   design. Subfolders make every delete/rename/download return 400. It must be
-   **replaced with a resolve-and-contain check, never simply relaxed.** This is
-   the single item most likely to introduce a vulnerability if done casually.
-3. **Cross-filesystem moves are not moves.** `os.replace` will not cross a
-   mount. If the library root is a different volume, a 6 GB game is a real
-   copy: minutes of I/O, both copies on disk simultaneously, and the
-   disk-space guard needs to account for it.
-4. **Remux writes beside the source** (`post_processor.py`, `with_suffix`).
-   Organising is a separate step afterwards with its own failure path, and the
-   notification plus the library entry must reference the *final* location,
-   not where the file was born.
-
-### Process note
-This touches `naming.py`, `server.py`, `post_processor.py`, `tuner.py`,
-`sessions.py` (the persisted output path) and the dashboard template, changes
-the on-disk layout, and rewrites a security control. Per the project
-directives that is a **convene-the-team change** — Architect, Security and
-DevOps get a scoped design before any code is written. Blocker 2 is the
-Security brief; blocker 3 is the DevOps brief.
-
-### If L4 is ever revisited
-Provider survey, done 2026-08-31:
-- **TheSportsDB** — the only realistic fit. Free tier, community-run,
-  teams/leagues/logos/events. Good coverage of major leagues, patchy below.
-  Requires a key. Would go behind a small provider interface as the single
-  implementation, entirely optional, strictly post-remux, and structurally
-  incapable of failing a recording.
-- **ESPN's undocumented JSON endpoints** — widely used, entirely unofficial,
-  can vanish overnight, ToS grey. Do not build on it.
-- **API-Sports and similar** — commercial, per-request quotas.
-- **Sportradar / Stats Perform** — enterprise pricing. Not for a self-hosted
-  tool.
+- [PENDING] Confirm Plex indexes the tree as intended (Personal Media Shows
+  agent) on the next real recording, with the library inside the recordings
+  volume.
+- Deliberately not built: a library on a separate mount (refused with a message,
+  never copied), .nfo sidecars, a sports-database lookup, retro-tagging the
+  existing library, a category-folder setting.
 
 ## Segment loss investigation
 

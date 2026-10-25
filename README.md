@@ -74,6 +74,18 @@ If you have a page that links to several sources for the same event, paste it in
 
 Set **Start at** and **End at** on the same form; the button changes to **Schedule**. At the start time PVArr checks the event page (if you gave one), takes the best three working streams (measured as for Find), tops up with any links you entered manually, and records until the end time. The container log notes which streams it picked and what each measured (as it does for **Find 3 streams**). If nothing plays yet it retries every few minutes until the window closes and notifies you. If a recording's sources die partway through, PVArr re-checks the event page for fresh links (see [When sources die mid-recording](docs/event-pages.md#when-sources-die-mid-recording)). Schedules survive a restart, and a job leaves the list as soon as its recording starts (the recording's own card takes over). One-shot only; for something recurring, use cron with `curl` against the API. Details: [Event pages and scheduling](docs/event-pages.md#scheduling-a-recording).
 
+## Organising finished recordings
+
+Set `PVARR_LIBRARY_DIR` and each finished recording is moved, after it is remuxed, into a tree Plex reads as a show per sport:
+
+```
+/recordings/Sports/NFL/Season 2026/NFL - S2026E07 - Bears vs Packers.mp4
+```
+
+The season is the calendar year of the recording. The episode number is the highest one already in that season folder plus one, so a file you move or delete by hand never makes the next number wrong. Recording itself is unchanged (flat files in `recordings/`); if the move fails the file simply stays there and the recording's log says why. Unset, nothing changes. In Plex add `Sports` as a library of type **TV Shows** with the **Personal Media Shows** agent.
+
+The easiest setup is a folder *inside* the recordings volume (`PVARR_LIBRARY_DIR=/recordings/Sports`), which PVArr creates itself. A library on a separate mount (a different `-v`) is refused, even on the same disk: a rename cannot cross mounts, and PVArr will not silently copy a multi-GB file. Mount one parent folder for both instead. Details: [Installation and configuration](docs/installation.md#environment-variables).
+
 ## Watching in Plex, Jellyfin or Emby
 
 PVArr emulates an HDHomeRun tuner. In Plex: **Settings → Live TV & DVR → Set up Plex DVR**, enter `http://<pvarr-host>:8999` as the device address, and `http://<pvarr-host>:8999/live/epg.xml` as the XMLTV guide. Jellyfin and Emby use the M3U playlist at `/live/playlist.m3u`. Each running recording appears as a channel, so you can watch an event while it records. Details: [Plex, Jellyfin and Emby](docs/tuner.md).

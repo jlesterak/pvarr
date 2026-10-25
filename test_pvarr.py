@@ -9342,6 +9342,382 @@ class TestListingPrivateLinks(unittest.TestCase):
         self.assertEqual(len(out["events"]), 2)
 
 
+class TestOrganiseIntoLibrary(unittest.TestCase):
+    """Phase 17: a finished recording moves to <Sport>/Season <YYYY>/ with an SxxExx name."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-lib-"))
+        self.root = self.tmp / "Sports"
+        self.root.mkdir()
+        self.rec = self.tmp / "rec"
+        self.rec.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _finished(self, name="2026-10-24_NFL_Bears_vs_Packers_1080p.mp4"):
+        f = self.rec / name
+        f.write_bytes(b"x" * 10)
+        return f
+
+    def _naming(self, **kw):
+        return {"sport": "NFL", "team_a": "Bears", "team_b": "Packers", **kw}
+
+    def test_the_file_lands_in_sport_season_with_an_episode_name(self):
+        from app import library
+        dest = library.organise(self._finished(), self._naming(), self.root)
+        self.assertEqual(
+            dest, self.root.resolve() / "NFL" / "Season 2026" / "NFL - S2026E01 - Bears vs Packers.mp4")
+        self.assertTrue(dest.exists())
+
+    def test_episode_numbers_come_from_scanning_the_folder(self):
+        from app import library
+        first = library.organise(self._finished(), self._naming(), self.root)
+        second = library.organise(self._finished(), self._naming(team_a="Lions", team_b="Vikings"), self.root)
+        self.assertIn("E02", second.name)
+        # A file removed from the middle does not make the next number wrong...
+        first.unlink()
+        third = library.organise(self._finished(), self._naming(), self.root)
+        self.assertIn("E03", third.name)
+        # ...and one dropped in by hand is respected.
+        (second.parent / "NFL - S2026E09 - Hand Made.mp4").write_bytes(b"x")
+        self.assertIn("E10", library.organise(self._finished(), self._naming(), self.root).name)
+
+    def test_two_games_finishing_together_get_different_numbers(self):
+        from app import library
+        files = [self._finished(f"2026-10-24_NFL_A{i}_vs_B{i}_1080p.mp4") for i in range(6)]
+        out, errors = [], []
+
+        def go(f, i):
+            try:
+                out.append(library.organise(f, self._naming(team_a=f"A{i}", team_b=f"B{i}"), self.root))
+            except Exception as exc:    # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=go, args=(f, i)) for i, f in enumerate(files)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(re.search(r"E(\d+)", p.name).group(1) for p in out),
+                         [f"{n:02d}" for n in range(1, 7)])
+
+    def test_hostile_names_stay_inside_the_library(self):
+        from app import library
+        for sport, team in [("../../x", "../etc"), ("CON", "NUL"), (".", ".."),
+                            ("a/b\\c", "x" * 500), ("", "")]:
+            dest = library.organise(self._finished(), self._naming(sport=sport, team_a=team, team_b=team), self.root)
+            self.assertIn(self.root.resolve(), dest.parents, (sport, team))
+            self.assertLessEqual(len(dest.name.encode()), 255)
+            self.assertFalse(dest.name.startswith("."))
+            self.assertNotIn("..", dest.relative_to(self.root.resolve()).parts)
+
+    def test_a_symlinked_season_folder_is_refused_and_the_file_stays(self):
+        from app import library
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (self.root / "NFL").mkdir()
+        (self.root / "NFL" / "Season 2026").symlink_to(outside)
+        src = self._finished()
+        with self.assertRaises(library.OrganiseError):
+            library.organise(src, self._naming(), self.root)
+        self.assertTrue(src.exists())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_cross_mount_move_refuses_instead_of_copying(self):
+        import errno
+        from unittest.mock import patch
+        from app import library
+        src = self._finished()
+        with patch("app.library.os.replace", side_effect=OSError(errno.EXDEV, "cross-device")):
+            with self.assertRaises(library.OrganiseError) as ctx:
+                library.organise(src, self._naming(), self.root)
+        self.assertIn("different mount", str(ctx.exception))
+        self.assertTrue(src.exists())
+
+    def test_only_a_remuxed_file_is_organised(self):
+        from app import library
+        ts = self.rec / "2026-10-24_NFL_A_vs_B_1080p.ts"
+        ts.write_bytes(b"x")
+        with self.assertRaises(library.OrganiseError):
+            library.organise(ts, self._naming(), self.root)
+        self.assertTrue(ts.exists())
+
+    def test_walk_skips_dotfiles_and_symlinks(self):
+        from app import library
+        d = self.root / "NFL" / "Season 2026"
+        d.mkdir(parents=True)
+        good = d / "NFL - S2026E01 - A vs B.mp4"
+        good.write_bytes(b"x")
+        (d / ".hidden.mp4").write_bytes(b"x")
+        (d / "NFL - S2026E02 - A vs B.mp4.pvarr-partial").write_bytes(b"x")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "secret.mp4").write_bytes(b"x")
+        (d / "link.mp4").symlink_to(outside / "secret.mp4")
+        (self.root / "linked").symlink_to(outside)
+        self.assertEqual(library.walk(self.root), [good])
+
+    def test_the_root_is_created_only_inside_the_recordings_volume(self):
+        from unittest.mock import patch
+        from app import library
+        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": str(self.rec / "Lib")}):
+            root, why = library.resolve_library(self.rec)
+        self.assertEqual((root, why), ((self.rec / "Lib").resolve(), ""))
+        # Elsewhere a missing folder means a forgotten mount: never invent it.
+        elsewhere = self.tmp / "nomount" / "library"
+        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": str(elsewhere)}):
+            root, why = library.resolve_library(self.rec)
+        self.assertIsNone(root)
+        self.assertIn("does not exist", why)
+        self.assertFalse(elsewhere.exists())
+
+    def test_a_symlink_loop_or_the_recordings_dir_itself_is_refused_not_raised(self):
+        from unittest.mock import patch
+        from app import library
+        loop = self.tmp / "loop"
+        loop.symlink_to(loop)
+        for value in (str(loop), str(self.rec), str(self.tmp)):
+            with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": value}):
+                root, why = library.resolve_library(self.rec)
+            self.assertIsNone(root, value)
+            self.assertTrue(why, value)
+
+    def test_unset_means_off(self):
+        from unittest.mock import patch
+        from app import library
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVARR_LIBRARY_DIR", None)
+            self.assertEqual(library.resolve_library(self.rec), (None, ""))
+
+
+class TestOrganisedLibraryOverHttp(ServerTestCase):
+    def setUp(self):
+        super().setUp()
+        from unittest.mock import patch
+        self.lib = Path(self.tmp) / "Sports"
+        self._env = patch.dict(os.environ, {"PVARR_LIBRARY_DIR": str(self.lib)})
+        self._env.start()
+        season = self.lib / "NFL" / "Season 2026"
+        season.mkdir(parents=True)
+        self.item = season / "NFL - S2026E01 - Bears vs Packers.mp4"
+        self.item.write_bytes(b"organised")
+        (Path(self.tmp) / "flat.mp4").write_bytes(b"flat")
+
+    def tearDown(self):
+        self._env.stop()
+        super().tearDown()
+
+    def test_the_listing_shows_both_places_with_their_folder(self):
+        rows = self.client.get("/api/library").json()["library"]
+        by_name = {r["filename"]: r for r in rows}
+        self.assertEqual(set(by_name), {"flat.mp4", self.item.name})
+        self.assertEqual(Path(by_name[self.item.name]["dir"]), self.item.parent.resolve())
+
+    def test_a_nested_file_downloads_and_deletes_with_its_dir(self):
+        d = str(self.item.parent)
+        r = self.client.get(f"/api/library/download/{self.item.name}", params={"dir_path": d})
+        self.assertEqual((r.status_code, r.content), (200, b"organised"))
+        r = self.client.delete(f"/api/library/{self.item.name}", params={"dir_path": d})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(self.item.exists())
+
+    def test_a_symlinked_file_is_refused_on_every_verb(self):
+        secret = Path(tempfile.mkdtemp(prefix="pvarr-secret-")) / "secret.mp4"
+        secret.write_bytes(b"secret")
+        link = Path(self.tmp) / "link.mp4"
+        link.symlink_to(secret)
+        self.assertEqual(self.client.get("/api/library/download/link.mp4").status_code, 403)
+        self.assertEqual(self.client.delete("/api/library/link.mp4").status_code, 403)
+        self.assertEqual(self.client.post("/api/library/rename",
+                         data={"old_name": "link.mp4", "new_name": "x.mp4"}).status_code, 403)
+        self.assertTrue(secret.exists())
+        shutil.rmtree(secret.parent, ignore_errors=True)
+
+    def test_a_directory_outside_the_roots_is_still_refused(self):
+        self.assertEqual(self.client.get(
+            f"/api/library/download/{self.item.name}", params={"dir_path": "/etc"}).status_code, 403)
+        # A sibling that merely shares the library's name as a prefix is outside it.
+        sibling = Path(self.tmp).parent / (Path(self.tmp).name + "-Sports2")
+        sibling.mkdir()
+        try:
+            r = self.client.get("/api/library", params={"dir_path": str(sibling)})
+            self.assertEqual(r.status_code, 403)
+        finally:
+            shutil.rmtree(sibling, ignore_errors=True)
+
+    def test_a_file_being_post_processed_cannot_be_deleted(self):
+        self.server._finishing_paths[self.item.resolve()] = "r9"
+        try:
+            r = self.client.delete(f"/api/library/{self.item.name}",
+                                   params={"dir_path": str(self.item.parent)})
+            self.assertEqual(r.status_code, 409)
+            self.assertTrue(self.item.exists())
+        finally:
+            self.server._finishing_paths.clear()
+
+    def test_rename_cannot_move_a_file_between_folders(self):
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": self.item.name, "new_name": "../moved.mp4",
+                                   "dir_path": str(self.item.parent)})
+        self.assertEqual(r.status_code, 400)
+
+    def test_a_library_set_to_the_recordings_dir_lists_each_file_once(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": self.tmp}):
+            rows = self.client.get("/api/library").json()["library"]
+        names = [r["filename"] for r in rows]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_rename_to_a_dotfile_is_refused(self):
+        r = self.client.post("/api/library/rename",
+                             data={"old_name": self.item.name, "new_name": ".hidden.mp4",
+                                   "dir_path": str(self.item.parent)})
+        self.assertEqual(r.status_code, 400)
+        self.assertTrue(self.item.exists())
+
+    def test_health_reports_a_library_problem_without_failing(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": "/nonexistent/mount/lib"}):
+            r = self.client.get("/api/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["library"]["enabled"])
+        self.assertIn("does not exist", r.json()["library"]["problem"])
+
+
+class TestFinishRecordingPipeline(ServerTestCase):
+    """remux -> save remuxed path -> organise -> notify -> forget -> comskip."""
+
+    def _run(self, record_name="2026-10-24_NFL_Bears_vs_Packers_1080p", src_suffix=".ts",
+             library_on=True, remux_ok=True):
+        from unittest.mock import MagicMock, patch
+        server = self.server
+        lib = Path(self.tmp) / "Sports"
+        src = Path(self.tmp) / f"{record_name}{src_suffix}"
+        src.write_bytes(b"footage")
+        mp4 = Path(self.tmp) / f"{record_name}.mp4"
+        calls = []
+
+        def fake_remux(path, target_format="mp4", delete_source=True):
+            calls.append("remux")
+            if not remux_ok:
+                return {"status": "failed", "error": "boom"}
+            Path(path).rename(mp4)
+            return {"status": "success", "output_filepath": str(mp4)}
+
+        store, notifier = MagicMock(), MagicMock()
+        store.save.side_effect = lambda r: calls.append(("save", r["output_filepath"], r.get("stage")))
+        store.remove.side_effect = lambda rid: calls.append("remove")
+        notifier.notify_recording_finished.side_effect = lambda *a, **k: calls.append(("notify", a[1]))
+        record = {"id": "r1", "output_filepath": str(src),
+                  "naming": {"sport": "NFL", "team_a": "Bears", "team_b": "Packers"}}
+        env = {"PVARR_LIBRARY_DIR": str(lib)} if library_on else {}
+        with patch.dict(os.environ, env), \
+             patch.object(server, "remux_recording", side_effect=fake_remux), \
+             patch.object(server, "session_store", store), \
+             patch.object(server, "notifier", notifier), \
+             patch.object(server.commercials, "process", side_effect=lambda p: calls.append(("comskip", p)) or {}):
+            if not library_on:
+                os.environ.pop("PVARR_LIBRARY_DIR", None)
+            final = server._finish_recording(record, str(src))
+        return final, calls, record
+
+    def test_the_order_is_remux_save_organise_notify_forget_comskip(self):
+        final, calls, record = self._run()
+        self.assertEqual(final.name, "NFL - S2026E01 - Bears vs Packers.mp4")
+        self.assertEqual(calls[0], "remux")
+        self.assertEqual(calls[1][0:3:2], ("save", "remuxed"))           # the remuxed path, before organising
+        self.assertEqual(calls[-3:], [("notify", final.name), "remove", ("comskip", str(final))])
+        self.assertEqual(record["output_filepath"], str(final))
+
+    def test_without_a_library_the_file_stays_flat(self):
+        final, calls, _ = self._run(library_on=False)
+        self.assertEqual(final.name, "2026-10-24_NFL_Bears_vs_Packers_1080p.mp4")
+        self.assertEqual(final.parent, Path(self.tmp))
+
+    def test_an_already_remuxed_file_is_not_remuxed_again(self):
+        # Boot-time recovery of a crash between remux and announce.
+        final, calls, _ = self._run(src_suffix=".mp4")
+        self.assertNotIn("remux", calls)
+        self.assertEqual(final.name, "NFL - S2026E01 - Bears vs Packers.mp4")
+
+    def test_a_failed_remux_keeps_the_ts_and_does_not_organise(self):
+        final, calls, _ = self._run(remux_ok=False)
+        self.assertEqual(final.suffix, ".ts")
+        self.assertTrue(final.exists())
+
+    def test_a_retry_after_organising_does_not_renumber_the_episode(self):
+        # Died after the move but before notify: boot finalises the same record.
+        final, calls, record = self._run()
+        self.assertEqual(record["stage"], "organised")
+        from unittest.mock import MagicMock, patch
+        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": str(Path(self.tmp) / "Sports")}), \
+             patch.object(self.server, "session_store", MagicMock()), \
+             patch.object(self.server, "notifier", MagicMock()), \
+             patch.object(self.server.commercials, "process", return_value={}):
+            again = self.server._finish_recording(record, record["output_filepath"])
+        self.assertEqual(again, final)
+        self.assertTrue(final.exists())
+        self.assertEqual(len(list(final.parent.iterdir())), 1)
+
+    def test_any_organise_failure_still_notifies_and_forgets(self):
+        from unittest.mock import patch
+        with patch("app.library.organise", side_effect=RuntimeError("disk on fire")):
+            final, calls, _ = self._run()
+        self.assertEqual(final.suffix, ".mp4")
+        self.assertEqual(final.parent, Path(self.tmp))       # stayed in recordings
+        self.assertIn("remove", calls)
+        self.assertTrue(any(c[0] == "notify" for c in calls if isinstance(c, tuple)))
+
+    def test_the_organised_file_is_protected_while_comskip_runs(self):
+        from unittest.mock import MagicMock, patch
+        seen = {}
+        server = self.server
+
+        def during_comskip(path):
+            seen["paths"] = set(server._active_output_paths())
+            seen["path"] = Path(path).resolve()
+            return {}
+
+        src = Path(self.tmp) / "2026-10-24_NFL_Bears_vs_Packers_1080p.mp4"
+        src.write_bytes(b"x")
+        record = {"id": "r1", "output_filepath": str(src),
+                  "naming": {"sport": "NFL", "team_a": "Bears", "team_b": "Packers"}}
+        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": str(Path(self.tmp) / "Sports")}), \
+             patch.object(server, "session_store", MagicMock()), \
+             patch.object(server, "notifier", MagicMock()), \
+             patch.object(server.commercials, "process", side_effect=during_comskip):
+            server._finish_recording(record, str(src))
+        self.assertIn(seen["path"], seen["paths"])
+        self.assertEqual(server._finishing_paths, {})
+
+    def test_nothing_stays_marked_as_finishing(self):
+        self._run()
+        self.assertEqual(self.server._finishing_paths, {})
+
+    def test_a_remuxed_record_is_finalised_not_discarded_or_resumed(self):
+        from app.sessions import resume_decision
+        f = Path(self.tmp) / "x.mp4"
+        f.write_bytes(b"x")
+        self.assertEqual(resume_decision({"output_filepath": str(f), "stage": "remuxed"}), "finalise")
+
+    def test_a_session_pointing_outside_the_roots_is_not_trusted(self):
+        self.assertFalse(self.server._session_path_allowed({"output_filepath": "/etc/passwd"}))
+        self.assertFalse(self.server._session_path_allowed({"output_filepath": ""}))
+        inside = Path(self.tmp) / "ok.ts"
+        self.assertTrue(self.server._session_path_allowed({"output_filepath": str(inside)}))
+
+    def test_ad_stats_group_an_organised_name_under_its_league(self):
+        d = Path(tempfile.mkdtemp(prefix="pvarr-stats-"))
+        try:
+            (d / commercials.STATS_FILE).write_text(
+                "finished_at,file,duration_sec,ad_sec,ad_pct,breaks,mode\n"
+                "2026-10-24 22:00:00,NFL - S2026E07 - Bears vs Packers.mp4,10000,2000,20.0,20,chapters\n")
+            rows = commercials.read_stats(d)["recordings"]
+            self.assertEqual((rows[0]["league"], rows[0]["title"]), ("NFL", "Bears vs Packers"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -35,6 +35,7 @@ from app import probe
 from app import tags
 from app import aggregator
 from app.naming import (
+    recording_item,
     StorageManager,
     generate_sports_filename,
     media_type_for,
@@ -54,6 +55,7 @@ from app.post_processor import remux_recording
 from app.cleanup import _shutdown_timeout
 from app.ringbuffer import RingBuffer
 from app import commercials
+from app import library
 from app.sessions import SessionStore, attempts_so_far, build_record, resume_decision
 from app import schedules
 from app import eventlists
@@ -185,6 +187,19 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 
+_library_warned: Optional[str] = None
+
+
+def _library() -> tuple:
+    """(root, why_not) for the optional organised library. Warns once per problem."""
+    global _library_warned
+    root, why = library.resolve_library(RECORDINGS_DIR)
+    if why and why != _library_warned:
+        _library_warned = why
+        logger.warning("Library organising is off: %s", why)
+    return root, why
+
+
 def _allowed_library_dirs():
     """Directories the library API may touch.
 
@@ -194,6 +209,11 @@ def _allowed_library_dirs():
     none of these endpoints are authenticated.
     """
     dirs = [RECORDINGS_DIR.resolve()]
+    # The organised library is added automatically: a second env var to forget
+    # would leave its files listed but impossible to download or delete.
+    lib_root, _ = _library()
+    if lib_root:
+        dirs.append(lib_root)
     for raw in os.environ.get("PVARR_ALLOWED_DIRS", "").split(os.pathsep):
         if raw.strip():
             try:
@@ -220,6 +240,9 @@ def _resolve_library_dir(dir_path: Optional[str]) -> Path:
     )
 
 
+_finishing_paths: Dict[Path, str] = {}
+
+
 def _active_output_paths() -> Dict[Path, str]:
     """Files a live recorder is currently writing to, mapped to session id.
 
@@ -227,7 +250,10 @@ def _active_output_paths() -> Dict[Path, str]:
     switches between them at completion and either one being removed underneath
     is the same accident.
     """
-    paths: Dict[Path, str] = {}
+    # Files being remuxed, organised or scanned for ads. stop() clears
+    # is_running before the completion callback runs, so without this a delete
+    # or rename sailed through the whole post-processing window.
+    paths: Dict[Path, str] = dict(_finishing_paths)
     for rid, rec in list(active_recorders.items()):
         try:
             if not rec.is_running or rec.is_rebroadcast:
@@ -295,7 +321,7 @@ async def favicon():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Render single-page management dashboard."""
-    recordings_list = storage.list_recordings()
+    recordings_list = _all_recordings()
     active_list = [r.get_status_summary() for r in active_recorders.values()]
     return templates.TemplateResponse(
         request=request,
@@ -444,7 +470,13 @@ async def get_health():
     wedged = wedged_sessions(active_recorders, time.time(), _health_progress, _wedge_seconds())
     if wedged:
         return JSONResponse(status_code=503, content={"ok": False, "wedged": wedged})
-    return {"ok": True, "version": __version__}
+    health: Dict[str, Any] = {"ok": True, "version": __version__}
+    if library.library_root_setting():
+        # Informational only: a library problem must not fail the container's
+        # healthcheck, since recording still works without it.
+        root, why = _library()
+        health["library"] = {"enabled": bool(root), "problem": why}
+    return health
 
 
 # Finished sessions are kept so the dashboard can show recent history, but not
@@ -642,6 +674,110 @@ def _discard_reservation(path) -> None:
         pass
 
 
+def _finish_recording(record: Dict[str, Any], filepath: str,
+                      recorder: Optional[StreamFailoverRecorder] = None) -> Path:
+    """Everything that happens to a recording once capture is over.
+
+    One code path for a normal completion and for a recording finalised at
+    boot, which used to be two copies that had already drifted (the boot path
+    skipped the lost-segment warning and commercial detection). The order is
+    deliberate, and each step leaves something a retry can pick up:
+
+      remux -> record the remuxed path (stage="remuxed") -> organise ->
+      notify -> forget the session -> commercial detection
+
+    A crash after the remux used to leave an .mp4 nobody ever announced,
+    because the next boot saw no .ts and discarded the session. Saving the
+    remuxed path first lets resume_decision() finalise it instead.
+    Organising comes before notify (the Plex scan must see the final path) and
+    before comskip (which rewrites the file in place and is 20-40 minutes).
+    """
+    recording_id = record["id"]
+    source = Path(filepath)
+    marked = {source.resolve()}
+    for p in marked:
+        _finishing_paths[p] = recording_id
+    try:
+        final = source
+        if source.suffix.lower() == ".ts":
+            result = remux_recording(str(source), target_format="mp4", delete_source=True)
+            if result.get("status") == "success" and result.get("output_filepath"):
+                final = Path(result["output_filepath"])
+                _finishing_paths[final.resolve()] = recording_id
+                marked.add(final.resolve())
+                # Persisted before anything else can fail: the .ts is gone now.
+                record["output_filepath"] = str(final)
+                record["stage"] = "remuxed"
+                session_store.save(record)
+        if recorder is not None:
+            recorder.final_filepath = final
+
+        final = _organise(record, final, recorder)
+        # Protected through commercial detection too, which rewrites it in place.
+        _finishing_paths[final.resolve()] = recording_id
+        marked.add(final.resolve())
+
+        size = round(final.stat().st_size / (1024 * 1024), 2) if final.exists() else 0
+        notifier.notify_recording_finished(
+            recording_id, final.name, size,
+            segments_lost=getattr(recorder, "segments_lost", 0) if recorder else 0,
+        )
+        # Genuinely finished: a later restart must not try to resume it.
+        session_store.remove(recording_id)
+
+        # Commercial detection runs last, deliberately. It is 20-40 minutes of
+        # CPU on a three-hour recording, and the file is already remuxed, in
+        # the library and announced -- so this only ever adds chapters to
+        # something the operator can already watch. Off by default; failure
+        # here changes nothing about the recording.
+        try:
+            outcome = commercials.process(str(final))
+            if outcome.get("ran"):
+                logger.info(
+                    "Commercial detection on %s: %s breaks found, chapters %s.",
+                    final.name, outcome["breaks"],
+                    "written" if outcome["applied"] else "not written",
+                )
+        except Exception as exc:
+            logger.warning("Commercial detection failed for %s: %s", final.name, exc)
+        return final
+    finally:
+        for p in marked:
+            _finishing_paths.pop(p, None)
+
+
+def _organise(record: Dict[str, Any], final: Path,
+              recorder: Optional[StreamFailoverRecorder]) -> Path:
+    """Move a finished recording into the library, if one is configured.
+
+    Any failure leaves the file where it is and says why on the session; the
+    recording is never lost to a tidiness step.
+    """
+    if final.suffix.lower() not in (".mp4", ".mkv"):
+        return final
+    root, why = _library()
+    if root is None:
+        return final            # off (or unusable -- already warned once)
+    # Already organised: a boot-time retry of a crash after the move must not
+    # move it again, which would renumber it and leave a gap.
+    if record.get("stage") == "organised" or root in final.resolve().parents:
+        return final
+    try:
+        dest = library.organise(final, record.get("naming") or {}, root)
+    except Exception as exc:    # any failure: the file stays put, the pipeline goes on
+        msg = f"Left {final.name} in recordings; could not organise it: {exc}"
+        logger.warning(msg)
+        if recorder is not None:
+            recorder._log(msg, "WARNING")
+        return final
+    record["output_filepath"] = str(dest)
+    record["stage"] = "organised"
+    session_store.save(record)
+    if recorder is not None:
+        recorder.final_filepath = dest
+    return dest
+
+
 def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder:
     """Build a recorder from a session record, persist it, and start it.
 
@@ -691,35 +827,7 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
             )
             return
 
-        result = remux_recording(filepath, target_format="mp4", delete_source=True)
-        # Point the session at the remuxed file: the .ts it was recording to
-        # has just been deleted, so size and filename lookups would read 0.
-        if result.get("status") == "success" and result.get("output_filepath"):
-            recorder.final_filepath = Path(result["output_filepath"])
-
-        final_path = recorder.final_filepath or Path(filepath)
-        sz = round(final_path.stat().st_size / (1024*1024), 2) if final_path.exists() else 0
-        notifier.notify_recording_finished(recording_id, final_path.name, sz,
-                                           segments_lost=recorder.segments_lost)
-        # Genuinely finished: stop tracking it, so a later restart does not
-        # try to resume a recording that has already been remuxed and shipped.
-        session_store.remove(recording_id)
-
-        # Commercial detection runs last, deliberately. It is 20-40 minutes of
-        # CPU on a three-hour recording, and the file is already remuxed, in
-        # the library and announced -- so this only ever adds chapters to
-        # something the operator can already watch. Off by default; failure
-        # here changes nothing about the recording.
-        try:
-            outcome = commercials.process(str(final_path))
-            if outcome.get("ran"):
-                logger.info(
-                    "Commercial detection on %s: %s breaks found, chapters %s.",
-                    final_path.name, outcome["breaks"],
-                    "written" if outcome["applied"] else "not written",
-                )
-        except Exception as exc:
-            logger.warning("Commercial detection failed for %s: %s", final_path.name, exc)
+        _finish_recording(record, filepath, recorder)
 
     def _on_failover(rec_id, next_name):
         notifier.notify_failover_triggered(rec_id, next_name)
@@ -799,17 +907,27 @@ def _finalise_orphan(record: Dict[str, Any]) -> None:
     no longer a process to attach one to.
     """
     recording_id = record["id"]
-    filepath = record["output_filepath"]
     try:
-        result = remux_recording(filepath, target_format="mp4", delete_source=True)
-        final = Path(result.get("output_filepath") or filepath)
-        size = round(final.stat().st_size / (1024 * 1024), 2) if final.exists() else 0
-        notifier.notify_recording_finished(recording_id, final.name, size)
+        final = _finish_recording(record, record["output_filepath"])
         logger.info("Finalised orphaned recording %s as %s", recording_id, final.name)
     except Exception as exc:
         logger.error("Could not finalise orphaned recording %s: %s", recording_id, exc)
     finally:
         session_store.remove(recording_id)
+
+
+def _session_path_allowed(record: Dict[str, Any]) -> bool:
+    """A persisted path is trusted only if it sits inside an allowed directory.
+
+    The session file is JSON on disk. Finalising one runs a remux that deletes
+    its source, so a record pointing at some other media file must not be
+    followed.
+    """
+    try:
+        path = Path(record.get("output_filepath", "")).resolve()
+    except (OSError, ValueError):
+        return False
+    return any(path == d or d in path.parents for d in _allowed_library_dirs())
 
 
 def resume_sessions() -> Dict[str, int]:
@@ -825,6 +943,13 @@ def resume_sessions() -> Dict[str, int]:
     for record in session_store.load_all():
         recording_id = record.get("id", "?")
         try:
+            if not _session_path_allowed(record):
+                logger.warning(
+                    "Dropping session %s: its output path is outside the permitted "
+                    "recording directories. Nothing was touched.", recording_id)
+                session_store.remove(recording_id)
+                counts["discarded"] += 1
+                continue
             decision = resume_decision(record)
             if decision == "discard":
                 logger.info("Discarding session %s: no footage on disk.", recording_id)
@@ -1974,11 +2099,43 @@ async def stream_recording(recording_id: str, live: bool = False):
     )
 
 
+def _all_recordings() -> List[Dict[str, Any]]:
+    """Recordings folder (flat) plus the organised library (recursive), newest first."""
+    items = storage.list_recordings()
+    root, _ = _library()
+    if root:
+        seen = {item["filepath"] for item in items}
+        items += [recording_item(f) for f in library.walk(root)
+                  if str(f) not in seen]      # a library set to the recordings dir itself
+    items.sort(key=lambda item: item["modified_timestamp"], reverse=True)
+    return items
+
+
+def _library_file(dir_path: Optional[str], filename: str) -> Path:
+    """The path a library endpoint may act on, or an HTTPException.
+
+    `_safe_filename` blocks a directory in the name and `_resolve_library_dir`
+    confines the folder to the allowlist by real path. Neither stopped a
+    symlink *file* inside an allowed folder, which download served and
+    delete/rename acted on, so it is refused here.
+    """
+    name = _safe_filename(filename)
+    path = _resolve_library_dir(dir_path) / name
+    if path.is_symlink():
+        raise HTTPException(status_code=403, detail="Refusing to follow a symbolic link")
+    return path
+
+
 @app.get("/api/library")
 async def list_library(dir_path: Optional[str] = None):
-    """List completed recordings in library."""
-    items = storage.list_recordings(str(_resolve_library_dir(dir_path)))
-    return {"library": items}
+    """List completed recordings in library.
+
+    With no dir_path: the recordings folder and the organised library together.
+    With one: just that folder.
+    """
+    if dir_path:
+        return {"library": storage.list_recordings(str(_resolve_library_dir(dir_path)))}
+    return {"library": _all_recordings()}
 
 
 @app.get("/api/stats/ads")
@@ -1990,11 +2147,13 @@ def ad_stats():
 @app.post("/api/library/rename")
 async def rename_file(old_name: str = Form(...), new_name: str = Form(...), dir_path: Optional[str] = Form(None)):
     """Rename a recording file in library."""
-    src = _safe_filename(old_name)
-    target_dir = _resolve_library_dir(dir_path)
-    _refuse_if_recording(target_dir / src, "rename")
+    src_path = _library_file(dir_path, old_name)
+    if _safe_filename(new_name).startswith("."):
+        # Dot-files are hidden from the listing, so the file would vanish from it.
+        raise HTTPException(status_code=400, detail="A name cannot start with a dot")
+    _refuse_if_recording(src_path, "rename")
     success = storage.rename_recording(
-        src, _safe_filename(new_name), str(target_dir),
+        src_path.name, _safe_filename(new_name), str(src_path.parent),
     )
     if not success:
         raise HTTPException(status_code=400, detail="Rename failed. File might not exist or target name already exists.")
@@ -2004,10 +2163,9 @@ async def rename_file(old_name: str = Form(...), new_name: str = Form(...), dir_
 @app.delete("/api/library/{filename}")
 async def delete_file(filename: str, dir_path: Optional[str] = None):
     """Delete a recording file from library."""
-    name = _safe_filename(filename)
-    target_dir = _resolve_library_dir(dir_path)
-    _refuse_if_recording(target_dir / name, "delete")
-    success = storage.delete_recording(name, str(target_dir))
+    file_path = _library_file(dir_path, filename)
+    _refuse_if_recording(file_path, "delete")
+    success = storage.delete_recording(file_path.name, str(file_path.parent))
     if not success:
         raise HTTPException(status_code=404, detail="File not found")
     return {"status": "success", "message": f"Deleted {filename}"}
@@ -2016,9 +2174,8 @@ async def delete_file(filename: str, dir_path: Optional[str] = None):
 @app.get("/api/library/download/{filename}")
 async def download_file(filename: str, dir_path: Optional[str] = None):
     """Download or stream recording file."""
-    target_dir = _resolve_library_dir(dir_path)
-    filename = _safe_filename(filename)
-    file_path = target_dir / filename
+    file_path = _library_file(dir_path, filename)
+    filename = file_path.name
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     # Was hardcoded to MPEG-TS, so a remuxed .mp4 downloaded with a Content-Type

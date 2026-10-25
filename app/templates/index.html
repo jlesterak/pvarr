@@ -371,22 +371,22 @@
               </tr>
             </template>
 
-            <template x-for="item in libraryFiles" :key="item.filename">
+            <template x-for="item in libraryFiles" :key="item.dir + '/' + item.filename">
               <tr class="hover:bg-slate-800/50 transition">
                 <td class="px-6 py-3.5 font-mono font-medium text-white flex items-center space-x-2">
                   <svg class="w-4 h-4 text-arr-blue shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 4v16M17 4v16M3 8h4m10 0h4M3 12h18M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"></path></svg>
-                  <span x-text="item.filename"></span>
+                  <span x-text="item.filename" :title="item.dir"></span>
                 </td>
                 <td class="px-6 py-3.5 font-mono text-cyan-400" x-text="item.size_mb + ' MB'"></td>
                 <td class="px-6 py-3.5 text-slate-400" x-text="item.created_at"></td>
                 <td class="px-6 py-3.5 text-right space-x-2">
-                  <a :href="'/api/library/download/' + item.filename" download class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 inline-flex items-center space-x-1">
+                  <a :href="'/api/library/download/' + encodeURIComponent(item.filename) + '?dir_path=' + encodeURIComponent(item.dir)" download class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 inline-flex items-center space-x-1">
                     <span>Download</span>
                   </a>
-                  <button @click="promptRename(item.filename)" class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200">
+                  <button @click="promptRename(item)" class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200">
                     Rename
                   </button>
-                  <button @click="deleteFile(item.filename)" class="px-3 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-xs font-semibold">
+                  <button @click="deleteFile(item)" class="px-3 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 text-xs font-semibold">
                     Delete
                   </button>
                 </td>
@@ -1946,13 +1946,15 @@
           }
         },
 
-        async promptRename(oldName) {
+        async promptRename(item) {
+          const oldName = item.filename;
           const newName = prompt('Enter new filename for recording:', oldName);
           if (!newName || newName === oldName) return;
 
           const formData = new FormData();
           formData.append('old_name', oldName);
           formData.append('new_name', newName);
+          formData.append('dir_path', item.dir);
 
           try {
             const res = await fetch('/api/library/rename', { method: 'POST', body: formData });
@@ -1963,10 +1965,10 @@
           }
         },
 
-        async deleteFile(filename) {
-          if (!confirm(`Delete ${filename}?`)) return;
+        async deleteFile(item) {
+          if (!confirm(`Delete ${item.filename}?`)) return;
           try {
-            const res = await fetch(`/api/library/${filename}`, { method: 'DELETE' });
+            const res = await fetch(`/api/library/${encodeURIComponent(item.filename)}?dir_path=${encodeURIComponent(item.dir)}`, { method: 'DELETE' });
             if (res.ok) this.fetchLibrary();
             else alert('Delete failed.');
           } catch (e) {

@@ -33,6 +33,9 @@ def media_type_for(filename: str) -> str:
     return MEDIA_TYPES.get(Path(filename).suffix.lower(), "application/octet-stream")
 
 
+MAX_TOKEN_CHARS = 60
+
+
 def sanitize_token(text: str, fallback: str = "Unknown") -> str:
     """Clean string token for safe filename usage.
 
@@ -44,7 +47,9 @@ def sanitize_token(text: str, fallback: str = "Unknown") -> str:
         return fallback
     folded = "".join(c for c in unicodedata.normalize("NFKD", text)
                      if not unicodedata.combining(c))
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", folded.strip()).strip("_")
+    # Capped: a 300-character name overruns the 255-byte filename limit and the
+    # recording would fail to start or to be organised.
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", folded.strip())[:MAX_TOKEN_CHARS].strip("_")
     return cleaned if cleaned else fallback
 
 
@@ -205,6 +210,20 @@ def reserve_output_path(path: Path) -> Path:
     raise OSError(f"Could not find a free filename for {path.name} in {target_dir}")
 
 
+def recording_item(file: Path) -> Dict[str, Any]:
+    """The library row for one recording. `dir` is what download, rename and
+    delete need alongside `filename`, since a file may live in a season folder."""
+    stat = file.stat()
+    return {
+        "filename": file.name,
+        "filepath": str(file),
+        "dir": str(file.parent),
+        "size_mb": round(stat.st_size / (1024 * 1024), 2),
+        "created_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        "modified_timestamp": stat.st_mtime,
+    }
+
+
 class StorageManager:
     def __init__(self, record_dir: str = "recordings"):
         self.record_dir = Path(record_dir).resolve()
@@ -236,18 +255,12 @@ class StorageManager:
         files = [
             f for f in dir_path.iterdir()
             if f.is_file() and f.suffix.lower() in RECORDING_EXTENSIONS
+            # A symlink would serve whatever it points at; a dot-file is a
+            # temp or hidden backup, not a recording.
+            and not f.is_symlink() and not f.name.startswith(".")
         ]
-        results = []
-        for file in sorted(files, key=os.path.getmtime, reverse=True):
-            stat = file.stat()
-            results.append({
-                "filename": file.name,
-                "filepath": str(file),
-                "size_mb": round(stat.st_size / (1024 * 1024), 2),
-                "created_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                "modified_timestamp": stat.st_mtime
-            })
-        return results
+        return sorted((recording_item(f) for f in files),
+                      key=lambda item: item["modified_timestamp"], reverse=True)
 
     def rename_recording(self, old_filename: str, new_filename: str, target_dir: Optional[str] = None) -> bool:
         dir_path = Path(target_dir).resolve() if target_dir else self.record_dir

@@ -25,11 +25,11 @@
 | `GET` | `/api/health` | The container healthcheck. `200 {"ok": true}`, or `503` with the ids of sessions that say `recording` but have written no new bytes for `PVARR_WEDGE_SEC` (default 300, min 60): the freeze watchdog itself is stuck. Retrying, waiting and finished sessions never count. |
 | `GET` | `/api/recordings/{id}/logs` | Tail recorder logs |
 | `GET` | `/api/recordings/{id}/stream` | Live MPEG-TS feed of an in-progress recording (`?live=true` to join at the write head instead of replaying from the start). This is what the tuner playlist points at. |
-| `GET` | `/api/library` | List completed recordings |
+| `GET` | `/api/library` | List completed recordings: the recordings folder plus, if `PVARR_LIBRARY_DIR` is set, the organised library. Each row has `filename` and `dir`; pass that `dir` back as `dir_path` to the three endpoints below. With `?dir_path=` it lists just that folder. |
 | `GET` | `/api/stats/ads` | The **Ad Stats** tab's data, from `/config/comskip-stats.csv`: `total`, `by_league` and `recordings` (newest first), each with `duration_sec`, `ad_sec` and `ad_pct` (share of recorded time, so longer recordings weigh more). Empty when comskip has never run. Read-only. |
-| `POST` | `/api/library/rename` | Rename a recording. A new name with no extension inherits the file's existing one, so a remuxed `.mp4` stays an `.mp4`. Returns `409` if a recording is currently writing to that file. |
-| `DELETE` | `/api/library/{filename}` | Delete a recording. Returns `409` if a recording is currently writing to that file — stop the recording first. |
-| `GET` | `/api/library/download/{filename}` | Download a recording. `Content-Type` follows the container (`.ts`, `.mp4`, `.mkv`). |
+| `POST` | `/api/library/rename` | Rename a recording. A new name with no extension inherits the file's existing one, so a remuxed `.mp4` stays an `.mp4`. Returns `409` if a recording is currently writing to or post-processing that file, `403` for a symbolic link or a folder outside the permitted ones. Takes `dir_path` (form field) for a file in a season folder. |
+| `DELETE` | `/api/library/{filename}` | Delete a recording. Optional `?dir_path=` for a file in a season folder. Returns `409` if a recording is currently writing to or post-processing that file — stop the recording first — and `403` for a symbolic link. |
+| `GET` | `/api/library/download/{filename}` | Download a recording. `Content-Type` follows the container (`.ts`, `.mp4`, `.mkv`). Optional `?dir_path=`; `403` for a symbolic link. |
 | `GET` | `/live/playlist.m3u` · `/live/playlist.m3u8` | M3U tuner playlist |
 | `GET` | `/live/epg.xml` | XMLTV EPG. Each programme names the file being written and the stream currently feeding it. |
 | `GET` | `/discover.json` · `/lineup.json` · `/lineup_status.json` · `/lineup.post` · `/device.xml` | HDHomeRun tuner emulation, also served under `/live` |
