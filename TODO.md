@@ -85,8 +85,12 @@ and the recorder spent a full lap on yt-dlp, header detection and the proxy for
 each candidate. Now classified as blocked by DNS, failed over at once, and the
 event page is re-checked for another source. Proven live: one event-page Find
 reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
-- [PENDING] Why the same CDN resolved normally for the first ~40 minutes and not
-  after the recreate is unexplained (the local resolver had not been asked).
+- [COMPLETED] Why it recorded for ~40 minutes first: neither local resolver
+  logged a single query for the CDN before the container was recreated, so the
+  old container resolved through a different (public) server. Not provable
+  after the fact; the recreated one used the blocking resolvers. The sponsor's
+  deployment now gives the container public DNS (documented in
+  docs/troubleshooting.md).
 - [PENDING] Boot finishing runs commercial detection inline and delayed the
   server coming up by ~7 minutes with two long recordings; resumed sessions
   waited behind it. Restarts also spend a session's resume allowance, so three

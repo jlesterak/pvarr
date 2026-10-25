@@ -61,8 +61,20 @@ still see this line, you are on an older image. Nothing to configure.
 AdGuard, a router blocklist) answers that host with `0.0.0.0`. PVArr will not
 connect there (it would reach this machine), fails over at once, and re-checks
 the event page for another source. If every source for an event sits on a
-blocked host, nothing can be recorded until the host is allowed in your
-resolver; PVArr does not work around your DNS.
+blocked host, either allow the host in your resolver or give the PVArr
+container its own DNS in compose:
+
+```yaml
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
+```
+
+PVArr reaches FlareSolverr by container name, which Docker resolves itself, so
+this is safe unless you point `PLEX_URL`/`EMBY_URL` at a local-only hostname
+(use an IP or `extra_hosts:` then). Listing your Pi-hole as a second server
+does not combine the two: Docker takes the first server's answer, and only
+asks the next one when the first does not respond.
 
 **A stopped recording shows `post processing` with an amber dot.** The capture
 has finished but the recorder is still remuxing the `.ts` into an `.mp4`, which
