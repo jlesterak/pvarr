@@ -4,6 +4,8 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-25
+
 ### Added
 - **Organise finished recordings** (`PVARR_LIBRARY_DIR`, off by default): after the remux a recording moves to `<dir>/<Sport>/Season <year>/<Sport> - S<year>E<NN> - <A> vs <B>.mp4`, a layout Plex reads as a show per sport. The episode number is found by scanning the season folder, so hand edits cannot desync it. A library on a separate mount is refused rather than copied; a failed move leaves the file in `recordings/` with the reason in the recording's log. The library listing now covers both folders and each row carries its folder.
 

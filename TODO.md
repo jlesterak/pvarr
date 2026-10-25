@@ -40,7 +40,7 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
 
 ---
 
-## Phase 17: Library organisation  (BUILT 2026-10-24, unreleased)
+## Phase 17: Library organisation  (BUILT 2026-10-24, released in v0.11.1)
 
 `PVARR_LIBRARY_DIR` moves a finished recording to
 `<dir>/<Sport>/Season <year>/<Sport> - S<year>E<NN> - <A> vs <B>.mp4`. See
@@ -61,7 +61,7 @@ finalised as E03, nothing left marked as finishing).
   never copied), .nfo sidecars, a sports-database lookup, retro-tagging the
   existing library, a category-folder setting.
 
-## Direct-mode extension refusal (fixed 2026-10-25, unreleased)
+## Direct-mode extension refusal (fixed and released in v0.11.1, 2026-10-25)
 A live game recorded 0 bytes for 10 minutes: every candidate's playlist listed
 byte-range segments on `.image` URLs. The segments were real MPEG-TS (sync bytes
 at the range offset, plain GET works), but direct mode refused them. Proven by
