@@ -100,7 +100,7 @@ finalised as E03, nothing left marked as finishing).
   hour. So the "3-segment window plus stale playlist" hypothesis does **not**
   hold for this source; it is still untested for the source that lost 16%.
   Next: repeat the probe whenever a game uses that source class.
-- Decisive test, next live game: poll the playlist every 1s for 2 min, log
+- Decisive test, next live game (scheduled 2026-10-25 afternoon, sponsor-approved): poll the playlist every 1s for 2 min, log
   media-sequence, window length, `Cache-Control`/`Age`, and which edge
   answered. Two minutes settles it.
 - Likely fix if confirmed: a small playlist relay (design already sketched in
