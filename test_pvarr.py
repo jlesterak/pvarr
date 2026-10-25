@@ -4562,6 +4562,70 @@ class TestRedirectsAndPlaylistsStayOffThePrivateNetwork(ProbeTestCase):
         self.assertIn("http://10.0.0.7/s1.ts", [u for u, _ in self.session.calls])
 
 
+from unittest.mock import patch  # noqa: E402
+
+
+class TestDnsBlockedSource(ProbeTestCase):
+    """A host a DNS blocklist answers with 0.0.0.0 is a dead source, not a LAN one."""
+
+    PLAYLIST = b"#EXTM3U\n#EXTINF:6.0,\nhttps://blocked.example/seg1.ts\n"
+
+    def _blocked(self, host_set):
+        from urllib.parse import urlsplit
+        return lambda url: (urlsplit(url).hostname if urlsplit(url).hostname in host_set else None)
+
+    def test_dns_blocked_host_needs_every_answer_unspecified(self):
+        from app import probe
+        def answers(*addrs):
+            return [(2, 1, 6, "", (a, 0)) for a in addrs]
+        for addrs, expected in ((("0.0.0.0",), True), (("0.0.0.0", "::"), True),
+                                (("0.0.0.0", "93.184.216.34"), False),
+                                (("192.168.1.10",), False), (("93.184.216.34",), False)):
+            with self.subTest(addrs=addrs), patch("app.probe.socket.getaddrinfo",
+                                                  return_value=answers(*addrs)):
+                self.assertEqual(probe.dns_blocked_host("https://h.example/x.ts") is not None,
+                                 expected)
+
+    def test_a_blocked_segment_host_marks_the_source_dns_blocked(self):
+        # 0.0.0.0 is also "not public", which is how the real lookup sees it.
+        with patch("app.probe.dns_blocked_host", self._blocked({"blocked.example"})), \
+                patch("app.probe.is_private_url", lambda u: "blocked.example" in u):
+            result = self.probe(lambda url, h: FakeResponse(url, 200, self.PLAYLIST),
+                                "https://cdn.example/live.m3u8", use_ytdlp=False)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["dns_blocked"])
+        self.assertIn("Blocked by DNS", result["message"])
+        self.assertIn("blocked.example", result["message"])
+
+    def test_an_ordinary_private_segment_is_not_called_dns_blocked(self):
+        playlist = b"#EXTM3U\n#EXTINF:6.0,\nhttp://192.168.1.10/seg1.ts\n"
+        result = self.probe(lambda url, h: FakeResponse(url, 200, playlist),
+                            "https://cdn.example/live.m3u8", use_ytdlp=False)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["dns_blocked"])
+
+    def test_a_blocked_playlist_host_is_never_fetched(self):
+        with patch("app.probe.dns_blocked_host", self._blocked({"cdn.example"})):
+            result = self.probe(lambda url, h: FakeResponse(url, 200, self.PLAYLIST),
+                                "https://cdn.example/live.m3u8", use_ytdlp=False)
+        self.assertTrue(result["dns_blocked"])
+        self.assertEqual(self.session.calls, [])
+
+    def test_the_recorder_skips_a_blocked_source_without_trying_it_further(self):
+        tmp = tempfile.mkdtemp(prefix="pvarr-dns-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        rec = StreamFailoverRecorder("d1", ["https://a.example/p.m3u8"], str(Path(tmp) / "o.ts"),
+                                     min_free_gb=0)
+        blocked = {"ok": False, "dns_blocked": True, "message": "Blocked by DNS on this network: x"}
+        with patch("app.recorder.probe_stream", return_value=blocked), \
+                patch.object(rec, "_resolve_via_ytdlp") as ytdlp_, \
+                patch.object(rec, "_detect_via_script") as script:
+            self.assertFalse(rec.detect_candidate_headers(rec.candidates[0]))
+        self.assertTrue(rec.candidates[0].dns_blocked)
+        ytdlp_.assert_not_called()
+        script.assert_not_called()
+
+
 class TestEmbedWalkIsBounded(ProbeTestCase):
     """A page cannot make one probe fetch more than MAX_EMBED_FETCHES embeds."""
 

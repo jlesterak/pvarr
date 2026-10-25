@@ -326,6 +326,45 @@ class PrivateAddressError(requests.RequestException):
     """A fetch was refused because it would reach a private or loopback address."""
 
 
+class DnsBlockedError(PrivateAddressError):
+    """A host resolves only to 0.0.0.0 or ::, the answer a DNS blocklist gives.
+
+    Not a LAN address and not a header problem: this network refuses to name
+    the host, so the source cannot be reached from here and another is needed.
+    """
+
+
+def dns_blocked_host(url: str) -> Optional[str]:
+    """The URL's host when DNS answers it only with an "unspecified" address.
+
+    Pi-hole, AdGuard and similar blocklists sinkhole a domain to 0.0.0.0 / ::.
+    Connecting there lands on this very machine, so it must never be tried,
+    and retrying the same source is pointless. A host that does not resolve is
+    not reported (the fetch will simply fail).
+    """
+    host = urlsplit(url).hostname or ""
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return None
+    addresses = [ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos]
+    if addresses and all(a.is_unspecified for a in addresses):
+        return host
+    return None
+
+
+def _dns_blocked_message(host: str) -> str:
+    return (f"Blocked by DNS on this network: {host} resolves to 0.0.0.0, so this "
+            "source cannot be reached from here. Another source is needed.")
+
+
 class NoPrivateRedirects:
     """A requests or curl_cffi session whose redirects are followed by hand.
 
@@ -548,6 +587,7 @@ def probe_stream(
     result: Dict[str, Any] = {
         "ok": False,
         "input_url": url,
+        "dns_blocked": False,
         "m3u8_url": "",
         "page_url": "",
         "referer": "",
@@ -651,6 +691,7 @@ def probe_stream(
                 except PrivateAddressError as exc:
                     # Not a header problem, so trying more headers is pointless.
                     result["message"] = str(exc)
+                    result["dns_blocked"] = isinstance(exc, DnsBlockedError)
                     return result
                 if found is True:
                     return result
@@ -683,7 +724,10 @@ def _try_playlist(fetch_session, plain_session, playlist_url, headers, impersona
     """One playlist attempt. True on success (result filled in), else the
     status seen, or None when the request itself failed."""
     note_tls = "with a browser TLS profile" if impersonate else ""
-    allow_private = is_private_url(result["input_url"])
+    allow_private = is_private_url(result["input_url"]) and not dns_blocked_host(result["input_url"])
+    blocked = None if allow_private else dns_blocked_host(playlist_url)
+    if blocked:
+        raise DnsBlockedError(_dns_blocked_message(blocked))
     try:
         resp, body = _fetch(fetch_session, playlist_url, headers, timeout)
     except _FETCH_ERRORS as exc:
@@ -720,6 +764,9 @@ def _try_playlist(fetch_session, plain_session, playlist_url, headers, impersona
     private = None if allow_private else private_playlist_uri(
         body.decode("utf-8", errors="replace"), resp.url)
     if private:
+        blocked = dns_blocked_host(private)
+        if blocked:
+            raise DnsBlockedError(_dns_blocked_message(blocked))
         raise PrivateAddressError(
             f"Refused: the playlist points at a private or loopback address ({private}).")
 

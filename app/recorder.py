@@ -532,6 +532,9 @@ class CandidateStream:
         self.needs_relay: bool = False
         self.fail_count: int = 0
         self.last_error: str = ""
+        # DNS on this network refuses to name the stream's host (0.0.0.0).
+        # Set by the probe on every connect; such a source is dead from here.
+        self.dns_blocked: bool = False
 
     def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
         """Serialise this candidate.
@@ -558,6 +561,7 @@ class CandidateStream:
             "used_proxy": self.used_proxy,
             "needs_relay": self.needs_relay,
             "fail_count": self.fail_count,
+            "dns_blocked": self.dns_blocked,
             "last_error": self.last_error,
         }
         if include_secrets:
@@ -782,9 +786,15 @@ class StreamFailoverRecorder:
         """
         candidate.slug = candidate.slug or f"cand_{self.current_candidate_index}"
         candidate.needs_relay = False
+        candidate.dns_blocked = False
 
         if self.auto_probe and self._probe_candidate(candidate):
             return True
+
+        # yt-dlp, detect-headers and the raw URL would all ask the same blocked
+        # host, so skip them and let the caller fail over.
+        if candidate.dns_blocked:
+            return False
 
         if self._resolve_via_ytdlp(candidate):
             return True
@@ -824,6 +834,7 @@ class StreamFailoverRecorder:
             self._log(f"Probe error for {candidate.name}: {exc}", "WARN")
             return False
 
+        candidate.dns_blocked = bool(result.get("dns_blocked"))
         if not result.get("ok"):
             candidate.last_error = result.get("message", "Probe failed")
             self._log(f"Probe found nothing playable for {candidate.name}: {candidate.last_error}", "WARN")
@@ -1912,31 +1923,42 @@ class StreamFailoverRecorder:
             # 1. Detect headers
             self.detect_candidate_headers(candidate)
 
+            # A source this network's DNS refuses to name is dead from here:
+            # retrying it, or routing it through the proxy, asks the same
+            # blocked host. Count it dead (so the event page is re-checked for
+            # another source) and move straight on.
+            dns_blocked = candidate.dns_blocked
+            if dns_blocked:
+                candidate.fail_count += 1
+                self._log(f"{candidate.name}: {candidate.last_error} Skipping it.", "WARN")
+                outcome = StreamOutcome.FAILED
+
             # 2. Attempt Direct Mode (Direct FFmpeg with -headers)
             #    A playlist only a browser TLS profile can fetch is read
             #    through a loopback relay; segments still go straight to the CDN
             #    with these same headers.
-            self._log(f"[Direct Mode] Connecting FFmpeg directly to {url_for_log(candidate.m3u8_url)}...")
-            relay = None
-            try:
-                input_url = candidate.m3u8_url
-                if candidate.needs_relay:
-                    try:
-                        relay = PlaylistRelay(candidate.m3u8_url, self._relay_headers(candidate))
-                        input_url = relay.start()
-                        self._log(f"[Relay] Playlist is only served to a browser TLS profile; "
-                                  f"relaying it on {input_url}.")
-                    except OSError as exc:
-                        relay = None
-                        self._log(f"[Relay] Could not start the playlist relay: {exc}", "ERROR")
-                direct_cmd = self._build_ffmpeg_cmd(
-                    input_url, candidate.referer, candidate.user_agent, candidate.cookie
-                )
-                outcome = self._stream_ffmpeg_process(direct_cmd, candidate)
-            finally:
-                self._reap_ffmpeg()
-                if relay is not None:
-                    relay.stop()
+            if not dns_blocked:
+                self._log(f"[Direct Mode] Connecting FFmpeg directly to {url_for_log(candidate.m3u8_url)}...")
+                relay = None
+                try:
+                    input_url = candidate.m3u8_url
+                    if candidate.needs_relay:
+                        try:
+                            relay = PlaylistRelay(candidate.m3u8_url, self._relay_headers(candidate))
+                            input_url = relay.start()
+                            self._log(f"[Relay] Playlist is only served to a browser TLS profile; "
+                                      f"relaying it on {input_url}.")
+                        except OSError as exc:
+                            relay = None
+                            self._log(f"[Relay] Could not start the playlist relay: {exc}", "ERROR")
+                    direct_cmd = self._build_ffmpeg_cmd(
+                        input_url, candidate.referer, candidate.user_agent, candidate.cookie
+                    )
+                    outcome = self._stream_ffmpeg_process(direct_cmd, candidate)
+                finally:
+                    self._reap_ffmpeg()
+                    if relay is not None:
+                        relay.stop()
 
             # 3. Fallback Mode: retry this candidate through hls-proxy -- but
             #    only where that can plausibly help.
@@ -1956,7 +1978,9 @@ class StreamFailoverRecorder:
             #    proxy retry is still better than nothing.
             dead_mid_recording = (outcome is StreamOutcome.INTERRUPTED
                                   and self.has_next_candidate)
-            if (dead_mid_recording
+            if dns_blocked:
+                pass    # already failed over above; the proxy asks the same host
+            elif (dead_mid_recording
                     and not self._stop_event.is_set()
                     and not self._force_failover_flag):
                 self._log(

@@ -77,6 +77,21 @@ container and a new session recorded cleanly (0 lost segments in the first minut
   the pinned proxy (`scripts/patch-hls-proxy.py`, fails the build if stale).
   Proven: ffmpeg through the patched proxy recorded valid h264/aac at 720p.
 
+## DNS-blocked sources (fixed 2026-10-25, unreleased)
+After a container recreate, a live source's segment CDN began resolving to
+`0.0.0.0` (a DNS blocklist), so a playlist that had recorded fine for ~40 minutes
+could no longer be followed; the probe called it a "private or loopback address"
+and the recorder spent a full lap on yt-dlp, header detection and the proxy for
+each candidate. Now classified as blocked by DNS, failed over at once, and the
+event page is re-checked for another source. Proven live: one event-page Find
+reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
+- [PENDING] Why the same CDN resolved normally for the first ~40 minutes and not
+  after the recreate is unexplained (the local resolver had not been asked).
+- [PENDING] Boot finishing runs commercial detection inline and delayed the
+  server coming up by ~7 minutes with two long recordings; resumed sessions
+  waited behind it. Restarts also spend a session's resume allowance, so three
+  restarts in an hour finalised a live recording instead of resuming it.
+
 ## Segment loss investigation
 
 ### Live session 66954d39, 2026-10-04 (local container, v:latest) -- cause 2 confirmed  [PENDING]
