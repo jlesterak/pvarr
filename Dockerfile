@@ -54,6 +54,11 @@ RUN if [ -f /opt/hls-restream-proxy/hls-proxy.py ]; then \
         ln -sf /usr/local/bin/detect-headers.sh /usr/local/bin/detect-headers; \
     fi
 
+# Let the proxy relay segments hosted on a different domain than the playlist.
+# Fails the build if the pinned source no longer matches the patch.
+COPY scripts/patch-hls-proxy.py /tmp/patch-hls-proxy.py
+RUN python3 /tmp/patch-hls-proxy.py /usr/local/bin/hls-proxy.py && rm /tmp/patch-hls-proxy.py
+
 # Copy application files
 COPY . .
 

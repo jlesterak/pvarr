@@ -69,8 +69,13 @@ running the container's ffmpeg against the live playlist: refused with no flags,
 clean with `-extension_picky 0 -allowed_extensions ALL`. Fix: relax the
 extension check on every path, test updated. Hot-patched into the running
 container and a new session recorded cleanly (0 lost segments in the first minute).
-- [PENDING] Why the hls-proxy fallback also reported every segment as "failed to
-  download" for this source class; the fallback should have rescued it.
+- [COMPLETED] The hls-proxy fallback also failed every segment for this source
+  class, for two reasons found by running the container's proxy against the live
+  playlist: it answered 403 "Unknown upstream host" for segments on a different
+  host than the playlist, and it ignored the Range header, returning whole files
+  where the playlist asked for byte ranges. Both fixed by a build-time patch of
+  the pinned proxy (`scripts/patch-hls-proxy.py`, fails the build if stale).
+  Proven: ffmpeg through the patched proxy recorded valid h264/aac at 720p.
 
 ## Segment loss investigation
 

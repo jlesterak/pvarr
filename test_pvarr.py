@@ -9720,6 +9720,49 @@ class TestFinishRecordingPipeline(ServerTestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class TestHlsProxyPatch(unittest.TestCase):
+    """scripts/patch-hls-proxy.py applies once, and fails loudly on a changed source."""
+
+    SOURCE = (
+        '            headers = {"User-Agent": UPSTREAM_UA}\n'
+        "                self.send_response(200)\n"
+        '                self.send_header("Content-Type", content_type)\n'
+        "        # Mirror the upstream file extension onto the proxy path.\n"
+        "def main():\n    pass\n"
+    )
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "patch_hls_proxy", Path(__file__).parent / "scripts" / "patch-hls-proxy.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_patch_adds_range_status_and_host_learning(self):
+        out = self._mod().patch(self.SOURCE)
+        self.assertIn('headers["Range"]', out)
+        self.assertIn("resp.status if resp.status == 206", out)
+        self.assertIn("_learn_segment_host(full, base_url)", out)
+
+    def test_private_hosts_are_not_learned(self):
+        import urllib.parse
+        ns = {"re": re, "urllib": urllib,
+              "_referer_map": {"http://a.example": "R"}}
+        exec(self._mod().DEF, ns)
+        ns["_learn_segment_host"]("http://10.0.0.5/x.ts", "http://a.example/")
+        ns["_learn_segment_host"]("http://cdn.example/x.ts", "http://a.example/")
+        self.assertNotIn("http://10.0.0.5", ns["_referer_map"])
+        self.assertEqual(ns["_referer_map"]["http://cdn.example"], "R")
+
+    def test_changed_or_already_patched_source_is_refused(self):
+        mod = self._mod()
+        with self.assertRaises(SystemExit):
+            mod.patch("def main():\n    pass\n")
+        with self.assertRaises(SystemExit):
+            mod.patch(mod.patch(self.SOURCE))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

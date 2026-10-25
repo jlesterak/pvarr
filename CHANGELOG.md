@@ -9,6 +9,7 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ### Fixed
 - A live stream whose playlist serves MPEG-TS segments under a non-video extension (`.image` URLs with byte ranges) was refused in direct mode ("not in allowed_segment_extensions"), so the recording stayed at 0 bytes while it cycled through every candidate. The extension relaxation now applies to direct mode as well as the local proxy path.
+- The fallback proxy now works for streams whose segments live on a different host than the playlist, and for playlists that pack segments into one file with byte ranges. Previously it refused those segments (403 "Unknown upstream host") and ignored the byte range, so every segment failed. The pinned proxy is patched at image build (`scripts/patch-hls-proxy.py`); the build fails if the patch stops matching.
 
 ### Changed
 - Finishing a recording is one code path for a normal stop and for a recording finalised at boot. The boot path now also warns about lost segments and runs commercial detection, and a crash between the remux and the announcement no longer leaves an `.mp4` that is never announced or organised.
