@@ -4625,6 +4625,25 @@ class TestDnsBlockedSource(ProbeTestCase):
         ytdlp_.assert_not_called()
         script.assert_not_called()
 
+    def test_the_loop_counts_a_blocked_source_dead_and_never_starts_ffmpeg_or_the_proxy(self):
+        tmp = tempfile.mkdtemp(prefix="pvarr-dns-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        rec = StreamFailoverRecorder("d2", ["https://a.example/p.m3u8"], str(Path(tmp) / "o.ts"),
+                                     min_free_gb=0)
+
+        def detect(candidate):
+            candidate.dns_blocked = True
+            candidate.last_error = "Blocked by DNS on this network: a.example"
+            rec._stop_event.set()     # one pass is enough
+
+        with patch.object(rec, "detect_candidate_headers", side_effect=detect), \
+                patch.object(rec, "_stream_ffmpeg_process") as ffmpeg, \
+                patch.object(rec, "start_proxy") as proxy:
+            rec._recording_loop()
+        ffmpeg.assert_not_called()
+        proxy.assert_not_called()
+        self.assertEqual(rec.candidates[0].fail_count, 1)
+
 
 class TestEmbedWalkIsBounded(ProbeTestCase):
     """A page cannot make one probe fetch more than MAX_EMBED_FETCHES embeds."""
@@ -6167,6 +6186,10 @@ class TestEventPageRescan(unittest.TestCase):
         self.assertFalse(due(dead=3, total=3, last_at=9_700, now=10_000, busy=False),
                          "at most once per ten minutes")
         self.assertFalse(due(dead=3, total=3, last_at=0, now=10_000, busy=True))
+        self.assertTrue(due(dead=0, total=3, last_at=0, now=10_000, busy=False, blocked=True),
+                        "one DNS-blocked source is enough")
+        self.assertFalse(due(dead=0, total=3, last_at=9_700, now=10_000, busy=False,
+                             blocked=True), "still at most once per ten minutes")
 
     def test_record_keeps_the_page_only_when_there_is_one(self):
         from app.sessions import build_record
@@ -9809,14 +9832,28 @@ class TestHlsProxyPatch(unittest.TestCase):
         self.assertIn("resp.status if resp.status == 206", out)
         self.assertIn("_learn_segment_host(full, base_url)", out)
 
-    def test_private_hosts_are_not_learned(self):
+    def test_only_hosts_that_resolve_to_public_addresses_are_learned(self):
+        import socket as socket_mod
         import urllib.parse
-        ns = {"re": re, "urllib": urllib,
-              "_referer_map": {"http://a.example": "R"}}
+        from unittest.mock import patch
+        real = socket_mod.getaddrinfo
+
+        def fake(host, *a, **k):
+            if host == "cdn.example":
+                return [(2, 1, 6, "", ("93.184.216.34", 0))]
+            if host == "nas.lan":
+                return [(2, 1, 6, "", ("192.168.1.20", 0))]
+            if host == "sinkholed.example":
+                return [(2, 1, 6, "", ("0.0.0.0", 0))]
+            return real(host, *a, **k)
+
+        ns = {"re": re, "urllib": urllib, "_referer_map": {"http://a.example": "R"}}
         exec(self._mod().DEF, ns)
-        ns["_learn_segment_host"]("http://10.0.0.5/x.ts", "http://a.example/")
-        ns["_learn_segment_host"]("http://cdn.example/x.ts", "http://a.example/")
-        self.assertNotIn("http://10.0.0.5", ns["_referer_map"])
+        with patch("socket.getaddrinfo", fake):
+            for host in ("10.0.0.5", "127.1", "2130706433", "localhost", "nas.lan",
+                         "sinkholed.example", "cdn.example"):
+                ns["_learn_segment_host"](f"http://{host}/x.ts", "http://a.example/")
+        self.assertEqual(sorted(ns["_referer_map"]), ["http://a.example", "http://cdn.example"])
         self.assertEqual(ns["_referer_map"]["http://cdn.example"], "R")
 
     def test_changed_or_already_patched_source_is_refused(self):

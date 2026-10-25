@@ -846,14 +846,10 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         loop = _main_loop
         if loop is None or not record.get("event_page"):
             return
-        # A source this network's DNS blocks is dead for good, so one is enough
-        # to go looking for another; ordinary failures wait for two.
-        dead = recorder.dead_since_rescan()
-        if any(c.dns_blocked for c in recorder.candidates):
-            dead = max(dead, len(recorder.candidates))
-        if schedules.rescan_due(dead, len(recorder.candidates),
+        if schedules.rescan_due(recorder.dead_since_rescan(), len(recorder.candidates),
                                 recorder.last_rescan_at, time.time(),
-                                busy=bool(recorder.rescan_state)):
+                                busy=bool(recorder.rescan_state),
+                                blocked=any(c.dns_blocked for c in recorder.candidates)):
             # Claimed here, on the recorder thread, so the next failover does
             # not queue a second check before the first one starts.
             recorder.rescan_state = "checking"

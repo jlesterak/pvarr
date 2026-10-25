@@ -52,12 +52,17 @@ post-processed and released within a few seconds.
 
 **FFmpeg says a segment `is not in allowed_segment_extensions`.** The stream
 serves its video segments with a non-video file extension (for example URLs
-ending `.image`), and FFmpeg's HLS demuxer refuses them by extension. Direct Mode cannot record such
-a stream — that check is deliberate — so PVArr falls back to hls-proxy, which
-re-serves the segments from `127.0.0.1` with the extension check relaxed for
-that local hop only. Remote playlists still get FFmpeg's strict default, and
-`-protocol_whitelist` forbids `file://` on both paths regardless. Nothing to
-configure; the fallback is automatic.
+ending `.image`), and FFmpeg's HLS demuxer refuses them by extension. PVArr
+relaxes that check on both Direct Mode and the hls-proxy fallback (since
+0.11.1); `-protocol_whitelist` still forbids `file://` on both paths. If you
+still see this line, you are on an older image. Nothing to configure.
+
+**A source says `Blocked by DNS on this network`.** Your resolver (Pi-hole,
+AdGuard, a router blocklist) answers that host with `0.0.0.0`. PVArr will not
+connect there (it would reach this machine), fails over at once, and re-checks
+the event page for another source. If every source for an event sits on a
+blocked host, nothing can be recorded until the host is allowed in your
+resolver; PVArr does not work around your DNS.
 
 **A stopped recording shows `post processing` with an amber dot.** The capture
 has finished but the recorder is still remuxing the `.ts` into an `.mp4`, which

@@ -6,6 +6,7 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ### Fixed
 - A source whose host this network's DNS blocklist answers with `0.0.0.0` / `::` (Pi-hole, AdGuard and similar) is now recognised as **blocked by DNS** rather than reported as a private address. The recorder fails over immediately, without the yt-dlp, header-detection and proxy retries that would ask the same blocked host, counts it as dead so the event page is re-checked for another source right away (one such source is enough; ordinary failures still wait for two), and a Find or re-check skips such links with the reason shown. Connecting to `0.0.0.0` reaches this very machine, so a blocked host is never tried.
+- The fallback proxy's new segment-host learning (0.11.1) refused only private IP *literals*; `localhost`, alternate spellings such as `127.1` or `2130706433`, and LAN hostnames were still learned. It now resolves each host and learns it only when every address is public.
 
 ## [0.11.1] - 2026-10-25
 

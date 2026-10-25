@@ -7,8 +7,8 @@ else. Live playlists often point at a separate CDN host, so every segment was
 refused and the fallback could never rescue such a stream.
 
 The patch registers the host of each segment URL found in a playlist the proxy
-itself fetched (reusing the playlist host's Referer), except hosts that are
-private, loopback or link-local IP literals.
+itself fetched (reusing the playlist host's Referer), except hosts that resolve
+to anything but public addresses (loopback, LAN, link-local, 0.0.0.0).
 
 It also passes a client's Range header upstream and relays the 206 and its
 Content-Range. Upstream ignored Range and answered 200 with the whole file, so
@@ -27,17 +27,23 @@ DEF_ANCHOR = "def main():\n"
 DEF = '''def _learn_segment_host(full, base_url):
     """PVArr patch: trust segment hosts named by a playlist we fetched."""
     import ipaddress
+    import socket
     host = re.match(r"https?://[^/]+", full)
     base = re.match(r"https?://[^/]+", base_url)
     if not host or host.group(0) in _referer_map:
         return
+    # Resolve rather than parse: "localhost", "127.1", "2130706433" and LAN
+    # names are not IP literals but all reach this machine or the LAN.
     name = urllib.parse.urlparse(full).hostname or ""
+    if not name or name == "localhost" or name.endswith(".localhost"):
+        return
     try:
-        ip = ipaddress.ip_address(name)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
-            return
-    except ValueError:
-        pass
+        infos = socket.getaddrinfo(name, None)
+    except (OSError, UnicodeError):
+        return
+    if not infos or any(not ipaddress.ip_address(i[4][0].split("%")[0]).is_global
+                        for i in infos):
+        return
     _referer_map[host.group(0)] = _referer_map.get(base.group(0), "") if base else ""
 
 
