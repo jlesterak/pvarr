@@ -1476,8 +1476,11 @@ class StreamFailoverRecorder:
             "-rw_timeout", "15000000",
         ]
 
-        if local_proxy:
-            cmd.extend(hls_extension_flags(self.ffmpeg_path))
+        # Direct mode needs this as much as the proxy path: a live origin
+        # served real MPEG-TS under ".image" URLs, and direct mode refused every
+        # segment. The protocol whitelist above, not the extension list, is
+        # what keeps FFmpeg off local files.
+        cmd.extend(hls_extension_flags(self.ffmpeg_path))
 
         # Construct HTTP headers for Direct Mode. Each value is checked because
         # FFmpeg copies this block verbatim into the request; see

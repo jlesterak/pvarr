@@ -3009,7 +3009,7 @@ class TestHlsExtensionFlags(unittest.TestCase):
 
 
 class TestFfmpegExtensionScope(unittest.TestCase):
-    """Relaxing the extension check is scoped to our own local proxy."""
+    """The extension check is relaxed on both the direct and the proxy path."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pvarr-scope-")
@@ -3024,9 +3024,11 @@ class TestFfmpegExtensionScope(unittest.TestCase):
         recorder._HLS_EXT_FLAGS_CACHE.clear()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_direct_mode_keeps_ffmpegs_strict_default(self):
+    def test_direct_mode_relaxes_it_too(self):
+        """Live incident: MPEG-TS under .image URLs was refused in direct mode."""
         cmd = self.rec._build_ffmpeg_cmd("https://remote.example/live.m3u8")
-        self.assertNotIn("-extension_picky", cmd)
+        self.assertIn("-extension_picky", cmd)
+        self.assertEqual(cmd[cmd.index("-extension_picky") + 1], "0")
 
     def test_the_proxy_path_relaxes_it(self):
         cmd = self.rec._build_ffmpeg_cmd(

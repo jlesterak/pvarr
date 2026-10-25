@@ -61,6 +61,17 @@ finalised as E03, nothing left marked as finishing).
   never copied), .nfo sidecars, a sports-database lookup, retro-tagging the
   existing library, a category-folder setting.
 
+## Direct-mode extension refusal (fixed 2026-10-25, unreleased)
+A live game recorded 0 bytes for 10 minutes: every candidate's playlist listed
+byte-range segments on `.image` URLs. The segments were real MPEG-TS (sync bytes
+at the range offset, plain GET works), but direct mode refused them. Proven by
+running the container's ffmpeg against the live playlist: refused with no flags,
+clean with `-extension_picky 0 -allowed_extensions ALL`. Fix: relax the
+extension check on every path, test updated. Hot-patched into the running
+container and a new session recorded cleanly (0 lost segments in the first minute).
+- [PENDING] Why the hls-proxy fallback also reported every segment as "failed to
+  download" for this source class; the fallback should have rescued it.
+
 ## Segment loss investigation
 
 ### Live session 66954d39, 2026-10-04 (local container, v:latest) -- cause 2 confirmed  [PENDING]
