@@ -929,6 +929,24 @@ class TestResolutionRetag(unittest.TestCase):
         self.assertFalse((Path(self.tmp) / "2026-09-13_NFL_A_vs_B_1080p.mp4").exists())
 
     @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_title_tag_survives_remux_and_chapters(self):
+        # Plex's Personal Media Shows agent titles episodes from this tag only;
+        # the chapter write used to replace the file's tags with comskip's (none).
+        src = self._ts("2026-09-13_NFL_A_vs_B_720p.ts", "1280x720")
+        res = remux_recording(str(src), target_format="mp4", title="Bears vs Packers")
+        self.assertEqual(res["status"], "success", res.get("error"))
+        meta = Path(self.tmp) / "c.ffmeta"
+        meta.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\n")
+        self.assertTrue(commercials.apply_chapters(res["output_filepath"], str(meta)))
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags=title",
+             "-show_chapters", "-of", "json", res["output_filepath"]],
+            capture_output=True, text=True).stdout
+        probed = json.loads(out)
+        self.assertEqual(probed["format"]["tags"]["title"], "Bears vs Packers")
+        self.assertEqual(len(probed["chapters"]), 1)
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
     def test_remux_does_not_overwrite_a_recording_under_the_new_name(self):
         # The corrected name was never reserved; a finished recording may
         # already hold it, and the remux runs `ffmpeg -y`.
@@ -9686,7 +9704,7 @@ class TestFinishRecordingPipeline(ServerTestCase):
         mp4 = Path(self.tmp) / f"{record_name}.mp4"
         calls = []
 
-        def fake_remux(path, target_format="mp4", delete_source=True):
+        def fake_remux(path, target_format="mp4", delete_source=True, title=None):
             calls.append("remux")
             if not remux_ok:
                 return {"status": "failed", "error": "boom"}

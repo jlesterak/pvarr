@@ -700,7 +700,8 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
     try:
         final = source
         if source.suffix.lower() == ".ts":
-            result = remux_recording(str(source), target_format="mp4", delete_source=True)
+            result = remux_recording(str(source), target_format="mp4", delete_source=True,
+                                     title=library.episode_title(record.get("naming") or {}))
             if result.get("status") == "success" and result.get("output_filepath"):
                 final = Path(result["output_filepath"])
                 _finishing_paths[final.resolve()] = recording_id

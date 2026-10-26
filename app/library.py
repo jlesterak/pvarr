@@ -143,6 +143,15 @@ def organised_name(sport: str, team_a: str, team_b: str, year: str,
     return f"{head}{teams.rstrip(' -')}{tail_ext}"
 
 
+def episode_title(naming: Dict[str, Any]) -> Optional[str]:
+    """`Bears vs Packers`, the title tag a finished recording carries, or None
+    when the form named no teams (a tag of "Team A vs Team B" helps nobody)."""
+    if not (naming.get("team_a") or naming.get("team_b")):
+        return None
+    return (f"{display_token(naming.get('team_a', ''), 'Team A')} vs "
+            f"{display_token(naming.get('team_b', ''), 'Team B')}")
+
+
 def organise(source: Path, naming: Dict[str, Any], root: Path) -> Path:
     """Move `source` into the library and return its new path.
 

@@ -188,7 +188,7 @@ def apply_chapters(video_path: str, ffmeta_path: str) -> bool:
         ffmpeg, "-y",
         "-i", str(source),
         "-i", str(meta),
-        "-map_metadata", "1",
+        "-map_metadata", "0",      # keep the file's own tags (its title); comskip's has none
         "-map_chapters", "1",
         "-codec", "copy",
         str(tmp),

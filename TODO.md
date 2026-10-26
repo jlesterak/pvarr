@@ -99,6 +99,11 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   waited behind it. Restarts also spend a session's resume allowance, so three
   restarts in an hour finalised a live recording instead of resuming it.
 
+## Episode titles missing in Plex (fixed 2026-10-26, unreleased)
+- Symptom: with the README's Plex setup (TV Shows, Personal Media Shows agent) every organised recording showed as "Episode 1" or a date. That agent reads episode titles only from the container's title tag; PVArr wrote none, and the comskip chapter write (`-map_metadata 1`) replaced the file's tags with the chapter file's (none).
+- Fix: the remux writes `<Team A> vs <Team B>` as the title (`library.episode_title`, same sanitising as the filename; no tag when the form named no teams); the chapter write keeps input 0's tags.
+- Proof: `test_title_tag_survives_remux_and_chapters` (real ffmpeg: remux with a title, write a chapter, ffprobe shows both); it fails with the old `-map_metadata 1`.
+
 ## Quality ranking ignores byte ranges  [PENDING]
 Find / re-check log "segment is not video" for every source whose playlist
 packs segments with EXT-X-BYTERANGE inside a non-video file: `quality.measure`

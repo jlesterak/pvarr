@@ -20,10 +20,14 @@ logger = logging.getLogger("PVArrPostProcessor")
 def remux_recording(
     ts_filepath: str,
     target_format: str = "mp4",
-    delete_source: bool = True
+    delete_source: bool = True,
+    title: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Remux a .ts file into fast-start mp4 or mkv container.
+
+    `title` goes into the container's title tag: Plex's Personal Media Shows
+    agent reads episode titles from it, never from the filename.
     """
     source_path = Path(ts_filepath).resolve()
     if not source_path.exists() or source_path.stat().st_size == 0:
@@ -67,6 +71,8 @@ def remux_recording(
 
     if target_format == "mp4":
         cmd.extend(["-movflags", "+faststart", "-bsf:a", "aac_adtstoasc"])
+    if title:
+        cmd.extend(["-metadata", f"title={title}"])
 
     cmd.append(str(dest_path))
 
