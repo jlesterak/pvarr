@@ -4,6 +4,11 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-26
+
+### Changed
+- New theme: warm wood, parchment and brass instead of blue (status colours keep their meanings).
+
 ### Fixed
 - Plex showed every organised recording as "Episode 1" (or a date) when the Sports library uses the **Personal Media Shows** agent, which takes episode titles only from the file's title tag, never the filename. The remux now writes `<Team A> vs <Team B>` as the title tag, and writing comskip chapters keeps the file's tags instead of replacing them with an empty set.
 - A source whose host this network's DNS blocklist answers with `0.0.0.0` / `::` (Pi-hole, AdGuard and similar) is now recognised as **blocked by DNS** rather than reported as a private address. The recorder fails over immediately, without the yt-dlp, header-detection and proxy retries that would ask the same blocked host, counts it as dead so the event page is re-checked for another source right away (one such source is enough; ordinary failures still wait for two), and a Find or re-check skips such links with the reason shown. Connecting to `0.0.0.0` reaches this very machine, so a blocked host is never tried.

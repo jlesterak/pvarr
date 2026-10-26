@@ -47,7 +47,7 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
 
 `PVARR_LIBRARY_DIR` moves a finished recording to
 `<dir>/<Sport>/Season <year>/<Sport> - S<year>E<NN> - <A> vs <B>.mp4`. See
-README "Organising finished recordings" and CHANGELOG [Unreleased]. Season is
+README "Organising finished recordings" and CHANGELOG [0.11.1]. Season is
 the recording's calendar year (sponsor decision), so an NFL season splits across
 two folders.
 
@@ -80,7 +80,7 @@ container and a new session recorded cleanly (0 lost segments in the first minut
   the pinned proxy (`scripts/patch-hls-proxy.py`, fails the build if stale).
   Proven: ffmpeg through the patched proxy recorded valid h264/aac at 720p.
 
-## DNS-blocked sources (fixed 2026-10-25, unreleased)
+## DNS-blocked sources (fixed 2026-10-25, released in v0.11.2)
 After a container recreate, a live source's segment CDN began resolving to
 `0.0.0.0` (a DNS blocklist), so a playlist that had recorded fine for ~40 minutes
 could no longer be followed; the probe called it a "private or loopback address"
@@ -99,7 +99,7 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   waited behind it. Restarts also spend a session's resume allowance, so three
   restarts in an hour finalised a live recording instead of resuming it.
 
-## Episode titles missing in Plex (fixed 2026-10-26, unreleased)
+## Episode titles missing in Plex (fixed 2026-10-26, released in v0.11.2)
 - Symptom: with the README's Plex setup (TV Shows, Personal Media Shows agent) every organised recording showed as "Episode 1" or a date. That agent reads episode titles only from the container's title tag; PVArr wrote none, and the comskip chapter write (`-map_metadata 1`) replaced the file's tags with the chapter file's (none).
 - Fix: the remux writes `<Team A> vs <Team B>` as the title (`library.episode_title`, same sanitising as the filename; no tag when the form named no teams); the chapter write keeps input 0's tags.
 - Proof: `test_title_tag_survives_remux_and_chapters` (real ffmpeg: remux with a title, write a chapter, ffprobe shows both); it fails with the old `-map_metadata 1`.
