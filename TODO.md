@@ -9,8 +9,7 @@ recorded broadcasts are "network A/B". Site-specific field notes live in a
 separate private notes repo and must not be copied into this one, its commit
 messages, tests or screenshots. See README "Scope".
 
-Everything finished is in the release notes (`docs/release-notes/`,
-`CHANGELOG.md`) and git history. Only open work and standing decisions stay here.
+Everything finished is in the private notes log (phases 1-33, through v0.11.0) and the release notes (`docs/release-notes/`, `CHANGELOG.md`). Only open work and standing decisions stay here.
 
 ## Decisions (closed, not open work)
 - **Quantified AI footprint figures — will not add.** The build was never
@@ -143,7 +142,7 @@ fetching the sample segment. Seen live 2026-10-25 on every pick of a re-check.
   hour. So the "3-segment window plus stale playlist" hypothesis does **not**
   hold for this source; it is still untested for the source that lost 16%.
   Next: repeat the probe whenever a game uses that source class.
-- Decisive test, next live game on that source class (sponsor approval per probe): poll the playlist every 1s for 2 min, log
+- Decisive test, next live game (scheduled 2026-10-25 afternoon, sponsor-approved): poll the playlist every 1s for 2 min, log
   media-sequence, window length, `Cache-Control`/`Age`, and which edge
   answered. Two minutes settles it.
 - Likely fix if confirmed: a small playlist relay (design already sketched in
