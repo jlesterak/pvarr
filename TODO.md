@@ -9,12 +9,10 @@ recorded broadcasts are "network A/B". Site-specific field notes live in a
 separate private notes repo and must not be copied into this one, its commit
 messages, tests or screenshots. See README "Scope".
 
-## Open work
+Everything finished is in the release notes (`docs/release-notes/`,
+`CHANGELOG.md`) and git history. Only open work and standing decisions stay here.
 
-Everything finished is in the private notes log (phases 1-33, through v0.11.0) and the release notes (`docs/release-notes/`, `CHANGELOG.md`). Only open work and standing decisions stay here.
-
-
-## Closed by decision (not open work)
+## Decisions (closed, not open work)
 - **Quantified AI footprint figures — will not add.** The build was never
   instrumented, and providers do not publish per-token energy for frontier
   models. Any gram-of-CO₂e or litre-of-water figure produced now would be
@@ -24,16 +22,12 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
   carbon-offset donation links (Cool Earth, Clean Air Task Force, Wren —
   all three URLs verified live). The "we don't know and they won't say"
   position is unchanged; only the voice moved.
-
-## Decisions
 - **Authentication: accepted risk, will not add.** Deployment is a trusted LAN
   behind a firewall. Documented prominently in the README instead. Revisit only
   if this is ever exposed — note that adding Basic auth would break the Plex and
   Emby tuner fetches unless `/live/*` is exempted or given a token parameter.
 
-## Still open
-
-### Longer-term candidates
+## Longer-term candidates
 - A retention/cleanup policy for old recordings on disk.
 - Integration coverage for the notification webhooks (currently mocks only).
 - A headless-browser probe path so JavaScript-built m3u8 URLs work without the
@@ -149,7 +143,7 @@ fetching the sample segment. Seen live 2026-10-25 on every pick of a re-check.
   hour. So the "3-segment window plus stale playlist" hypothesis does **not**
   hold for this source; it is still untested for the source that lost 16%.
   Next: repeat the probe whenever a game uses that source class.
-- Decisive test, next live game (scheduled 2026-10-25 afternoon, sponsor-approved): poll the playlist every 1s for 2 min, log
+- Decisive test, next live game on that source class (sponsor approval per probe): poll the playlist every 1s for 2 min, log
   media-sequence, window length, `Cache-Control`/`Age`, and which edge
   answered. Two minutes settles it.
 - Likely fix if confirmed: a small playlist relay (design already sketched in
@@ -160,23 +154,23 @@ fetching the sample segment. Seen live 2026-10-25 on every pick of a re-check.
 ## Open items carried from completed phases
 
 *From "v0.2.1 validated on the test server (2026-08-31)":*
-- [ ] **PTS discontinuity across a failover, seen by a live rebroadcast
+- [PENDING] **PTS discontinuity across a failover, seen by a live rebroadcast
       viewer.** The channel itself works; what has still never been observed is
       a failover *while a client is watching it*. That remains the first thing
       to look at if Plex ever drops a channel mid-game. Recordings are
       unaffected and measured — only the live viewer path is open.
 
-*From "Candidate 1's 404s: two bugs, neither of them the stream (2026-08-3":*
-- [ ] Whether candidate 1 *records* for the sponsor now. This proves the
+*From "Candidate 1's 404s: two bugs, neither of them the stream" (2026-08):*
+- [PENDING] Whether candidate 1 *records* for the sponsor now. This proves the
       mechanism against a synthetic origin of the same shape; it does not prove
       that particular provider stays up.
 
-*From "Phase 25: Event page -> first three working streams (2026-10-05) [C":*
+*From "Phase 25: Event page -> first three working streams" (2026-10-05):*
 - [PENDING] If the cookie paste fails from the container but works in the
   browser, the `cf_clearance` cookie is likely bound to something the
   container does not share (IP or TLS client); FlareSolverr is then the only
   route.
 
-*From "Phase 31-rescan: Re-check the event page when sources die (2026-10-":*
+*From "Phase 31-rescan: Re-check the event page when sources die" (2026-10):*
 - [PENDING] Live re-check with `exclude` on the next event-page recording
   (container restarted onto 9c96d27 the same evening).
