@@ -4,6 +4,16 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-28
+
+### Added
+- Event-page checks count every link by status (working, not video, failed, unresolved, not checked) and group working links into real sources: mirrors of one feed share a letter. Shown in the result line, the link list, the re-check log and `/api/aggregate` (`summary`; `status` and `source` per link).
+- The recording card shows how many real sources stand behind its candidates and a source letter on each; `/api/status` adds `source` per candidate and `distinct_sources`/`unknown_sources` per session.
+
+### Fixed
+- A link whose segments are not video (images, HTML) counted as working and could be picked as the primary; it is now excluded and listed as *not video*.
+- Quality measurement ignored EXT-X-BYTERANGE and fetched whole files, so sources packing segments inside a non-video file were picked unmeasured; it now requests the range.
+
 ## [0.11.2] - 2026-10-26
 
 ### Changed
