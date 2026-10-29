@@ -172,3 +172,8 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 *From "Phase 31-rescan: Re-check the event page when sources die" (2026-10):*
 - [PENDING] Live re-check with `exclude` on the next event-page recording
   (container restarted onto 9c96d27 the same evening).
+
+*Launch prep (2026-10-29):*
+- [PENDING] README: add a short "How it differs" note. If you have an IPTV
+  provider playlist, Dispatcharr (or DVarr for scheduled sports) is the better
+  tool; PVArr is for web pages, with multi-source failover into one file.
