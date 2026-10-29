@@ -95,13 +95,12 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - Fix: the remux writes `<Team A> vs <Team B>` as the title (`library.episode_title`, same sanitising as the filename; no tag when the form named no teams); the chapter write keeps input 0's tags.
 - Proof: `test_title_tag_survives_remux_and_chapters` (real ffmpeg: remux with a title, write a chapter, ffprobe shows both); it fails with the old `-map_metadata 1`.
 
-## Quality ranking ignores byte ranges  [PENDING]
-Find / re-check log "segment is not video" for every source whose playlist
-packs segments with EXT-X-BYTERANGE inside a non-video file: `quality.measure`
-fetches the whole file and sees the wrapper's header (an image) instead of the
-MPEG-TS at the offset. Those sources still get picked, but unmeasured, so the
-ranking cannot tell a good one from a bad one. Fix: honour the byte range when
-fetching the sample segment. Seen live 2026-10-25 on every pick of a re-check.
+## Real-source counts; non-video and byte-range segments (fixed 2026-10-28)
+- Symptom: a page check reported "3 working streams from 2 independent sources" while every recordable link on the page was one feed; the counts covered only the three picks. Its pick 1 was a playlist whose segments are real images (video drawn into the pixels, decoded by the site's player): FFmpeg found no stream in it, and the recording spent each failover cycling through it and its mirror. Separately, the byte-range item below.
+- Byte ranges: `quality.measure` fetched the whole file for EXT-X-BYTERANGE segments packed inside a non-video file and saw the wrapper's header, so those sources were picked unmeasured. Now it requests the range (and slices it out when a server ignores Range).
+- Fix: a link whose every sampled segment is not video is never picked (`status: not_video`). The page check reports every link's status and a source letter shared by mirrors of one feed, with counts in `summary` and the result line; a re-check logs the same for the rest of the page. `/api/status` gives each candidate its letter and the session `distinct_sources`/`unknown_sources`; the card shows them.
+- Proof: `test_not_video_is_never_picked_and_the_page_is_summarised`, `test_measure_reads_the_video_at_the_byte_range` (Range honoured and ignored), `test_segments_that_are_all_images_are_not_video`, `test_byterange_segments_parse_with_and_without_offset`, `test_status_counts_real_sources_behind_the_candidates`. Mutation-checked: removing the exclusion, the Range header or the whole-file slice each fails a test.
+- [PENDING] The single-URL probe (manual paste) still sniffs only bytes 0-2047 and ignores byte ranges, so it can still call an image-only stream "resolved". Not-video detection needs ranking on (`PVARR_RANK_STREAMS=1`, the default) and two or more working links.
 
 ## Segment loss investigation
 

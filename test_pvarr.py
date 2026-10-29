@@ -621,6 +621,21 @@ class TestRecorderConstruction(unittest.TestCase):
         StreamFailoverRecorder("test-id", ["http://a/1.m3u8"], nested)
         self.assertFalse((Path(self.tmp) / "sub").exists())
 
+    def test_status_counts_real_sources_behind_the_candidates(self):
+        rec = self._rec(["https://p1.example/w", "https://p2.example/w",
+                         "https://p3.example/w", "https://p4.example/w"])
+        feeds = ["https://edge2.cdn.example/hls/abc.m3u8?st=1",
+                 "https://other.example/hls/game.m3u8",
+                 "https://edge5.cdn.example/hls/abc.m3u8?st=2", ""]
+        for c, url in zip(rec.candidates, feeds):
+            c.m3u8_url, c.detected = url, bool(url)
+        s = rec.get_status_summary()
+        self.assertEqual([c["source"] for c in s["candidates"]], ["A", "B", "A", ""])
+        self.assertEqual((s["distinct_sources"], s["unknown_sources"]), (2, 1))
+        # Before its first probe a candidate's URL is the page: unknown, not a source.
+        rec.candidates[1].detected = False
+        self.assertEqual(rec.get_status_summary()["distinct_sources"], 1)
+
     def test_status_summary_shape(self):
         rec = self._rec(["http://a/1.m3u8", "http://b/2.m3u8"])
         s = rec.get_status_summary()
@@ -9289,10 +9304,126 @@ class TestStreamRanking(unittest.TestCase):
         with patch.dict(os.environ, {"PVARR_RANK_STREAMS": "1"}):
             self.assertTrue(quality.enabled())
 
+    def test_byterange_segments_parse_with_and_without_offset(self):
+        body = (b"#EXTM3U\n#EXTINF:6.0,\n#EXT-X-BYTERANGE:1000@500\nwrap.image\n"
+                b"#EXTINF:6.0,\n#EXT-X-BYTERANGE:200\nwrap.image\n#EXTINF:6.0,\nplain.ts\n")
+        self.assertEqual(quality._segments(body, "https://cdn.example/live/x.m3u8"), [
+            ("https://cdn.example/live/wrap.image", 6.0, (500, 1499)),
+            ("https://cdn.example/live/wrap.image", 6.0, (1500, 1699)),   # continues
+            ("https://cdn.example/live/plain.ts", 6.0, None)])
+
+    def _wrapped(self, ranges_honoured=True):
+        """Fake fetch for segments packed at an offset inside a PNG file."""
+        from unittest.mock import MagicMock
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 992          # 1,000 B of wrapper
+        blob = png + self.TS
+        playlist = b"#EXTM3U\n" + b"".join(
+            b"#EXTINF:2.0,\n#EXT-X-BYTERANGE:%d@1000\nseg%d.image\n" % (len(self.TS), i)
+            for i in range(4))
+        seen = []
+
+        def fetch(session, url, hdrs, timeout, max_bytes=0):
+            r = MagicMock(ok=True, url="https://cdn.example/live/index.m3u8")
+            if url.endswith(".m3u8"):
+                r.status_code, r.headers = 200, {}
+                return r, playlist
+            seen.append(hdrs.get("Range"))
+            if ranges_honoured and hdrs.get("Range"):
+                a, b = (int(x) for x in hdrs["Range"][6:].split("-"))
+                r.status_code, r.headers = 206, {"Content-Length": str(b - a + 1)}
+                return r, blob[a:b + 1]
+            r.status_code, r.headers = 200, {"Content-Length": str(len(blob))}
+            return r, blob
+        return fetch, seen
+
+    def test_measure_reads_the_video_at_the_byte_range(self):
+        from unittest.mock import patch
+        for honoured in (True, False):
+            fetch, seen = self._wrapped(ranges_honoured=honoured)
+            with patch.object(quality.probe, "_fetch", side_effect=fetch), \
+                    patch.object(quality, "_ffprobe", return_value={"height": 720}):
+                q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+            self.assertTrue(q["measured"], honoured)
+            self.assertFalse(q["not_video"], honoured)
+            self.assertEqual(seen[0], f"bytes=1000-{1000 + len(self.TS) - 1}")
+
+    def test_a_whole_file_cut_off_before_the_range_is_not_called_not_video(self):
+        from unittest.mock import patch
+        fetch, _ = self._wrapped(ranges_honoured=False)
+
+        def short(session, url, hdrs, timeout, max_bytes=0):
+            r, body = fetch(session, url, hdrs, timeout, max_bytes)
+            return r, (body if url.endswith(".m3u8") else body[:500])   # stops before offset 1000
+        with patch.object(quality.probe, "_fetch", side_effect=short):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["not_video"])
+
+    def test_segments_that_are_all_images_are_not_video(self):
+        from unittest.mock import patch
+        png = b"\x89PNG\r\n\x1a\n" + b"\x01" * 200000
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:6.0,\nseg%d.image\n" % i for i in range(4))
+        fake = self._per_url(playlist, {f"seg{i}.image": png for i in range(3)})
+        with patch.object(quality.probe, "_fetch", side_effect=fake):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertTrue(q["not_video"])
+        # One real segment among them is enough to keep it.
+        fake = self._per_url(playlist, {"seg0.image": png, "seg1.image": self.TS, "seg2.image": png})
+        with patch.object(quality.probe, "_fetch", side_effect=fake), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            self.assertFalse(quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})["not_video"])
+
+    def test_not_video_is_never_picked_and_the_page_is_summarised(self):
+        # 0: images (pick 1 before this fix), 1 and 3: one origin on two edges,
+        # 2: an independent feed, 4: a player built in JavaScript (no playlist),
+        # 5: playlist found but segments refused, 6: mirror of 0's player.
+        links = [f"https://site{i}.example/watch" for i in range(7)]
+        m3u8 = {0: "https://img.example/live/923.m3u8", 1: "https://edge2.cdn.example/hls/abc.m3u8?st=1",
+                2: "https://own.example/hls/game.m3u8", 3: "https://edge5.cdn.example/hls/abc.m3u8?st=2",
+                5: "https://gated.example/hls/x.m3u8", 6: "https://img.example/live/923.m3u8"}
+
+        def probe_fn(url):
+            i = links.index(url)
+            if i == 4:
+                return {"ok": False, "m3u8_url": "", "message": "No .m3u8 found"}
+            if i == 5:
+                return {"ok": True, "segment_ok": False, "m3u8_url": m3u8[5], "message": "rejected"}
+            return {"ok": True, "segment_ok": True, "m3u8_url": m3u8[i], "message": "ok"}
+
+        def measure(res, deadline):
+            if "img." in res["m3u8_url"]:
+                return {"measured": False, "not_video": True, "note": "segment is not video"}
+            return {"measured": True, "height": 720, "kbps": 1800, "headroom": 5.0}
+        out = aggregator.pick_first_working(links, probe_fn=probe_fn, gather=10, measure_fn=measure)
+        picked = [p["url"] for p in out["picked"]]
+        self.assertNotIn(links[0], picked)
+        self.assertNotIn(links[6], picked)
+        self.assertEqual(picked[0], links[1])
+        by_url = {t["url"]: t for t in out["tried"]}
+        self.assertEqual(by_url[links[0]]["status"], "not_video")
+        self.assertFalse(by_url[links[0]]["ok"])
+        self.assertEqual(by_url[links[1]]["source"], by_url[links[3]]["source"])
+        self.assertEqual(by_url[links[0]]["source"], by_url[links[6]]["source"])
+        self.assertEqual(by_url[links[4]]["source"], "")
+        self.assertEqual(by_url[links[5]]["status"], "failed")
+        s = out["summary"]
+        self.assertEqual((s["links"], s["working"], s["sources"], s["not_video"], s["failed"],
+                          s["unresolved"], s["not_checked"]), (7, 3, 2, 2, 1, 1, 0))
+        self.assertEqual(aggregator.summary_text(s),
+                         "7 links: 3 working from 2 real sources (A \u00d72, B \u00d71), "
+                         "2 not video, 1 failed, 1 unresolved.")
+
+    def test_source_letters_follow_first_appearance(self):
+        urls = ["https://e1.cdn.example/hls/a.m3u8", "", "https://x.example/b.m3u8",
+                "https://e9.cdn.example/hls/a.m3u8?st=z"]
+        self.assertEqual(quality.source_letters(urls), ["A", "", "B", "A"])
+        many = quality.source_letters([f"https://h.example/s{i}.m3u8" for i in range(28)])
+        self.assertEqual(many[25:], ["Z", "AA", "AB"])
+
     def test_segments_parsing_and_best_variant(self):
         body = b"#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n#EXTINF:abc,\nbad.ts\n#EXTINF:4.5,\n/abs/seg2.ts\n"
         self.assertEqual(quality._segments(body, "https://cdn.example/live/index.m3u8"),
-                         [("https://cdn.example/live/seg1.ts", 6.0), ("https://cdn.example/abs/seg2.ts", 4.5)])
+                         [("https://cdn.example/live/seg1.ts", 6.0, None),
+                          ("https://cdn.example/abs/seg2.ts", 4.5, None)])
         v = quality._best_variant([{"url": "a", "bandwidth": 800000, "resolution": "640x360"},
                                    {"url": "b", "bandwidth": 6000000, "resolution": "1920x1080"}])
         self.assertEqual(v["url"], "b")

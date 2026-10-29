@@ -26,7 +26,7 @@ from typing import List, Optional, Callable, Dict, Any, Tuple
 
 from app.check_deps import find_executable
 from app.logging_config import redact_url_secrets
-from app import ytdlp
+from app import quality, ytdlp
 from app.probe import DEFAULT_USER_AGENT, probe_stream
 from app.relay import PlaylistRelay
 
@@ -2240,6 +2240,10 @@ class StreamFailoverRecorder:
         return changed
 
     def get_status_summary(self) -> Dict[str, Any]:
+        # Only a resolved playlist says which feed a candidate is; before its
+        # first probe the URL is still the stream page.
+        letters = quality.source_letters(
+            [c.m3u8_url if c.detected else "" for c in self.candidates])
         return {
             "id": self.recording_id,
             "status": self.status,
@@ -2276,6 +2280,11 @@ class StreamFailoverRecorder:
             "total_candidates": len(self.candidates),
             "has_event_page": self.has_event_page,
             "rescan_state": self.rescan_state,
-            "candidates": [c.to_dict() for c in self.candidates],
+            "candidates": [dict(c.to_dict(), source=letter)
+                           for c, letter in zip(self.candidates, letters)],
+            # Distinct real feeds behind the candidates that have a known
+            # playlist; mirrors of one origin count once (quality.source_key).
+            "distinct_sources": len({x for x in letters if x}),
+            "unknown_sources": sum(1 for x in letters if not x),
             "logs": self.log_history[-30:]
         }

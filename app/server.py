@@ -1576,6 +1576,11 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
                 continue
         if not recorder.is_running:
             return
+        # This session's own links are excluded from the scan, so the counts
+        # cover the rest of the page.
+        counts = aggregator.summary_text((result or {}).get("summary") or {})
+        if counts:
+            recorder._log(f"Event page re-checked, other links on it: {counts}")
         changed = recorder.replace_dead_candidates(urls)
         if changed:
             record["candidates"] = [c.url for c in recorder.candidates]

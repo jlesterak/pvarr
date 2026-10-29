@@ -525,6 +525,12 @@ def pick_first_working(
     measured: Dict[int, Dict[str, Any]] = {}
     if measure_fn and len(working) > 1 and not (abort is not None and abort.is_set()):
         measured = _measure_all({i: results[i] for i in working}, measure_fn, abort)
+    # Every sampled segment was something other than video (a real image, an
+    # HTML page): the playlist works but FFmpeg cannot record what it lists,
+    # so it is no candidate at all, let alone pick 1.
+    not_video = {i for i in working if measured.get(i, {}).get("not_video")}
+    working = [i for i in working if i not in not_video]
+    if measured:
         # Stable sort: equal scores keep page order.
         working.sort(key=lambda i: quality.score(measured.get(i, {})))
     keys = {i: quality.source_key(results[i].get("m3u8_url", "")) for i in working}
@@ -558,8 +564,10 @@ def pick_first_working(
             tried.append({"url": url, "ok": False,
                           "note": "not checked (time budget)" if timed_out else "not needed"})
             continue
-        ok = _works(res)
+        ok = _works(res) and i not in not_video
         note = res.get("message", "") if not ok else "works"
+        if i in not_video:
+            note = "segment is not video -- FFmpeg cannot record it"
         if ok and i in measured:
             rank = chosen.index(i) + 1 if i in chosen else None
             same = next((n + 1 for n, j in enumerate(chosen)
@@ -569,7 +577,78 @@ def pick_first_working(
                     + (f": {quality.summary(measured[i])}" if quality.summary(measured[i]) else ""))
         tried.append({"url": url, "ok": ok, "note": note})
     sources = len({keys.get(i) or f"?{i}" for i in chosen})
-    return {"picked": picked, "tried": tried, "timed_out": timed_out, "sources": sources}
+    summary = _source_summary(links, results, chosen, working, not_video, tried)
+    return {"picked": picked, "tried": tried, "timed_out": timed_out, "sources": sources,
+            "summary": summary}
+
+
+def _source_summary(links: List[str], results: Dict[int, Dict[str, Any]], chosen: List[int],
+                    working: List[int], not_video: set,
+                    tried: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """How many real feeds the page's links come down to.
+
+    Each link gets a status and, when a playlist was found, the letter of its
+    real feed (quality.source_letters: mirrors of one origin on numbered edge
+    servers share a letter). Letters follow the picks, so the primary is A.
+    Fills `source` and `status` into `tried` in place. Links whose player
+    builds its URL in JavaScript have no playlist and so no letter: they are
+    counted as unresolved, never guessed at.
+    """
+    def status(i: int) -> str:
+        res = results.get(i)
+        if res is None:
+            return "not_checked"
+        if i in not_video:
+            return "not_video"
+        if _works(res):
+            return "working"
+        return "failed" if res.get("m3u8_url") else "unresolved"
+
+    order = list(chosen) + [i for i in working if i not in chosen]
+    order += [i for i in range(len(links)) if i not in order]
+    urls = [(results.get(i) or {}).get("m3u8_url", "") for i in order]
+    letter = dict(zip(order, quality.source_letters(urls)))
+    counts = {k: 0 for k in ("working", "not_video", "failed", "unresolved", "not_checked")}
+    groups: Dict[str, Dict[str, Any]] = {}
+    for i in order:
+        st = status(i)
+        counts[st] += 1
+        tried[i]["status"], tried[i]["source"] = st, letter[i]
+        if letter[i]:
+            g = groups.setdefault(letter[i], {
+                "source": letter[i],
+                "host": urlsplit(urls[order.index(i)]).hostname or "",
+                "links": 0, "working": 0, "not_video": 0})
+            g["links"] += 1
+            if st in ("working", "not_video"):
+                g[st] += 1
+    # A working link without a playlist URL (not expected) is its own feed.
+    real = {letter[i] or f"?{i}" for i in range(len(links)) if status(i) == "working"}
+    return {"links": len(links), **counts, "sources": len(real),
+            "groups": list(groups.values())}
+
+
+def summary_text(summary: Dict[str, Any]) -> str:
+    """'12 links: 4 working from 2 real sources (A x3, B x1), 2 not video,
+    6 unresolved.' -- zero counts left out."""
+    if not summary or not summary.get("links"):
+        return ""
+    n = summary["links"]
+    text = f"{n} link{'s' if n != 1 else ''}"
+    parts = []
+    if summary["working"]:
+        mirrors = ", ".join(f"{g['source']} \u00d7{g['working']}"
+                            for g in summary["groups"] if g["working"])
+        parts.append(f"{summary['working']} working from {summary['sources']} real source"
+                     f"{'s' if summary['sources'] != 1 else ''}"
+                     + (f" ({mirrors})" if mirrors else ""))
+    else:
+        parts.append("none working")
+    for key, label in (("not_video", "not video"), ("failed", "failed"),
+                       ("unresolved", "unresolved"), ("not_checked", "not checked")):
+        if summary.get(key):
+            parts.append(f"{summary[key]} {label}")
+    return f"{text}: " + ", ".join(parts) + "."
 
 
 def _measure_all(candidates: Dict[int, Dict[str, Any]],
@@ -687,17 +766,17 @@ def find_streams(
     result.update(picked=chosen["picked"], tried=chosen["tried"])
     result["ok"] = bool(chosen["picked"])
     n = len(chosen["picked"])
-    checked = sum(1 for t in chosen["tried"] if not t["note"].startswith("not "))
+    result["summary"] = chosen["summary"]
+    counts = summary_text(chosen["summary"])
     if n:
-        result["message"] = (f"{n} working stream{'s' if n != 1 else ''} out of "
-                             f"{checked} checked ({len(links)} links on the page)"
+        result["message"] = (f"Picked {n} stream{'s' if n != 1 else ''}"
                              + (", best first by measured quality" if any("quality" in p for p in chosen["picked"])
                                 else "")
-                             + (f", from {chosen['sources']} independent source"
-                                f"{'s' if chosen['sources'] != 1 else ''}." if n > 1 else "."))
+                             + f". {counts}").rstrip()
     else:
-        result["message"] = (f"None of the {checked} links checked gave a recordable stream"
-                             + (" before the time limit" if chosen["timed_out"] else "") + ".")
+        result["message"] = ("No recordable stream"
+                             + (" before the time limit" if chosen["timed_out"] else "")
+                             + f". {counts}").rstrip()
     return result
 
 

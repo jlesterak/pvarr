@@ -53,6 +53,7 @@ SETUP_ALLOWANCE_SEC = 1.0   # DNS + TCP + TLS + first byte, paid on the warm-up 
 MIN_VIDEO_KBPS = 100    # below this it is not a video feed, whatever it sniffs as
 
 _EXTINF_RE = re.compile(r"^#EXTINF:\s*([0-9.]+)")
+_BYTERANGE_RE = re.compile(r"^#EXT-X-BYTERANGE:\s*(\d+)(?:@(\d+))?")
 _GENERIC_PATH_RE = re.compile(
     r"(?:/(?:hls|live|stream|streams|tv|video|media|playlist))*"
     r"/(?:index|playlist|master|chunklist|mono|stream|live|video)[\w-]*\.m3u8?")
@@ -75,9 +76,19 @@ def _height(resolution: Optional[str]) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _segments(body: bytes, base: str) -> List[Tuple[str, float]]:
-    """(url, seconds) for every segment in a media playlist, in order."""
-    out, duration = [], None
+def _segments(body: bytes, base: str) -> List[Tuple[str, float, Optional[Tuple[int, int]]]]:
+    """(url, seconds, byte range) for every segment in a media playlist, in order.
+
+    The range is (first, last) inclusive from EXT-X-BYTERANGE, or None for a
+    whole file. Some sources pack each segment at an offset inside a larger
+    file (an image, say): only the range is video, so a whole-file fetch would
+    sniff as the wrapper. A range without "@offset" continues where the
+    previous range of the same file ended (RFC 8216 4.3.2.2).
+    """
+    out: List[Tuple[str, float, Optional[Tuple[int, int]]]] = []
+    duration: Optional[float] = None
+    pending: Optional[Tuple[int, Optional[int]]] = None   # (length, offset)
+    next_offset: Dict[str, int] = {}
     for line in body.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         m = _EXTINF_RE.match(line)
@@ -86,10 +97,21 @@ def _segments(body: bytes, base: str) -> List[Tuple[str, float]]:
                 duration = float(m.group(1))
             except ValueError:
                 duration = None
-        elif line and not line.startswith("#"):
+            continue
+        m = _BYTERANGE_RE.match(line)
+        if m:
+            pending = (int(m.group(1)), int(m.group(2)) if m.group(2) else None)
+            continue
+        if line and not line.startswith("#"):
+            url = urljoin(base, line)
+            rng = None
+            if pending and pending[0] > 0:
+                start = pending[1] if pending[1] is not None else next_offset.get(url, 0)
+                rng = (start, start + pending[0] - 1)
+                next_offset[url] = start + pending[0]
             if duration and 0 < duration <= 60:
-                out.append((urljoin(base, line), duration))
-            duration = None
+                out.append((url, duration, rng))
+            duration, pending = None, None
     return out
 
 
@@ -141,7 +163,8 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
     """
     out: Dict[str, Any] = {"measured": False, "height": None, "width": None, "fps": None,
                            "codec": None, "kbps": None, "headroom": None,
-                           "declared_height": None, "declared_kbps": None, "note": ""}
+                           "declared_height": None, "declared_kbps": None, "note": "",
+                           "not_video": False}
     playlist = res.get("m3u8_url") or ""
     if not playlist:
         out["note"] = "no playlist to measure"
@@ -183,7 +206,8 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
         got_bytes, got_secs, spent, first, too_slow = 0, 0.0, 0.0, b"", False
         warm = None     # (bytes, seconds of video, took) of the warm-up segment
         out_of_time = False
-        for n, (url, secs) in enumerate(segs):
+        not_media, media_seen = 0, False
+        for n, (url, secs, rng) in enumerate(segs):
             # Each download is cut short at the deadline (probe._fetch stops
             # reading at twice its timeout), so a slow stream is caught in the
             # act rather than abandoned unmeasured.
@@ -199,7 +223,8 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             allowed = secs / MIN_HEADROOM + (SETUP_ALLOWANCE_SEC if n == 0 else 0.0)
             t0 = time.monotonic()
             try:
-                r, data = probe._fetch(plain, url, headers, half, max_bytes=SEGMENT_MAX_BYTES)
+                seg_headers = dict(headers, Range=f"bytes={rng[0]}-{rng[1]}") if rng else headers
+                r, data = probe._fetch(plain, url, seg_headers, half, max_bytes=SEGMENT_MAX_BYTES)
             except probe._FETCH_ERRORS as exc:
                 # One bad segment keeps what the others measured. A stall
                 # (Timeout before the headers, ConnectionError mid-body) is too
@@ -212,13 +237,26 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
             if not (r.ok and data):
                 out["note"] = f"segment answered {r.status_code}"
                 break
+            if rng and r.status_code == 200:
+                # The server ignored Range and sent the whole file: the video
+                # is still at the offset, if it arrived before the size cap.
+                data = data[rng[0]:rng[1] + 1]
+                if len(data) < min(377, rng[1] - rng[0] + 1):
+                    # Cut off (size cap, clock) before the offset: nothing of
+                    # the segment arrived, so this says nothing either way.
+                    out["note"] = "byte range not reached"
+                    continue
             if not _looks_like_media(data):
                 out["note"] = "segment is not video"
+                not_media += 1
                 continue        # never credited, whichever segment it is
+            media_seen = True
             try:
                 length = int(r.headers.get("Content-Length") or 0)
             except (TypeError, ValueError):
                 length = 0
+            if rng and r.status_code == 200:
+                length = rng[1] - rng[0] + 1    # what was sliced out, not the whole file
             if length and len(data) >= length:
                 share = 1.0                     # all of it, even right at the cutoff
             elif length and len(data) >= SEGMENT_MAX_BYTES:
@@ -261,6 +299,10 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 got_bytes, got_secs, spent = warm
             else:
                 out["note"] = out["note"] or "only a warm-up fitted in the time"
+        # Every segment that arrived was something other than video (a real
+        # image, an HTML page): FFmpeg cannot record it, so it is not a working
+        # stream, however well its playlist and fetches behaved.
+        out["not_video"] = bool(not_media and not media_seen)
         if not first and not too_slow:
             out["note"] = out["note"] or ("out of time to measure" if out_of_time else "segment is not video")
             return out
@@ -320,6 +362,29 @@ def source_key(m3u8_url: str) -> str:
     if not _is_ip(host) and not _GENERIC_PATH_RE.fullmatch(path.lower()):
         host = re.sub(r"\d+", "", host)
     return f"{host}{f':{port}' if port else ''}{path}"
+
+
+def source_letters(m3u8_urls: List[str]) -> List[str]:
+    """A letter per playlist URL naming its real feed (source_key), in order of
+    first appearance: mirrors of one origin share a letter. "" where the URL is
+    unknown. Past Z the letters run on as AA, AB, ..."""
+    letters: Dict[str, str] = {}
+    out = []
+    for url in m3u8_urls:
+        key = source_key(url)
+        if not key:
+            out.append("")
+            continue
+        if key not in letters:
+            n, name = len(letters), ""
+            while True:
+                name = chr(ord("A") + n % 26) + name
+                n = n // 26 - 1
+                if n < 0:
+                    break
+            letters[key] = name
+        out.append(letters[key])
+    return out
 
 
 def diversify(order: List[int], keys: Dict[int, str], slow: Dict[int, bool], pick: int) -> List[int]:

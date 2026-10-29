@@ -51,8 +51,16 @@ which runs the same check first when no stream link has been entered. PVArr:
    each *other* source, preferring ones that keep up but taking even a slow
    independent one over another copy of the primary, and only then fills the
    last slot with another edge of a source already held. The result line
-   says how many independent sources the three picks come from, and the
-   list marks each `same source as pick N`. The list under
+   counts every link on the page by what it turned out to be: working
+   (and how many real sources those come from, with how many links each),
+   not video, failed (a playlist was found but its segments were refused),
+   unresolved (no playlist found, usually a player built in JavaScript) and
+   not checked. Each link in the list carries its source letter, and the
+   list marks each `same source as pick N`. A link whose sampled segments
+   are all something other than video (an image, an HTML page) is never
+   picked: its playlist works, but FFmpeg cannot record it. That check
+   needs measuring on, and segments packed at a byte range inside a larger
+   file are read at their range, so those still count as video. The list under
    the button shows each measurement, e.g. `works, pick 1: 720p · 1.8 Mbps
    · 8.6x real-time`. `PVARR_RANK_STREAMS=0` turns measuring off: then the
    first three that work fill the slots in page order. Links on private/LAN
@@ -101,7 +109,7 @@ re-checking its event page").
 
 A recording started with something in the **Event page** box (whether or not you pressed **Find 3 streams**), or by a schedule, remembers the page, along with the cookie and User-Agent you gave for it. If two of its sources die (or its only source, for a single-link recording), PVArr checks the page again in the background and puts fresh working links into the dead slots. Links the recording already holds are skipped, so it reads further down the page rather than finding the same ones again. The source currently recording is never touched. It checks automatically at most once every 10 minutes, and skips a turn rather than queue when another page check is running, so it never delays a scheduled start. Every swap is logged on the recording's card.
 
-**Re-check event page** on the card does the same thing on demand (no 10-minute limit; one check per recording at a time), for when you can see a source is struggling before PVArr can. It only replaces a source that has failed since the last check, never a working one: when none has, the card log says how many working links it found and that nothing was replaced. A recording started from manually entered links only has no page to re-check, so the button does not appear.
+**Re-check event page** on the card does the same thing on demand (no 10-minute limit; one check per recording at a time), for when you can see a source is struggling before PVArr can. It only replaces a source that has failed since the last check, never a working one: when none has, the card log says how many working links it found and that nothing was replaced. Every re-check also logs the counts for the rest of the page (its own links are skipped), e.g. `other links on it: 9 links: 3 working from 1 real source (A ×3), 6 unresolved.`, so you can tell when the page simply has no other feed. A recording started from manually entered links only has no page to re-check, so the button does not appear.
 
 A cookie that has expired since you pasted it (Cloudflare's last hours, not days) means the re-check falls back to FlareSolverr if you run it, or finds nothing; the card log says so. The cookie is kept in the session file under `/config` (readable only by PVArr's user) so a restart can carry on; it is never returned by the API. A re-checked link can occasionally be the wrong channel, as with **Find**: it is only used once the current source dies, and the card says when a slot was swapped.
 

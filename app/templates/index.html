@@ -247,6 +247,15 @@
               <div>
                 <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Active Candidate</span>
                 <span class="text-sm font-bold text-arr-accent" x-text="'Stream ' + session.current_candidate + ' of ' + session.total_candidates"></span>
+                <!-- Mirrors of one origin die together, so three links can
+                     be one real source; the letters on the badges below say
+                     which. -->
+                <span x-show="session.total_candidates > 1 && session.distinct_sources"
+                      class="text-[11px] block font-mono"
+                      :class="session.distinct_sources < 2 ? 'text-amber-400' : 'text-slate-500'"
+                      title="Candidates whose playlists are the same feed (only the edge server or token differs) count once. A candidate not yet probed is unknown."
+                      x-text="session.distinct_sources + (session.distinct_sources === 1 ? ' real source' : ' real sources')
+                              + (session.unknown_sources ? ' + ' + session.unknown_sources + ' unknown' : '')"></span>
               </div>
               <div>
                 <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Elapsed Time</span>
@@ -295,11 +304,14 @@
                      :title="(idx + 1) === session.current_candidate
                                ? 'Currently recording this stream'
                                : (session.is_running ? 'Switch to ' + cand.name : '')
+                             + (cand.source ? ' — source ' + cand.source : '')
                              + (cand.detect_note ? ' — ' + cand.detect_note : '')
                              + (cand.referer ? ' Referer: ' + cand.referer : '')"
                      :class="(idx + 1) === session.current_candidate ? 'bg-arr-brass/20 text-arr-accent border-arr-brass/40 font-semibold' : 'bg-slate-900/60 text-slate-400 border-slate-800'">
                   <span class="w-2 h-2 rounded-full" :class="(idx + 1) === session.current_candidate ? 'bg-emerald-400 animate-ping' : 'bg-slate-600'"></span>
                   <span x-text="cand.name + ': ' + (cand.url.length > 40 ? cand.url.slice(0, 40) + '...' : cand.url)"></span>
+                  <span x-show="cand.source" class="px-1 rounded border border-slate-700 font-mono text-[10px] text-slate-300"
+                        x-text="cand.source"></span>
                   <span x-show="cand.fail_count > 0" class="text-amber-500/80"
                         x-text="'⚠ ' + cand.fail_count"></span>
                 </button>
@@ -749,6 +761,7 @@
               <template x-for="(t, i) in agg.tried" :key="i">
                 <li class="truncate" :title="t.note">
                   <span x-text="t.ok ? '\u2713' : '\u2715'" :class="t.ok ? 'text-emerald-400' : 'text-rose-400'"></span>
+                  <span x-show="t.source" class="font-semibold text-slate-300" x-text="t.source"></span>
                   <span x-text="t.url + ' \u2014 ' + t.note"></span>
                 </li>
               </template>
