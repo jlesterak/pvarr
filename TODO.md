@@ -48,7 +48,7 @@ mutation-checked to fail when the guard is removed), and a real-ffmpeg run in a
 scratch folder (two remuxed games organised as E01/E02, a crash-recovery record
 finalised as E03, nothing left marked as finishing).
 
-- [PENDING] Confirm Plex indexes the tree as intended (Personal Media Shows
+- [COMPLETED 2026-10-31, owner confirmed] Confirm Plex indexes the tree as intended (Personal Media Shows
   agent) on the next real recording, with the library inside the recordings
   volume.
 - Deliberately not built: a library on a separate mount (refused with a message,
@@ -141,7 +141,7 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   hour. So the "3-segment window plus stale playlist" hypothesis does **not**
   hold for this source; it is still untested for the source that lost 16%.
   Next: repeat the probe whenever a game uses that source class.
-- Decisive test, next live game (scheduled 2026-10-25 afternoon, sponsor-approved): poll the playlist every 1s for 2 min, log
+- Decisive test (ran, owner confirmed 2026-10-31; results not written down here), next live game (scheduled 2026-10-25 afternoon, sponsor-approved): poll the playlist every 1s for 2 min, log
   media-sequence, window length, `Cache-Control`/`Age`, and which edge
   answered. Two minutes settles it.
 - Likely fix if confirmed: a small playlist relay (design already sketched in
