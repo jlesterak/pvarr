@@ -1683,7 +1683,10 @@ async def _run_schedule(job: Dict[str, Any]) -> None:
         reason = schedules.miss_reason(result if job.get("agg_url") else None)
         job["attempts"] = int(job.get("attempts") or 0) + 1
         delay = schedules.retry_delay(job["attempts"])
+        scanned = result if job.get("agg_url") else None
         job.update(state=schedules.WAITING, last_reason=reason, next_try_at=now + delay,
+                   miss_kind=schedules.miss_kind(scanned),
+                   fixable=schedules.fixable_links(scanned),
                    message=f"{reason} Retrying in {int(delay // 60)} min, until the end "
                            f"time (attempt {job['attempts']}).")
         first = not job.get("notified_miss")

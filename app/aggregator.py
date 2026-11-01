@@ -575,7 +575,9 @@ def pick_first_working(
             note = ("works" + (f", pick {rank}" if rank else ", ranked lower")
                     + (f" (same source as pick {same})" if same else "")
                     + (f": {quality.summary(measured[i])}" if quality.summary(measured[i]) else ""))
-        tried.append({"url": url, "ok": ok, "note": note})
+        tried.append({"url": url, "ok": ok, "note": note,
+                      # A manual step could rescue it (probe.fixable_kind).
+                      "fixable": "" if ok or i in not_video else res.get("fixable", "")})
     sources = len({keys.get(i) or f"?{i}" for i in chosen})
     summary = _source_summary(links, results, chosen, working, not_video, tried)
     return {"picked": picked, "tried": tried, "timed_out": timed_out, "sources": sources,

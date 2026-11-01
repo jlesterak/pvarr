@@ -204,6 +204,18 @@ retried, since it would hit the same wall; you are notified. If PVArr is
 shutting down when a job comes due, the job is left waiting and runs after
 the restart.
 
+While it retries, the job's badge says why instead of plain *waiting*:
+**not listed yet** (amber: the page has no links yet, normal before
+kick-off), **blocked** (red: an anti-bot check), **page error** (red: the
+page would not load) or **no stream** (red: links found, none play). Under it, PVArr lists up to five links that failed in a way
+you can fix by hand, each with what to do: a player that builds its link in
+JavaScript (copy the `.m3u8` from DevTools), a host that wants a cookie or
+referer, or a rejected token (open the page for a fresh link). **Record
+manually** opens New Recording with the game, its page, its end time and that
+link filled in. Links that are dead, not video, blocked by your DNS or refused
+by a host that refuses everything are not listed. These links appear on the
+dashboard only, never in a notification.
+
 Why the page is checked at the start time and not when you schedule: stream
 links carry tokens that expire within hours, and most links on an event page
 only appear shortly before kick-off. The page address is the stable part.

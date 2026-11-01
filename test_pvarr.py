@@ -6561,6 +6561,19 @@ class TestProbeFallsBackToYtdlp(unittest.TestCase):
             result = probe.probe_stream("https://site.example/watch", check_segment=False)
         self.assertIn("yt-dlp could not resolve", result["message"])
         self.assertIn("token", result["message"])
+        # A failed schedule lists this link as worth a manual DevTools look.
+        self.assertEqual(result["fixable"], "devtools_m3u8")
+
+    def test_only_refusals_a_person_can_fix_are_marked_fixable(self):
+        # Same branches as the failure message: a host refusing everything,
+        # a plain 404 and an unreachable host are not worth a manual look.
+        tok = "https://c.example/live.m3u8?token=abc"
+        plain = "https://c.example/live.m3u8"
+        self.assertEqual(probe.fixable_kind(403, tok, 403), "")
+        self.assertEqual(probe.fixable_kind(403, tok, 200), "token")
+        self.assertEqual(probe.fixable_kind(403, plain, 200), "headers")
+        self.assertEqual(probe.fixable_kind(404, plain, 200), "")
+        self.assertEqual(probe.fixable_kind(None, plain, None), "")
 
     def test_it_can_be_switched_off(self):
         from unittest.mock import patch
@@ -8418,6 +8431,34 @@ class TestScheduleDecisions(unittest.TestCase):
         fs = {"page": {"challenged": True, "status": 403, "flaresolverr_failed": True}}
         self.assertIn("FlareSolverr did not solve", schedules.miss_reason(fs))
 
+    def test_miss_kind_matches_the_reason(self):
+        # The dashboard badge (NO STREAM / NOT LISTED YET / BLOCKED) comes from
+        # miss_kind, the sentence from miss_reason: they must agree.
+        cases = [
+            ({"page": {"challenged": True, "status": 403}}, "blocked", "Cloudflare"),
+            ({"page": {"ok": False, "status": None}}, "page_error", "could not be loaded"),
+            ({"page": {"status": 200}, "links_found": 0}, "not_ready", "no stream links yet"),
+            ({"page": {"status": 200}, "links_found": 3, "tried": [{}] * 3}, "no_working", "3 links"),
+            ({"error": True}, "error", "internal error"),
+            (None, "no_input", "No event page"),
+        ]
+        for result, kind, words in cases:
+            with self.subTest(kind=kind):
+                self.assertEqual(schedules.miss_kind(result), kind)
+                self.assertIn(words, schedules.miss_reason(result))
+
+    def test_fixable_links_keep_only_tagged_links_with_a_hint(self):
+        result = {"tried": [
+            {"url": "https://a.example/1", "fixable": "devtools_m3u8"},
+            {"url": "https://b.example/2", "fixable": ""},
+            {"url": "https://c.example/3", "fixable": "headers"},
+        ] + [{"url": f"https://d.example/{i}", "fixable": "token"} for i in range(10)]}
+        out = schedules.fixable_links(result)
+        self.assertEqual(len(out), schedules.MAX_FIXABLE)
+        self.assertEqual([o["url"] for o in out[:2]], ["https://a.example/1", "https://c.example/3"])
+        self.assertIn("DevTools", out[0]["hint"])
+        self.assertEqual(schedules.fixable_links(None), [])
+
 
 @unittest.skipUnless(HAS_TESTCLIENT, "httpx not installed (see requirements-dev.txt)")
 class ScheduleServerTestCase(ServerTestCase):
@@ -8570,6 +8611,20 @@ class TestScheduleLoop(ScheduleServerTestCase):
         self.assertEqual(job["attempts"], 2)
         self.assertEqual(self.notifier.send.call_count, 1)
         self.assertNotIn("cf_clearance=c", str(self.notifier.send.call_args))
+
+    def test_a_miss_records_its_kind_and_the_fixable_links_but_never_notifies_them(self):
+        # The dashboard turns these into a red NO STREAM badge and a list of
+        # links worth a manual look. Links stay off the notification.
+        job = self.due()
+        dead = MagicMock(return_value={
+            "ok": False, "picked": [], "links_found": 2, "page": {"status": 200},
+            "tried": [{"url": "https://js.example/watch", "ok": False, "fixable": "devtools_m3u8"},
+                      {"url": "https://gone.example/watch", "ok": False, "fixable": ""}]})
+        self.run_pass(find=dead)
+        self.assertEqual(job["state"], "waiting")
+        self.assertEqual(job["miss_kind"], "no_working")
+        self.assertEqual([f["url"] for f in job["fixable"]], ["https://js.example/watch"])
+        self.assertNotIn("js.example", str(self.notifier.send.call_args))
 
     def test_manual_links_are_used_when_the_page_yields_nothing(self):
         job = self.due(url_primary="https://m/1.m3u8")
@@ -9431,7 +9486,8 @@ class TestStreamRanking(unittest.TestCase):
         def probe_fn(url):
             i = links.index(url)
             if i == 4:
-                return {"ok": False, "m3u8_url": "", "message": "No .m3u8 found"}
+                return {"ok": False, "m3u8_url": "", "message": "No .m3u8 found",
+                        "fixable": "devtools_m3u8"}
             if i == 5:
                 return {"ok": True, "segment_ok": False, "m3u8_url": m3u8[5], "message": "rejected"}
             return {"ok": True, "segment_ok": True, "m3u8_url": m3u8[i], "message": "ok"}
@@ -9452,6 +9508,9 @@ class TestStreamRanking(unittest.TestCase):
         self.assertEqual(by_url[links[0]]["source"], by_url[links[6]]["source"])
         self.assertEqual(by_url[links[4]]["source"], "")
         self.assertEqual(by_url[links[5]]["status"], "failed")
+        # The manual-fix hint rides through to the schedule; never on a pick.
+        self.assertEqual(by_url[links[4]]["fixable"], "devtools_m3u8")
+        self.assertEqual({t["fixable"] for u, t in by_url.items() if u != links[4]}, {""})
         s = out["summary"]
         self.assertEqual((s["links"], s["working"], s["sources"], s["not_video"], s["failed"],
                           s["unresolved"], s["not_checked"]), (7, 3, 2, 2, 1, 1, 0))

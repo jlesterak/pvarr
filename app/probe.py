@@ -600,6 +600,10 @@ def probe_stream(
         "impersonate": False,
         "attempts": [],
         "message": "",
+        # Set when a person could get this link working by hand: see
+        # fixable_kind(). Lets a failed schedule point at the links worth a
+        # look rather than every dead one on the page.
+        "fixable": "",
     }
 
     try:
@@ -657,6 +661,7 @@ def probe_stream(
                     resolved = _try_ytdlp(target, result)
                     if resolved:
                         return resolved
+                result["fixable"] = "devtools_m3u8"
                 result["message"] = (
                     f"No .m3u8 found on that page (HTTP {resp.status_code})"
                     + (", and yt-dlp could not resolve it either" if use_ytdlp else "")
@@ -701,6 +706,7 @@ def probe_stream(
     failed_url = playlists[0] if playlists else target
     origin_status = _check_origin(session, failed_url, ua, timeout, result["attempts"])
     result["message"] = _failure_message(last_status, failed_url, origin_status)
+    result["fixable"] = fixable_kind(last_status, failed_url, origin_status)
     return result
 
 
@@ -1018,6 +1024,29 @@ def looks_tokenised(url: str) -> bool:
         _HEX_SEGMENT.match(seg) or _MIXED_CASE_SEGMENT.match(seg)
         for seg in parts.path.split("/")
     )
+
+
+def fixable_kind(
+    status: Optional[int],
+    url: str,
+    origin_status: Optional[int] = None,
+) -> str:
+    """Which manual step could rescue a refused playlist, or "" for none.
+
+    Mirrors the branches of _failure_message() so the hint and the message
+    never disagree: a host refusing everything, a 404 and an unreachable host
+    have no manual fix; a rejected token wants a fresh link (`token`); a plain
+    403 from a host that otherwise answers wants a cookie or referer copied
+    from DevTools (`headers`).
+    """
+    if (status is not None and origin_status is not None
+            and origin_status == status and status in (401, 403, 429)):
+        return ""
+    if status in (401, 403, 404) and looks_tokenised(url):
+        return "token"
+    if status == 403:
+        return "headers"
+    return ""
 
 
 def _failure_message(

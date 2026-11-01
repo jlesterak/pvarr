@@ -168,20 +168,37 @@
           </span>
           <template x-for="job in scheduleList" :key="job.id">
             <div class="arr-card rounded-lg border border-slate-800/80 px-4 py-2.5 flex items-start gap-3">
-              <span class="w-2 h-2 rounded-full shrink-0 mt-1.5" :class="scheduleDotClass(job)"></span>
+              <span class="w-2 h-2 rounded-full shrink-0 mt-1.5" :class="scheduleBadge(job).dot"></span>
               <div class="flex-1 min-w-0 space-y-0.5">
                 <div class="text-sm text-slate-200 truncate">
                   <span x-text="scheduleTitle(job)"></span>
                   <span class="text-slate-500 text-xs" x-text="' — ' + scheduleWindow(job)"></span>
                 </div>
                 <div class="text-xs">
-                  <span class="uppercase tracking-wider font-semibold" :class="scheduleTextClass(job)" x-text="job.state"></span>
+                  <span class="uppercase tracking-wider font-semibold" :class="scheduleBadge(job).text" x-text="scheduleBadge(job).label"></span>
                   <span class="text-slate-400" x-text="job.message"></span>
                   <span class="text-slate-500" x-show="job.state === 'waiting' && job.next_try_at"
                         x-text="'Next try ' + timeLocal(job.next_try_at) + '.'"></span>
                 </div>
                 <div class="text-[11px] text-slate-500 font-mono truncate" x-show="job.agg_url"
                      x-text="job.agg_url + (job.agg_cookie_set ? '  (cookie set)' : '')"></div>
+                <!-- Links that failed in a way a person can fix by hand
+                     (schedules.fixable_links). Only after a miss. -->
+                <div x-show="job.state === 'waiting' && (job.fixable || []).length" class="pt-1 space-y-1">
+                  <div class="text-[11px] text-amber-400 font-semibold">Could work with a manual step:</div>
+                  <template x-for="(f, i) in (job.fixable || [])" :key="i">
+                    <div class="text-[11px] flex items-start gap-2">
+                      <div class="flex-1 min-w-0">
+                        <a :href="f.url" target="_blank" rel="noopener noreferrer"
+                           class="block font-mono text-sky-400 hover:underline truncate" x-text="f.url"></a>
+                        <span class="text-slate-500" x-text="f.hint"></span>
+                      </div>
+                      <button type="button" @click="recordManually(job, f.url)"
+                              title="Open New Recording with this game and link filled in"
+                              class="shrink-0 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold">Record manually</button>
+                    </div>
+                  </template>
+                </div>
               </div>
               <button type="button" @click="cancelSchedule(job)"
                       class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold shrink-0"
@@ -787,6 +804,7 @@
                   <span x-text="t.ok ? '\u2713' : '\u2715'" :class="t.ok ? 'text-emerald-400' : 'text-rose-400'"></span>
                   <span x-show="t.source" class="font-semibold text-slate-300" x-text="t.source"></span>
                   <span x-text="t.url + ' \u2014 ' + t.note"></span>
+                  <span x-show="t.fixable" class="text-amber-400" title="A manual step could get this one working: see the note">(fixable by hand)</span>
                 </li>
               </template>
             </ul>
@@ -1032,15 +1050,39 @@
           return this.timeLocal(job.start_at) + ' → ' + this.timeLocal(job.end_time);
         },
 
-        scheduleDotClass(job) {
-          return { waiting: 'bg-sky-400', searching: 'bg-amber-400 animate-pulse',
-                   started: 'bg-emerald-400', failed: 'bg-rose-500', missed: 'bg-rose-500' }[job.state]
-                 || 'bg-slate-500';
+        // A job that has checked and found nothing is still `waiting` on the
+        // server (it retries), but must not look like one that simply has
+        // not started yet. An empty page before kick-off is normal: amber.
+        scheduleBadge(job) {
+          const tone = {
+            sky: { dot: 'bg-sky-400', text: 'text-sky-400' },
+            amber: { dot: 'bg-amber-400', text: 'text-amber-400' },
+            pulse: { dot: 'bg-amber-400 animate-pulse', text: 'text-amber-400' },
+            green: { dot: 'bg-emerald-400', text: 'text-emerald-400' },
+            red: { dot: 'bg-rose-500', text: 'text-rose-400' },
+          };
+          if (job.state === 'waiting' && job.attempts > 0) {
+            if (job.miss_kind === 'not_ready') return { ...tone.amber, label: 'not listed yet' };
+            if (job.miss_kind === 'blocked') return { ...tone.red, label: 'blocked' };
+            if (job.miss_kind === 'page_error') return { ...tone.red, label: 'page error' };
+            return { ...tone.red, label: 'no stream' };
+          }
+          const by = { waiting: tone.sky, searching: tone.pulse, started: tone.green,
+                       failed: tone.red, missed: tone.red };
+          return { ...(by[job.state] || { dot: 'bg-slate-500', text: 'text-slate-400' }), label: job.state };
         },
 
-        scheduleTextClass(job) {
-          return { waiting: 'text-sky-400', searching: 'text-amber-400', started: 'text-emerald-400',
-                   failed: 'text-rose-400', missed: 'text-rose-400' }[job.state] || 'text-slate-400';
+        // A fixable link from a failed schedule: the New Recording form with
+        // the game's names, its page, its end time and that link in slot 1.
+        recordManually(job, url) {
+          this.openNewModal = true;
+          this.form.sport = job.sport || this.form.sport;
+          this.form.team_a = job.team_a || this.form.team_a;
+          this.form.team_b = job.team_b || this.form.team_b;
+          this.agg.url = job.agg_url || '';
+          this.form.url_primary = url;
+          this.sched.start = '';
+          this.sched.end = job.end_time ? this.localInput(job.end_time) : '';
         },
 
         async cancelSchedule(job) {

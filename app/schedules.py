@@ -217,6 +217,57 @@ def miss_reason(result: Optional[Dict[str, Any]]) -> str:
     return f"None of the {tried} links checked gave a recordable stream yet."
 
 
+def miss_kind(result: Optional[Dict[str, Any]]) -> str:
+    """The category behind miss_reason(), for the dashboard's badge.
+
+    `not_ready` (the page lists no links yet: normal before kick-off),
+    `blocked` (a Cloudflare check), `page_error`, `no_working` (links found,
+    none recordable), `error`, or `no_input`. Same branches in the same order
+    as miss_reason(), so the badge and the sentence cannot disagree.
+    """
+    if not result:
+        return "no_input"
+    page = result.get("page") or {}
+    if result.get("error"):
+        return "error"
+    if page.get("challenged"):
+        return "blocked"
+    status = page.get("status")
+    if not page or page.get("ok") is False or (status is not None and status != 200):
+        return "page_error"
+    if not result.get("links_found"):
+        return "not_ready"
+    return "no_working"
+
+
+# What to do by hand, per probe.fixable_kind(). Shown beside the link.
+FIX_HINTS = {
+    "devtools_m3u8": "Player builds its link in JavaScript: open it, copy the .m3u8 "
+                     "from DevTools (Network, filter m3u8) and record that.",
+    "headers": "Host wants a cookie or referer: copy them from DevTools into the "
+               "link's advanced fields.",
+    "token": "Its token was rejected: open the page for a fresh link.",
+}
+MAX_FIXABLE = 5
+
+
+def fixable_links(result: Optional[Dict[str, Any]],
+                  limit: int = MAX_FIXABLE) -> List[Dict[str, str]]:
+    """Links from a page check that a manual step could get recording.
+
+    Dashboard only (GET /api/schedules, same as agg_url): never put these in
+    a notification, where a page's link would reach a third-party chat.
+    """
+    out: List[Dict[str, str]] = []
+    for t in (result or {}).get("tried") or []:
+        hint = FIX_HINTS.get(str(t.get("fixable") or ""))
+        if hint and t.get("url"):
+            out.append({"url": str(t["url"]), "hint": hint})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def public_view(job: Dict[str, Any]) -> Dict[str, Any]:
     """A job as GET /api/schedules returns it: secrets replaced by flags."""
     view = {k: v for k, v in job.items() if k not in _SECRET_FIELDS}
