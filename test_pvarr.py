@@ -3581,6 +3581,53 @@ class TestRecordingRoutes(ServerTestCase):
         self.assertEqual(r.status_code, 200)
         rec.force_failover.assert_called_once()
 
+    def _running(self, deadline):
+        from unittest.mock import MagicMock
+        rec = MagicMock()
+        rec.is_running = True
+        rec.deadline.return_value = deadline
+        rec.session_record = {"id": "abc", "end_time": deadline}
+        self.server.active_recorders["abc"] = rec
+        return rec
+
+    def test_extend_adds_to_the_current_end_and_persists_it(self):
+        # The point of the button: a game running long is extended from its
+        # end, and a restart mid-overtime must resume with the new end.
+        from unittest.mock import patch
+        end = time.time() + 600
+        rec = self._running(end)
+        with patch.object(self.server.session_store, "save") as save:
+            r = self.client.post("/api/recordings/abc/end", data={"add_minutes": 30})
+        self.assertEqual(r.status_code, 200)
+        new_end = rec.set_end_time.call_args[0][0]
+        self.assertAlmostEqual(new_end, end + 1800, delta=1)
+        self.assertEqual(rec.session_record["end_time"], new_end)
+        save.assert_called_once_with(rec.session_record)
+
+    def test_extend_without_a_deadline_counts_from_now(self):
+        from unittest.mock import patch
+        rec = self._running(None)
+        with patch.object(self.server.session_store, "save"):
+            r = self.client.post("/api/recordings/abc/end", data={"add_minutes": 15})
+        self.assertEqual(r.status_code, 200)
+        self.assertAlmostEqual(rec.set_end_time.call_args[0][0], time.time() + 900, delta=5)
+
+    def test_end_edit_refuses_past_far_and_stopped(self):
+        from unittest.mock import patch
+        rec = self._running(time.time() + 600)
+        with patch.object(self.server.session_store, "save"):
+            for data in ({"end_time": time.time() - 5}, {"end_time": time.time() + 25 * 3600},
+                         {"add_minutes": 0}, {}):
+                with self.subTest(data=data):
+                    r = self.client.post("/api/recordings/abc/end", data=data)
+                    self.assertEqual(r.status_code, 400)
+            rec.set_end_time.assert_not_called()
+            rec.is_running = False
+            r = self.client.post("/api/recordings/abc/end", data={"add_minutes": 15})
+            self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.client.post("/api/recordings/nope/end",
+                                          data={"add_minutes": 15}).status_code, 404)
+
     def test_start_refuses_when_the_volume_is_nearly_full(self):
         # Fail fast rather than starting a capture the guard aborts moments
         # later -- and rather than being the thing that fills the volume.

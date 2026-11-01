@@ -102,6 +102,12 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - Proof: `test_not_video_is_never_picked_and_the_page_is_summarised`, `test_measure_reads_the_video_at_the_byte_range` (Range honoured and ignored), `test_segments_that_are_all_images_are_not_video`, `test_byterange_segments_parse_with_and_without_offset`, `test_status_counts_real_sources_behind_the_candidates`. Mutation-checked: removing the exclusion, the Range header or the whole-file slice each fails a test.
 - [PENDING] The single-URL probe (manual paste) still sniffs only bytes 0-2047 and ignores byte ranges, so it can still call an image-only stream "resolved". Not-video detection needs ranking on (`PVARR_RANK_STREAMS=1`, the default) and two or more working links.
 
+## Extend a running recording (built 2026-11-01, unreleased)
+- Ask: games run long and the only fix was a second recording; the Events tab had "start early" but nothing for running late.
+- Built: `POST /api/recordings/{id}/end` (`add_minutes` from the current end, or exact `end_time`), saved to the session record so a resume keeps it. Card buttons **+15m / +30m / +1h / Edit**; Events tab **Keep 0/15/30/60 min after** (default 0, today's behaviour).
+- Proof: `test_extend_adds_to_the_current_end_and_persists_it`, `test_extend_without_a_deadline_counts_from_now`, `test_end_edit_refuses_past_far_and_stopped`.
+- Not built: editing a *waiting* schedule's end (cancel and reschedule).
+
 ## Segment loss investigation
 
 ### Live session 66954d39, 2026-10-04 (local container, v:latest) -- cause 2 confirmed  [PENDING]

@@ -1895,6 +1895,50 @@ async def stop_recording(recording_id: str):
     return {"status": "success", "message": f"Stopped session {recording_id}"}
 
 
+@app.post("/api/recordings/{recording_id}/end")
+async def move_recording_end(
+    recording_id: str,
+    add_minutes: Optional[float] = Form(None),
+    end_time: Optional[float] = Form(None),
+):
+    """Extend or edit when a running recording stops.
+
+    `add_minutes` counts from the current end (or from now, if that has
+    passed or there is none); `end_time` is an exact epoch, as the start form
+    sends, and may also shorten. Saved to the session record so a resume after
+    a restart keeps the new end.
+    """
+    recorder = active_recorders.get(recording_id)
+    if not recorder:
+        raise HTTPException(status_code=404, detail="Recording session not found")
+    if not recorder.is_running:
+        raise HTTPException(status_code=409, detail="Recording session is not currently running")
+
+    now = time.time()
+    if end_time is not None:
+        if not math.isfinite(end_time):
+            raise HTTPException(status_code=400, detail="end_time must be epoch seconds")
+        new_end = float(end_time)
+    elif add_minutes is not None:
+        if not math.isfinite(add_minutes) or add_minutes <= 0:
+            raise HTTPException(status_code=400, detail="add_minutes must be more than 0")
+        new_end = max(recorder.deadline() or now, now) + add_minutes * 60.0
+    else:
+        raise HTTPException(status_code=400, detail="Give add_minutes or end_time")
+    if new_end <= now:
+        raise HTTPException(status_code=400, detail="The new end time is in the past")
+    # Same ceiling as /api/recordings/start's duration_minutes.
+    if new_end - now > 24 * 3600:
+        raise HTTPException(status_code=400, detail="The new end time is more than 24 hours away")
+
+    recorder.set_end_time(new_end)
+    record = getattr(recorder, "session_record", None)
+    if record is not None:
+        record["end_time"] = new_end
+        session_store.save(record)
+    return {"status": "success", "ends_at": new_end}
+
+
 @app.post("/api/recordings/{recording_id}/failover")
 async def trigger_failover(recording_id: str):
     """Force switch to the next backup stream candidate."""

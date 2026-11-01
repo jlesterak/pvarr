@@ -267,6 +267,25 @@
                       class="text-[11px] block text-slate-500 font-mono"
                       :title="'Stops at ' + endsAtLocal(session)"
                       x-text="endsIn(session)"></span>
+                <!-- Games run long: push the end out without a second recording.
+                     +N counts from the current end; Edit sets an exact time. -->
+                <div x-show="['recording', 'failing_over'].includes(session.status)" class="flex flex-wrap items-center gap-1 mt-1">
+                  <template x-for="m in [15, 30, 60]" :key="m">
+                    <button type="button" @click="moveEnd(session.id, { add_minutes: m })"
+                            :title="'Record ' + m + ' min longer'"
+                            class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold"
+                            x-text="m < 60 ? '+' + m + 'm' : '+1h'"></button>
+                  </template>
+                  <button type="button" @click="endEdit[session.id] = session.ends_at ? localInput(session.ends_at) : localInput(Date.now() / 1000 + 3600)"
+                          class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold">Edit</button>
+                </div>
+                <div x-show="endEdit[session.id]" class="flex items-center gap-1 mt-1">
+                  <input type="datetime-local" x-model="endEdit[session.id]" class="px-1 py-0.5 rounded arr-input text-[11px] text-slate-200">
+                  <button type="button" @click="moveEnd(session.id, { end_time: toEpoch(endEdit[session.id]) })"
+                          class="px-1.5 py-0.5 rounded bg-arr-brass text-white text-[10px] font-semibold">Save</button>
+                  <button type="button" @click="endEdit[session.id] = ''"
+                          class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 text-[10px]">Cancel</button>
+                </div>
               </div>
               <div>
                 <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">On Disk</span>
@@ -498,6 +517,11 @@
                 <select x-model.number="lists.lead" class="mx-1 px-2 py-1 rounded arr-input text-xs text-slate-200">
                   <option value="5">5</option><option value="10">10</option><option value="15">15</option>
                 </select>min early
+              </label>
+              <label class="text-xs text-slate-400" title="Games often run past their listed length. Running recordings can also be extended from their card.">Keep
+                <select x-model.number="lists.late" class="mx-1 px-2 py-1 rounded arr-input text-xs text-slate-200">
+                  <option value="0">0</option><option value="15">15</option><option value="30">30</option><option value="60">60</option>
+                </select>min after
               </label>
               <button type="button" @click="scheduleSelected()" :disabled="!selectedGames().length || lists.state === 'working'"
                       class="ml-auto px-4 py-2 rounded-lg text-sm font-semibold bg-arr-brass hover:bg-blue-600 text-white disabled:opacity-40"
@@ -928,6 +952,8 @@
         // only when sent.
         sched: { start: '', end: '' },
         scheduleList: [],
+        // Session id -> datetime-local string while its end time is being edited.
+        endEdit: {},
         submitting: false,
         suggestions: { league: [], team_a: [], team_b: [] },
         suggestActive: { league: -1, team_a: -1, team_b: -1 },
@@ -937,7 +963,7 @@
           { field: 'team_b', model: 'team_b', label: 'Team B / Rival', placeholder: 'Raiders' }
         ],
         // Events tab: saved list pages (server-side) and the games of the one shown.
-        lists: { pages: [], current: null, games: [], selected: {}, results: {}, lead: 5,
+        lists: { pages: [], current: null, games: [], selected: {}, results: {}, lead: 5, late: 0,
                  adding: false, newUrl: '', newName: '', state: 'idle', message: '' },
         agg: { url: '', cookie: '', user_agent: '', showHeaders: false,
                state: 'idle', message: '', tried: [], events: [] },
@@ -1209,7 +1235,7 @@
             const now = Date.now() / 1000;
             const started = g.live || g.start_at <= now;
             const start = started ? now : Math.max(g.start_at - this.lists.lead * 60, now);
-            const end = this.gameEnd(g) || now + (g.duration_hours || 3) * 3600;
+            const end = (this.gameEnd(g) || now + (g.duration_hours || 3) * 3600) + this.lists.late * 60;
             this.lists.message = 'Scheduling ' + g.team_a + ' vs ' + g.team_b + '...';
             const body = new FormData();
             body.append('sport', g.sport || 'Sports');
@@ -1923,6 +1949,24 @@
             this.refreshStatus();
           } catch (e) {
             alert('Re-check error: ' + e);
+          }
+        },
+
+        // Extend (+N min) or set an exact end for a running recording.
+        async moveEnd(id, fields) {
+          if (fields.end_time === null) { alert('Pick a date and time first.'); return; }
+          try {
+            const res = await fetch(`/api/recordings/${id}/end`,
+                                    { method: 'POST', body: new URLSearchParams(fields) });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              alert('End time not changed: ' + (err.detail || ('HTTP ' + res.status)));
+              return;
+            }
+            this.endEdit[id] = '';
+            this.refreshStatus();
+          } catch (e) {
+            alert('End time error: ' + e);
           }
         },
 

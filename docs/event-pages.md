@@ -152,7 +152,9 @@ the local start time, league and usual length. Tick games and press
 
 - **Start** is the page's start time minus the lead you choose (5, 10 or
   15 min early); a game already under way starts now.
-- **End** is the start time plus the league's usual length (as above).
+- **End** is the start time plus the league's usual length (as above),
+  plus the margin you choose (**Keep 0, 15, 30 or 60 min after**) for games
+  that run long. A recording already running can be extended from its card.
 - A game already scheduled shows **Scheduled**; one with no time listed,
   or long over, cannot be ticked. **Edit** opens the New Recording form
   filled in from that game, for anything else.

@@ -1274,6 +1274,18 @@ class StreamFailoverRecorder:
         self._stop_event.set()
         return False
 
+    def set_end_time(self, end_time: float) -> None:
+        """Move this recording's end (the dashboard's +15m / Edit buttons).
+
+        One float assignment: the capture thread reads it through deadline()
+        on every write-path check and failover lap, so no lock is needed.
+        Logged as minutes from now, not a clock time -- the container's
+        timezone is usually UTC and would only confuse.
+        """
+        self.end_time = float(end_time)
+        self._log(f"End time moved by the operator: now stops in "
+                  f"{max(0.0, self.end_time - time.time()) / 60:.0f} min.", "WARN")
+
     def deadline(self) -> Optional[float]:
         """When this recording must stop, as an absolute epoch time.
 
