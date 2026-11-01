@@ -4,6 +4,13 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-01
+
+### Added
+- Extend or edit a running recording's end: **+15m / +30m / +1h / Edit** on the card, `POST /api/recordings/{id}/end` (`add_minutes` from the current end, or an exact `end_time`). Saved, so a resume keeps it.
+- Events tab: **Keep 0/15/30/60 min after**, added to each scheduled game's end.
+- A schedule that found no stream shows **not listed yet**, **blocked**, **page error** or **no stream** instead of *waiting*, and lists up to five links a manual step could rescue, with a hint and **Record manually**. `/api/schedules` adds `miss_kind` and `fixable`; `/api/aggregate` adds `fixable` per link.
+
 ## [0.12.0] - 2026-10-28
 
 ### Added

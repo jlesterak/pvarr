@@ -102,13 +102,13 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - Proof: `test_not_video_is_never_picked_and_the_page_is_summarised`, `test_measure_reads_the_video_at_the_byte_range` (Range honoured and ignored), `test_segments_that_are_all_images_are_not_video`, `test_byterange_segments_parse_with_and_without_offset`, `test_status_counts_real_sources_behind_the_candidates`. Mutation-checked: removing the exclusion, the Range header or the whole-file slice each fails a test.
 - [PENDING] The single-URL probe (manual paste) still sniffs only bytes 0-2047 and ignores byte ranges, so it can still call an image-only stream "resolved". Not-video detection needs ranking on (`PVARR_RANK_STREAMS=1`, the default) and two or more working links.
 
-## Extend a running recording (built 2026-11-01, unreleased)
+## Extend a running recording (built 2026-11-01, released in v0.13.0)
 - Ask: games run long and the only fix was a second recording; the Events tab had "start early" but nothing for running late.
 - Built: `POST /api/recordings/{id}/end` (`add_minutes` from the current end, or exact `end_time`), saved to the session record so a resume keeps it. Card buttons **+15m / +30m / +1h / Edit**; Events tab **Keep 0/15/30/60 min after** (default 0, today's behaviour).
 - Proof: `test_extend_adds_to_the_current_end_and_persists_it`, `test_extend_without_a_deadline_counts_from_now`, `test_end_edit_refuses_past_far_and_stopped`.
 - Not built: editing a *waiting* schedule's end (cancel and reschedule).
 
-## Schedules that find no stream look like errors (built 2026-11-01, unreleased)
+## Schedules that find no stream look like errors (built 2026-11-01, released in v0.13.0)
 - Symptom: a schedule whose page check found nothing kept the blue **WAITING** badge, reading as "not time yet"; the reason was only in the grey message.
 - Built: on a miss the job stores `miss_kind` and `fixable`; the badge shows **not listed yet** (amber), **blocked**, **page error** or **no stream** (red). The probe tags failures a person can rescue (`probe.fixable_kind`: JS-built player, 403 wanting a cookie/referer, rejected token); the row lists up to five with a hint and **Record manually**. Find's link list marks them "(fixable by hand)". Notifications unchanged: no links.
 - Proof: `test_miss_kind_matches_the_reason`, `test_only_refusals_a_person_can_fix_are_marked_fixable`, `test_fixable_links_keep_only_tagged_links_with_a_hint`, `test_a_miss_records_its_kind_and_the_fixable_links_but_never_notifies_them`, plus asserts added to the aggregator summary and DevTools-message tests.
