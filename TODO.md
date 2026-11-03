@@ -120,6 +120,9 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - [PENDING] If an upstream re-signs segment URLs on every reload, each reload looks like new segments: up to four extra image fetches and cache churn. Not seen yet; keying on the path alone could merge distinct segments, so it waits for a real case.
 - [PENDING] Live page check showing both providers picked as independent sources, and a full game recorded on them.
 
+## Protocol-relative base64 stream URLs (fixed 2026-11-02)
+- Symptom: three of five links on a college basketball event page led to one player that loads `atob("Ly9...index.m3u8")`, a protocol-relative URL; the probe decoded base64 only when it starts "aHR0c" ("http"), so all three were "no playlist". Fix: "Ly9" ("//") is accepted too. Proof: `test_protocol_relative_base64_stream_url_is_decoded` (fails on the old probe). At the time the decoded playlist answered 404 (channel not yet live), so recording it is still unproven.
+
 ## College games got the wrong league (fixed 2026-11-02)
 - Symptom: a men's basketball game added from the Events tab was scheduled as NCAAF. Both schools play football and basketball; the page's league label ("NCAAB") was not a known alias, so `eventinfo._event` fell back to the first league the two teams share, which is football in catalogue order.
 - Fix: "ncaab", "cbb" and "ncaa basketball" are aliases of NCAAM; when the label names no league, a word in the URL path may (`_league_in_url`); a sport word in the label or URL ("basketball") narrows the shared leagues to that sport. A hint still wins only if both teams play in that league.

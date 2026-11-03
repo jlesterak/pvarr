@@ -4866,6 +4866,23 @@ class TestProbePageScraping(ProbeTestCase):
         self.assertTrue(result["ok"], result["message"])
         self.assertEqual(result["m3u8_url"], url.decode())
 
+    def test_protocol_relative_base64_stream_url_is_decoded(self):
+        # 2026-11-02: `player.load({source: window.atob('Ly9...')})`, the URL
+        # starting "//", so its base64 starts "Ly9", not "aHR0c".
+        import base64
+        page = (b"<script>player.load({source: window.atob('"
+                + base64.b64encode(b"//cdn.example/abc/ch1/index.m3u8") + b"')});</script>")
+
+        def handler(u, headers):
+            if u.endswith("/channel.php"):
+                return FakeResponse(u, 200, page)
+            if ".m3u8" in u:
+                return FakeResponse(u, 200, MEDIA_PLAYLIST)
+            return FakeResponse(u, 200, b"\x47" * 512)
+        result = self.probe(handler, "https://embed.example/channel.php", use_ytdlp=False)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertEqual(result["m3u8_url"], "https://cdn.example/abc/ch1/index.m3u8")
+
     def test_page_with_no_playlist_says_so(self):
         result = self.probe(
             lambda url, h: FakeResponse(url, 200, b"<html>nothing here</html>"),

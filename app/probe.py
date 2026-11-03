@@ -91,9 +91,11 @@ _CONCAT_RE = re.compile(r"""(["'])\s*\+\s*(?:window\.)?([A-Za-z_$][\w$]*)\s*\+\s
 _QUOTED = r"""(?:"[^"\\]*"|'[^'\\]*')"""
 _QUOTED_RE = re.compile(r""""([^"\\]*)"|'([^'\\]*)'""")
 # A quoted base64 string that decodes to an http(s) URL: "aHR0c" is base64 for
-# "http". Anchoring on it keeps the search linear on pages carrying large
+# "http" ("Ly9" for a protocol-relative "//"). Anchoring on them keeps the search linear on pages carrying large
 # base64 blobs, which never start that way.
-_B64_URL_RE = re.compile(r"""(["'])(aHR0c[A-Za-z0-9+/]{10,4000}={0,2})\1""")
+# "Ly9" is "//": a protocol-relative URL, seen 2026-11-02 in a player's
+# `player.load({source: atob("Ly9...index.m3u8")})`.
+_B64_URL_RE = re.compile(r"""(["'])((?:aHR0c|Ly9)[A-Za-z0-9+/]{10,4000}={0,2})\1""")
 _JOINED_ARRAY_RE = re.compile(
     r"\[\s*((?:" + _QUOTED + r"\s*,\s*)*" + _QUOTED + r")\s*,?\s*\]\s*\.join\(\s*(?:\"\"|'')\s*\)")
 
@@ -343,7 +345,7 @@ def _normalise(raw: str, variables: Dict[str, str]) -> str:
         )
     if variables:
         text = _CONCAT_RE.sub(lambda m: variables.get(m.group(2), m.group(0)), text)
-    if "aHR0c" in text:
+    if "aHR0c" in text or "Ly9" in text:
         text = _B64_URL_RE.sub(_decode_b64_url, text)
     return text
 
