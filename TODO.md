@@ -125,10 +125,10 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - [PENDING] On a loaded 3-core host, FlareSolverr took 95-120 s to solve an event page against PVArr's 120 s limit, so Events-tab loads sometimes time out. Measure before raising the limit.
 - [PENDING] Nothing stops a working link that plays a different game from being recorded under the scheduled game's name (seen on a college game where every playable link was another game). Needs a design idea before code.
 
-## Protocol-relative base64 stream URLs (fixed 2026-11-02)
+## Protocol-relative base64 stream URLs (fixed 2026-11-02, released in v0.14.1)
 - Symptom: three of five links on a college basketball event page led to one player that loads `atob("Ly9...index.m3u8")`, a protocol-relative URL; the probe decoded base64 only when it starts "aHR0c" ("http"), so all three were "no playlist". Fix: "Ly9" ("//") is accepted too. Proof: `test_protocol_relative_base64_stream_url_is_decoded` (fails on the old probe). At the time the decoded playlist answered 404 (channel not yet live), so recording it is still unproven.
 
-## College games got the wrong league (fixed 2026-11-02)
+## College games got the wrong league (fixed 2026-11-02, released in v0.14.1)
 - Symptom: a men's basketball game added from the Events tab was scheduled as NCAAF. Both schools play football and basketball; the page's league label ("NCAAB") was not a known alias, so `eventinfo._event` fell back to the first league the two teams share, which is football in catalogue order.
 - Fix: "ncaab", "cbb" and "ncaa basketball" are aliases of NCAAM; when the label names no league, a word in the URL path may (`_league_in_url`); a sport word in the label or URL ("basketball") narrows the shared leagues to that sport. A hint still wins only if both teams play in that league.
 - Proof: `test_college_league_follows_the_label_or_url_not_the_first_sport_both_schools_play` (three cases fail on the old code; no-hint and wrong-league guards pass on both). The live schedule was re-created as NCAAM by hand.

@@ -4,6 +4,8 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-02
+
 ### Fixed
 - A player page passing a protocol-relative URL through base64 (`atob("Ly9...")`) was not resolved: only base64 starting with "http" was decoded.
 - A college game read from an event page could get the wrong league when both schools play several sports: an unrecognised label ("NCAAB") let the first shared league (football) win. "NCAAB", "CBB" and "NCAA basketball" now name men's basketball, a league word in the page's URL counts as a hint, and a sport word ("Basketball") narrows the choice to that sport.
