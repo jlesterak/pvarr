@@ -26,6 +26,8 @@ What you record is your responsibility.
 - **No DRM, ever.** PVArr does not decrypt Widevine, FairPlay or PlayReady. Pages that need a login use your own browser session.
 - **No site-specific code or stream lists.** Requests for either are closed. Don't post stream URLs in issues; **Copy trace** on the dashboard strips tokens for you.
 
+Streams are HLS. Two packagings seen on event pages are read as well: segments packed inside PNG images and playlists delivered as JSON segment lists ([details](docs/finding-streams.md)). Those pass the video through PVArr itself, at roughly half a second of CPU per segment.
+
 PVArr sends no telemetry and contacts nothing except the URLs you give it (and ESPN's public team list, only when a maintainer runs the `--refresh` command).
 
 ---

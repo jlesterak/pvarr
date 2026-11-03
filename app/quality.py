@@ -40,7 +40,7 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 
-from app import probe
+from app import pngwrap, probe
 from app.check_deps import find_executable
 
 MIN_HEADROOM = 1.5
@@ -164,7 +164,7 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
     out: Dict[str, Any] = {"measured": False, "height": None, "width": None, "fps": None,
                            "codec": None, "kbps": None, "headroom": None,
                            "declared_height": None, "declared_kbps": None, "note": "",
-                           "not_video": False}
+                           "not_video": False, "wrapped": False}
     playlist = res.get("m3u8_url") or ""
     if not playlist:
         out["note"] = "no playlist to measure"
@@ -195,7 +195,8 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
 
         resp, body = probe._fetch(fetcher, playlist, headers,
                                   max(0.5, min(PLAYLIST_TIMEOUT_SEC, left() / 2)))
-        if not (resp.ok and probe._is_playlist_body(body)):
+        body = (probe.as_playlist(body) if resp.ok else None) or b""
+        if not body:
             out["note"] = f"playlist answered {resp.status_code}"
             return out
         segs = _segments(body, resp.url)[:-1][-SEGMENTS:]   # skip the newest
@@ -246,6 +247,13 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                     # the segment arrived, so this says nothing either way.
                     out["note"] = "byte range not reached"
                     continue
+            raw_len = len(data)     # as served: what timing and the size cap saw
+            if pngwrap.is_png(data):
+                # Video packed inside an image; the relay unwraps it for FFmpeg.
+                inner = pngwrap.unwrap(data)
+                if inner:
+                    data = inner
+                    out["wrapped"] = True
             if not _looks_like_media(data):
                 out["note"] = "segment is not video"
                 not_media += 1
@@ -257,16 +265,16 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                 length = 0
             if rng and r.status_code == 200:
                 length = rng[1] - rng[0] + 1    # what was sliced out, not the whole file
-            if length and len(data) >= length:
+            if length and raw_len >= length:
                 share = 1.0                     # all of it, even right at the cutoff
-            elif length and len(data) >= SEGMENT_MAX_BYTES:
-                share = len(data) / length      # cut off by the size cap: only what arrived
+            elif length and raw_len >= SEGMENT_MAX_BYTES:
+                share = raw_len / length      # cut off by the size cap: only what arrived
             elif length:
                 # Cut off by the clock: a short tail that still holds the whole
                 # first-byte delay reads far too slow. It may prove the stream
                 # too slow (below); otherwise it earns no credit.
                 share = 0.0
-            elif len(data) >= SEGMENT_MAX_BYTES:
+            elif raw_len >= SEGMENT_MAX_BYTES:
                 share = None                    # over the size cap, length unknown
             elif took >= half * 2 - 0.5:
                 share = 0.0                     # still arriving when the clock ran out
@@ -355,7 +363,9 @@ def source_key(m3u8_url: str) -> str:
         return ""
     if not host:
         return ""
-    path = parts.path
+    # A token carried as a path segment (long, letters and digits only)
+    # changes per visitor; the stream's own name does not.
+    path = re.sub(r"/[A-Za-z0-9_-]{32,}(?=/)", "", parts.path)
     # Only a path naming a specific stream identifies the feed. A generic one
     # ("/live/index.m3u8") on tv1.example and tv2.example says nothing about
     # being the same origin, so then the exact host is kept.

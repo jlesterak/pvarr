@@ -530,6 +530,12 @@ class CandidateStream:
         # The playlist is served only to a browser TLS profile, so FFmpeg
         # reads it through app.relay. Set by the probe on every connect.
         self.needs_relay: bool = False
+        # Segments are video packed inside PNG images (app.pngwrap): the relay
+        # serves FFmpeg the MPEG-TS inside them. Set by the probe on every connect.
+        self.png_wrapped: bool = False
+        # The playlist is a JSON segment list FFmpeg cannot read; the relay
+        # serves it as m3u8. Set by the probe on every connect.
+        self.json_playlist: bool = False
         self.fail_count: int = 0
         self.last_error: str = ""
         # DNS on this network refuses to name the stream's host (0.0.0.0).
@@ -560,6 +566,8 @@ class CandidateStream:
             "detect_note": self.detect_note,
             "used_proxy": self.used_proxy,
             "needs_relay": self.needs_relay,
+            "png_wrapped": self.png_wrapped,
+            "json_playlist": self.json_playlist,
             "fail_count": self.fail_count,
             "dns_blocked": self.dns_blocked,
             "last_error": self.last_error,
@@ -786,6 +794,8 @@ class StreamFailoverRecorder:
         """
         candidate.slug = candidate.slug or f"cand_{self.current_candidate_index}"
         candidate.needs_relay = False
+        candidate.png_wrapped = False
+        candidate.json_playlist = False
         candidate.dns_blocked = False
 
         if self.auto_probe and self._probe_candidate(candidate):
@@ -842,6 +852,8 @@ class StreamFailoverRecorder:
 
         candidate.m3u8_url = result["m3u8_url"]
         candidate.needs_relay = bool(result.get("impersonate"))
+        candidate.png_wrapped = bool(result.get("wrapped"))
+        candidate.json_playlist = bool(result.get("json_playlist"))
         candidate.referer = result.get("referer", "")
         candidate.cookie = result.get("cookie", "")
         if result.get("user_agent"):
@@ -1954,12 +1966,19 @@ class StreamFailoverRecorder:
                 relay = None
                 try:
                     input_url = candidate.m3u8_url
-                    if candidate.needs_relay:
+                    if candidate.needs_relay or candidate.png_wrapped or candidate.json_playlist:
                         try:
-                            relay = PlaylistRelay(candidate.m3u8_url, self._relay_headers(candidate))
+                            relay = PlaylistRelay(candidate.m3u8_url, self._relay_headers(candidate),
+                                                  unwrap_segments=candidate.png_wrapped)
                             input_url = relay.start()
-                            self._log(f"[Relay] Playlist is only served to a browser TLS profile; "
-                                      f"relaying it on {input_url}.")
+                            why = "; ".join(filter(None, (
+                                "segments are video packed inside PNG images, unwrapping them"
+                                if candidate.png_wrapped else "",
+                                "playlist is a JSON segment list" if candidate.json_playlist else "",
+                                "playlist is only served to a browser TLS profile"
+                                if candidate.needs_relay else "")))
+                            why = why[:1].upper() + why[1:]
+                            self._log(f"[Relay] {why}; relaying on {input_url}.")
                         except OSError as exc:
                             relay = None
                             self._log(f"[Relay] Could not start the playlist relay: {exc}", "ERROR")
@@ -1992,6 +2011,8 @@ class StreamFailoverRecorder:
                                   and self.has_next_candidate)
             if dns_blocked:
                 pass    # already failed over above; the proxy asks the same host
+            elif candidate.png_wrapped or candidate.json_playlist:
+                pass    # hls-proxy can read neither the images nor a JSON playlist
             elif (dead_mid_recording
                     and not self._stop_event.is_set()
                     and not self._force_failover_flag):

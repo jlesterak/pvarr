@@ -16,6 +16,7 @@ longer be the first thing anyone has to do.
 import base64
 import binascii
 import ipaddress
+import json
 import logging
 import re
 import socket
@@ -24,6 +25,8 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urljoin, urlparse, urlsplit
 
 import requests
+
+from app import pngwrap
 
 logger = logging.getLogger("PVArrProbe")
 
@@ -136,6 +139,63 @@ def _is_playlist_body(body: bytes) -> bool:
     return body.lstrip()[:7].upper().startswith(b"#EXTM3U")
 
 
+# A live playlist delivered as JSON instead of m3u8 text: an object whose
+# "segments" list gives each segment's URL and duration. Seen 2026-11 from a
+# relay whose own m3u8 refuses every client and whose player builds the
+# playlist from this. Recognised by shape; never by host.
+_JSON_URL_RE = re.compile(r"""["']((?:https?:)?//[^"'\s<>]{1,4000}?\.json(?:\?[^"'\s<>]{0,4000})?)["']""")
+MAX_JSON_CANDIDATES = 2
+MAX_JSON_SEGMENTS = 1000
+
+
+def json_segment_list(body: bytes) -> Optional[str]:
+    """m3u8 text for a JSON segment list, or None if `body` is not one."""
+    if body.lstrip()[:1] != b"{":
+        return None
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    segments = data.get("segments") if isinstance(data, dict) else None
+    if not isinstance(segments, list) or not segments:
+        return None
+    rows = []
+    for seg in segments[-MAX_JSON_SEGMENTS:]:
+        if not isinstance(seg, dict):
+            return None
+        url, secs = seg.get("url"), seg.get("duration")
+        if (not isinstance(url, str) or not url.startswith(("http://", "https://"))
+                or not isinstance(secs, (int, float)) or isinstance(secs, bool)
+                or not 0 < secs <= 60 or "\n" in url or "\r" in url):
+            return None
+        rows.append((url, float(secs), seg.get("sn"), seg.get("cc")))
+
+    def whole(value, default: int) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else default
+    target = max([secs for _, secs, _, _ in rows] + [whole(data.get("target_duration"), 0)])
+    first_cc = whole(rows[0][3], 0)
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+             f"#EXT-X-TARGETDURATION:{int(-(-target // 1))}",
+             f"#EXT-X-MEDIA-SEQUENCE:{whole(rows[0][2], whole(data.get('sequence'), 0))}",
+             f"#EXT-X-DISCONTINUITY-SEQUENCE:{first_cc}"]
+    cc = first_cc
+    for url, secs, _, seg_cc in rows:
+        seg_cc = whole(seg_cc, cc)
+        if seg_cc != cc:
+            lines.append("#EXT-X-DISCONTINUITY")
+            cc = seg_cc
+        lines += [f"#EXTINF:{secs:.3f},", url]
+    return "\n".join(lines) + "\n"
+
+
+def as_playlist(body: bytes) -> Optional[bytes]:
+    """The body as m3u8 bytes: as served, or converted from a JSON segment list."""
+    if _is_playlist_body(body):
+        return body
+    text = json_segment_list(body)
+    return text.encode("utf-8") if text is not None else None
+
+
 def _dedupe(items: List[str]) -> List[str]:
     seen, out = set(), []
     for item in items:
@@ -234,6 +294,7 @@ def _extract_playlists(text: str, page_url: str) -> List[str]:
         elif not candidate.startswith(("http://", "https://")):
             candidate = urljoin(page_url, candidate)
         found.append(candidate)
+    has_m3u8 = bool(found)
 
     # A master playlist is the better recording target than a single variant,
     # and is conventionally named. Otherwise keep page order.
@@ -243,7 +304,16 @@ def _extract_playlists(text: str, page_url: str) -> List[str]:
             return 0
         return 1
 
-    return sorted(_dedupe(found), key=rank)[:MAX_PAGE_CANDIDATES]
+    playlists = sorted(_dedupe(found), key=rank)[:MAX_PAGE_CANDIDATES]
+    if has_m3u8:
+        # A player document may name an m3u8 it never loads and build the
+        # playlist from a JSON segment list instead. Only looked for next to an
+        # m3u8, so an ordinary page's JSON (manifests, configs) costs nothing.
+        scheme = urlparse(page_url).scheme or "https"
+        found_json = [(scheme + ":" + m) if m.startswith("//") else m
+                      for m in _JSON_URL_RE.findall(text)]
+        playlists += [u for u in _dedupe(found_json) if u not in playlists][:MAX_JSON_CANDIDATES]
+    return playlists
 
 
 def _normalise(raw: str, variables: Dict[str, str]) -> str:
@@ -597,6 +667,8 @@ def probe_stream(
         "variants": [],
         "headers_required": [],
         "segment_ok": None,
+        "wrapped": False,
+        "json_playlist": False,
         "impersonate": False,
         "attempts": [],
         "message": "",
@@ -759,11 +831,16 @@ def _try_playlist(fetch_session, plain_session, playlist_url, headers, impersona
         # on a 403 the body is obviously not a playlist, and saying so is noise
         # that reads like a second, unrelated problem.
         "note": ("2xx but not a playlist (HTML or interstitial?)"
+                 if resp.ok and as_playlist(body) is None else
+                 "JSON segment list (relayed as a playlist)"
                  if resp.ok and not _is_playlist_body(body) else note_tls),
     })
 
-    if not (resp.ok and _is_playlist_body(body)):
+    playlist = as_playlist(body) if resp.ok else None
+    if playlist is None:
         return resp.status_code
+    json_list = playlist is not body
+    body = playlist
 
     # A public playlist naming a LAN segment, key or variant would have FFmpeg
     # (or the relay, cookie attached) fetch from inside the network.
@@ -789,6 +866,7 @@ def _try_playlist(fetch_session, plain_session, playlist_url, headers, impersona
             "variants": parsed["variants"],
             "headers_required": [k for k in ("Referer", "Cookie") if headers.get(k)],
             "impersonate": impersonate,
+            "json_playlist": json_list,
         }
     )
 
@@ -807,7 +885,7 @@ def _try_playlist(fetch_session, plain_session, playlist_url, headers, impersona
         result["segment_ok"] = _check_segment(
             plain_session, parsed, headers, result["cookie"], timeout,
             result["attempts"], playlist_session=fetch_session,
-            allow_private=allow_private,
+            allow_private=allow_private, flags=result,
         )
 
     result["message"] = _describe(result)
@@ -836,6 +914,7 @@ def _check_segment(
     attempts: Optional[List[Dict[str, Any]]] = None,
     playlist_session=None,
     allow_private: bool = True,
+    flags: Optional[Dict[str, Any]] = None,
 ) -> Optional[bool]:
     """Confirm the media the playlist points at is fetchable with the same headers.
 
@@ -893,6 +972,20 @@ def _check_segment(
             # makes FFmpeg refuse the stream later, so name it now.
             note = (f"served as {ext} -- not a video extension, FFmpeg refuses "
                     "these by extension")
+        if ok and pngwrap.is_png(body):
+            # Video packed inside a PNG: only the whole image can say whether
+            # it carries MPEG-TS, and the recorder must then unwrap it.
+            full, data = _fetch(session, target, {k: v for k, v in probe_headers.items() if k != "Range"}, timeout,
+                                max_bytes=pngwrap.MAX_WRAPPED_BYTES)
+            if full.ok and pngwrap.unwrap(data):
+                note = "PNG-wrapped MPEG-TS -- unwrapped by the relay"
+                if flags is not None:
+                    flags["wrapped"] = True
+            else:
+                note = "an image, not video -- FFmpeg cannot record it"
+                ok = False
+                if flags is not None:
+                    flags["segment_image"] = True
         record({"url": target, "status": resp.status_code, "note": note})
         return ok
     except _FETCH_ERRORS as exc:
@@ -909,9 +1002,15 @@ def _describe(result: Dict[str, Any]) -> str:
         parts.append("needs " + " + ".join(result["headers_required"]))
     else:
         parts.append("no special headers")
+    if result.get("json_playlist"):
+        parts.append("playlist delivered as a JSON segment list (relayed)")
     if result.get("impersonate"):
         parts.append("playlist only served to a browser TLS profile (relayed)")
-    if result["segment_ok"] is False:
+    if result.get("wrapped"):
+        parts.append("segments are PNG-wrapped video (unwrapped by the relay)")
+    if result.get("segment_image"):
+        parts.append("segments are images, not video — FFmpeg cannot record this")
+    elif result["segment_ok"] is False:
         parts.append("segments rejected — stream may be session gated")
     return ", ".join(parts) + "."
 

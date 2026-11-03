@@ -10119,6 +10119,248 @@ class TestHlsProxyPatch(unittest.TestCase):
             mod.patch(mod.patch(self.SOURCE))
 
 
+
+def _png_wrap(ts: bytes, width: int = 64) -> bytes:
+    """A PNG laid out like the wrapped segments seen in the field: RGB pixels
+    holding a marker, a 4-byte big-endian length and a gzip of the MPEG-TS.
+    Rows cycle through all five PNG filter types, as real encoders mix them."""
+    import gzip
+    import struct
+    import zlib
+    payload = gzip.compress(ts)
+    body = b"WRAPTEST" + b"\x00" + struct.pack(">I", len(payload)) + payload
+    stride = width * 3
+    height = -(-len(body) // stride)
+    pixels = body.ljust(stride * height, b"\x00")
+    raw, prev = bytearray(), bytes(stride)
+    for y in range(height):
+        line = pixels[y * stride:(y + 1) * stride]
+        kind = y % 5
+        out = bytearray([kind])
+        for i in range(stride):
+            a = line[i - 3] if i >= 3 else 0
+            b = prev[i]
+            c = prev[i - 3] if i >= 3 else 0
+            if kind == 0:
+                pred = 0
+            elif kind == 1:
+                pred = a
+            elif kind == 2:
+                pred = b
+            elif kind == 3:
+                pred = (a + b) >> 1
+            else:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                pred = a if pa <= pb and pa <= pc else b if pb <= pc else c
+            out.append((line[i] - pred) & 0xFF)
+        raw += out
+        prev = line
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw)))
+            + chunk(b"IEND", b""))
+
+
+class TestPngWrappedSegments(unittest.TestCase):
+    """2026-11-02: a live game recorded 0 bytes. Every recordable link on its
+    event page served segments as PNG images whose pixels carry a gzip of
+    MPEG-TS; FFmpeg found "no stream" in them and the page check called the
+    same feed "working" on some links and "not video" on others."""
+
+    TS = (b"\x47" + bytes(range(187))) * 600       # 112,800 bytes of MPEG-TS
+
+    def test_unwrap_returns_the_ts_byte_for_byte(self):
+        from app import pngwrap
+        wrapped = _png_wrap(self.TS)
+        self.assertTrue(pngwrap.is_png(wrapped))
+        self.assertEqual(pngwrap.unwrap(wrapped), self.TS)
+
+    def test_ordinary_and_damaged_images_are_not_unwrapped(self):
+        from app import pngwrap
+        self.assertIsNone(pngwrap.unwrap(_png_wrap(b"just a picture" * 50)[:-40]))
+        # A gzip that holds something other than MPEG-TS is not video.
+        self.assertIsNone(pngwrap.unwrap(_png_wrap(b"<html>" * 400)))
+        self.assertIsNone(pngwrap.unwrap(b"\x89PNG\r\n\x1a\n" + b"\x01" * 5000))
+        self.assertIsNone(pngwrap.unwrap(self.TS))
+
+    def test_measure_counts_wrapped_segments_as_video(self):
+        from unittest.mock import MagicMock, patch
+        wrapped = _png_wrap(self.TS)
+        playlist = b"#EXTM3U\n" + b"".join(b"#EXTINF:6.0,\nseg%d.image\n" % i for i in range(4))
+
+        def fetch(session, url, hdrs, timeout, max_bytes=0):
+            r = MagicMock(ok=True, status_code=200, url="https://cdn.example/live/index.m3u8")
+            r.headers = {}
+            return r, (playlist if url.endswith(".m3u8") else wrapped)
+        with patch.object(quality.probe, "_fetch", side_effect=fetch), \
+                patch.object(quality, "_ffprobe", return_value={}):
+            q = quality.measure({"m3u8_url": "https://cdn.example/live/index.m3u8"})
+        self.assertFalse(q["not_video"])
+        self.assertTrue(q["wrapped"])
+
+    def test_probe_flags_wrapped_segments_and_refuses_plain_images(self):
+        from unittest.mock import MagicMock, patch
+        for segment, ok, wrapped in ((_png_wrap(self.TS), True, True),
+                                     (_png_wrap(b"<html>" * 400), False, False)):
+            def fetch(session, url, hdrs, timeout, max_bytes=0):
+                if max_bytes > 4096:    # the whole image, so no Range header
+                    self.assertNotIn("Range", hdrs)
+                r = MagicMock(ok=True, status_code=200, url=url)
+                return r, segment[:max_bytes] if max_bytes else segment
+            flags = {}
+            with patch.object(probe, "_fetch", side_effect=fetch):
+                got = probe._check_segment(MagicMock(), {"first_segment": "https://cdn.example/a.image"},
+                                           {}, "", 5, [], flags=flags)
+            self.assertEqual(got, ok)
+            self.assertEqual(flags.get("wrapped", False), wrapped)
+            self.assertEqual(flags.get("segment_image", False), not ok)
+
+    def test_relay_refuses_a_public_playlist_naming_a_private_segment(self):
+        from app.relay import PlaylistRelay
+        body = b"#EXTM3U\n#EXTINF:6.0,\nhttp://192.168.1.5/seg.image\n"
+        relay = PlaylistRelay("https://cdn.example/live.m3u8", {},
+                              fetch=lambda u, h, t, m=0: (200, body, u), unwrap_segments=True)
+        self.assertEqual(relay.serve(0)[0], 403)
+
+    def test_relay_fetches_listed_segments_before_ffmpeg_asks(self):
+        # FFmpeg reads one segment at a time; fetched on demand, a few seconds
+        # per image stacked into freezes on the 2026-11-02 live game.
+        import threading
+        from app.relay import PlaylistRelay
+        body = b"#EXTM3U\n" + b"".join(b"#EXTINF:5.0,\nhttps://cdn.example/s%d.image\n" % i
+                                       for i in range(6))
+        wrapped, fetched, done = _png_wrap(self.TS), [], threading.Event()
+
+        def fetch(url, headers, timeout, max_bytes=0):
+            if url.endswith(".m3u8"):
+                return 200, body, url
+            fetched.append(url)
+            if len(fetched) == 4:
+                done.set()
+            return 200, wrapped, url
+        relay = PlaylistRelay("https://cdn.example/live.m3u8", {}, fetch=fetch, unwrap_segments=True)
+        self.addCleanup(relay.stop)
+        self.assertEqual(relay.serve(0)[0], 200)
+        self.assertTrue(done.wait(5))
+        self.assertEqual(sorted(fetched), [f"https://cdn.example/s{i}.image" for i in range(2, 6)])
+        self.assertEqual(relay.segment(5), (200, self.TS))
+        self.assertEqual(len(fetched), 4)        # served from the prefetch, not fetched again
+
+    def test_ffmpeg_records_wrapped_segments_through_the_relay(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from app.relay import PlaylistRelay
+        tmp = Path(tempfile.mkdtemp(prefix="pvarr-pngwrap-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ffmpeg = check_deps.find_executable("ffmpeg")
+        subprocess.run(
+            [ffmpeg, "-hide_banner", "-v", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10:duration=3",
+             "-c:v", "libx264", "-preset", "ultrafast", "-g", "10",
+             "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+             "-hls_segment_filename", str(tmp / "seg%d.ts"), str(tmp / "media.m3u8")],
+            check=True, timeout=60)
+        # Serve every segment as a PNG image, named like one.
+        text = (tmp / "media.m3u8").read_text()
+        for seg in sorted(tmp.glob("seg*.ts")):
+            (tmp / (seg.stem + ".image")).write_bytes(_png_wrap(seg.read_bytes()))
+            text = text.replace(seg.name, seg.stem + ".image")
+        (tmp / "media.m3u8").write_text(text)
+
+        class Origin(BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = tmp / self.path.lstrip("/")
+                body = path.read_bytes() if path.is_file() else b""
+                self.send_response(200 if body else 404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+        threading.Thread(target=origin.serve_forever, daemon=True).start()
+        self.addCleanup(origin.server_close)
+        self.addCleanup(origin.shutdown)
+        relay = PlaylistRelay(f"http://127.0.0.1:{origin.server_address[1]}/media.m3u8", {},
+                              unwrap_segments=True)
+        local = relay.start()
+        self.addCleanup(relay.stop)
+        out = tmp / "out.ts"
+        res = subprocess.run([ffmpeg, "-hide_banner", "-v", "error", "-y", "-i", local,
+                              "-c", "copy", str(out)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        probe_out = subprocess.run(
+            [check_deps.find_executable("ffprobe"), "-v", "error", "-show_entries",
+             "format=duration", "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True, timeout=30)
+        self.assertGreater(float(probe_out.stdout.strip()), 2.5)
+
+
+
+class TestJsonSegmentList(unittest.TestCase):
+    """2026-11-02: provider A's player page names an m3u8 that refuses every
+    client and builds its playlist from a JSON segment list instead."""
+
+    BODY = json.dumps({
+        "sequence": 23947, "target_duration": 4,
+        "segments": [
+            {"sn": 3662, "cc": 0, "duration": 3.854, "url": "https://img.example/a.image?t=1"},
+            {"sn": 3663, "cc": 0, "duration": 4.204, "url": "https://img.example/b.image?t=2"},
+            {"sn": 3664, "cc": 1, "duration": 4.0, "url": "https://img.example/c.image?t=3"},
+        ]}).encode()
+
+    def test_json_list_becomes_a_live_m3u8(self):
+        text = probe.as_playlist(self.BODY).decode()
+        self.assertTrue(text.startswith("#EXTM3U"))
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:3662", text)
+        self.assertIn("#EXT-X-TARGETDURATION:5", text)          # longest segment, rounded up
+        self.assertNotIn("#EXT-X-ENDLIST", text)
+        lines = text.splitlines()
+        self.assertEqual(lines.index("#EXT-X-DISCONTINUITY") + 2,
+                         lines.index("https://img.example/c.image?t=3"))
+        self.assertEqual(text.count("#EXT-X-DISCONTINUITY\n"), 1)
+        parsed = probe._parse_playlist(text.encode(), "https://cdn.example/x.json")
+        self.assertEqual(parsed["first_segment"], "https://img.example/a.image?t=1")
+
+    def test_other_json_is_not_a_playlist(self):
+        for body in (b'{"name": "app", "icons": []}', b'{"segments": [{"url": "/rel.ts", "duration": 4}]}',
+                     b'{"segments": [{"url": "https://a.example/x.ts\\nevil", "duration": 4}]}',
+                     b'{"segments": [{"url": "https://a.example/x.ts", "duration": true}]}',
+                     b"[1, 2]", b"not json"):
+            self.assertIsNone(probe.as_playlist(body), body)
+        self.assertEqual(probe.as_playlist(b"#EXTM3U\n"), b"#EXTM3U\n")
+
+    def test_json_urls_are_only_taken_next_to_an_m3u8(self):
+        player = ('const playlistUrl = "https://edge.example/hls/abc.m3u8";'
+                  'const cdnUrl = "https://edge.example/access/TOKEN/hls/abc.json";')
+        self.assertEqual(probe._extract_playlists(player, "https://embed.example/p.php"),
+                         ["https://edge.example/hls/abc.m3u8",
+                          "https://edge.example/access/TOKEN/hls/abc.json"])
+        self.assertEqual(probe._extract_playlists('fetch("https://site.example/config.json")',
+                                                  "https://site.example/"), [])
+
+    def test_relay_serves_the_json_list_as_m3u8(self):
+        from app.relay import PlaylistRelay
+        relay = PlaylistRelay("https://edge.example/access/T/hls/abc.json", {},
+                              fetch=lambda u, h, t, m=0: (200, self.BODY, u))
+        status, body = relay.serve(0)
+        self.assertEqual(status, 200)
+        self.assertIn(b"#EXT-X-MEDIA-SEQUENCE:3662", body)
+        self.assertIn(b"https://img.example/b.image?t=2", body)
+
+    def test_mirrors_with_different_path_tokens_share_a_source(self):
+        a = "https://edge3.example/sh/access/U0hBQ0NFU1MBAAAAAQECAAAAAGrpY_cAAAAAAA/cdn/hls/abc.json"
+        b = "https://edge5.example/sh/access/U0hBQ0NFU1MBAAAAAQECAAAAAGrpZZZZZZZZZZ/cdn/hls/abc.json"
+        self.assertEqual(quality.source_key(a), quality.source_key(b))
+        self.assertNotEqual(quality.source_key(a),
+                            quality.source_key(b.replace("abc.json", "xyz.json")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

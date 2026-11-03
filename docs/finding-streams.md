@@ -51,6 +51,25 @@ every few seconds); FFmpeg still downloads the video straight from the CDN. The
 log says `[Relay] Playlist is only served to a browser TLS profile` when this happens,
 and the Add Recording check line says *relayed*.
 
+The same relay handles two packagings FFmpeg cannot read on its own:
+
+- **Segments packed inside PNG images.** Each segment is a real image whose
+  pixels hold a gzip of ordinary MPEG-TS. The probe recognises the shape on the
+  first segment ("PNG-wrapped video") and the relay fetches each image, unpacks
+  it and hands FFmpeg the MPEG-TS. Here the video itself passes through PVArr:
+  a few Mbps on loopback and roughly half a second of CPU per segment. To keep
+  FFmpeg from waiting, the relay fetches the newest few segments as soon as the
+  playlist lists them. An image that holds no video is reported as *images, not
+  video* and is never picked.
+- **Playlists delivered as JSON.** Some players never load the `.m3u8` their
+  page names (it refuses every client) and build the playlist from a JSON list
+  of segments instead. Next to an `.m3u8` in a player page, the probe also tries
+  up to two `.json` URLs; one whose body is an object with a `segments` list
+  (each with `url` and `duration`) is accepted, and the relay serves it to
+  FFmpeg as an ordinary m3u8 on each reload. Such a URL usually carries an
+  access token that expires after a few hours; when it does, the recorder
+  reconnects and the probe picks up a fresh one from the page.
+
 It is skipped when you paste a playlist URL directly — the probe has already
 tried that exact URL with every header combination it knows, so calling yt-dlp
 would add up to 20 seconds to a failover to learn nothing.
