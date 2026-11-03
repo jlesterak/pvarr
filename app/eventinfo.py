@@ -26,7 +26,7 @@ from collections import deque
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from app import tags
 
@@ -257,13 +257,44 @@ def duration_hours(league_id: str, label: str = "", url: str = "") -> float:
     return FALLBACK_HOURS
 
 
+def _league_in_url(url: str) -> Optional[Dict]:
+    """A league named by a word in the page's path ("/watch-123-ncaab-a-b/").
+
+    Only a hint: like the page's label, it wins only when both teams play in
+    that league (see _event), so a stray word cannot relabel a game.
+    """
+    for word in re.split(r"[^a-z0-9]+", urlsplit(url or "").path.lower()):
+        league = tags.resolve_league(word) if word and not word.isdigit() else None
+        if league:
+            return league
+    return None
+
+
+_SPORTS = ("football", "basketball", "hockey", "baseball", "soccer")
+
+
+def _sport_word(label: str, url: str) -> str:
+    words = re.split(r"[^a-z]+", (label or "").lower() + " " + urlsplit(url or "").path.lower())
+    return next((w for w in words if w in _SPORTS), "")
+
+
+def _sport_of(league_id: str) -> str:
+    league = tags.resolve_league(league_id) or {}
+    return (league.get("espn") or "").split("/", 1)[0]
+
+
 def _event(team_a: str, team_b: str, label: str, ts: Optional[float],
            chunks: List[str], url: str) -> Dict[str, Any]:
     """Canonical teams and league from the snapshot; page text otherwise."""
     hits_a, hits_b = tags.find_team(team_a), tags.find_team(team_b)
     in_b = {lg for lg, _ in hits_b}
     common = [lg for lg, _ in hits_a if lg in in_b]
-    hint = tags.resolve_league(label)
+    hint = tags.resolve_league(label) or _league_in_url(url)
+    # "Basketball" names no league, but it rules out the football teams of
+    # the same two schools.
+    sport = _sport_word(label, url)
+    if sport:
+        common = [lg for lg in common if _sport_of(lg) == sport] or common
     if hint and (not common or hint["id"] in common):
         league = hint["id"]
     elif common:

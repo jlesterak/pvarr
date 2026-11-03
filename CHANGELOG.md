@@ -4,6 +4,9 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- A college game read from an event page could get the wrong league when both schools play several sports: an unrecognised label ("NCAAB") let the first shared league (football) win. "NCAAB", "CBB" and "NCAA basketball" now name men's basketball, a league word in the page's URL counts as a hint, and a sport word ("Basketball") narrows the choice to that sport.
+
 ## [0.14.0] - 2026-11-02
 
 ### Added

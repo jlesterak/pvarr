@@ -8909,6 +8909,22 @@ class TestEventInfo(unittest.TestCase):
         self.assertEqual(ev["end_at"], 1792455300.0 + 3.5 * 3600)
         self.assertFalse(ev["live"])
 
+    def test_college_league_follows_the_label_or_url_not_the_first_sport_both_schools_play(self):
+        # 2026-11-02: a men's basketball game between two schools that also
+        # play football was scheduled as NCAAF: the page's "NCAAB" was not a
+        # known league, so the first league both teams share won.
+        teams = ("Montana State Bobcats", "Colorado State Rams")
+        cases = [("NCAAB", "https://events.example/watch-1/"),
+                 ("", "https://events.example/watch-68418-ncaab-montana-state-colorado-state/"),
+                 ("Basketball", "https://events.example/watch-1/")]
+        for label, url in cases:
+            with self.subTest(label=label, url=url):
+                self.assertEqual(eventinfo._event(*teams, label, None, [], url)["sport"], "NCAAM")
+        # No hint at all keeps the old answer; a word naming a league neither
+        # team plays in cannot relabel the game.
+        self.assertEqual(eventinfo._event(*teams, "", None, [], "https://events.example/w/")["sport"], "NCAAF")
+        self.assertEqual(eventinfo._event(*teams, "", None, [], "https://events.example/nba-x/")["sport"], "NCAAF")
+
     def test_live_page_with_unknown_teams_keeps_page_text(self):
         ev = eventinfo.parse(LIVE_PAGE, "https://soccer.example/watch-3/")["event"]
         self.assertEqual((ev["team_a"], ev["team_b"]), ("Corinthians", "Vitória"))

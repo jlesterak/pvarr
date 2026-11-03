@@ -52,7 +52,7 @@ LEAGUES: List[Dict] = [
     {"id": "NWSL", "name": "National Women's Soccer League", "aliases": [], "espn": "soccer/usa.nwsl"},
     {"id": "CFL", "name": "Canadian Football League", "aliases": [], "espn": "football/cfl"},
     {"id": "NCAAF", "name": "NCAA Football", "aliases": ["cfb", "college football", "ncaa fb"], "espn": "football/college-football"},
-    {"id": "NCAAM", "name": "NCAA Men's Basketball", "aliases": ["mbb", "ncaa mbb", "college basketball", "march madness"], "espn": "basketball/mens-college-basketball"},
+    {"id": "NCAAM", "name": "NCAA Men's Basketball", "aliases": ["mbb", "ncaa mbb", "ncaab", "cbb", "ncaa basketball", "college basketball", "march madness"], "espn": "basketball/mens-college-basketball"},
     {"id": "NCAAW", "name": "NCAA Women's Basketball", "aliases": ["wbb", "ncaa wbb", "womens college basketball"], "espn": "basketball/womens-college-basketball"},
     {"id": "NCAAH", "name": "NCAA Men's Ice Hockey", "aliases": ["college hockey", "ncaa hockey"], "espn": "hockey/mens-college-hockey"},
     {"id": "NCAABSB", "name": "NCAA Baseball", "aliases": ["college baseball", "ncaa baseball"], "espn": "baseball/college-baseball"},
