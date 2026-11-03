@@ -219,3 +219,4 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - [PENDING] README: add a short "How it differs" note. If you have an IPTV
   provider playlist, Dispatcharr (or DVarr for scheduled sports) is the better
   tool; PVArr is for web pages, with multi-source failover into one file.
+- [PENDING] Commercial detection misses breaks where a source replaces ads with cards. Measured on one baseball recording (1280x720, re-encoded at a flat ~1.5 Mb/s): comskip with the shipped ini caught 5% of break time. A simple rule, "audio at least 10 dB under the recording's median **and** the score overlay gone, for at least 30 s", caught ~89% with no false hits, scored against two independent signals (exact repeated footage, overlay absence). Not hand-checked yet. Cost: two FFmpeg passes (~75 s for 2.5 h), stdlib only. Awaiting a build decision; would run alongside comskip, not replace it.
