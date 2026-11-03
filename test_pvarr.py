@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -10171,7 +10172,8 @@ class TestPngWrappedSegments(unittest.TestCase):
     MPEG-TS; FFmpeg found "no stream" in them and the page check called the
     same feed "working" on some links and "not video" on others."""
 
-    TS = (b"\x47" + bytes(range(187))) * 600       # 112,800 bytes of MPEG-TS
+    # 600 packets with random payloads: real video barely compresses.
+    TS = b"".join(b"\x47" + random.Random(n).randbytes(187) for n in range(600))
 
     def test_unwrap_returns_the_ts_byte_for_byte(self):
         from app import pngwrap
@@ -10181,6 +10183,8 @@ class TestPngWrappedSegments(unittest.TestCase):
 
     def test_ordinary_and_damaged_images_are_not_unwrapped(self):
         from app import pngwrap
+        # A payload that inflates far past its gzip size is a bomb, not video.
+        self.assertIsNone(pngwrap.unwrap(_png_wrap(b"\x47" * 188 * 2000)))
         self.assertIsNone(pngwrap.unwrap(_png_wrap(b"just a picture" * 50)[:-40]))
         # A gzip that holds something other than MPEG-TS is not video.
         self.assertIsNone(pngwrap.unwrap(_png_wrap(b"<html>" * 400)))
@@ -10249,6 +10253,53 @@ class TestPngWrappedSegments(unittest.TestCase):
         self.assertEqual(sorted(fetched), [f"https://cdn.example/s{i}.image" for i in range(2, 6)])
         self.assertEqual(relay.segment(5), (200, self.TS))
         self.assertEqual(len(fetched), 4)        # served from the prefetch, not fetched again
+
+    def _relay(self, body, fetched=None, fail=None):
+        from app.relay import PlaylistRelay
+        wrapped = _png_wrap(self.TS)
+
+        def fetch(url, headers, timeout, max_bytes=0):
+            if url.endswith(".m3u8"):
+                if fail:
+                    return fail()
+                return 200, body, url
+            if fetched is not None:
+                fetched.append(url)
+            return 200, wrapped, url
+        relay = PlaylistRelay("https://cdn.example/live.m3u8", {}, fetch=fetch, unwrap_segments=True)
+        self.addCleanup(relay.stop)
+        return relay
+
+    def test_a_segment_older_than_the_cache_is_still_served(self):
+        # Review 2026-11-02: once FFmpeg ran more than the cache behind, the
+        # segment it asked for was evicted the moment it was queued: 502.
+        body = b"#EXTM3U\n" + b"".join(b"#EXTINF:5.0,\nhttps://cdn.example/s%d.image\n" % i
+                                       for i in range(20))
+        relay = self._relay(body)
+        self.assertEqual(relay.serve(0)[0], 200)
+        for sid in range(12, 20):       # fill the cache with newer segments
+            relay.segment(sid)
+        self.assertEqual(relay.segment(0), (200, self.TS))
+
+    def test_a_playlist_blip_serves_the_last_good_copy_but_a_refusal_does_not(self):
+        body = b"#EXTM3U\n#EXTINF:5.0,\nhttps://cdn.example/s0.image\n"
+        outcome = {}
+        relay = self._relay(body, fail=lambda: outcome["fail"]() if "fail" in outcome
+                            else (200, body, "https://cdn.example/live.m3u8"))
+        good = relay.serve(0)
+        self.assertEqual(good[0], 200)
+        outcome["fail"] = lambda: (503, b"", "x")
+        self.assertEqual(relay.serve(0), good)
+        outcome["fail"] = lambda: (403, b"", "x")
+        self.assertEqual(relay.serve(0)[0], 403)
+
+    def test_relay_never_reads_a_non_web_url(self):
+        body = b"#EXTM3U\n#EXTINF:5.0,\nfile:///etc/hostname\n"
+        fetched = []
+        relay = self._relay(body, fetched)
+        relay.serve(0)
+        self.assertEqual(relay.segment(0)[0], 403)
+        self.assertEqual(fetched, [])
 
     def test_ffmpeg_records_wrapped_segments_through_the_relay(self):
         import threading
@@ -10331,6 +10382,8 @@ class TestJsonSegmentList(unittest.TestCase):
         for body in (b'{"name": "app", "icons": []}', b'{"segments": [{"url": "/rel.ts", "duration": 4}]}',
                      b'{"segments": [{"url": "https://a.example/x.ts\\nevil", "duration": 4}]}',
                      b'{"segments": [{"url": "https://a.example/x.ts", "duration": true}]}',
+                     b'{"segments": [{"url": "https://a.example/x.ts", "duration": 4}]}',  # no sequence
+                     b'{"sequence": 1, "segments": [{"url": "https://a.example/x\u2028y.ts", "duration": 4}]}',
                      b"[1, 2]", b"not json"):
             self.assertIsNone(probe.as_playlist(body), body)
         self.assertEqual(probe.as_playlist(b"#EXTM3U\n"), b"#EXTM3U\n")

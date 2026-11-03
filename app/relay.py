@@ -18,11 +18,12 @@ and for the variant/rendition playlists that playlist itself lists.
 Segments packaged inside PNG images (`app/pngwrap.py`) are the exception: with
 `unwrap_segments` the relay also serves the segments, fetching each image and
 handing FFmpeg the MPEG-TS inside it. Then all of the video passes through
-here (a few Mbps on loopback, roughly 0.5 s of CPU per segment).
+here (a few Mbps on loopback, and an FFmpeg image decode per segment).
 """
 
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional, Tuple
@@ -52,6 +53,13 @@ SEGMENT_TIMEOUT = 20
 PREFETCH = 4
 PREFETCH_WORKERS = 2
 MAX_CACHED = 8
+# Below FFmpeg's -rw_timeout (15 s): past it FFmpeg has given up on the segment.
+SEGMENT_WAIT = 12
+# A reload that fails for a moment (5xx, timeout) is answered with the last
+# good playlist for this long: FFmpeg ends a live playlist on a failed reload,
+# and a full reconnect costs a re-probe and a gap. A refusal (4xx: an expired
+# token) is passed on at once, so the recorder re-resolves.
+STALE_PLAYLIST_SEC = 15
 
 _URI_ATTR = re.compile(r'URI="([^"]+)"')
 
@@ -73,16 +81,22 @@ def browser_tls_fetch(url: str, headers: Dict[str, str], timeout: int,
         resp = NoPrivateRedirects(session).get(url, headers=headers, timeout=timeout,
                                                stream=True)
         try:
-            body = b""
+            body = bytearray()      # `bytes +=` re-copied it all per chunk: ~1 s per 6 MB
             for chunk in resp.iter_content():
                 body += chunk
                 if len(body) >= max_bytes:
                     break
-            return resp.status_code, body, str(resp.url)
+            return resp.status_code, bytes(body), str(resp.url)
         finally:
             resp.close()
     finally:
         session.close()
+
+
+def _is_web_url(url: str) -> bool:
+    """Only http(s): the fetch client also opens file:// and other schemes,
+    and a playlist is untrusted text naming whatever it likes."""
+    return urlsplit(url).scheme.lower() in ("http", "https")
 
 
 class PlaylistRelay:
@@ -96,6 +110,7 @@ class PlaylistRelay:
         self._loads: Dict[int, "Future[Tuple[int, bytes]]"] = {}
         self._pool: Optional[ThreadPoolExecutor] = None
         self._stopped = False
+        self._last_good: Dict[int, Tuple[float, bytes]] = {}
         self._headers = dict(headers)
         self._fetch = fetch or browser_tls_fetch
         self._lock = threading.Lock()
@@ -172,14 +187,16 @@ class PlaylistRelay:
             if not 0 <= index < len(self._playlists):
                 return 404, b""
             upstream = self._playlists[index]
+        if not _is_web_url(upstream):
+            return 403, b""
         if index and not self._allow_private and is_private_url(upstream):
             return 403, b""
         try:
             status, body, final_url = self._fetch(upstream, self._headers, FETCH_TIMEOUT)
         except Exception:  # any upstream failure is FFmpeg's to retry
-            return 502, b""
+            return self._stale(index, 502)
         if status != 200:
-            return status, b""
+            return self._stale(index, status) if status >= 500 else (status, b"")
         # A JSON segment list (`probe.as_playlist`) is handed over as m3u8.
         playlist = as_playlist(body)
         if playlist is None:
@@ -193,9 +210,18 @@ class PlaylistRelay:
             return 403, b""
         listed: List[int] = []
         rewritten = self.rewrite(text, base, listed).encode("utf-8")
+        with self._lock:
+            self._last_good[index] = (time.monotonic(), rewritten)
         for sid in listed[-PREFETCH:]:
             self._load_async(sid)
         return 200, rewritten
+
+    def _stale(self, index: int, status: int) -> Tuple[int, bytes]:
+        with self._lock:
+            last = self._last_good.get(index)
+        if last and time.monotonic() - last[0] <= STALE_PLAYLIST_SEC:
+            return 200, last[1]
+        return status, b""
 
     def _load_async(self, sid: int) -> "Future[Tuple[int, bytes]]":
         """The (possibly still running) fetch of one listed segment."""
@@ -210,8 +236,13 @@ class PlaylistRelay:
                                                     thread_name_prefix="pvarr-segment")
                 load = self._pool.submit(self._load, sid)
                 self._loads[sid] = load
+                # Evict the oldest finished segment, else the oldest other one;
+                # never the one just asked for (it is often the oldest when
+                # FFmpeg runs behind, and evicting it handed FFmpeg a 502).
                 while len(self._loads) > MAX_CACHED:
-                    self._loads.pop(min(self._loads)).cancel()
+                    others = sorted(k for k in self._loads if k != sid)
+                    victim = next((k for k in others if self._loads[k].done()), others[0])
+                    self._loads.pop(victim).cancel()
             return load
 
     def segment(self, sid: int) -> Tuple[int, bytes]:
@@ -222,7 +253,7 @@ class PlaylistRelay:
         recording's segment-loss count still sees it.
         """
         try:
-            return self._load_async(sid).result(timeout=SEGMENT_TIMEOUT * 2)
+            return self._load_async(sid).result(timeout=SEGMENT_WAIT)
         except Exception:   # cancelled (evicted), timed out, or the pool is gone
             return 502, b""
 
@@ -231,6 +262,8 @@ class PlaylistRelay:
             upstream = self._segments.get(sid)
         if upstream is None:
             return 404, b""
+        if not _is_web_url(upstream):   # file:// and friends: never read
+            return 403, b""
         if not self._allow_private and is_private_url(upstream):
             return 403, b""
         try:

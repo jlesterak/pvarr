@@ -8,18 +8,30 @@ encrypted; it is gzip inside an image. FFmpeg cannot read it, so the relay
 (`app/relay.py`) hands FFmpeg the unwrapped TS instead.
 
 Recognised by shape only: a PNG whose pixel bytes start with a gzip member,
-right after its length, that inflates to MPEG-TS. Standard library only; one
-~2.5 MB segment takes about 0.2 s of CPU.
+right after its length, that inflates to MPEG-TS. The image is decoded by the
+FFmpeg PVArr already ships (about 0.1 s per ~2.5 MB segment, outside Python's
+GIL); a pure-Python decode cost 0.4-1.8 s depending on the encoder's filters.
 """
 
 import struct
+import subprocess
 import zlib
 from typing import Optional
 
+from app.check_deps import find_executable
+
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_WRAPPED_BYTES = 16 * 1024 * 1024     # one segment as served
-MAX_PIXEL_BYTES = 64 * 1024 * 1024       # inflated image data
-MAX_TS_BYTES = 64 * 1024 * 1024          # inflated payload
+# Real segments are 3-6 MB. The payload is gzip, which does not compress
+# again, so a genuine image inflates to about its own size and its payload to
+# about the gzip's: a large ratio is a decompression bomb, refused before
+# anything inflates it or a cache holds the result.
+MAX_PIXEL_BYTES = 24 * 1024 * 1024       # inflated image data
+MAX_TS_BYTES = 24 * 1024 * 1024          # inflated payload
+MAX_PIXEL_RATIO = 4                      # inflated image data / IDAT bytes
+MAX_TS_RATIO = 10                        # payload / gzip bytes
+MAX_IDAT_CHUNKS = 10000
+DECODE_TIMEOUT_SEC = 10
 # The marker before the payload is short; looking further would only invite
 # false hits inside ordinary image data.
 _HEADER_SEARCH = 64
@@ -32,67 +44,51 @@ def is_png(data: bytes) -> bool:
 
 
 def png_pixels(data: bytes) -> Optional[bytes]:
-    """The raw, unfiltered pixel bytes of an 8-bit RGB/RGBA, non-interlaced PNG.
+    """The raw pixel bytes of an 8-bit RGB/RGBA, non-interlaced PNG.
 
-    None for anything else (other formats, damaged or oversized files).
+    None for anything else (other formats, damaged or oversized files). The
+    header is checked here; FFmpeg does the decode (argv list, stdin/stdout,
+    killed on timeout by `subprocess.run`, so no child outlives the call).
     """
     if not is_png(data) or len(data) > MAX_WRAPPED_BYTES:
         return None
-    pos, idat, header = 8, [], None
+    pos, idat_bytes, idat_chunks, header = 8, 0, 0, None
     try:
         while pos + 8 <= len(data):
             length, kind = struct.unpack(">I4s", data[pos:pos + 8])
-            chunk = data[pos + 8:pos + 8 + length]
-            if len(chunk) < length:
+            if pos + 12 + length > len(data):
                 return None
             if kind == b"IHDR":
-                header = struct.unpack(">IIBBBBB", chunk[:13])
+                header = struct.unpack(">IIBBBBB", data[pos + 8:pos + 21])
             elif kind == b"IDAT":
-                idat.append(chunk)
+                idat_bytes += length
+                idat_chunks += 1
+                if idat_chunks > MAX_IDAT_CHUNKS:
+                    return None
             elif kind == b"IEND":
                 break
             pos += 12 + length
-        if header is None or not idat:
-            return None
-        width, height, depth, colour, _, _, interlace = header
-        bpp = _CHANNELS.get(colour)
-        if depth != 8 or bpp is None or interlace or not width or not height:
-            return None
-        stride = width * bpp
-        if (stride + 1) * height > MAX_PIXEL_BYTES:
-            return None
-        raw = zlib.decompressobj().decompress(b"".join(idat), (stride + 1) * height)
-    except (struct.error, zlib.error):
+    except struct.error:
         return None
-    if len(raw) < (stride + 1) * height:
+    if header is None or not idat_bytes:
         return None
-    out = bytearray()
-    prev = bytearray(stride)
-    for y in range(height):
-        start = y * (stride + 1)
-        kind = raw[start]
-        line = bytearray(raw[start + 1:start + 1 + stride])
-        if kind == 1:        # Sub
-            for i in range(bpp, stride):
-                line[i] = (line[i] + line[i - bpp]) & 0xFF
-        elif kind == 2:      # Up
-            line = bytearray((a + b) & 0xFF for a, b in zip(line, prev))
-        elif kind == 3:      # Average
-            for i in range(stride):
-                left = line[i - bpp] if i >= bpp else 0
-                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
-        elif kind == 4:      # Paeth
-            for i in range(stride):
-                a = line[i - bpp] if i >= bpp else 0
-                b = prev[i]
-                c = prev[i - bpp] if i >= bpp else 0
-                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
-                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
-        elif kind != 0:
-            return None
-        out += line
-        prev = line
-    return bytes(out)
+    width, height, depth, colour, _, _, interlace = header
+    bpp = _CHANNELS.get(colour)
+    if depth != 8 or bpp is None or interlace or not width or not height:
+        return None
+    size = width * bpp * height
+    if size > MAX_PIXEL_BYTES or size > MAX_PIXEL_RATIO * idat_bytes:
+        return None
+    cmd = [find_executable("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-v", "error",
+           "-f", "png_pipe", "-i", "pipe:0",
+           "-f", "rawvideo", "-pix_fmt", "rgb24" if bpp == 3 else "rgba", "pipe:1"]
+    try:
+        res = subprocess.run(cmd, input=data, capture_output=True, timeout=DECODE_TIMEOUT_SEC)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0 or len(res.stdout) != size:
+        return None
+    return res.stdout
 
 
 def unwrap(data: bytes) -> Optional[bytes]:
@@ -106,9 +102,12 @@ def unwrap(data: bytes) -> Optional[bytes]:
     (length,) = struct.unpack(">I", pixels[at - 4:at])
     if not 0 < length <= len(pixels) - at:
         return None
+    inflate = zlib.decompressobj(31)
     try:
-        ts = zlib.decompressobj(31).decompress(pixels[at:at + length], MAX_TS_BYTES)
+        ts = inflate.decompress(pixels[at:at + length], min(MAX_TS_BYTES, MAX_TS_RATIO * length))
     except zlib.error:
+        return None
+    if not inflate.eof:     # cut off at the cap (or truncated): not a whole segment
         return None
     # MPEG-TS: sync byte every 188 bytes, three packets seen.
     if len(ts) >= 377 and ts[0] == ts[188] == ts[376] == 0x47:

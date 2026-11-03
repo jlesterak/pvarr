@@ -57,7 +57,8 @@ The same relay handles two packagings FFmpeg cannot read on its own:
   pixels hold a gzip of ordinary MPEG-TS. The probe recognises the shape on the
   first segment ("PNG-wrapped video") and the relay fetches each image, unpacks
   it and hands FFmpeg the MPEG-TS. Here the video itself passes through PVArr:
-  a few Mbps on loopback and roughly half a second of CPU per segment. To keep
+  a few Mbps on loopback and one short FFmpeg image decode per segment (about
+  0.1 s on a desktop, several times that on a Raspberry Pi). To keep
   FFmpeg from waiting, the relay fetches the newest few segments as soon as the
   playlist lists them. An image that holds no video is reported as *images, not
   video* and is never picked.

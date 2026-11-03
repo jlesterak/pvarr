@@ -166,9 +166,15 @@ def json_segment_list(body: bytes) -> Optional[str]:
         url, secs = seg.get("url"), seg.get("duration")
         if (not isinstance(url, str) or not url.startswith(("http://", "https://"))
                 or not isinstance(secs, (int, float)) or isinstance(secs, bool)
-                or not 0 < secs <= 60 or "\n" in url or "\r" in url):
+                or not 0 < secs <= 60
+                or any(c.isspace() or not c.isprintable() for c in url)):
             return None
         rows.append((url, float(secs), seg.get("sn"), seg.get("cc")))
+
+    # Without a sequence number a sliding window looks unchanged on every
+    # reload, and FFmpeg would never fetch past its first segments.
+    if not isinstance(rows[0][2], int) and not isinstance(data.get("sequence"), int):
+        return None
 
     def whole(value, default: int) -> int:
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else default
