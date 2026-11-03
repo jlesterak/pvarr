@@ -714,18 +714,41 @@ def probe_stream(
             result["message"] = f"Could not open {target}: {exc}"
             return result
 
+        page_session = session
+        if resp.status_code in (401, 403):
+            # Same rule as for playlists below: some pages answer only a
+            # browser-compatible TLS client. The embeds it leads to are then
+            # walked with that client too. (A challenge page still fails.)
+            result["attempts"].append({"stage": "page", "url": target,
+                                       "status": resp.status_code})
+            tls_session = _browser_tls_session()
+            if tls_session is not None:
+                try:
+                    tls_resp, tls_body = _fetch(tls_session, target, page_headers, timeout,
+                                                max_bytes=PAGE_MAX_BYTES)
+                    if tls_resp.ok:
+                        resp, body, page_session = tls_resp, tls_body, tls_session
+                    else:
+                        result["attempts"].append({"stage": "page", "url": target,
+                                                   "status": tls_resp.status_code,
+                                                   "note": "with a browser TLS profile"})
+                except _FETCH_ERRORS as exc:
+                    result["attempts"].append({"stage": "page", "url": target, "error": str(exc),
+                                               "note": "with a browser TLS profile"})
+
         result["attempts"].append({
             "stage": "page",
             "url": target,
             "status": resp.status_code,
-            "note": "served a playlist directly" if _is_playlist_body(body) else "scraped for an m3u8",
+            "note": ("served a playlist directly" if _is_playlist_body(body) else "scraped for an m3u8")
+                    + (" (browser TLS profile)" if page_session is not session else ""),
         })
 
         if _is_playlist_body(body):
             playlists = [resp.url]
         else:
             page_url, playlists = _follow_embeds(
-                session, resp.url, body, page_headers, timeout, result["attempts"],
+                page_session, resp.url, body, page_headers, timeout, result["attempts"],
                 allow_private=is_private_url(target))
             if not playlists:
                 result["page_url"] = resp.url
@@ -751,6 +774,11 @@ def probe_stream(
                 return result
 
     last_status = None
+    # A page often lists several playlists (mirrors, backup paths). The first
+    # that resolves is kept only if its segment check passed; otherwise it is
+    # held as a fallback while the rest are tried. Seen live: the first of six
+    # answered 504 on every segment while the fifth served video at 3.8x.
+    fallback: Optional[Dict[str, Any]] = None
     # Second pass, only when every plain attempt was refused: some origins
     # answer only a browser-compatible TLS client (measured 2026-09-01: one
     # browser profile 200, every other client 403 with identical headers).
@@ -777,9 +805,19 @@ def probe_stream(
                     result["dns_blocked"] = isinstance(exc, DnsBlockedError)
                     return result
                 if found is True:
-                    return result
+                    if result.get("segment_ok") is True or not check_segment:
+                        return result
+                    if fallback is None:
+                        fallback = {k: v for k, v in result.items() if k != "attempts"}
+                    result.update(ok=False, segment_ok=None, wrapped=False, json_playlist=False,
+                                  segment_image=False)
+                    break   # next playlist; other headers would only repeat this
                 if found is not None:
                     last_status = found
+
+    if fallback is not None:
+        result.update(fallback)
+        return result
 
     failed_url = playlists[0] if playlists else target
     origin_status = _check_origin(session, failed_url, ua, timeout, result["attempts"])

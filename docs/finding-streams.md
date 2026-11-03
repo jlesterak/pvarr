@@ -51,6 +51,15 @@ every few seconds); FFmpeg still downloads the video straight from the CDN. The
 log says `[Relay] Playlist is only served to a browser TLS profile` when this happens,
 and the Add Recording check line says *relayed*.
 
+A page that answers 401/403 to the probe's ordinary client is fetched once more
+with the same browser TLS profile, and the players it embeds are walked with
+it. A page showing a challenge ("Just a moment...") still fails here; the
+event-page FlareSolverr fallback is the route for those.
+
+When a player names several playlists, the probe does not stop at the first
+that loads: it keeps the first whose segment check passes, and falls back to
+the first that loaded only if none does.
+
 The same relay handles two packagings FFmpeg cannot read on its own:
 
 - **Segments packed inside PNG images.** Each segment is a real image whose

@@ -4304,6 +4304,60 @@ class ProbeTestCase(unittest.TestCase):
             return probe_mod.probe_stream(url, **kwargs)
 
 
+class TestProbeFindsTheWorkingPlaylist(ProbeTestCase):
+    """2026-11-02: a link whose page answered 403 to the plain client (200 to
+    a browser TLS profile, no challenge) led to a player listing six
+    playlists; the first answered 504 on every segment, the fifth served
+    video. The probe stopped at the 403, and from the player it kept the
+    first playlist that resolved."""
+
+    PAGE = b"<html><iframe src=\"https://player.example/live.php\"></iframe></html>"
+    PLAYER = (b'<script>const streamUrls = ["https://a.example/live/x/master.m3u8?st=1",'
+              b'"https://b.example/live3/x/index.m3u8?st=2"];</script>')
+    TS = b"\x47" + b"\x00" * 4000
+
+    def handler(self, url, headers):
+        if url.startswith("https://player.example/"):
+            return FakeResponse(url, 200, self.PLAYER)
+        if ".m3u8" in url:
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+        if url.startswith("https://a.example/"):
+            return FakeResponse(url, 504, b"<html>gateway timeout</html>")
+        if url.startswith("https://b.example/"):
+            return FakeResponse(url, 206, self.TS)
+        return FakeResponse(url, 404)
+
+    def test_the_playlist_with_working_segments_is_chosen(self):
+        result = self.probe(self.handler, "https://player.example/live.php")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["segment_ok"])
+        self.assertTrue(result["m3u8_url"].startswith("https://b.example/live3/"))
+
+    def test_a_resolving_playlist_is_still_the_fallback(self):
+        def all_bad(url, headers):
+            r = self.handler(url, headers)
+            return FakeResponse(url, 504) if url.startswith("https://b.example/live3/x/seg") else r
+        result = self.probe(all_bad, "https://player.example/live.php")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["m3u8_url"].startswith("https://a.example/"))
+
+    def test_a_page_refused_to_the_plain_client_is_read_with_the_browser_profile(self):
+        def plain(url, headers):
+            if url.startswith("https://site.example/"):
+                return FakeResponse(url, 403, b"forbidden")
+            return self.handler(url, headers)
+
+        def browser(url, headers):
+            if url.startswith("https://site.example/"):
+                return FakeResponse(url, 200, self.PAGE)
+            return self.handler(url, headers)
+        self.browser_tls_handler = browser
+        result = self.probe(plain, "https://site.example/game")
+        self.assertTrue(result["ok"], result["message"])
+        self.assertTrue(result["m3u8_url"].startswith("https://b.example/"))
+        self.assertIn("browser TLS", " ".join(a.get("note", "") for a in result["attempts"]))
+
+
 class TestProbeUrlCleaning(unittest.TestCase):
     def test_strips_quotes_and_whitespace(self):
         from app.probe import clean_url
