@@ -735,8 +735,8 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
             outcome = commercials.process(str(final))
             if outcome.get("ran"):
                 logger.info(
-                    "Commercial detection on %s: %s breaks found, chapters %s.",
-                    final.name, outcome["breaks"],
+                    "Commercial detection on %s: %s breaks found (%s from break cards), chapters %s.",
+                    final.name, outcome["breaks"], outcome.get("card_breaks", 0),
                     "written" if outcome["applied"] else "not written",
                 )
         except Exception as exc:

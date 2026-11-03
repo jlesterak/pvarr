@@ -6295,9 +6295,11 @@ class TestCommercialGating(unittest.TestCase):
         from unittest.mock import patch
         with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
              patch.object(commercials, "comskip_path", return_value=None), \
+             patch.object(commercials.breakcards, "detect", return_value=[]) as cards, \
              patch.object(commercials, "detect") as detect:
             out = commercials.process("/tmp/whatever.mp4")
         detect.assert_not_called()
+        cards.assert_called_once()          # the card pass needs only FFmpeg
         self.assertFalse(out["ran"])
 
 
@@ -10499,6 +10501,166 @@ class TestJsonSegmentList(unittest.TestCase):
         self.assertEqual(quality.source_key(a), quality.source_key(b))
         self.assertNotEqual(quality.source_key(a),
                             quality.source_key(b.replace("abc.json", "xyz.json")))
+
+
+class TestBreakCards(unittest.TestCase):
+    """Breaks a source fills with its own card: quiet audio AND overlay gone."""
+
+    W = 64 * 36
+
+    def _frame(self, overlay: bool, seed: int, partial: float = 0.0) -> bytes:
+        rnd = random.Random(seed)
+        px = bytearray(rnd.randrange(30, 230) for _ in range(self.W))   # moving picture
+        for i, p in enumerate(range(31 * 64 + 48, 31 * 64 + 62)):       # a 14x2 overlay
+            for row in (0, 64):
+                if overlay and not (partial and i < 14 * partial):
+                    px[p + row] = 240
+        return bytes(px)
+
+    def _clip(self, layout):
+        """layout: list of (seconds, loud, overlay[, partial]); one keyframe a second."""
+        rms, times, frames, t = [], [], [], 0
+        for seg in layout:
+            secs, loud, overlay = seg[:3]
+            partial = seg[3] if len(seg) > 3 else 0.0
+            for _ in range(secs):
+                rms.append(-27.0 if loud else -45.0)
+                times.append(float(t))
+                frames.append(self._frame(overlay, t, partial))
+                t += 1
+        return rms, times, frames
+
+    def test_a_card_break_is_found(self):
+        from app import breakcards
+        rms, times, frames = self._clip([(600, True, True), (120, False, False), (600, True, True)])
+        spans = breakcards.find_breaks(rms, times, frames)
+        self.assertEqual(len(spans), 1)
+        start, end = spans[0]
+        self.assertLess(abs(start - 600), 20)
+        self.assertLess(abs(end - 720), 20)
+
+    def test_a_replay_or_a_quiet_spell_alone_is_not_a_break(self):
+        from app import breakcards
+        rms, times, frames = self._clip([
+            (600, True, True), (90, True, False),     # replay: overlay gone, loud
+            (600, True, True), (90, False, True),     # quiet play: overlay stays
+            (600, True, True), (120, False, False), (300, True, True)])
+        spans = breakcards.find_breaks(rms, times, frames)
+        self.assertEqual(len(spans), 1, spans)
+        self.assertLess(abs(spans[0][0] - 1980), 20)
+
+    def test_a_score_change_does_not_read_as_the_overlay_leaving(self):
+        """A few digit pixels changing during a quiet stretch must not count."""
+        from app import breakcards
+        rms, times, frames = self._clip([
+            (600, True, True), (90, False, True, 0.3),
+            (600, True, True), (120, False, False), (300, True, True)])
+        spans = breakcards.find_breaks(rms, times, frames)
+        self.assertEqual(len(spans), 1, spans)
+
+    def test_no_steady_overlay_means_no_breaks_rather_than_an_audio_guess(self):
+        from app import breakcards
+        rms, times, frames = self._clip([(600, True, False), (120, False, False), (600, True, False)])
+        self.assertEqual(breakcards.find_breaks(rms, times, frames), [])
+
+    def test_ffmpeg_output_parsing(self):
+        from app import breakcards
+        text = ("frame:0    pts:0       pts_time:0\nlavfi.astats.Overall.RMS_level=-27.5\n"
+                "frame:1    pts:8000    pts_time:1\nlavfi.astats.Overall.RMS_level=-inf\n")
+        self.assertEqual(breakcards.parse_rms(text), [-27.5, breakcards.SILENT_DB])
+        raw = b"\x01" * self.W * 3
+        log = "\n".join(f"[Parsed_showinfo_0 @ 0x1] n:{i} pts_time:{t}" for i, t in
+                        enumerate((0.0, 0.5, 1.4)))
+        times, frames = breakcards.parse_frames(raw, log)
+        self.assertEqual(times, [0.0, 1.4])           # frames under 1 s apart dropped
+        self.assertEqual(breakcards.parse_frames(raw, log + "\n" + log), ([], []))
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_end_to_end_on_a_generated_clip(self):
+        """Real FFmpeg passes: moving picture with a box in the corner and a
+        loud tone; from 60 to 130 s the box goes and the tone drops 20 dB."""
+        from app import breakcards
+        tmp = Path(tempfile.mkdtemp(prefix="pvarr-cards-test-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        clip = tmp / "clip.mp4"
+        subprocess.run([
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=240",
+            "-f", "lavfi", "-i", "sine=f=440:d=240",
+            "-vf", "drawbox=x=250:y=150:w=60:h=20:color=white:t=fill:enable='not(between(t,60,130))'",
+            "-af", "volume='if(between(t,60,130),0.1,1)':eval=frame",
+            "-c:v", "libx264", "-g", "10", "-preset", "ultrafast", "-c:a", "aac", "-shortest",
+            str(clip)], check=True, timeout=120)
+        spans = breakcards.detect(str(clip))
+        self.assertEqual(len(spans), 1, spans)
+        self.assertLess(abs(spans[0][0] - 60), 20)
+        self.assertLess(abs(spans[0][1] - 130), 20)
+
+
+class TestCommercialsWithCards(unittest.TestCase):
+    """How the card pass and comskip combine in process()."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pvarr-com-cards-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.video = self.tmp / "game.mp4"
+        self.video.write_bytes(b"recording")
+
+    def _run(self, found, cards, apply_results=(True,), duration=1000.0):
+        from unittest.mock import patch
+        applied = []
+
+        def fake_apply(video, meta):
+            applied.append(Path(meta).read_text())
+            return apply_results[min(len(applied) - 1, len(apply_results) - 1)]
+
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1", "PVARR_COMSKIP_MODE": "chapters"}), \
+             patch.object(commercials, "comskip_path", return_value="/usr/bin/comskip" if found is not False else None), \
+             patch.object(commercials, "detect", return_value=found or None), \
+             patch.object(commercials.breakcards, "detect", side_effect=cards if callable(cards) else None, return_value=cards), \
+             patch.object(commercials, "media_duration", return_value=duration), \
+             patch.object(commercials, "record_stats"), \
+             patch.object(commercials, "apply_chapters", side_effect=fake_apply):
+            return commercials.process(str(self.video)), applied
+
+    def _found(self):
+        scratch = Path(tempfile.mkdtemp(prefix="pvarr-com-scratch-"))
+        self.addCleanup(shutil.rmtree, scratch, True)
+        meta = scratch / "comskip.ffmeta"
+        meta.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/100\nSTART=0\nEND=100\ntitle=comskip\n")
+        return {"workdir": scratch, "ffmeta": str(meta), "edl": "", "breaks": [(100.0, 200.0)]}
+
+    def test_without_comskip_the_card_pass_still_writes_chapters(self):
+        out, applied = self._run(False, [(300.0, 420.0)])
+        self.assertTrue(out["ran"] and out["applied"])
+        self.assertEqual(out["card_breaks"], 1)
+        self.assertIn("START=300000", applied[0])
+        self.assertIn("title=Commercial", applied[0])
+
+    def test_one_chapter_write_carries_both_detectors(self):
+        out, applied = self._run(self._found(), [(150.0, 260.0), (500.0, 600.0)])
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(out["breaks"], 2)            # 100-200 and 150-260 merged
+        self.assertIn("START=100000\nEND=260000", applied[0])
+
+    def test_a_failed_card_pass_still_leaves_comskip_chapters(self):
+        def boom(_):
+            raise RuntimeError("card pass exploded")
+        out, applied = self._run(self._found(), boom)
+        self.assertTrue(out["applied"])
+        self.assertIn("title=comskip", applied[0])
+
+    def test_if_our_chapter_file_will_not_apply_comskips_still_does(self):
+        out, applied = self._run(self._found(), [(500.0, 600.0)], apply_results=(False, True))
+        self.assertEqual(len(applied), 2)
+        self.assertIn("title=comskip", applied[1])
+        self.assertTrue(out["applied"])
+
+    def test_chapters_cover_the_whole_file(self):
+        path = self.tmp / "c.ffmeta"
+        text = Path(commercials.write_ffmeta([(100.0, 200.0)], 1000.0, path)).read_text()
+        self.assertEqual(re.findall(r"title=(\w+)", text), ["Show", "Commercial", "Show"])
+        self.assertIn("END=1000000", text)
 
 
 if __name__ == "__main__":

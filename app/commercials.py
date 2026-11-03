@@ -24,7 +24,8 @@ leans on station logos, black frames, aspect changes and audio silence. On a
 rebroadcast OTA channel that is exactly right. On a stream that fills its
 breaks with an animated "commercial break in progress" card it has much less to
 work with -- such a card is not black, not silent, and not frozen, so the
-obvious signals all miss it.
+obvious signals all miss it. app/breakcards.py covers that case; process()
+combines both detectors' breaks into one chapter write.
 """
 
 import csv
@@ -39,6 +40,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from app import breakcards
 from app.check_deps import find_executable
 from app.sessions import config_dir
 
@@ -447,36 +449,98 @@ def record_stats(video_path: str, breaks: List[Tuple[float, float]],
     return path
 
 
+def merge_ranges(ranges: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Sorted union of break ranges; overlapping or touching ones become one."""
+    merged: List[List[float]] = []
+    for start, end in sorted(ranges):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
+
+
+def write_ffmeta(breaks: List[Tuple[float, float]], duration: float, path: Path) -> str:
+    """Chapters for the whole file, alternating Show and Commercial.
+
+    Used instead of comskip's own file when the break-card pass added breaks,
+    so one chapter write carries both. Titles are constants: nothing from a
+    file name or a stream reaches this file.
+    """
+    lines = [";FFMETADATA1"]
+    cursor = 0.0
+    marks: List[Tuple[float, float, str]] = []
+    for start, end in merge_ranges(breaks):
+        start, end = max(0.0, start), min(duration, end)
+        if end <= start:
+            continue
+        if start > cursor:
+            marks.append((cursor, start, "Show"))
+        marks.append((start, end, "Commercial"))
+        cursor = end
+    if duration > cursor:
+        marks.append((cursor, duration, "Show"))
+    for start, end, title in marks:
+        lines += ["[CHAPTER]", "TIMEBASE=1/1000",
+                  f"START={int(start * 1000)}", f"END={int(end * 1000)}", f"title={title}"]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
 def process(video_path: str) -> Dict[str, Any]:
     """Detect commercials and mark (or remove) them. Never raises.
 
-    Returns a small summary for the log and the session record.
+    Two detectors: comskip, when installed, and the break-card pass (needs
+    only FFmpeg). Their breaks are combined. Returns a small summary for the
+    log and the session record.
     """
-    result: Dict[str, Any] = {"ran": False, "breaks": 0, "mode": mode(),
-                              "applied": False, "cut": False}
+    result: Dict[str, Any] = {"ran": False, "breaks": 0, "card_breaks": 0,
+                              "mode": mode(), "applied": False, "cut": False}
     if not enabled():
         return result
-    if not comskip_path():
-        logger.info("PVARR_COMSKIP is on but comskip is not installed; skipping.")
-        return result
 
-    found = detect(video_path)
-    if not found:
-        return result
-
-    result["ran"] = True
-    result["breaks"] = len(found["breaks"])
+    found: Optional[Dict[str, Any]] = None
+    if comskip_path():
+        found = detect(video_path)
+    else:
+        logger.info("comskip is not installed; running the break-card pass only.")
     try:
-        record_stats(video_path, found["breaks"], result["mode"])
-        if found["ffmeta"]:
+        cards = breakcards.detect(video_path)
+    except Exception as exc:        # belt and braces: detect() already never raises
+        logger.warning("Break-card pass failed on %s: %s", Path(video_path).name, exc)
+        cards = []
+    if not found and not cards:
+        return result
+
+    workdir = found["workdir"] if found else Path(tempfile.mkdtemp(prefix="pvarr-cards-"))
+    breaks = merge_ranges(list(found["breaks"] if found else []) + list(cards))
+    result.update(ran=True, breaks=len(breaks), card_breaks=len(cards))
+    try:
+        record_stats(video_path, breaks, result["mode"])
+        # One chapter write: PVArr's own file when cards added breaks, comskip's
+        # otherwise. If ours cannot be written or applied, comskip's chapters
+        # still go in.
+        meta = ""
+        if cards:
+            duration = media_duration(video_path)
+            if duration:
+                try:
+                    meta = write_ffmeta(breaks, duration, Path(workdir) / "pvarr-chapters.ffmeta")
+                except OSError as exc:
+                    logger.warning("Could not write chapter file: %s", exc)
+        if meta:
+            result["applied"] = apply_chapters(video_path, meta)
+        if not result["applied"] and found and found["ffmeta"]:
             result["applied"] = apply_chapters(video_path, found["ffmeta"])
-        if result["mode"] == "cut" and found["breaks"]:
+        if result["mode"] == "cut" and breaks:
             # Chapters were written first deliberately: if the cut refuses its
             # own verification, the operator is left with a marked-up recording
             # rather than nothing.
-            result["cut"] = cut_breaks(video_path, found["breaks"])
+            result["cut"] = cut_breaks(video_path, breaks)
     finally:
-        _discard_workdir(found.get("workdir"), video_path)
+        _discard_workdir(workdir, video_path)
     return result
 
 
