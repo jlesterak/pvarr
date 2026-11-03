@@ -120,6 +120,11 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - [PENDING] If an upstream re-signs segment URLs on every reload, each reload looks like new segments: up to four extra image fetches and cache churn. Not seen yet; keying on the path alone could merge distinct segments, so it waits for a real case.
 - [PENDING] Live page check showing both providers picked as independent sources, and a full game recorded on them.
 
+## Open after the 2026-11-02 evening
+- [PENDING] Provider A (JSON segment list, PNG-wrapped) froze for 15 s twice in about 40 minutes of one game, with no relay error logged; each cost ~25 s and a failover to a slower source, then a manual switch back. Cause unknown: find out whether the JSON list stopped advancing, a segment fetch hung, or the relay's prefetch fell behind.
+- [PENDING] On a loaded 3-core host, FlareSolverr took 95-120 s to solve an event page against PVArr's 120 s limit, so Events-tab loads sometimes time out. Measure before raising the limit.
+- [PENDING] Nothing stops a working link that plays a different game from being recorded under the scheduled game's name (seen on a college game where every playable link was another game). Needs a design idea before code.
+
 ## Protocol-relative base64 stream URLs (fixed 2026-11-02)
 - Symptom: three of five links on a college basketball event page led to one player that loads `atob("Ly9...index.m3u8")`, a protocol-relative URL; the probe decoded base64 only when it starts "aHR0c" ("http"), so all three were "no playlist". Fix: "Ly9" ("//") is accepted too. Proof: `test_protocol_relative_base64_stream_url_is_decoded` (fails on the old probe). At the time the decoded playlist answered 404 (channel not yet live), so recording it is still unproven.
 
