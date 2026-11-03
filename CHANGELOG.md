@@ -4,6 +4,20 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-02
+
+### Added
+- Segments packed inside PNG images (video carried as a gzip of MPEG-TS in the pixels) are recognised and recorded: the probe and quality check unwrap them, and the loopback relay hands FFmpeg the MPEG-TS, fetching new segments as soon as the playlist lists them. The image is decoded by the bundled FFmpeg.
+- Playlists delivered as a JSON segment list (`segments` with `url` and `duration`) are found next to an `.m3u8` in a player page and served to FFmpeg as m3u8 by the relay.
+- A page that answers 401/403 to the probe's ordinary client is fetched again with the browser TLS profile, and its embeds are walked with it.
+- When a player lists several playlists, the probe keeps the first whose segment check passes rather than the first that loads.
+- `/api/probe` and `/api/status` add `wrapped` / `png_wrapped` and `json_playlist`.
+
+### Fixed
+- The single-URL probe could call a stream whose segments are plain images "resolved"; it now fails with "segments are images, not video".
+- Mirrors whose playlist URLs differ only by a long token in the path now share a source letter.
+- The relay refuses non-http(s) URIs and keeps serving the last good playlist through a brief 5xx/timeout instead of ending FFmpeg's run.
+
 ## [0.13.0] - 2026-11-01
 
 ### Added
