@@ -11,7 +11,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Dict, Any
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("ProcessCleanup")
 
@@ -37,8 +37,14 @@ def _shutdown_timeout() -> float:
         return DEFAULT_SHUTDOWN_TIMEOUT_SEC
 
 
-def stop_all(active_recorders_ref: dict, timeout: float) -> bool:
+def stop_all(active_recorders_ref: dict, timeout: float,
+             before_stop: Optional[Callable[[str, Any], None]] = None) -> bool:
     """Stop every recorder, then wait for post-processing within one budget.
+
+    `before_stop(rec_id, recorder)` runs first for each one, before anything
+    is killed: the server marks the session "interrupted by shutdown" there,
+    while there is still time to write it (Docker's SIGKILL can land before
+    the completion callback ever runs).
 
     Stopping and waiting are separate passes on purpose: stop() returns as soon
     as FFmpeg is reaped, so stopping everything first lets all the remuxes run
@@ -48,6 +54,11 @@ def stop_all(active_recorders_ref: dict, timeout: float) -> bool:
     """
     recorders = list(active_recorders_ref.items())
     for rec_id, recorder in recorders:
+        if before_stop is not None:
+            try:
+                before_stop(rec_id, recorder)
+            except Exception as exc:
+                logger.error("Error marking recorder %s before stopping it: %s", rec_id, exc)
         try:
             logger.info("Stopping active recorder session: %s", rec_id)
             # "shutdown", not the default "operator": the recording is not
@@ -74,7 +85,8 @@ def stop_all(active_recorders_ref: dict, timeout: float) -> bool:
     return all_done
 
 
-def register_signal_handlers(active_recorders_ref: dict):
+def register_signal_handlers(active_recorders_ref: dict,
+                             before_stop: Optional[Callable[[str, Any], None]] = None):
     """Stop recorders on SIGINT/SIGTERM, then chain to the previous handler.
 
     This used to call sys.exit(0) directly, which had two consequences. It
@@ -99,7 +111,7 @@ def register_signal_handlers(active_recorders_ref: dict):
         shutting_down.set()
         logger.info("Received %s. Stopping active recordings...", sig_name)
 
-        finished = stop_all(active_recorders_ref, _shutdown_timeout())
+        finished = stop_all(active_recorders_ref, _shutdown_timeout(), before_stop)
         logger.info(
             "Active recordings stopped%s.",
             "" if finished else " (post-processing incomplete)",

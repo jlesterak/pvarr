@@ -57,6 +57,11 @@ DEFAULT_MAX_RESUME_ATTEMPTS = 3
 # its attempt count starts over. Without this the limit was for life, so a
 # triple-boot plus one later restart finalised a healthy recording mid-game.
 RESUME_SETTLED_SEC = 600.0
+# A resume after a clean shutdown (docker stop, an image update, dockerd
+# restarting) costs no attempt: the recording did nothing wrong. Capped per
+# session so a container that restarts itself gracefully in a loop still
+# ends in a finalised file rather than resuming forever.
+MAX_FREE_RESUMES = 10
 
 
 def config_dir() -> Path:
@@ -79,6 +84,27 @@ def attempts_so_far(record: Dict[str, Any], last_write: float) -> int:
     if resumed_at and last_write - float(resumed_at) >= RESUME_SETTLED_SEC:
         return 0
     return int(record.get("resume_attempts", 0))
+
+
+def count_resume(record: Dict[str, Any], last_write: float) -> None:
+    """Update the attempt counters for a resume that is about to happen.
+
+    A session the last process stopped cleanly (`interrupted_by` exactly
+    "shutdown") is not counted, up to MAX_FREE_RESUMES; anything else -- a
+    crash, an OOM kill, a SIGKILL before the mark was written -- counts as
+    before. The mark is cleared here; the caller persists the record before
+    relaunching, so a crash after this resume is counted next time.
+    """
+    clean = record.pop("interrupted_by", None) == "shutdown"
+    try:
+        free = max(0, int(record.get("free_resumes", 0) or 0))
+    except (TypeError, ValueError):
+        free = MAX_FREE_RESUMES      # junk on disk: no free resumes
+    if clean and free < MAX_FREE_RESUMES:
+        record["free_resumes"] = free + 1
+        record["resume_attempts"] = attempts_so_far(record, last_write)
+    else:
+        record["resume_attempts"] = attempts_so_far(record, last_write) + 1
 
 
 def max_resume_attempts() -> int:

@@ -15,7 +15,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, List
+from typing import Any, Dict, Iterable, Optional, List, Tuple
 
 from fastapi import FastAPI, APIRouter, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response
@@ -56,7 +56,7 @@ from app.cleanup import _shutdown_timeout
 from app.ringbuffer import RingBuffer
 from app import commercials
 from app import library
-from app.sessions import SessionStore, attempts_so_far, build_record, resume_decision
+from app.sessions import SessionStore, build_record, count_resume, resume_decision
 from app import schedules
 from app import eventlists
 from app.schedules import ScheduleStore
@@ -84,12 +84,16 @@ async def lifespan(app: FastAPI):
     # Reattach to anything that was recording when this process last died.
     # Offloaded: it stats files and may run a remux, and this is the event loop.
     try:
-        counts = await asyncio.to_thread(resume_sessions)
+        counts, to_finalise = await asyncio.to_thread(resume_sessions)
         if any(counts.values()):
             logger.info(
-                "Session recovery: %s resumed, %s finalised, %s discarded.",
+                "Session recovery: %s resumed, %s finalising in the background, %s discarded.",
                 counts["resumed"], counts["finalised"], counts["discarded"],
             )
+        # Not awaited: remux plus commercial detection is minutes to an hour
+        # per recording, and the server (and every resume behind it) used to
+        # wait for it.
+        _finalise_in_background(to_finalise)
     except Exception as exc:
         # A broken session file must never stop the server from booting.
         logger.error("Session recovery failed: %s", exc)
@@ -109,7 +113,8 @@ async def lifespan(app: FastAPI):
     # Offloaded because stopping reaps FFmpeg (up to 7s each) and then waits for
     # post-processing -- both blocking, and this still runs on the event loop.
     try:
-        await asyncio.to_thread(stop_all, active_recorders, _shutdown_timeout())
+        await asyncio.to_thread(stop_all, active_recorders, _shutdown_timeout(),
+                                _mark_interrupted_by_shutdown)
     except Exception as exc:
         logger.error("Error stopping recorders during shutdown: %s", exc)
 
@@ -173,7 +178,8 @@ storage = StorageManager(record_dir=str(RECORDINGS_DIR))
 active_recorders: Dict[str, StreamFailoverRecorder] = {}
 
 # Register SIGINT / SIGTERM handlers for container & process safety
-register_signal_handlers(active_recorders)
+register_signal_handlers(active_recorders,
+                         lambda rec_id, recorder: _mark_interrupted_by_shutdown(rec_id, recorder))
 
 
 @app.exception_handler(Exception)
@@ -901,6 +907,72 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
     return recorder
 
 
+def _mark_interrupted_by_shutdown(rec_id: str, recorder: Any) -> None:
+    """Note on a capturing session's record that a clean shutdown stopped it,
+    so the resume at the next boot does not spend one of its attempts.
+
+    Only while it is still capturing: a recorder already finishing has had
+    (or is about to have) its record removed, and saving it again would bring
+    a finished recording back at the next boot.
+    """
+    record = getattr(recorder, "session_record", None)
+    if not isinstance(record, dict) or record.get("rebroadcast") \
+            or getattr(recorder, "is_running", False) is not True:
+        return
+    record["interrupted_by"] = "shutdown"
+    session_store.save(record)
+
+
+# The boot finalise thread, kept for the tests.
+_boot_finalise_thread: Optional[threading.Thread] = None
+
+
+def _finalise_in_background(records: List[Dict[str, Any]]) -> Optional[threading.Thread]:
+    """Finish the recordings boot decided not to resume, one at a time, on a
+    daemon thread, after the server is up.
+
+    Their files are marked as finishing straight away, so the delete and
+    rename routes refuse them while they wait their turn. Daemon, not
+    asyncio.to_thread: the default executor is joined at exit, and an hour
+    of comskip would hold a shutdown. Stopping part-way loses nothing: a
+    record is removed only once its file is finished, so the next boot picks
+    up what this one did not reach.
+    """
+    global _boot_finalise_thread
+    if not records:
+        return None
+    marked: List[Path] = []
+    for record in records:
+        try:
+            p = Path(record["output_filepath"]).resolve()
+        except (KeyError, OSError, ValueError):
+            continue
+        _finishing_paths[p] = record.get("id", "?")
+        marked.append(p)
+
+    def _run() -> None:
+        try:
+            for record in records:
+                rid = record.get("id", "?")
+                if cleanup.shutting_down.is_set():
+                    logger.info("Shutting down: session %s is left for the next boot to finalise.", rid)
+                    continue
+                # Checked again: an earlier recording may have taken an hour.
+                if not _session_path_allowed(record):
+                    logger.warning("Not finalising session %s: its output path is outside the "
+                                   "permitted recording directories.", rid)
+                    session_store.remove(rid)
+                    continue
+                _finalise_orphan(record)
+        finally:
+            for p in marked:
+                _finishing_paths.pop(p, None)
+
+    _boot_finalise_thread = threading.Thread(target=_run, name="pvarr-boot-finalise", daemon=True)
+    _boot_finalise_thread.start()
+    return _boot_finalise_thread
+
+
 def _finalise_orphan(record: Dict[str, Any]) -> None:
     """Post-process a recording we are not going to reconnect to.
 
@@ -932,16 +1004,20 @@ def _session_path_allowed(record: Dict[str, Any]) -> bool:
     return any(path == d or d in path.parents for d in _allowed_library_dirs())
 
 
-def resume_sessions() -> Dict[str, int]:
+def resume_sessions() -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
     """Reattach to recordings that were in flight when the process died.
 
     Runs once at startup. Every record gets one of three fates, decided by
     resume_decision(): reconnect and keep appending to the same .ts, finalise
-    it as it stands, or discard it because there is nothing on disk. Failures
+    it as it stands, or discard it because there is nothing on disk. Resumes
+    and discards happen here; the records to finalise are returned for
+    _finalise_in_background(), so a remux and an hour of commercial detection
+    no longer hold up the server, or a resume queued behind them. Failures
     are contained per-session -- one bad record must not stop the others, and
     must never stop the server booting.
     """
     counts = {"resumed": 0, "finalised": 0, "discarded": 0}
+    to_finalise: List[Dict[str, Any]] = []
     for record in session_store.load_all():
         recording_id = record.get("id", "?")
         try:
@@ -959,13 +1035,16 @@ def resume_sessions() -> Dict[str, int]:
                 counts["discarded"] += 1
                 continue
             if decision == "finalise":
-                logger.info("Finalising session %s rather than resuming.", recording_id)
-                _finalise_orphan(record)
+                logger.info("Finalising session %s rather than resuming (in the background).",
+                            recording_id)
+                to_finalise.append(record)
                 counts["finalised"] += 1
                 continue
 
             last_write = Path(record["output_filepath"]).stat().st_mtime
-            record["resume_attempts"] = attempts_so_far(record, last_write) + 1
+            # A clean shutdown's resume is free; _launch_session saves the
+            # record (mark cleared) before the recorder starts.
+            count_resume(record, last_write)
             record["resumed_at"] = time.time()
             _launch_session(record, _allocate_proxy_port())
             logger.info(
@@ -976,7 +1055,7 @@ def resume_sessions() -> Dict[str, int]:
             counts["resumed"] += 1
         except Exception as exc:
             logger.error("Could not resume session %s: %s", recording_id, exc)
-    return counts
+    return counts, to_finalise
 
 
 def _check_candidate_urls(candidates: List[str]) -> None:

@@ -1549,6 +1549,37 @@ class TestResumeDecision(unittest.TestCase):
         looping = self.record(resume_attempts=limit, resumed_at=time.time() - 30)
         self.assertEqual(sessions.resume_decision(looping), "finalise")
 
+    def test_a_clean_restart_does_not_spend_a_resume_attempt(self):
+        """Three restarts in an hour (an image update, dockerd restarting)
+        finalised a live recording instead of resuming it."""
+        self.write(age=5)
+        r = self.record()
+        for _ in range(sessions.DEFAULT_MAX_RESUME_ATTEMPTS + 2):
+            r["interrupted_by"] = "shutdown"          # what stop_all writes
+            self.assertEqual(sessions.resume_decision(r), "resume")
+            sessions.count_resume(r, self.ts.stat().st_mtime)
+            r["resumed_at"] = time.time()
+        self.assertEqual(r["resume_attempts"], 0)
+        self.assertNotIn("interrupted_by", r, "the mark is used up by the resume")
+        self.assertEqual(sessions.resume_decision(r), "resume")
+
+    def test_a_crash_still_counts_and_free_resumes_are_capped(self):
+        self.write(age=5)
+        last = self.ts.stat().st_mtime
+        crashed = self.record()
+        sessions.count_resume(crashed, last)
+        self.assertEqual(crashed["resume_attempts"], 1, "no mark: a crash")
+        for junk in ("Shutdown", ["shutdown"], 1):
+            r = self.record(interrupted_by=junk)
+            sessions.count_resume(r, last)
+            self.assertEqual(r["resume_attempts"], 1, junk)
+        looping = self.record(interrupted_by="shutdown", free_resumes=sessions.MAX_FREE_RESUMES)
+        sessions.count_resume(looping, last)
+        self.assertEqual(looping["resume_attempts"], 1, "a graceful restart loop still ends")
+        bad = self.record(interrupted_by="shutdown", free_resumes="lots")
+        sessions.count_resume(bad, last)
+        self.assertEqual(bad["resume_attempts"], 1)
+
     def test_limits_are_configurable(self):
         self.write(age=100)
         self.assertEqual(
@@ -10272,6 +10303,65 @@ class TestFinishRecordingPipeline(ServerTestCase):
             server._finish_recording(record, str(src))
         self.assertIn(seen["path"], seen["paths"])
         self.assertEqual(server._finishing_paths, {})
+
+    def test_boot_resumes_first_and_finalises_in_the_background(self):
+        """Boot ran commercial detection inline: the server came up ~7 min
+        late and a resumable session waited behind a finalise."""
+        import threading
+        from unittest.mock import MagicMock, patch
+        server = self.server
+        old = Path(self.tmp) / "old.ts"
+        old.write_bytes(b"x")
+        past = time.time() - 3600
+        os.utime(old, (past, past))
+        live = Path(self.tmp) / "live.ts"
+        live.write_bytes(b"x")
+        records = [{"id": "old", "output_filepath": str(old)},
+                   {"id": "live", "output_filepath": str(live), "candidates": ["http://a/1"],
+                    "interrupted_by": "shutdown"}]
+        order, release = [], threading.Event()
+        store = MagicMock()
+        store.load_all.return_value = records
+
+        def slow_finalise(record):
+            order.append(("finalise", record["id"]))
+            release.wait(5)
+
+        with patch.object(server, "session_store", store), \
+             patch.object(server, "_launch_session",
+                          side_effect=lambda r, port: order.append(("resume", r["id"]))), \
+             patch.object(server, "_allocate_proxy_port", return_value=8100), \
+             patch.object(server, "_finalise_orphan", side_effect=slow_finalise):
+            counts, later = server.resume_sessions()
+            self.assertEqual(order, [("resume", "live")], "nothing is finalised inline")
+            self.assertEqual(counts, {"resumed": 1, "finalised": 1, "discarded": 0})
+            self.assertEqual(records[1]["resume_attempts"], 0, "a clean restart is free")
+            thread = server._finalise_in_background(later)
+            # Protected while it waits and while it runs.
+            self.assertIn(old.resolve(), server._active_output_paths())
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(order[-1], ("finalise", "old"))
+        self.assertEqual(server._finishing_paths, {})
+
+    def test_shutdown_marks_only_sessions_still_capturing(self):
+        from unittest.mock import MagicMock, patch
+        from app import cleanup
+        server = self.server
+        live, done = MagicMock(), MagicMock()
+        live.session_record, live.is_running = {"id": "a"}, True
+        done.session_record, done.is_running = {"id": "b"}, False
+        calls = []
+        live.stop.side_effect = lambda reason: calls.append(("stop", dict(live.session_record)))
+        store = MagicMock()
+        store.save.side_effect = lambda r: calls.append(("save", r["id"]))
+        with patch.object(server, "session_store", store):
+            cleanup.stop_all({"a": live, "b": done}, 0, server._mark_interrupted_by_shutdown)
+        self.assertEqual(calls[0], ("save", "a"), "marked before anything is killed")
+        self.assertEqual(calls[1], ("stop", {"id": "a", "interrupted_by": "shutdown"}))
+        self.assertNotIn("interrupted_by", done.session_record,
+                         "a finishing recording's removed record must not come back")
 
     def test_nothing_stays_marked_as_finishing(self):
         self._run()
