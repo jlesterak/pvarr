@@ -682,9 +682,11 @@ class StreamFailoverRecorder:
         # How many complete laps of the candidate list may pass without a
         # single byte arriving before the recording is given up on. Reset the
         # moment any candidate delivers data, so a long capture that fails over
-        # occasionally never exhausts its budget.
+        # occasionally never exhausts its budget. A lap only counts when no
+        # candidate delivered anything during it (_lap_had_data).
         self.max_cycles = max(1, int(max_cycles))
         self.cycles_without_data: int = 0
+        self._lap_had_data: bool = False
         # Recordings are uncompressed TS and grow without bound. The recordings
         # volume is usually the same filesystem as everything else, so an
         # unattended 24/7 capture does not just lose itself -- it takes the host
@@ -2045,8 +2047,11 @@ class StreamFailoverRecorder:
             # the "fruitless laps" budget starts over. Without this reset, a
             # long capture that fails over now and then would eventually spend
             # its budget and stop despite recording perfectly well.
+            # The flag stops the wrap below from counting this lap as
+            # fruitless right after the reset.
             if self.bytes_written > bytes_before:
                 self.cycles_without_data = 0
+                self._lap_had_data = True
 
             # Consume the force-failover request: it applies to the candidate we
             # are leaving, not the one we are about to try. Leaving it latched
@@ -2092,7 +2097,9 @@ class StreamFailoverRecorder:
                 wrapped = next_index <= self.current_candidate_index
 
             if wrapped:
-                self.cycles_without_data += 1
+                if not self._lap_had_data:
+                    self.cycles_without_data += 1
+                self._lap_had_data = False
                 # Sponsor decision: a recording with a window keeps trying
                 # until that window closes. max_cycles is a guess at "these
                 # sources are dead"; an explicit end time is a statement that
@@ -2105,7 +2112,9 @@ class StreamFailoverRecorder:
                 # no explicit end time this is a plain 6h default the operator
                 # may not know about, and retrying for six hours against three
                 # dead URLs is not what anyone meant by it.
-                if self.end_time and self._within_window():
+                if self.cycles_without_data == 0:
+                    pass  # this lap delivered data: nothing to warn about
+                elif self.end_time and self._within_window():
                     remaining = self.seconds_remaining() or 0
                     self._log(
                         f"No data from any candidate in "
@@ -2151,11 +2160,16 @@ class StreamFailoverRecorder:
             self.status = "failing_over"
             delay = self._failover_delay(wrapped)
             if wrapped:
+                # Only a fruitless lap is worth counting out loud; after a lap
+                # that delivered data, "lap 0 of 3" would read as a mistake.
+                fruitless = (
+                    f" (fruitless lap {self.cycles_without_data}"
+                    + ("" if self.is_rebroadcast else f" of {self.max_cycles}")
+                    + ")"
+                ) if self.cycles_without_data else ""
                 self._log(
                     f"Cycling back to Candidate {next_index + 1} ({next_name}) "
-                    f"after {delay:.0f}s (lap {self.cycles_without_data}"
-                    + ("" if self.is_rebroadcast else f" of {self.max_cycles}")
-                    + ")...", "WARN",
+                    f"after {delay:.0f}s{fruitless}...", "WARN",
                 )
             else:
                 self._log(

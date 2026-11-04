@@ -1844,6 +1844,29 @@ class TestFailoverAdvance(FailoverLoopTestCase):
         self.assertEqual(rec.status, "completed")
         self.assertEqual(rec.cycles_without_data, 0)
 
+    def test_lap_that_delivered_data_is_not_counted_as_fruitless(self):
+        # Both candidates record, then drop; the wrap used to add one to the
+        # counter just reset, logging "No data from any candidate in 1 full
+        # attempts" after a lap that recorded fine.
+        def deliver(rec, candidate):
+            rec.bytes_written += 4096
+            return StreamOutcome.INTERRUPTED
+
+        rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"],
+                        [deliver, deliver, True], max_cycles=1)
+        self.run_loop(rec)
+        # With a budget of one lap that miscount also ended the recording.
+        self.assertEqual(rec.status, "completed")
+        self.assertEqual(rec.cycles_without_data, 0)
+        logs = "\n".join(rec.log_history)
+        self.assertNotIn("No data from any candidate", logs)
+        self.assertIn("Cycling back to Candidate 1", logs)
+        self.assertNotIn("lap 0", logs)
+        # A lap with nothing still counts, and says so.
+        rec = self.make(["http://a/1.m3u8"], [False, False, True], max_cycles=3)
+        self.run_loop(rec)
+        self.assertIn("(fruitless lap 1 of 3)", "\n".join(rec.log_history))
+
     def test_backoff_grows_between_fruitless_laps(self):
         rec = self.make(["http://a/1.m3u8", "http://b/2.m3u8"], [])
         self.assertEqual(rec._failover_delay(wrapped=False), 1.0)
