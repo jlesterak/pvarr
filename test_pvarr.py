@@ -2597,9 +2597,32 @@ class TestFreezeDetection(unittest.TestCase):
         rec = StreamFailoverRecorder("t", ["http://a/1.m3u8"], self.out, min_free_gb=0)
         tail = rec._drain_stderr(types.SimpleNamespace(stderr=CountingFileIO(r, "rb")),
                                  ffmpeg=True)
-        self.assertTrue(self._wait_for(lambda: "the last line" in " ".join(tail)))
+        self.assertTrue(self._wait_for(
+            lambda: "the last line" in " ".join(l for _, l in tail)))
         # ~6,000 reads unbuffered; a handful buffered.
         self.assertLess(reads[0], 20, reads[0])
+
+    def test_failure_reports_only_stderr_from_near_the_failure(self):
+        """The tail spans the whole run: a start-up message from 14 min
+        earlier was reported as if it caused the freeze."""
+        import collections
+        now = 10_000.0
+        startup = (now - 14 * 60, "[h264 @ 0x1] [error] SPS 0 buffering period missing")
+        recent = (now - 5, "[https @ 0x1] [error] Server returned 403 Forbidden")
+        describe = StreamFailoverRecorder._describe_stderr_tail
+        detail = describe(collections.deque([startup, recent]), now)
+        self.assertIn("403", detail)
+        self.assertNotIn("SPS", detail)
+        # Nothing recent: the newest line, labelled with its age.
+        detail = describe(collections.deque([startup]), now)
+        self.assertTrue(detail.startswith("(from 14 min earlier) "), detail)
+        self.assertIn("SPS", detail)
+        # Still redacted per line and capped.
+        token = (now, "[https @ 0x1] [error] https://cdn.example/secure/"
+                      "Qx7RmT2kLp9VbN4cWe8YzA/playlist.m3u8: " + "x" * 600)
+        detail = describe(collections.deque([token]), now)
+        self.assertNotIn("Qx7RmT", detail)
+        self.assertEqual(len(detail), 500)
 
     def test_freeze_fires_while_the_pipe_is_still_open(self):
         # The regression that mattered: a source that stalls mid-buffer without

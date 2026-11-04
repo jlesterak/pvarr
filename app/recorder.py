@@ -605,6 +605,10 @@ class StreamFailoverRecorder:
     STARTUP_GRACE_SEC = 30
     # Tail of FFmpeg's stderr kept for diagnostics when an attempt fails.
     STDERR_TAIL_LINES = 15
+    # Only tail lines this recent are reported as the cause of a failure. The
+    # tail spans the whole FFmpeg run, so without this a message from when it
+    # joined the stream, hours earlier, was reported as if it caused a freeze.
+    STDERR_RECENT_SEC = 60
     SEGMENT_LOSS_LOG_INTERVAL_SEC = 60
     _MAX_TRACKED_FAILURES = 256
     # Lines of recorder log kept for the dashboard. Older lines are dropped.
@@ -1033,7 +1037,8 @@ class StreamFailoverRecorder:
             self._proxy_stderr_tail = self._drain_stderr(self._proxy_process)
             time.sleep(1.5)
             if self._proxy_process.poll() is not None:
-                detail = "; ".join(self._proxy_stderr_tail) or "no output"
+                detail = "; ".join(
+                    line for _, line in self._proxy_stderr_tail) or "no output"
                 self._log(
                     f"hls-proxy exited immediately (code "
                     f"{self._proxy_process.returncode}): {detail}", "ERROR")
@@ -1633,12 +1638,9 @@ class StreamFailoverRecorder:
             def finish(outcome: "StreamOutcome") -> "StreamOutcome":
                 """Attach FFmpeg's own words to a failed attempt."""
                 if outcome is not StreamOutcome.COMPLETED and stderr_tail:
-                    # Redacted per line *before* the cut: truncating first can
-                    # shorten a path token until it no longer looks like one.
-                    # And stored redacted, since last_error is served by
-                    # /api/status. list() first: the pump may still be appending.
-                    detail = " | ".join(
-                        redact_url_secrets(l) for l in list(stderr_tail))[:500]
+                    # Stored as logged (redacted), since last_error is served
+                    # by /api/status.
+                    detail = self._describe_stderr_tail(stderr_tail, time.time())
                     candidate.last_error = detail
                     self._log(f"FFmpeg said: {detail}", "ERROR")
                 return outcome
@@ -1762,6 +1764,25 @@ class StreamFailoverRecorder:
             return _RingSink(self.ring)
         return _FileSink(self.output_filepath)
 
+    @classmethod
+    def _describe_stderr_tail(cls, tail: "collections.deque", now: float) -> str:
+        """The stderr tail as one line, limited to what is near the failure.
+
+        Lines from the last STDERR_RECENT_SEC are joined. If there are none,
+        the newest line is shown with its age, so an old message is not read
+        as the cause. Redacted per line *before* the 500-char cut: truncating
+        first can shorten a path token until it no longer looks like one.
+        """
+        entries: List[Tuple[float, str]] = list(tail)  # the pump may be appending
+        if not entries:
+            return ""
+        recent = [line for ts, line in entries if now - ts <= cls.STDERR_RECENT_SEC]
+        if recent:
+            return " | ".join(redact_url_secrets(l) for l in recent)[:500]
+        ts, line = entries[-1]
+        age = f"(from {(now - ts) / 60:.0f} min earlier) "
+        return (age + redact_url_secrets(line))[:500]
+
     def _drain_stderr(self, proc: subprocess.Popen, ffmpeg: bool = False) -> "collections.deque":
         """Continuously drain a child's stderr, keeping only the tail.
 
@@ -1776,6 +1797,9 @@ class StreamFailoverRecorder:
         of the tail, so a burst of "Packet corrupt" cannot push the line that
         explains a failure out of a 15-line buffer -- the tail holds what it
         held when FFmpeg ran at "error". hls-proxy has no tags; kept whole.
+
+        Each entry is `(time received, line)`, so a failure can tell lines
+        near it from lines left over from FFmpeg's start-up.
 
         Daemon thread, bounded buffer: it holds at most STDERR_TAIL_LINES lines
         and exits on its own when the pipe closes.
@@ -1812,7 +1836,7 @@ class StreamFailoverRecorder:
                                 # thread exists to prevent.
                                 pass
                             continue
-                    tail.append(line)
+                    tail.append((time.time(), line))
             except Exception:
                 pass  # pipe closed under us during shutdown; nothing to do
 
