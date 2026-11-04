@@ -50,6 +50,12 @@ logger = logging.getLogger("PVArrCommercials")
 # not. Generous, because being killed halfway produces nothing useful.
 DEFAULT_TIMEOUT_SEC = 3 * 60 * 60
 
+# The chapter remux writes a full copy beside the recording before swapping it
+# in, so it needs the file's size free plus this. 5 GiB matches the default
+# recording floor (PVARR_MIN_FREE_GB), so at default settings the remux cannot
+# push a recording that is still running into its own low-disk abort.
+CHAPTER_FREE_MARGIN_BYTES = 5 * 1024 ** 3
+
 # comskip's own defaults write nothing we can use. These two outputs are the
 # whole point: ffmeta gives chapters ffmpeg can apply directly, and the EDL
 # gives the ranges needed to cut. detect_method=111 (black frames + logo +
@@ -179,10 +185,24 @@ def apply_chapters(video_path: str, ffmeta_path: str) -> bool:
     Stream copy, so this is an I/O-bound remux of container metadata and takes
     seconds rather than the length of the recording. Written to a temp file and
     moved into place only on success: the recording is already in the library
-    and someone may be watching it.
+    and someone may be watching it. Skipped when the volume lacks room for that
+    copy; the new file gets the original's permission bits.
     """
     source, meta = Path(video_path), Path(ffmeta_path)
     if not source.is_file() or not meta.is_file():
+        return False
+    try:
+        needed = source.stat().st_size + CHAPTER_FREE_MARGIN_BYTES
+        free = shutil.disk_usage(source.parent).free
+    except OSError as exc:
+        logger.warning("Skipping chapters for %s: cannot check free space: %s",
+                       source.name, exc)
+        return False
+    if free < needed:
+        logger.warning(
+            "Skipping chapters for %s: %.1f GB free, the remux needs %.1f GB "
+            "(a full copy plus %.0f GB headroom).", source.name, free / 1024 ** 3,
+            needed / 1024 ** 3, CHAPTER_FREE_MARGIN_BYTES / 1024 ** 3)
         return False
     ffmpeg = find_executable("ffmpeg") or "ffmpeg"
     tmp = source.with_name(f".{source.stem}.chapters{source.suffix}")
@@ -201,6 +221,9 @@ def apply_chapters(video_path: str, ffmeta_path: str) -> bool:
             logger.warning("Could not write chapters into %s", source.name)
             tmp.unlink(missing_ok=True)
             return False
+        # FFmpeg creates the copy with the process umask; without this a
+        # recording the operator made group-readable came back private.
+        shutil.copymode(source, tmp)
         os.replace(tmp, source)
         return True
     except Exception as exc:

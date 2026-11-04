@@ -6492,6 +6492,33 @@ class TestCommercialsNeverDamageARecording(unittest.TestCase):
         self.assertFalse(commercials.apply_chapters(str(self.video), str(self.tmp / "nope.ffmeta")))
         self.assertEqual(self.video.read_bytes(), b"original recording bytes")
 
+    def test_chapter_remux_keeps_mode_bits_and_checks_free_space(self):
+        """The remux swapped in a file with FFmpeg's default mode, and ran
+        with no free-space check though it writes a full copy."""
+        from unittest.mock import patch, MagicMock
+        from collections import namedtuple
+
+        def fake_ffmpeg(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"with chapters")
+            os.chmod(cmd[-1], 0o600)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        os.chmod(self.video, 0o664)
+        with patch("app.commercials.subprocess.run", side_effect=fake_ffmpeg):
+            self.assertTrue(commercials.apply_chapters(str(self.video), str(self.meta)))
+        self.assertEqual(self.video.read_bytes(), b"with chapters")
+        self.assertEqual(self.video.stat().st_mode & 0o777, 0o664)
+
+        Usage = namedtuple("Usage", "total used free")
+        short = commercials.CHAPTER_FREE_MARGIN_BYTES  # no room for the copy itself
+        with patch("app.commercials.shutil.disk_usage", return_value=Usage(0, 0, short)), \
+             patch("app.commercials.subprocess.run") as run, \
+             patch.object(commercials.logger, "warning") as warn:
+            self.assertFalse(commercials.apply_chapters(str(self.video), str(self.meta)))
+        run.assert_not_called()
+        self.assertIn("Skipping chapters", warn.call_args[0][0])
+        self.assertEqual(self.video.read_bytes(), b"with chapters")
+
     def test_cut_mode_does_not_silently_delete_anything_yet(self):
         """Cut is accepted as a setting but not implemented. It must fall back
         to chapters rather than half-doing the destructive thing."""

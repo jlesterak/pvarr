@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md)
 
-**Commercial detection** *(optional, off by default)* — with `PVARR_COMSKIP=1`, each finished recording is scanned by [comskip](https://github.com/erikkaashoek/Comskip) and by PVArr's break-card pass, and the breaks are written in as **chapter marks**, so Plex gives you skip points. Nothing is deleted by default: a false positive should cost you a click, not a play you cannot re-record. `PVARR_COMSKIP_MODE=cut` will remove them, and refuses to replace your recording unless the cut file is readable and its duration dropped by roughly the amount removed. Runs after the recording is already remuxed, in the library and announced.
+**Commercial detection** *(optional, off by default)* — with `PVARR_COMSKIP=1`, each finished recording is scanned by [comskip](https://github.com/erikkaashoek/Comskip) and by PVArr's break-card pass, and the breaks are written in as **chapter marks**, so Plex gives you skip points. Nothing is deleted by default: a false positive should cost you a click, not a play you cannot re-record. `PVARR_COMSKIP_MODE=cut` will remove them, and refuses to replace your recording unless the cut file is readable and its duration dropped by roughly the amount removed. Runs after the recording is already remuxed, in the library and announced. Writing the chapters makes a full copy of the recording beside it, so it is skipped (with a warning in the log) unless the volume has the file's size plus 5 GB free; the new file keeps the original's permissions.
 
 Settings: `PVARR_COMSKIP`, `PVARR_COMSKIP_MODE`, `PVARR_COMSKIP_KEEP_ORIGINAL`, `PVARR_COMSKIP_INI` (see [Installation and configuration](installation.md#environment-variables)).
 
