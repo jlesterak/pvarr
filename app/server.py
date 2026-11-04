@@ -1581,13 +1581,37 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
         counts = aggregator.summary_text((result or {}).get("summary") or {})
         if counts:
             recorder._log(f"Event page re-checked, other links on it: {counts}")
-        changed = recorder.replace_dead_candidates(urls)
+        # Probe each fresh link again just before it goes in, one at a time
+        # and only as many as there are slots to fill: a link that no longer
+        # plays is dropped and the failed source keeps its slot, since a
+        # source that froze now and then beats one with nothing playable.
+        # Off the event loop (the probe is blocking network I/O) and outside
+        # the page lock, so a Find or a scheduled scan is not held up.
+        need = recorder.slots_to_refill()
+        held = {c.url for c in recorder.candidates}
+        playable: List[str] = []
+        unplayable = 0
+        for url in urls:
+            if len(playable) >= need or not recorder.is_running:
+                break
+            if url in held:
+                continue
+            if await asyncio.to_thread(recorder.fresh_link_plays, url):
+                playable.append(url)
+            else:
+                unplayable += 1
+        if not recorder.is_running:
+            return
+        changed = recorder.replace_dead_candidates(playable)
         if changed:
             record["candidates"] = [c.url for c in recorder.candidates]
             session_store.save(record)
         else:
             if not urls:
                 recorder._log("Event page re-checked: no working links on it.", "WARN")
+            elif unplayable and not playable:
+                recorder._log(f"Event page re-checked: {unplayable} fresh link(s) found, but none "
+                              "played when probed again; kept the current links.", "WARN")
             else:
                 # Only a source that failed is replaced, never a working one.
                 recorder._log(f"Event page re-checked: {len(urls)} working link(s) found, "

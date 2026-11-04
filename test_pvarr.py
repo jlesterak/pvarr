@@ -2617,6 +2617,11 @@ class TestFreezeDetection(unittest.TestCase):
         detail = describe(collections.deque([startup]), now)
         self.assertTrue(detail.startswith("(from 14 min earlier) "), detail)
         self.assertIn("SPS", detail)
+        # Under a minute old reads in seconds, not "0 min".
+        from unittest.mock import patch
+        with patch.object(StreamFailoverRecorder, "STDERR_RECENT_SEC", 10):
+            detail = describe(collections.deque([(now - 25, "[https @ 0x1] [error] x")]), now)
+        self.assertTrue(detail.startswith("(from 25 s earlier) "), detail)
         # Still redacted per line and capped.
         token = (now, "[https @ 0x1] [error] https://cdn.example/secure/"
                       "Qx7RmT2kLp9VbN4cWe8YzA/playlist.m3u8: " + "x" * 600)
@@ -2832,9 +2837,13 @@ class TestStaticRoutes(ServerTestCase):
             fut.set_result({"picked": [{"url": "http://fresh.example/9"}]})
             return fut
 
+        probed = []
         with patch.object(self.server, "_scan_in_daemon_thread", side_effect=fake_scan), \
-             patch.object(self.server.session_store, "save"):
+             patch.object(self.server.session_store, "save"), \
+             patch.object(StreamFailoverRecorder, "_probe_candidate",
+                          side_effect=lambda c: probed.append(c.url) or True):
             asyncio.run(self.server._rescan_event_page("rs2", manual=True))
+        self.assertEqual(probed, ["http://fresh.example/9"], "probed before it went in")
         self.assertEqual(seen, {"url": "https://events.example/e", "cookie": "sess=1",
                                 "exclude": ["http://a/1", "http://b/2"]},
                          "the links already held are skipped, so the page is read further down")
@@ -2842,6 +2851,73 @@ class TestStaticRoutes(ServerTestCase):
         self.assertEqual(rec.rescan_state, "")
         status = self.client.get("/api/status").text
         self.assertNotIn("sess=1", status, "the page cookie never leaves the server")
+
+    def test_rescan_keeps_a_failed_source_when_the_fresh_link_does_not_play(self):
+        """A link that had played (freezing now and then) was twice swapped for
+        a page with nothing playable, costing ~50 s and ~2 min of gap."""
+        import asyncio
+        import threading
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder("rs5", ["http://a/1", "http://b/2"],
+                                     os.path.join(self.tmp, "o.ts"), min_free_gb=0)
+        rec.is_running, rec.has_event_page = True, True
+        rec.candidates[1].fail_count = 1
+        rec.session_record = {"id": "rs5", "candidates": ["http://a/1", "http://b/2"],
+                              "event_page": {"url": "https://events.example/e"}}
+        self.server.active_recorders["rs5"] = rec
+
+        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=()):
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result({"picked": [{"url": "http://dud.example/1"},
+                                       {"url": "http://good.example/2"}]})
+            return fut
+
+        threads = []
+
+        def probe(c):
+            threads.append(threading.current_thread())
+            return "good" in c.url
+
+        with patch.object(self.server, "_scan_in_daemon_thread", side_effect=fake_scan), \
+             patch.object(self.server.session_store, "save") as save, \
+             patch.object(StreamFailoverRecorder, "_probe_candidate", side_effect=probe):
+            asyncio.run(self.server._rescan_event_page("rs5", manual=True))
+        self.assertEqual([c.url for c in rec.candidates], ["http://a/1", "http://good.example/2"],
+                         "the dud is skipped and the next fresh link is tried")
+        self.assertTrue(all(t is not threading.main_thread() for t in threads),
+                        "probes run off the event loop")
+        save.assert_called_once()
+
+        # Every fresh link a dud: the failed source keeps its slot.
+        rec.candidates[1].fail_count = 2
+        with patch.object(self.server, "_scan_in_daemon_thread", side_effect=fake_scan), \
+             patch.object(self.server.session_store, "save") as save, \
+             patch.object(StreamFailoverRecorder, "_probe_candidate", return_value=False):
+            asyncio.run(self.server._rescan_event_page("rs5", manual=True))
+        self.assertEqual([c.url for c in rec.candidates], ["http://a/1", "http://good.example/2"])
+        save.assert_not_called()
+        self.assertTrue(any("none played when probed again" in l for l in rec.log_history), rec.log_history[-3:])
+
+    def test_rescan_probes_nothing_when_no_slot_needs_a_link(self):
+        import asyncio
+        from unittest.mock import patch
+        rec = StreamFailoverRecorder("rs6", ["http://a/1", "http://b/2", "http://c/3"],
+                                     os.path.join(self.tmp, "o.ts"), min_free_gb=0)
+        rec.is_running, rec.has_event_page = True, True
+        rec.session_record = {"id": "rs6", "candidates": [c.url for c in rec.candidates],
+                              "event_page": {"url": "https://events.example/e"}}
+        self.server.active_recorders["rs6"] = rec
+
+        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=()):
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result({"picked": [{"url": "http://fresh.example/9"}]})
+            return fut
+
+        with patch.object(self.server, "_scan_in_daemon_thread", side_effect=fake_scan), \
+             patch.object(StreamFailoverRecorder, "_probe_candidate") as probe:
+            asyncio.run(self.server._rescan_event_page("rs6", manual=True))
+        probe.assert_not_called()
+        self.assertTrue(any("nothing replaced" in l for l in rec.log_history))
 
     def test_ad_stats_route_serves_the_summary(self):
         from unittest.mock import patch

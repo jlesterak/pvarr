@@ -1780,8 +1780,10 @@ class StreamFailoverRecorder:
         if recent:
             return " | ".join(redact_url_secrets(l) for l in recent)[:500]
         ts, line = entries[-1]
-        age = f"(from {(now - ts) / 60:.0f} min earlier) "
-        return (age + redact_url_secrets(line))[:500]
+        # Seconds under a minute: "0 min earlier" would read as "just now".
+        secs = max(0.0, now - ts)
+        when = f"{secs:.0f} s" if secs < 59.5 else f"{secs / 60:.0f} min"
+        return (f"(from {when} earlier) " + redact_url_secrets(line))[:500]
 
     def _drain_stderr(self, proc: subprocess.Popen, ffmpeg: bool = False) -> "collections.deque":
         """Continuously drain a child's stderr, keeping only the tail.
@@ -2272,6 +2274,29 @@ class StreamFailoverRecorder:
         """How many candidates have failed since the event page was last checked."""
         return sum(1 for c in self.candidates
                    if c.fail_count > self._fail_snapshot.get(c.url, 0))
+
+    def slots_to_refill(self, max_candidates: int = 3) -> int:
+        """How many slots replace_dead_candidates() would fill right now:
+        failed slots other than the one being recorded, plus room to top up."""
+        dead = sum(1 for i, c in enumerate(self.candidates)
+                   if i != self.current_candidate_index
+                   and c.fail_count > self._fail_snapshot.get(c.url, 0))
+        return dead + max(0, max_candidates - len(self.candidates))
+
+    def fresh_link_plays(self, url: str) -> bool:
+        """Probe a fresh event-page link the way a connect does, before it
+        replaces a source.
+
+        The page check probed it already, but minutes can pass between that
+        and the swap, and a link that "worked" for the scan was twice found
+        with nothing playable once it was swapped in, while the source it
+        replaced still played. Uses the connect's own probe; with auto-probe
+        off the recorder never probes, so neither does this. Blocking (network
+        I/O): call it from a worker thread, never the event loop.
+        """
+        if not self.auto_probe:
+            return True
+        return self._probe_candidate(CandidateStream(url, name="fresh link from the event page"))
 
     def replace_dead_candidates(self, urls: List[str],
                                 max_candidates: int = 3) -> List[Tuple[int, str]]:
