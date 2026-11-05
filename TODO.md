@@ -26,6 +26,9 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
   if this is ever exposed — note that adding Basic auth would break the Plex and
   Emby tuner fetches unless `/live/*` is exempted or given a token parameter.
 
+## CI runners (2026-11-04)
+- [PENDING] Pin the four `runs-on: ubuntu-latest` jobs (`.github/workflows/test.yml`, `publish.yml`) to `ubuntu-24.04`: GitHub moves `ubuntu-latest` to Ubuntu 26 from 2026-10-19 (v0.14.2 run annotation). Also move `actions/checkout@v4` and `actions/setup-python@v5` to releases on Node 24 (Node 20 is deprecated; the runner forces them for now).
+
 ## Longer-term candidates
 - A retention/cleanup policy for old recordings on disk.
 - Integration coverage for the notification webhooks (currently mocks only).
