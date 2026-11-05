@@ -4,6 +4,15 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-11-04
+
+### Fixed
+- A lap in which any candidate recorded data no longer counts as fruitless, so "No data from any candidate" and the giving-up path only follow laps that really got nothing.
+- The "FFmpeg said" line on a freeze (and a candidate's `last_error`) shows only FFmpeg output from the last 60 s; with none, the newest line is shown with its age.
+- The event-page re-check probes each fresh link before it replaces a failed source, so a link with nothing playable no longer pushes out one that was working.
+- The chapter remux keeps the recording's file permissions and is skipped (with a warning) unless the volume has the file's size plus 5 GB free.
+- At boot, stale sessions are finished in the background after the server is up, and a clean restart no longer spends a recording's resume allowance.
+
 ## [0.14.1] - 2026-11-02
 
 ### Fixed
