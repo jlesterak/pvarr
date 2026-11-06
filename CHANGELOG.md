@@ -4,6 +4,13 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-11-05
+
+### Added
+- The recording card counts the real sources behind its links (mirrors of one feed count once) and turns the count amber when every backup is the same feed.
+- Backups are checked every 90 s while another source records (a page and playlist fetch, no video), with a green or red dot on each badge. Failover goes to the next backup that answered, and falls back to plain order if none did; a backup that did not answer is re-checked every 3 minutes.
+- The card shows the stream rate (bandwidth the recording uses, over the last minute). Three or more lost segments within 5 minutes send one notification (at most every 15 minutes) naming that rate.
+
 ## [0.15.0] - 2026-11-05
 
 ### Added

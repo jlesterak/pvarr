@@ -43,7 +43,7 @@ Capture, failover and the timeline are solid; the losses now come from discovery
 (JavaScript players PVArr cannot resolve, the wrong game), backups that are one
 feed behind several links, and a thin WAN. In order:
 
-- [COMPLETED] **Quick wins** (2026-11-05). "N real sources" badge (amber when every backup is
+- [COMPLETED] **Quick wins** (2026-11-05, released in v0.15.1). "N real sources" badge (amber when every backup is
   one feed); standby checks probe each backup every 90 s on a copy (no segment fetch) and
   failover takes the next one that answered, plain order if none did; stream rate over
   ~60 s on the card; 3+ lost segments in 5 min sends one notification per 15 min. Proven by
