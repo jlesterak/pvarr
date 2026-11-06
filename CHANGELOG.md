@@ -4,6 +4,11 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-05
+
+### Added
+- **Wrong Game** button on a running recording (`POST /api/recordings/{id}/failover` with `wrong_game=true`). It marks the stream being recorded as the wrong game: PVArr leaves it at once and never connects to it again in that recording, under any link that plays the same feed (mirrors on other edge hosts included). Marked sources count as failed, so the event-page re-check refills their slots but never swaps the same feed back in; the mark survives a restart. Allowed on a single-URL session, which then keeps retrying until its window closes.
+
 ## [0.14.2] - 2026-11-04
 
 ### Fixed

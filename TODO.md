@@ -29,7 +29,7 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
 ## CI runners (2026-11-04)
 - [PENDING] Pin the four `runs-on: ubuntu-latest` jobs (`.github/workflows/test.yml`, `publish.yml`) to `ubuntu-24.04`: GitHub moves `ubuntu-latest` to Ubuntu 26 from 2026-10-19 (v0.14.2 run annotation). Also move `actions/checkout@v4` and `actions/setup-python@v5` to releases on Node 24 (Node 20 is deprecated; the runner forces them for now).
 
-## Wrong-game mark (2026-11-05)
+## Wrong-game mark (2026-11-05, released in v0.15.0)
 - [COMPLETED] **Wrong Game** button on a running recording (`POST /failover` with `wrong_game=true`). Symptom: a
   live recording captured the wrong game for ~40 min. Both backups and the only link a restart found were the same
   feed (one `quality.source_key`), so a manual switch and the event-page re-check kept landing on it. The mark is per
