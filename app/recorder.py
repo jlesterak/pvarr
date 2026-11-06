@@ -541,6 +541,14 @@ class CandidateStream:
         # DNS on this network refuses to name the stream's host (0.0.0.0).
         # Set by the probe on every connect; such a source is dead from here.
         self.dns_blocked: bool = False
+        # Standby check (a backup probed while another candidate records):
+        # "alive", "dead", "wrong_game" or "" when never checked. Read through
+        # StreamFailoverRecorder.standby_state(), which ages it out.
+        self.standby: str = ""
+        self.standby_at: float = 0.0
+        # The playlist the last standby check resolved to: says which feed a
+        # backup is before it is ever connected to (the "real sources" count).
+        self.standby_m3u8: str = ""
 
     def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
         """Serialise this candidate.
@@ -635,6 +643,7 @@ class StreamFailoverRecorder:
         log_callback: Optional[Callable[[str], None]] = None,
         on_completion_callback: Optional[Callable[[str], None]] = None,
         on_failover_callback: Optional[Callable[[str, str], None]] = None,
+        on_alert_callback: Optional[Callable[[str, str, str], None]] = None,
         header_overrides: Optional[Dict[str, Dict[str, str]]] = None,
         auto_probe: bool = True,
         max_cycles: int = 3,
@@ -681,6 +690,15 @@ class StreamFailoverRecorder:
         self.log_callback = log_callback
         self.on_completion_callback = on_completion_callback
         self.on_failover_callback = on_failover_callback
+        # (recording_id, title, body): something the operator should hear about
+        # while the recording runs, e.g. a burst of lost segments.
+        self.on_alert_callback = on_alert_callback
+        # Monitor thread state: bytes_written samples for the stream rate, lost
+        # segment times for the burst alert, when that alert last fired.
+        self._rate_samples: "collections.deque" = collections.deque(maxlen=7)
+        self._loss_times: "collections.deque" = collections.deque(maxlen=200)
+        self._last_alert_at: float = 0.0
+        self._monitor_thread: Optional[threading.Thread] = None
 
         self.current_candidate_index: int = 0
         # How many complete laps of the candidate list may pass without a
@@ -1170,6 +1188,9 @@ class StreamFailoverRecorder:
         self.output_filepath.parent.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._recording_loop, daemon=True)
         self._thread.start()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, name=f"pvarr-monitor-{self.recording_id}", daemon=True)
+        self._monitor_thread.start()
 
     @property
     def has_next_candidate(self) -> bool:
@@ -1417,6 +1438,120 @@ class StreamFailoverRecorder:
         if not wrapped:
             return 1.0
         return min(5.0 * (2 ** max(0, self.cycles_without_data - 1)), 60.0)
+
+    # -- monitor: standby checks, stream rate, loss alert ------------------
+
+    STANDBY_INTERVAL_SEC = 90.0
+    MONITOR_TICK_SEC = 10.0
+    LOSS_BURST_COUNT = 3
+    LOSS_BURST_WINDOW_SEC = 300.0
+    ALERT_INTERVAL_SEC = 900.0
+
+    def standby_state(self, candidate: CandidateStream, now: Optional[float] = None) -> str:
+        """A backup's last standby result, or "" once it is too old to trust
+        (three missed intervals) or was never taken."""
+        now = time.time() if now is None else now
+        if not candidate.standby or now - candidate.standby_at > 3 * self.STANDBY_INTERVAL_SEC:
+            return ""
+        return candidate.standby
+
+    def _next_candidate_index(self) -> int:
+        """The next candidate in cycle order that a standby check has not seen
+        dead (or on the wrong game). If every other one has, plain next: never
+        worse than before the checks existed."""
+        n = len(self.candidates)
+        here = self.current_candidate_index
+        for step in range(1, n):
+            i = (here + step) % n
+            if self.standby_state(self.candidates[i]) not in ("dead", "wrong_game"):
+                return i
+        return (here + 1) % n
+
+    def check_standby(self, index: int) -> str:
+        """Probe one backup without touching it: the probe runs on a copy, so
+        the recording loop's candidate (which it may enter at any moment) never
+        sees half-written fields. Light: no segment download, no yt-dlp.
+        Blocking network I/O, so only ever called from the monitor thread."""
+        live = self.candidates[index]
+        copy = CandidateStream(live.url, name=live.name)
+        copy.referer, copy.cookie, copy.user_agent = live.referer, live.cookie, live.user_agent
+        try:
+            result = probe_stream(copy.url, referer=copy.referer or None,
+                                  user_agent=copy.user_agent, cookie=copy.cookie or None,
+                                  check_segment=False, use_ytdlp=False)
+        except Exception:
+            result = {"ok": False}
+        if not result.get("ok"):
+            state = "dead"
+        else:
+            copy.m3u8_url = result.get("m3u8_url") or ""
+            state = "wrong_game" if self.is_wrong_source(copy) else "alive"
+        before = self.standby_state(live)
+        if copy.m3u8_url:
+            live.standby_m3u8 = copy.m3u8_url
+        live.standby, live.standby_at = state, time.time()
+        if before and before != state:
+            word = {"alive": "is answering again", "dead": "is not answering",
+                    "wrong_game": "plays the stream marked as the wrong game"}[state]
+            self._log(f"Standby check: {live.name} {word}.", "WARN" if state != "alive" else "INFO")
+        return state
+
+    def rate_mbps(self) -> Optional[float]:
+        """Stream rate over the monitor's samples (~60 s), in Mbit/s."""
+        samples = list(self._rate_samples)
+        if len(samples) < 2 or samples[-1][0] <= samples[0][0]:
+            return None
+        (t0, b0), (t1, b1) = samples[0], samples[-1]
+        return round(max(0, b1 - b0) * 8 / (t1 - t0) / 1e6, 1)
+
+    def _check_loss_burst(self, now: float) -> None:
+        recent = sum(1 for t in self._loss_times if now - t <= self.LOSS_BURST_WINDOW_SEC)
+        if recent < self.LOSS_BURST_COUNT or now - self._last_alert_at < self.ALERT_INTERVAL_SEC:
+            return
+        self._last_alert_at = now
+        rate = self.rate_mbps()
+        need = f" This stream needs about {rate} Mbps;" if rate else ""
+        body = (f"{recent} stream segments lost in the last "
+                f"{self.LOSS_BURST_WINDOW_SEC / 60:.0f} min.{need} check what else is using "
+                "your connection.")
+        self._log(f"Losing segments: {body}", "WARN")
+        if self.on_alert_callback:
+            try:
+                self.on_alert_callback(self.recording_id, "PVArr — Losing stream segments", body)
+            except Exception as exc:
+                logger.warning("Alert callback failed for %s: %s", self.recording_id, exc)
+
+    def _monitor_loop(self) -> None:
+        """Side thread for the life of the recording: samples the write rate,
+        watches for bursts of lost segments, and probes the backups now and
+        then so a failover goes to one that answers. Starts no processes."""
+        next_standby = time.time() + self.STANDBY_INTERVAL_SEC / 3
+        failed_logged = False
+        while self.is_running and not self._stop_event.wait(self.MONITOR_TICK_SEC):
+            # A fault here must not end the thread quietly: the rate, the
+            # alerts and the standby checks would all stop with no trace.
+            try:
+                now = time.time()
+                self._rate_samples.append((now, self.bytes_written))
+                self._check_loss_burst(now)
+                if len(self.candidates) > 1 and now >= next_standby:
+                    next_standby = now + self.STANDBY_INTERVAL_SEC
+                    for i in range(len(self.candidates)):
+                        if not self.is_running:
+                            return
+                        c = self.candidates[i]
+                        # A backup that was dead is re-checked every other
+                        # round: a dead page is not fetched every 90 s all game.
+                        if (i == self.current_candidate_index
+                                or (c.standby == "dead"
+                                    and now - c.standby_at < 2 * self.STANDBY_INTERVAL_SEC)):
+                            continue
+                        self.check_standby(i)
+            except Exception as exc:
+                if not failed_logged:
+                    failed_logged = True
+                    logger.warning("[%s] Monitor tick failed (it keeps running): %s",
+                                   self.recording_id, exc)
 
     @staticmethod
     def _candidate_key(candidate: CandidateStream) -> str:
@@ -1937,6 +2072,8 @@ class StreamFailoverRecorder:
             self.segments_expired += expired
             self._loss_unlogged += failed + expired
             now = time.time()
+            for _ in range(failed + expired):
+                self._loss_times.append(now)
             if (self._loss_logged_at
                     and now - self._loss_logged_at < self.SEGMENT_LOSS_LOG_INTERVAL_SEC):
                 return
@@ -2176,7 +2313,7 @@ class StreamFailoverRecorder:
             if manual_target is not None:
                 next_index, wrapped = manual_target, False
             else:
-                next_index = (self.current_candidate_index + 1) % len(self.candidates)
+                next_index = self._next_candidate_index()
                 # A single-candidate session wraps onto itself, which is what
                 # gives it retries at all rather than one attempt and out.
                 wrapped = next_index <= self.current_candidate_index
@@ -2402,10 +2539,10 @@ class StreamFailoverRecorder:
         return changed
 
     def get_status_summary(self) -> Dict[str, Any]:
-        # Only a resolved playlist says which feed a candidate is; before its
-        # first probe the URL is still the stream page.
+        # Only a resolved playlist says which feed a candidate is (a backup's
+        # standby check resolves one too); before that the URL is a page.
         letters = quality.source_letters(
-            [c.m3u8_url if c.detected else "" for c in self.candidates])
+            [c.m3u8_url if c.detected else c.standby_m3u8 for c in self.candidates])
         return {
             "id": self.recording_id,
             "status": self.status,
@@ -2443,8 +2580,11 @@ class StreamFailoverRecorder:
             "has_event_page": self.has_event_page,
             "rescan_state": self.rescan_state,
             "candidates": [dict(c.to_dict(), source=letter,
-                                wrong_game=self.is_wrong_source(c))
+                                wrong_game=self.is_wrong_source(c),
+                                standby=self.standby_state(c))
                            for c, letter in zip(self.candidates, letters)],
+            # What this stream needs from the connection, over the last ~60 s.
+            "rate_mbps": self.rate_mbps(),
             # Distinct real feeds behind the candidates that have a known
             # playlist; mirrors of one origin count once (quality.source_key).
             "distinct_sources": len({x for x in letters if x}),

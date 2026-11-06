@@ -43,17 +43,19 @@ Capture, failover and the timeline are solid; the losses now come from discovery
 (JavaScript players PVArr cannot resolve, the wrong game), backups that are one
 feed behind several links, and a thin WAN. In order:
 
-- [PENDING] **Quick wins.** (a) Card warns "1 real source" when every backup is a
-  mirror of one feed (`distinct_sources` already exists). (b) Standby health checks:
-  fetch backup playlists every ~60 s so failover goes to a known-live backup.
-  (c) Download rate vs. stream bitrate on the card, with a notification under ~20%
-  headroom.
+- [COMPLETED] **Quick wins** (2026-11-05). "N real sources" badge (amber when every backup is
+  one feed); standby checks probe each backup every 90 s on a copy (no segment fetch) and
+  failover takes the next one that answered, plain order if none did; stream rate over
+  ~60 s on the card; 3+ lost segments in 5 min sends one notification per 15 min. Proven by
+  6 tests (`TestStandbyAndAlerts`) and a dev-instance run: a backup whose playlist was
+  removed read dead within one check, and a forced failover from candidate 2 skipped it.
 - [PENDING] **Browser resolver sidecar** (optional `pvarr-browser` container,
   Playwright Chromium + ad blocker, `POST /resolve` -> playlist + headers). Used by
   `detect_candidate_headers()` and by Find for links the probe cannot resolve.
   Would supersede `detect-headers` and most FlareSolverr use. Prototype and measure
   first (target: >=70% of JavaScript-player links resolved); Architecture + Security
   review before merge; isolated like FlareSolverr (own network, no LAN egress).
+  Detailed plan kept in the private notes; first step is measuring a link corpus.
 - [PENDING] **Follow a team.** Auto-schedule from a public schedule; end a recording
   a few minutes after the game's status reads final (status only, never score or
   clock, never shown), so overtime is never cut; resolve at T-20, record from T-5.

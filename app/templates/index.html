@@ -332,10 +332,29 @@
                       title="Bytes the recorder has received from the stream"
                       x-text="toMB(session.bytes_written) + ' MB'"></span>
               </div>
+              <!-- What the stream needs from the connection. When segments go
+                   missing, compare this with what the line can actually do. -->
+              <div x-show="session.rate_mbps">
+                <span class="text-xs text-slate-400 block font-medium uppercase tracking-wider">Stream rate</span>
+                <span class="text-sm font-bold font-mono text-slate-200"
+                      title="Bandwidth this stream uses, averaged over the last minute"
+                      x-text="'≈ ' + session.rate_mbps + ' Mbps'"></span>
+              </div>
             </div>
 
             <!-- Candidate Stream Slots Badges -->
             <div class="flex items-center space-x-3 overflow-x-auto pb-1">
+              <!-- Links are not sources: mirrors of one feed die together. -->
+              <span x-show="session.total_candidates > 1"
+                    class="px-2 py-1 rounded-lg text-xs border shrink-0"
+                    :class="(session.distinct_sources === 1 && session.unknown_sources === 0)
+                              ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 font-semibold'
+                              : 'bg-slate-900/60 text-slate-400 border-slate-800'"
+                    :title="(session.distinct_sources === 1 && session.unknown_sources === 0)
+                              ? 'Every backup is the same feed as the primary: if it dies, they all die'
+                              : 'Distinct feeds behind these links (mirrors of one feed count once)'"
+                    x-text="session.distinct_sources + ' real source' + (session.distinct_sources === 1 ? '' : 's')
+                            + (session.unknown_sources ? ' (+' + session.unknown_sources + ' unchecked)' : '')"></span>
               <template x-for="(cand, idx) in session.candidates" :key="idx">
                 <!-- Clickable: this is the only route back to an earlier
                      candidate, since failover only ever moves forwards. -->
@@ -357,6 +376,11 @@
                   <span x-show="cand.fail_count > 0" class="text-amber-500/80"
                         x-text="'⚠ ' + cand.fail_count"></span>
                   <span x-show="cand.wrong_game" class="text-fuchsia-400/90">wrong game</span>
+                  <!-- Standby check on a backup: green answers, red does not. -->
+                  <span x-show="(idx + 1) !== session.current_candidate && cand.standby && cand.standby !== 'wrong_game'"
+                        class="w-1.5 h-1.5 rounded-full"
+                        :class="cand.standby === 'alive' ? 'bg-emerald-500' : 'bg-rose-500'"
+                        :title="cand.standby === 'alive' ? 'Standby check: answering' : 'Standby check: not answering; failover skips it'"></span>
                 </button>
               </template>
             </div>

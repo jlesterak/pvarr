@@ -7802,6 +7802,78 @@ class TestWrongGame(FailoverLoopTestCase):
         self.assertEqual(recorder.wrong_sources, {"cdn.example/hls/abc.m3u8"})
 
 
+class TestStandbyAndAlerts(FailoverLoopTestCase):
+    """Backups are probed while another candidate records; failover prefers
+    one that answered, and a burst of lost segments alerts the operator."""
+
+    URLS = ["http://a.example/1.m3u8", "http://b.example/2.m3u8", "http://c.example/3.m3u8"]
+
+    def test_failover_skips_a_backup_seen_dead(self):
+        # Candidate 1 fails twice (direct mode, then the proxy fallback).
+        rec = self.make(self.URLS, [False, False, True])
+        rec.candidates[1].standby, rec.candidates[1].standby_at = "dead", time.time()
+        self.run_loop(rec)
+        self.assertNotIn("Candidate 2", rec.attempts)
+        self.assertEqual(rec.attempts[-1], "Candidate 3")
+
+    def test_all_backups_dead_falls_back_to_plain_next(self):
+        rec = self.make(self.URLS, [])
+        for c in rec.candidates[1:]:
+            c.standby, c.standby_at = "dead", time.time()
+        self.assertEqual(rec._next_candidate_index(), 1)
+
+    def test_a_stale_result_is_not_trusted(self):
+        rec = self.make(self.URLS, [])
+        rec.candidates[1].standby = "dead"
+        rec.candidates[1].standby_at = time.time() - 4 * rec.STANDBY_INTERVAL_SEC
+        self.assertEqual(rec.standby_state(rec.candidates[1]), "")
+        self.assertEqual(rec._next_candidate_index(), 1)
+
+    def test_standby_probe_does_not_touch_the_live_candidate(self):
+        from unittest.mock import patch
+        rec = self.make(self.URLS, [])
+        live = rec.candidates[1]
+        live.m3u8_url, live.detected = "http://b.example/old.m3u8", True
+        answer = {"ok": True, "m3u8_url": "http://b.example/new.m3u8"}
+        with patch("app.recorder.probe_stream", return_value=answer) as probe:
+            self.assertEqual(rec.check_standby(1), "alive")
+        self.assertFalse(probe.call_args.kwargs["check_segment"])
+        self.assertEqual(live.m3u8_url, "http://b.example/old.m3u8")
+        self.assertEqual(live.standby_m3u8, "http://b.example/new.m3u8")
+
+    def test_monitor_survives_a_failing_check(self):
+        from unittest.mock import patch
+        rec = self.make(self.URLS, [])
+        rec.is_running = True
+        rec.MONITOR_TICK_SEC = 0.01
+        rec.STANDBY_INTERVAL_SEC = 0.0
+        calls = []
+
+        def boom(i):
+            calls.append(i)
+            if len(calls) >= 4:
+                rec.is_running = False
+            raise RuntimeError("probe blew up")
+
+        with patch.object(rec, "check_standby", side_effect=boom):
+            rec._monitor_loop()
+        self.assertGreaterEqual(len(calls), 4, "the monitor died on the first fault")
+
+    def test_loss_burst_alerts_once_per_interval(self):
+        alerts = []
+        rec = self.make(self.URLS, [], on_alert_callback=lambda *a: alerts.append(a))
+        rec._note_segment_loss(failed=1)
+        rec._note_segment_loss(expired=1)
+        rec._check_loss_burst(time.time())
+        self.assertEqual(alerts, [], "two losses is not a burst")
+        rec._note_segment_loss(failed=1)
+        rec._check_loss_burst(time.time())
+        rec._note_segment_loss(failed=5)
+        rec._check_loss_burst(time.time())
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("3 stream segments lost", alerts[0][2])
+
+
 class TestRelayRoutesNestedPlaylistsByTag(unittest.TestCase):
     """Review 2026-10-05: only URIs ending .m3u8 were relayed, so a variant
     at `/live/720p` or a `.m3u` rendition went to FFmpeg direct and 403'd,

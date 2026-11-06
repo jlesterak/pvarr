@@ -870,6 +870,8 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         freeze_timeout_sec=record.get("freeze_timeout_sec", 60),
         on_completion_callback=_on_complete,
         on_failover_callback=_on_failover,
+        on_alert_callback=lambda rec_id, title, body: notifier.send(
+            title, f"Session: {rec_id}\n{body}"),
         header_overrides=record.get("header_overrides") or {},
         min_free_gb=record.get("min_free_gb", DEFAULT_MIN_FREE_GB),
         ring=ring,
