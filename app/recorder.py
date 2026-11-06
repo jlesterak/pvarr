@@ -22,7 +22,7 @@ from enum import Enum
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
-from typing import List, Optional, Callable, Dict, Any, Tuple
+from typing import List, Optional, Callable, Dict, Any, Set, Tuple
 
 from app.check_deps import find_executable
 from app.logging_config import redact_url_secrets
@@ -753,6 +753,12 @@ class StreamFailoverRecorder:
         # Set by switch_to_candidate() to redirect the next hop to a specific
         # candidate rather than simply the next one.
         self._manual_target_index: Optional[int] = None
+        # Streams the operator marked as the wrong game, by quality.source_key:
+        # never connected to again in this recording, under any link. Mirrors
+        # of one origin share a key, so a backup that turns out to be the same
+        # feed is skipped too -- the case that made "switch to the backup"
+        # land on the same wrong game.
+        self.wrong_sources: Set[str] = set()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -1412,6 +1418,51 @@ class StreamFailoverRecorder:
             return 1.0
         return min(5.0 * (2 ** max(0, self.cycles_without_data - 1)), 60.0)
 
+    @staticmethod
+    def _candidate_key(candidate: CandidateStream) -> str:
+        """The feed a candidate plays (quality.source_key); "" before its
+        playlist is known. A raw playlist URL is its own playlist."""
+        return quality.source_key(candidate.m3u8_url or (
+            candidate.url if ".m3u8" in candidate.url.lower() else ""))
+
+    def is_wrong_source(self, candidate: CandidateStream) -> bool:
+        key = self._candidate_key(candidate)
+        return bool(key) and key in self.wrong_sources
+
+    def mark_wrong_game(self) -> Optional[str]:
+        """The operator says the stream being recorded is the wrong game.
+
+        Marks its feed, counts every candidate on that feed as failed (so the
+        event-page re-check refills those slots) and leaves it now, through
+        the force-failover abort path. Unlike force_failover() a single-URL
+        session is not refused: recording nothing beats recording the wrong
+        game, and the loop keeps retrying (and re-checking) until the window
+        closes. Returns the key, or None when the playlist is not known yet.
+        """
+        if not 0 <= self.current_candidate_index < len(self.candidates):
+            return None
+        current = self.candidates[self.current_candidate_index]
+        key = self._candidate_key(current)
+        if not key:
+            self._log("Wrong-game mark refused: this stream's playlist is not known yet.", "WARN")
+            return None
+        self.wrong_sources.add(key)
+        same = [c for c in self.candidates if self._candidate_key(c) == key]
+        for c in same:
+            c.fail_count += 1
+        names = ", ".join(c.name for c in same)
+        self._log(f"Marked as the wrong game: {names}. That stream will not be used again "
+                  "in this recording, under any link.", "WARN")
+        self._force_failover_flag = True
+        if self.is_running:
+            self.status = "failing_over"
+        if self._ffmpeg_process:
+            try:
+                self._ffmpeg_process.terminate()
+            except Exception:
+                pass
+        return key
+
     def force_failover(self) -> bool:
         """Manual trigger to force switch to the next stream candidate.
 
@@ -1979,17 +2030,25 @@ class StreamFailoverRecorder:
             # retrying it, or routing it through the proxy, asks the same
             # blocked host. Count it dead (so the event page is re-checked for
             # another source) and move straight on.
-            dns_blocked = candidate.dns_blocked
-            if dns_blocked:
+            skip = candidate.dns_blocked
+            if skip:
                 candidate.fail_count += 1
                 self._log(f"{candidate.name}: {candidate.last_error} Skipping it.", "WARN")
+                outcome = StreamOutcome.FAILED
+            # The operator marked this feed as the wrong game, possibly under
+            # another link: skip it the same way, counted dead for a re-check.
+            elif self.is_wrong_source(candidate):
+                skip = True
+                candidate.fail_count += 1
+                self._log(f"{candidate.name} plays the stream marked as the wrong game. "
+                          "Skipping it.", "WARN")
                 outcome = StreamOutcome.FAILED
 
             # 2. Attempt Direct Mode (Direct FFmpeg with -headers)
             #    A playlist only a browser TLS profile can fetch is read
             #    through a loopback relay; segments still go straight to the CDN
             #    with these same headers.
-            if not dns_blocked:
+            if not skip:
                 self._log(f"[Direct Mode] Connecting FFmpeg directly to {url_for_log(candidate.m3u8_url)}...")
                 relay = None
                 try:
@@ -2037,8 +2096,8 @@ class StreamFailoverRecorder:
             #    proxy retry is still better than nothing.
             dead_mid_recording = (outcome is StreamOutcome.INTERRUPTED
                                   and self.has_next_candidate)
-            if dns_blocked:
-                pass    # already failed over above; the proxy asks the same host
+            if skip:
+                pass    # already failed over above; the proxy asks the same host (or the wrong game)
             elif candidate.png_wrapped or candidate.json_playlist:
                 pass    # hls-proxy can read neither the images nor a JSON playlist
             elif (dead_mid_recording
@@ -2296,7 +2355,14 @@ class StreamFailoverRecorder:
         """
         if not self.auto_probe:
             return True
-        return self._probe_candidate(CandidateStream(url, name="fresh link from the event page"))
+        fresh = CandidateStream(url, name="fresh link from the event page")
+        if not self._probe_candidate(fresh):
+            return False
+        if self.is_wrong_source(fresh):
+            self._log("A fresh event-page link plays the stream marked as the wrong game; "
+                      "not using it.", "WARN")
+            return False
+        return True
 
     def replace_dead_candidates(self, urls: List[str],
                                 max_candidates: int = 3) -> List[Tuple[int, str]]:
@@ -2376,7 +2442,8 @@ class StreamFailoverRecorder:
             "total_candidates": len(self.candidates),
             "has_event_page": self.has_event_page,
             "rescan_state": self.rescan_state,
-            "candidates": [dict(c.to_dict(), source=letter)
+            "candidates": [dict(c.to_dict(), source=letter,
+                                wrong_game=self.is_wrong_source(c))
                            for c, letter in zip(self.candidates, letters)],
             # Distinct real feeds behind the candidates that have a known
             # playlist; mirrors of one origin count once (quality.source_key).

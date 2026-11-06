@@ -880,6 +880,10 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
     if record.get("started_at"):
         recorder.start_time = record["started_at"]
     recorder.has_event_page = bool(record.get("event_page"))
+    # Streams the operator marked as the wrong game stay marked across a
+    # restart; the record is JSON on disk, so keep only strings.
+    recorder.wrong_sources = {k for k in (record.get("wrong_sources") or [])
+                              if isinstance(k, str) and k}
 
     # Reattach to the candidate that was actually working. _on_failover has
     # been writing this to the record all along, with a comment saying exactly
@@ -2046,14 +2050,34 @@ async def move_recording_end(
 
 
 @app.post("/api/recordings/{recording_id}/failover")
-async def trigger_failover(recording_id: str):
-    """Force switch to the next backup stream candidate."""
+async def trigger_failover(recording_id: str, wrong_game: bool = Form(False)):
+    """Force switch to the next backup stream candidate.
+
+    With `wrong_game=true` the stream being recorded is also marked as the
+    wrong game: it is left now and never used again in this recording, under
+    any link that plays the same feed. Allowed on a single-URL session too
+    (it then retries, and re-checks the event page, until the window closes).
+    """
     recorder = active_recorders.get(recording_id)
     if not recorder:
         raise HTTPException(status_code=404, detail="Recording session not found")
 
     if not recorder.is_running:
         raise HTTPException(status_code=400, detail="Recording session is not currently running")
+
+    if wrong_game:
+        key = recorder.mark_wrong_game()
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="The stream being recorded has no known playlist yet; try again in a moment.",
+            )
+        record = getattr(recorder, "session_record", None)
+        if record is not None:
+            record["wrong_sources"] = sorted(recorder.wrong_sources)
+            session_store.save(record)
+        return {"status": "success",
+                "message": f"Marked the current stream of {recording_id} as the wrong game"}
 
     # A single-URL session has nowhere to go: honouring the request would end
     # the recording rather than switch it, and the caller still got a "success".

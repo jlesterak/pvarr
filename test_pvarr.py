@@ -3735,6 +3735,27 @@ class TestRecordingRoutes(ServerTestCase):
         self.assertEqual(r.status_code, 200)
         rec.force_failover.assert_called_once()
 
+    def test_wrong_game_mark_is_saved_or_refused(self):
+        # The mark must reach the session record (a resume reads it back), and
+        # an unresolved stream must be refused rather than answer "success".
+        from unittest.mock import MagicMock, patch
+        rec = MagicMock()
+        rec.is_running = True
+        rec.wrong_sources = {"cdn.example/hls/abc.m3u8"}
+        rec.session_record = {"id": "abc"}
+        rec.mark_wrong_game.return_value = None
+        self.server.active_recorders["abc"] = rec
+        with patch.object(self.server, "session_store", MagicMock()) as store:
+            r = self.client.post("/api/recordings/abc/failover", data={"wrong_game": "true"})
+            self.assertEqual(r.status_code, 400)
+            store.save.assert_not_called()
+            rec.mark_wrong_game.return_value = "cdn.example/hls/abc.m3u8"
+            r = self.client.post("/api/recordings/abc/failover", data={"wrong_game": "true"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(rec.session_record["wrong_sources"], ["cdn.example/hls/abc.m3u8"])
+            store.save.assert_called_once()
+        rec.force_failover.assert_not_called()
+
     def _running(self, deadline):
         from unittest.mock import MagicMock
         rec = MagicMock()
@@ -7718,6 +7739,67 @@ class TestResumeReattachesToTheWorkingCandidate(unittest.TestCase):
             with self.subTest(value=junk):
                 recorder = self._launch(current_candidate_index=junk)
                 self.assertEqual(recorder.current_candidate_index, 0)
+
+
+class TestWrongGame(FailoverLoopTestCase):
+    """The operator marks the stream being recorded as the wrong game.
+
+    2026-11-05: two backups and a fresh event-page link were all the same
+    feed as the wrong-game stream, so "switch to the backup" and the re-check
+    kept landing on it. The mark is per feed (quality.source_key), not per link.
+    """
+
+    MIRROR_A = "http://edge1.cdn.example/hls/abc.m3u8"
+    MIRROR_B = "http://edge2.cdn.example/hls/abc.m3u8"
+    OTHER = "http://other.example/live/xyz.m3u8"
+
+    def test_a_mirror_of_the_wrong_stream_is_skipped(self):
+        keys = []
+
+        def mark(rec, candidate):
+            keys.append(rec.mark_wrong_game())
+            return False
+
+        rec = self.make([self.MIRROR_A, self.MIRROR_B, self.OTHER], [mark, True])
+        self.run_loop(rec)
+        self.assertTrue(keys[0])
+        self.assertEqual(rec.attempts, ["Candidate 1", "Candidate 3"],
+                         "the backup on the same feed was connected to")
+        self.assertEqual(rec.status, "completed")
+        self.assertGreater(rec.candidates[1].fail_count, 0,
+                           "the mirror must count as dead so a re-check refills it")
+
+    def test_a_single_url_session_can_be_marked(self):
+        # force_failover() refuses a single URL; the wrong-game mark must not,
+        # and the marked stream is never connected to again.
+        keys = []
+
+        def mark(rec, candidate):
+            keys.append(rec.mark_wrong_game())
+            return False
+
+        rec = self.make([self.MIRROR_A], [mark])
+        self.run_loop(rec)
+        self.assertTrue(keys[0], "the mark was refused on a single-URL session")
+        self.assertEqual(rec.attempts, ["Candidate 1"])
+
+    def test_a_fresh_link_on_the_wrong_stream_is_not_used(self):
+        rec = StreamFailoverRecorder("test-id", [self.OTHER], self.out, min_free_gb=0)
+        from app import quality
+        rec.wrong_sources = {quality.source_key(self.MIRROR_A)}
+
+        def fake_probe(candidate):
+            candidate.m3u8_url = self.MIRROR_B     # the page link resolves to a mirror
+            candidate.detected = True
+            return True
+
+        rec._probe_candidate = fake_probe
+        self.assertFalse(rec.fresh_link_plays("https://page.example/watch/1"))
+
+    def test_the_mark_survives_a_resume(self):
+        recorder = TestResumeReattachesToTheWorkingCandidate()._launch(
+            wrong_sources=["cdn.example/hls/abc.m3u8", 7, ""])
+        self.assertEqual(recorder.wrong_sources, {"cdn.example/hls/abc.m3u8"})
 
 
 class TestRelayRoutesNestedPlaylistsByTag(unittest.TestCase):

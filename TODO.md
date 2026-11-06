@@ -29,6 +29,17 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
 ## CI runners (2026-11-04)
 - [PENDING] Pin the four `runs-on: ubuntu-latest` jobs (`.github/workflows/test.yml`, `publish.yml`) to `ubuntu-24.04`: GitHub moves `ubuntu-latest` to Ubuntu 26 from 2026-10-19 (v0.14.2 run annotation). Also move `actions/checkout@v4` and `actions/setup-python@v5` to releases on Node 24 (Node 20 is deprecated; the runner forces them for now).
 
+## Wrong-game mark (2026-11-05)
+- [COMPLETED] **Wrong Game** button on a running recording (`POST /failover` with `wrong_game=true`). Symptom: a
+  live recording captured the wrong game for ~40 min. Both backups and the only link a restart found were the same
+  feed (one `quality.source_key`), so a manual switch and the event-page re-check kept landing on it. The mark is per
+  feed: the loop skips any candidate resolving to it (like a DNS-blocked one, counted dead so a re-check refills the
+  slot), `fresh_link_plays` refuses it, and `wrong_sources` is saved in the session record for resume. Proven by 5
+  tests (`TestWrongGame`, plus the `/failover` route saving or refusing the mark) and a live run on a dev instance: marked on candidate 1, candidate 2 (a mirror on
+  another edge host) was skipped, candidate 3 recorded, and the mark was in the saved session.
+- [PENDING] Candidate: a "send to PVArr" bookmarklet that hands a playing page's m3u8 + Referer to the Add form;
+  11 of 12 event-page links that night were JavaScript players PVArr could not resolve.
+
 ## Longer-term candidates
 - A retention/cleanup policy for old recordings on disk.
 - Integration coverage for the notification webhooks (currently mocks only).
