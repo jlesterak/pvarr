@@ -37,14 +37,38 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
   slot), `fresh_link_plays` refuses it, and `wrong_sources` is saved in the session record for resume. Proven by 5
   tests (`TestWrongGame`, plus the `/failover` route saving or refusing the mark) and a live run on a dev instance: marked on candidate 1, candidate 2 (a mirror on
   another edge host) was skipped, candidate 3 recorded, and the mark was in the saved session.
-- [PENDING] Candidate: a "send to PVArr" bookmarklet that hands a playing page's m3u8 + Referer to the Add form;
-  11 of 12 event-page links that night were JavaScript players PVArr could not resolve.
+
+## Roadmap (sponsor-approved 2026-11-05)
+Capture, failover and the timeline are solid; the losses now come from discovery
+(JavaScript players PVArr cannot resolve, the wrong game), backups that are one
+feed behind several links, and a thin WAN. In order:
+
+- [PENDING] **Quick wins.** (a) Card warns "1 real source" when every backup is a
+  mirror of one feed (`distinct_sources` already exists). (b) Standby health checks:
+  fetch backup playlists every ~60 s so failover goes to a known-live backup.
+  (c) Download rate vs. stream bitrate on the card, with a notification under ~20%
+  headroom.
+- [PENDING] **Browser resolver sidecar** (optional `pvarr-browser` container,
+  Playwright Chromium + ad blocker, `POST /resolve` -> playlist + headers). Used by
+  `detect_candidate_headers()` and by Find for links the probe cannot resolve.
+  Would supersede `detect-headers` and most FlareSolverr use. Prototype and measure
+  first (target: >=70% of JavaScript-player links resolved); Architecture + Security
+  review before merge; isolated like FlareSolverr (own network, no LAN egress).
+- [PENDING] **Follow a team.** Auto-schedule from a public schedule; end a recording
+  a few minutes after the game's status reads final (status only, never score or
+  clock, never shown), so overtime is never cut; resolve at T-20, record from T-5.
+- [PENDING] **Fewer gaps without more bandwidth.** Refetch a failed segment from a
+  mirror of the same feed (same `source_key`); drop to a lower variant of the same
+  feed on repeated expired segments, back up when headroom returns.
+- [PENDING] **Gap map** per recording (where, how long, which source) on the Library card.
+- [PENDING] **Team-name check** (warning only) from the resolved page title/text.
+
+Not pursuing: stitching different broadcasts together, scorebug OCR, site-specific
+code, DRM, a built-in player, transcoding, a bookmarklet (the sidecar covers it).
 
 ## Longer-term candidates
 - A retention/cleanup policy for old recordings on disk.
 - Integration coverage for the notification webhooks (currently mocks only).
-- A headless-browser probe path so JavaScript-built m3u8 URLs work without the
-  external `detect-headers`.
 
 ---
 
