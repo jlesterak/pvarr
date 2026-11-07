@@ -9989,6 +9989,8 @@ class TestStreamRanking(unittest.TestCase):
         self.assertEqual(aggregator.summary_text(s),
                          "7 links: 3 working from 2 real sources (A \u00d72, B \u00d71), "
                          "2 not video, 1 failed, 1 unresolved.")
+        # The re-check logs exactly the unresolved link, not the failed one.
+        self.assertEqual(aggregator.unresolved_links(out), [links[4]])
 
     def test_source_letters_follow_first_appearance(self):
         urls = ["https://e1.cdn.example/hls/a.m3u8", "", "https://x.example/b.m3u8",

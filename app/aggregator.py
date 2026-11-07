@@ -630,6 +630,14 @@ def _source_summary(links: List[str], results: Dict[int, Dict[str, Any]], chosen
             "groups": list(groups.values())}
 
 
+def unresolved_links(result: Dict[str, Any], limit: int = 20) -> List[str]:
+    """Links whose player builds its URL in JavaScript, so no playlist was
+    found. Logged by the mid-recording re-check so they can be tried by hand
+    or with a browser-based resolver; capped so one page cannot flood the log."""
+    return [t["url"] for t in (result or {}).get("tried") or []
+            if t.get("status") == "unresolved" and t.get("url")][:limit]
+
+
 def summary_text(summary: Dict[str, Any]) -> str:
     """'12 links: 4 working from 2 real sources (A x3, B x1), 2 not video,
     6 unresolved.' -- zero counts left out."""

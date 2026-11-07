@@ -1666,6 +1666,10 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
         counts = aggregator.summary_text((result or {}).get("summary") or {})
         if counts:
             recorder._log(f"Event page re-checked, other links on it: {counts}")
+        stuck = aggregator.unresolved_links(result or {})
+        if stuck:
+            recorder._log("Unresolved links (no playlist found; the player may build it in "
+                          "JavaScript): " + ", ".join(stuck))
         # Probe each fresh link again just before it goes in, one at a time
         # and only as many as there are slots to fill: a link that no longer
         # plays is dropped and the failed source keeps its slot, since a
