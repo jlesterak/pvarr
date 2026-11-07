@@ -24,7 +24,8 @@ leans on station logos, black frames, aspect changes and audio silence. On a
 rebroadcast OTA channel that is exactly right. On a stream that fills its
 breaks with an animated "commercial break in progress" card it has much less to
 work with -- such a card is not black, not silent, and not frozen, so the
-obvious signals all miss it. app/breakcards.py covers that case; process()
+obvious signals all miss it. app/breakcards.py covers that case (a card
+repeats from break to break; live play never does); process()
 combines both detectors' breaks into one chapter write.
 """
 

@@ -11,3 +11,6 @@ curl_cffi>=0.7
 # One interface to 100+ notification services, replacing hand-rolled Discord
 # and Telegram senders. 1.8 MB.
 apprise>=1.9
+# The break-card pass compares every second of a recording with every other
+# (a few seconds in numpy, hours in plain Python). ~70 MB installed.
+numpy>=2.0

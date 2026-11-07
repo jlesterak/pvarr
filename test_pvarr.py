@@ -10945,70 +10945,63 @@ class TestJsonSegmentList(unittest.TestCase):
 
 
 class TestBreakCards(unittest.TestCase):
-    """Breaks a source fills with its own card: quiet audio AND overlay gone."""
+    """Breaks a source fills with its own card: the same pictures come back
+    many minutes apart, which live play never does."""
 
     W = 64 * 36
 
-    def _frame(self, overlay: bool, seed: int, partial: float = 0.0) -> bytes:
-        rnd = random.Random(seed)
-        px = bytearray(rnd.randrange(30, 230) for _ in range(self.W))   # moving picture
-        for i, p in enumerate(range(31 * 64 + 48, 31 * 64 + 62)):       # a 14x2 overlay
-            for row in (0, 64):
-                if overlay and not (partial and i < 14 * partial):
-                    px[p + row] = 240
-        return bytes(px)
+    def _live(self, t: int) -> bytes:
+        rnd = random.Random(t)
+        return bytes(rnd.randrange(30, 230) for _ in range(self.W))
+
+    def _card(self, t: int) -> bytes:
+        """A 10-picture loop, each shown with a little encoder noise."""
+        base = random.Random(f"card-{t % 10}")
+        noise = random.Random(t)
+        return bytes(min(255, max(0, base.randrange(30, 230) + noise.randint(-2, 2)))
+                     for _ in range(self.W))
 
     def _clip(self, layout):
-        """layout: list of (seconds, loud, overlay[, partial]); one keyframe a second."""
-        rms, times, frames, t = [], [], [], 0
-        for seg in layout:
-            secs, loud, overlay = seg[:3]
-            partial = seg[3] if len(seg) > 3 else 0.0
+        """layout: list of (seconds, kind); kind is 'live', 'card' or a fixed
+        picture (bytes). One keyframe a second."""
+        times, frames, t = [], [], 0
+        for secs, kind in layout:
             for _ in range(secs):
-                rms.append(-27.0 if loud else -45.0)
                 times.append(float(t))
-                frames.append(self._frame(overlay, t, partial))
+                frames.append(kind if isinstance(kind, bytes) else
+                              self._card(t) if kind == "card" else self._live(t))
                 t += 1
-        return rms, times, frames
+        return times, frames
 
-    def test_a_card_break_is_found(self):
+    def test_a_card_shown_in_two_breaks_is_found_in_both(self):
         from app import breakcards
-        rms, times, frames = self._clip([(600, True, True), (120, False, False), (600, True, True)])
-        spans = breakcards.find_breaks(rms, times, frames)
-        self.assertEqual(len(spans), 1)
-        start, end = spans[0]
-        self.assertLess(abs(start - 600), 20)
-        self.assertLess(abs(end - 720), 20)
+        times, frames = self._clip([(600, "live"), (120, "card"), (600, "live"),
+                                    (90, "card"), (300, "live")])
+        spans = breakcards.find_breaks(times, frames)
+        self.assertEqual(len(spans), 2, spans)
+        for (start, end), (want_a, want_b) in zip(spans, [(600, 720), (1320, 1410)]):
+            self.assertLess(abs(start - want_a), 5)
+            self.assertLess(abs(end - want_b), 12)
 
-    def test_a_replay_or_a_quiet_spell_alone_is_not_a_break(self):
+    def test_live_play_and_a_long_still_shot_are_not_breaks(self):
+        """A picture held for four minutes only matches itself within the
+        repeat gap; a card shown once has nothing to match."""
         from app import breakcards
-        rms, times, frames = self._clip([
-            (600, True, True), (90, True, False),     # replay: overlay gone, loud
-            (600, True, True), (90, False, True),     # quiet play: overlay stays
-            (600, True, True), (120, False, False), (300, True, True)])
-        spans = breakcards.find_breaks(rms, times, frames)
-        self.assertEqual(len(spans), 1, spans)
-        self.assertLess(abs(spans[0][0] - 1980), 20)
+        still = self._live(99999)
+        times, frames = self._clip([(600, "live"), (240, still), (600, "live"),
+                                    (120, "card"), (600, "live")])
+        self.assertEqual(breakcards.find_breaks(times, frames), [])
 
-    def test_a_score_change_does_not_read_as_the_overlay_leaving(self):
-        """A few digit pixels changing during a quiet stretch must not count."""
+    def test_sparse_keyframes_hold_for_the_seconds_between(self):
         from app import breakcards
-        rms, times, frames = self._clip([
-            (600, True, True), (90, False, True, 0.3),
-            (600, True, True), (120, False, False), (300, True, True)])
-        spans = breakcards.find_breaks(rms, times, frames)
-        self.assertEqual(len(spans), 1, spans)
-
-    def test_no_steady_overlay_means_no_breaks_rather_than_an_audio_guess(self):
-        from app import breakcards
-        rms, times, frames = self._clip([(600, True, False), (120, False, False), (600, True, False)])
-        self.assertEqual(breakcards.find_breaks(rms, times, frames), [])
+        times, frames = self._clip([(600, "live"), (120, "card"), (600, "live"),
+                                    (120, "card"), (300, "live")])
+        sparse = list(range(0, len(times), 4))
+        spans = breakcards.find_breaks([times[i] for i in sparse], [frames[i] for i in sparse])
+        self.assertEqual(len(spans), 2, spans)
 
     def test_ffmpeg_output_parsing(self):
         from app import breakcards
-        text = ("frame:0    pts:0       pts_time:0\nlavfi.astats.Overall.RMS_level=-27.5\n"
-                "frame:1    pts:8000    pts_time:1\nlavfi.astats.Overall.RMS_level=-inf\n")
-        self.assertEqual(breakcards.parse_rms(text), [-27.5, breakcards.SILENT_DB])
         raw = b"\x01" * self.W * 3
         log = "\n".join(f"[Parsed_showinfo_0 @ 0x1] n:{i} pts_time:{t}" for i, t in
                         enumerate((0.0, 0.5, 1.4)))
@@ -11018,24 +11011,25 @@ class TestBreakCards(unittest.TestCase):
 
     @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
     def test_end_to_end_on_a_generated_clip(self):
-        """Real FFmpeg passes: moving picture with a box in the corner and a
-        loud tone; from 60 to 130 s the box goes and the tone drops 20 dB."""
+        """Real FFmpeg pass: moving noise, with the same bars card from 30 to
+        90 s and again from 400 to 460 s."""
         from app import breakcards
         tmp = Path(tempfile.mkdtemp(prefix="pvarr-cards-test-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         clip = tmp / "clip.mp4"
         subprocess.run([
             "ffmpeg", "-v", "error", "-y",
-            "-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=240",
-            "-f", "lavfi", "-i", "sine=f=440:d=240",
-            "-vf", "drawbox=x=250:y=150:w=60:h=20:color=white:t=fill:enable='not(between(t,60,130))'",
-            "-af", "volume='if(between(t,60,130),0.1,1)':eval=frame",
-            "-c:v", "libx264", "-g", "10", "-preset", "ultrafast", "-c:a", "aac", "-shortest",
+            "-f", "lavfi", "-i", "color=c=gray:s=160x90:r=2:d=480,noise=alls=100:allf=t",
+            "-f", "lavfi", "-i", "smptebars=s=160x90:r=2:d=480",
+            "-filter_complex",
+            "[0][1]overlay=enable='between(t,30,90)+between(t,400,460)'",
+            "-c:v", "libx264", "-g", "2", "-crf", "18", "-preset", "ultrafast",
             str(clip)], check=True, timeout=120)
         spans = breakcards.detect(str(clip))
-        self.assertEqual(len(spans), 1, spans)
-        self.assertLess(abs(spans[0][0] - 60), 20)
-        self.assertLess(abs(spans[0][1] - 130), 20)
+        self.assertEqual(len(spans), 2, spans)
+        for (start, end), (want_a, want_b) in zip(spans, [(30, 90), (400, 460)]):
+            self.assertLess(abs(start - want_a), 5)
+            self.assertLess(abs(end - want_b), 12)
 
 
 class TestCommercialsWithCards(unittest.TestCase):
