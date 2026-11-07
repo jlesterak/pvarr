@@ -27,7 +27,7 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
   Emby tuner fetches unless `/live/*` is exempted or given a token parameter.
 
 ## CI runners (2026-11-04)
-- [PENDING] Pin the four `runs-on: ubuntu-latest` jobs (`.github/workflows/test.yml`, `publish.yml`) to `ubuntu-24.04`: GitHub moves `ubuntu-latest` to Ubuntu 26 from 2026-10-19 (v0.14.2 run annotation). Also move `actions/checkout@v4` and `actions/setup-python@v5` to releases on Node 24 (Node 20 is deprecated; the runner forces them for now).
+- [COMPLETED] CI stays on `ubuntu-latest` (sponsor, 2026-11-07): pinning means a bump every runner generation; the jobs only need Python and Docker, so a new Ubuntu is low risk and a failure shows on the next push. Moved `actions/checkout` to v5 and `actions/setup-python` to v6 (Node 24), which clears the Node 20 deprecation warning.
 
 ## Wrong-game mark (2026-11-05, released in v0.15.0)
 - [COMPLETED] **Wrong Game** button on a running recording (`POST /failover` with `wrong_game=true`). Symptom: a
