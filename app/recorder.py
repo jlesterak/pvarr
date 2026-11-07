@@ -1691,6 +1691,16 @@ class StreamFailoverRecorder:
             except Exception:
                 pass
 
+    def _step_dropped(self, step: Tuple[int, int, Optional[int]]) -> None:
+        """The loop discarded a step (a failover or the operator got there
+        first). Undo its bookkeeping so it does not use up a step-down."""
+        here, target, _cap = step
+        if self._stepped_to is not None:      # it was a step down
+            self._step_downs = max(0, self._step_downs - 1)
+            if target == here:
+                self.candidates[here].max_kbps = None
+        self._stepped_from = self._stepped_to = None
+
     def _alert(self, title: str, body: str) -> None:
         if self.on_alert_callback:
             try:
@@ -1705,6 +1715,9 @@ class StreamFailoverRecorder:
         since = max(self._step_at, now - self.STEP_WINDOW_SEC)
         slow = sum(1 for t in self._slow_events if t > since)
         here = self.current_candidate_index
+        # A failover moved us off the stepped-down stream: that step is over.
+        if self._stepped_to is not None and here != self._stepped_to:
+            self._stepped_from = self._stepped_to = None
 
         if slow >= self.STEP_DOWN_EVENTS:
             if self._step_downs >= self.MAX_STEP_DOWNS:
@@ -2560,6 +2573,8 @@ class StreamFailoverRecorder:
                         and step[0] == self.current_candidate_index)
             if stepping:
                 manual_target = step[1]
+            elif step is not None:
+                self._step_dropped(step)
 
             # A clean finish ends the recording -- unless the operator asked to
             # move, in which case honour that instead.

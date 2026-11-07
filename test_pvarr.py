@@ -11328,6 +11328,31 @@ class TestStepDownOnSlowConnection(unittest.TestCase):
         rec._check_step(t2 + 10 * rec.STEP_UP_QUIET_SEC)
         self.assertIsNone(rec._step_request, "stays down after a relapse")
 
+    def test_dropped_step_does_not_use_up_a_step_down(self):
+        rec = self.make()
+        c = rec.candidates[0]
+        c.variants = self.levels((6800, 1080), (3800, 720))
+        c.declared_kbps = 6800
+        now = time.time()
+        self.slow(rec, 4, now)
+        rec._check_step(now)
+        step = rec._step_request
+        self.assertEqual(rec._step_downs, 1)
+        rec._step_request = None
+        rec._step_dropped(step)        # a failover got there first
+        self.assertEqual(rec._step_downs, 0)
+        self.assertIsNone(c.max_kbps)
+        self.assertIsNone(rec._stepped_from)
+
+    def test_failover_off_the_lighter_stream_clears_step_state(self):
+        rec = self.make(3)
+        now = time.time()
+        rec._stepped_from, rec._stepped_to = 0, 1
+        rec.current_candidate_index = 2      # a failover moved us on
+        rec._check_step(now)
+        self.assertIsNone(rec._stepped_from)
+        self.assertIsNone(rec._stepped_to)
+
     def test_insane_bandwidth_and_schemes_are_dropped(self):
         from app.recorder import usable_variants
         got = usable_variants(self.MASTER, [
