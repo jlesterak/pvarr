@@ -4,6 +4,14 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-07
+
+### Added
+- Step down on a slow connection: four segment losses within five minutes that are timeouts (not HTTP errors from the source) switch to a lower quality of the same playlist, or to an alive backup that is a different feed at no more than 75% of the bitrate. Back up after 20 quiet minutes; stays down after a relapse within 10 minutes; at most three step-downs per recording.
+
+### Changed
+- The break-card pass finds cards by repeated pictures (a keyframe matching one at least five minutes away, held for 45 s) instead of quiet audio plus a missing score overlay. One FFmpeg pass instead of two; adds numpy to the image (~70 MB).
+
 ## [0.15.1] - 2026-11-05
 
 ### Added
