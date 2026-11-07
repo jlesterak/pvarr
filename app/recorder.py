@@ -27,7 +27,7 @@ from typing import List, Optional, Callable, Dict, Any, Set, Tuple
 from app.check_deps import find_executable
 from app.logging_config import redact_url_secrets
 from app import quality, ytdlp
-from app.probe import DEFAULT_USER_AGENT, probe_stream
+from app.probe import DEFAULT_USER_AGENT, is_private_url, probe_stream
 from app.relay import PlaylistRelay
 
 logger = logging.getLogger("PVArrRecorder")
@@ -373,6 +373,21 @@ _SEGMENT_FAILED_RE = re.compile(
     _HLS_WARNING + r"Failed to open segment (\d{1,12}) of playlist (\d{1,6})$")
 _SEGMENTS_EXPIRED_RE = re.compile(
     _HLS_WARNING + r"skipping (\d{1,12}) segments ahead, expired from playlists?$")
+# Why the next "Failed to open segment" happened, read from the lines FFmpeg
+# writes just before it (checked against FFmpeg 6.1 with this recorder's flags):
+# a 404 logs "HTTP error 404 Not Found" / "Server returned 404 Not Found"; an
+# open that times out logs "keepalive request failed ... Connection timed out".
+# A segment that times out on a fresh connection logs no reason at all, so a
+# failure counts as the connection's unless one of these named the source.
+# Refused connections and failed lookups are not a slow link either.
+_SOURCE_REASON_RE = re.compile(
+    r"HTTP error [45]\d\d|Server returned [45]\d\d|Connection refused|Failed to resolve")
+_SLOW_REASON_RE = re.compile(
+    r"Connection timed out|Operation timed out|Connection reset by peer|Input/output error",
+    re.I)
+# An expiry this soon after a source error follows FFmpeg's retries of the bad
+# segment, not a slow connection.
+SOURCE_SHADOW_SEC = 10.0
 # No live window expires more than this in one go; FFmpeg's 15s read timeout
 # fails the attempt long before. Anything larger is not a real count.
 _MAX_EXPIRED_PER_LINE = 10000
@@ -513,6 +528,47 @@ class _RingSink:
         return False
 
 
+MAX_VARIANT_KBPS = 200_000
+
+
+def usable_variants(master_url: str, variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A master playlist's quality levels that a step-down may record, best first.
+
+    Each is `{"url", "kbps", "height"}`. A level is kept only when its declared
+    bitrate is sane, it is plain http(s), and it is on the master's own host:
+    the candidate's Cookie and Referer go with every request, and a master on
+    one host must not be able to send them to another. A public master may not
+    name a level on a private address (the relay re-checks the level's own
+    contents on every reload).
+    """
+    host = (urlsplit(master_url).hostname or "").lower()
+    private_ok = is_private_url(master_url)
+    out = []
+    for v in variants or []:
+        url = str(v.get("url") or "")
+        bw = v.get("bandwidth")
+        if not isinstance(bw, int) or not 0 < bw <= MAX_VARIANT_KBPS * 1000:
+            continue
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or (parts.hostname or "").lower() != host:
+            continue
+        if not private_ok and is_private_url(url):
+            continue
+        res = str(v.get("resolution") or "")
+        height = int(res.split("x")[1]) if re.fullmatch(r"\d{1,5}x\d{1,5}", res) else 0
+        out.append({"url": url, "kbps": bw // 1000, "height": height})
+    out.sort(key=lambda v: (v["kbps"], v["height"]), reverse=True)
+    return out
+
+
+def describe_level(kbps: Optional[float], height: int = 0) -> str:
+    """'720p, 3.8 Mbps' from our own numbers only (never upstream text)."""
+    parts = [f"{height}p"] if height else []
+    if kbps:
+        parts.append(f"{kbps / 1000:.1f} Mbps")
+    return ", ".join(parts) or "unknown quality"
+
+
 class CandidateStream:
     def __init__(self, url: str, name: str = "Stream"):
         self.url = url.strip()
@@ -549,6 +605,15 @@ class CandidateStream:
         # The playlist the last standby check resolved to: says which feed a
         # backup is before it is ever connected to (the "real sources" count).
         self.standby_m3u8: str = ""
+        # Quality levels the last probe listed (a master playlist's variants),
+        # and the step-down ceiling: None records the best one. A ceiling, not
+        # a stored URL, because every connect re-probes and the variant URLs
+        # carry tokens that go stale. See StreamFailoverRecorder._check_step.
+        self.variants: List[Dict[str, Any]] = []
+        self.max_kbps: Optional[int] = None
+        # Declared bitrate of this feed's best level, from its last probe or
+        # standby check; None when the playlist does not say.
+        self.declared_kbps: Optional[int] = None
 
     def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
         """Serialise this candidate.
@@ -699,6 +764,23 @@ class StreamFailoverRecorder:
         self._loss_times: "collections.deque" = collections.deque(maxlen=200)
         self._last_alert_at: float = 0.0
         self._monitor_thread: Optional[threading.Thread] = None
+        # Step-down on a slow connection (_check_step). Lost-segment events the
+        # connection caused (one per FFmpeg line, not per segment, so one long
+        # freeze is one event); when a source error was last seen, so expiries
+        # that follow it are not blamed on the connection.
+        self._slow_events: "collections.deque" = collections.deque(maxlen=200)
+        self._source_fail_at: float = 0.0
+        # A pending step for the recording loop: (from index, to index, ceiling).
+        # Its own slot, not _manual_target_index, so it never overrides the
+        # operator or a wrong-game mark, and is dropped if a failover moved on.
+        self._step_request: Optional[Tuple[int, int, Optional[int]]] = None
+        self._step_at: float = 0.0           # last step, either way
+        self._step_up_at: float = 0.0
+        self._step_downs: int = 0
+        self._stepped_from: Optional[int] = None  # candidate to go back up to
+        self._stepped_to: Optional[int] = None
+        self._stay_down: bool = False
+        self._no_lighter_logged: bool = False
 
         self.current_candidate_index: int = 0
         # How many complete laps of the candidate list may pass without a
@@ -827,6 +909,7 @@ class StreamFailoverRecorder:
         candidate.png_wrapped = False
         candidate.json_playlist = False
         candidate.dns_blocked = False
+        candidate.variants = []
 
         if self.auto_probe and self._probe_candidate(candidate):
             return True
@@ -881,6 +964,9 @@ class StreamFailoverRecorder:
             return False
 
         candidate.m3u8_url = result["m3u8_url"]
+        candidate.variants = list(result.get("variants") or [])
+        levels = usable_variants(candidate.m3u8_url, candidate.variants)
+        candidate.declared_kbps = levels[0]["kbps"] if levels else None
         candidate.needs_relay = bool(result.get("impersonate"))
         candidate.png_wrapped = bool(result.get("wrapped"))
         candidate.json_playlist = bool(result.get("json_playlist"))
@@ -1486,6 +1572,9 @@ class StreamFailoverRecorder:
         else:
             copy.m3u8_url = result.get("m3u8_url") or ""
             state = "wrong_game" if self.is_wrong_source(copy) else "alive"
+            # Feeds the step-down's choice of a lighter backup (no download).
+            levels = usable_variants(copy.m3u8_url, result.get("variants") or [])
+            live.declared_kbps = levels[0]["kbps"] if levels else None
         before = self.standby_state(live)
         if copy.m3u8_url:
             live.standby_m3u8 = copy.m3u8_url
@@ -1521,6 +1610,149 @@ class StreamFailoverRecorder:
             except Exception as exc:
                 logger.warning("Alert callback failed for %s: %s", self.recording_id, exc)
 
+    # -- step-down on a slow connection ------------------------------------
+    #
+    # Records the best quality, and drops to a lighter stream only when the
+    # connection (not the source) is losing segments: a lower level of the same
+    # playlist, else a backup that is a different, clearly lighter feed. Each
+    # step restarts FFmpeg, a gap of a few seconds like a failover, so the
+    # trigger needs sustained loss and stepping back up waits for a long quiet
+    # spell. A step-up that loses again soon stays down for good.
+
+    STEP_DOWN_EVENTS = 4
+    STEP_WINDOW_SEC = 300.0
+    STEP_UP_QUIET_SEC = 1200.0
+    RELAPSE_SEC = 600.0
+    MAX_STEP_DOWNS = 3
+    LIGHTER_RATIO = 0.75
+
+    def _capped_level(self, candidate: CandidateStream) -> Optional[Dict[str, Any]]:
+        """The level to record under the candidate's ceiling, or None for the
+        playlist as probed (no ceiling, a single level, or none fits)."""
+        if candidate.max_kbps is None:
+            return None
+        levels = usable_variants(candidate.m3u8_url, candidate.variants)
+        if len(levels) < 2:
+            return None
+        fit = [v for v in levels if v["kbps"] <= candidate.max_kbps]
+        if not fit or fit[0]["kbps"] == levels[0]["kbps"]:
+            return None
+        return fit[0]
+
+    def _current_kbps(self, candidate: CandidateStream) -> Optional[float]:
+        level = self._capped_level(candidate)
+        if level:
+            return level["kbps"]
+        if candidate.declared_kbps:
+            return candidate.declared_kbps
+        rate = self.rate_mbps()
+        return rate * 1000 if rate else None
+
+    def _lighter_option(self) -> Optional[Tuple[int, Optional[int], str]]:
+        """(candidate index, ceiling, description) one step lighter than now."""
+        here = self.current_candidate_index
+        cur = self.candidates[here]
+        levels = usable_variants(cur.m3u8_url, cur.variants)
+        now_kbps = self._current_kbps(cur)
+        if len(levels) > 1 and now_kbps:
+            lower = [v for v in levels if v["kbps"] < now_kbps]
+            if lower:
+                v = lower[0]
+                return here, v["kbps"], describe_level(v["kbps"], v["height"])
+        if not now_kbps:
+            return None
+        key = self._candidate_key(cur)
+        best = None
+        for i, c in enumerate(self.candidates):
+            if i == here or self.standby_state(c) != "alive" or not c.declared_kbps:
+                continue
+            other = quality.source_key(c.standby_m3u8) if c.standby_m3u8 else ""
+            if not other or other == key or c.declared_kbps > self.LIGHTER_RATIO * now_kbps:
+                continue
+            if best is None or c.declared_kbps > self.candidates[best].declared_kbps:
+                best = i
+        if best is None:
+            return None
+        c = self.candidates[best]
+        return best, None, f"{c.name} ({describe_level(c.declared_kbps)})"
+
+    def _request_step(self, target: int, cap: Optional[int], now: float) -> None:
+        """Hand the recording loop a step and end the current attempt."""
+        here = self.current_candidate_index
+        if target == here:
+            self.candidates[here].max_kbps = cap
+        self._step_request = (here, target, cap)
+        self._step_at = now
+        self._force_failover_flag = True
+        proc = self._ffmpeg_process
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _alert(self, title: str, body: str) -> None:
+        if self.on_alert_callback:
+            try:
+                self.on_alert_callback(self.recording_id, title, body)
+            except Exception as exc:
+                logger.warning("Alert callback failed for %s: %s", self.recording_id, exc)
+
+    def _check_step(self, now: float) -> None:
+        """Step down on sustained slow-connection loss; back up after quiet."""
+        if self.status != "recording" or self._step_request is not None:
+            return
+        since = max(self._step_at, now - self.STEP_WINDOW_SEC)
+        slow = sum(1 for t in self._slow_events if t > since)
+        here = self.current_candidate_index
+
+        if slow >= self.STEP_DOWN_EVENTS:
+            if self._step_downs >= self.MAX_STEP_DOWNS:
+                return
+            option = self._lighter_option()
+            if option is None:
+                if not self._no_lighter_logged:
+                    self._no_lighter_logged = True
+                    body = (f"Slow connection: {slow} segment losses in "
+                            f"{self.STEP_WINDOW_SEC / 60:.0f} min were timeouts, not the "
+                            "source. Nothing lighter to switch to; recording continues "
+                            "at the current quality.")
+                    self._log(body, "WARN")
+                    self._alert("PVArr — Slow connection", body)
+                return
+            target, cap, what = option
+            if self._step_up_at and now - self._step_up_at < self.RELAPSE_SEC:
+                self._stay_down = True
+            if self._stepped_from is None:
+                self._stepped_from = here
+            self._stepped_to = target
+            self._step_downs += 1
+            body = (f"Slow connection: {slow} segment losses in "
+                    f"{self.STEP_WINDOW_SEC / 60:.0f} min were timeouts, not the source. "
+                    f"Switching to {what}; a few seconds are lost at the switch. "
+                    + ("Staying there for the rest of the recording (it lost segments "
+                       "again soon after going back up)." if self._stay_down else
+                       f"Back to the best quality after {self.STEP_UP_QUIET_SEC / 60:.0f} "
+                       "quiet minutes."))
+            self._log(body, "WARN")
+            self._alert("PVArr — Stepped down to a lighter stream", body)
+            self._request_step(target, cap, now)
+            return
+
+        # Back up: only from where the step-down put us, after a quiet spell.
+        if (self._stepped_from is None or self._stay_down
+                or here != self._stepped_to
+                or now - self._step_at < self.STEP_UP_QUIET_SEC
+                or any(t > now - self.STEP_UP_QUIET_SEC for t in self._slow_events)):
+            return
+        back = self._stepped_from
+        self._stepped_from = self._stepped_to = None
+        self._step_up_at = now
+        self.candidates[back].max_kbps = None
+        self._log(f"Connection quiet for {self.STEP_UP_QUIET_SEC / 60:.0f} min: going back "
+                  f"to the best quality on {self.candidates[back].name}.")
+        self._request_step(back, None, now)
+
     def _monitor_loop(self) -> None:
         """Side thread for the life of the recording: samples the write rate,
         watches for bursts of lost segments, and probes the backups now and
@@ -1534,6 +1766,9 @@ class StreamFailoverRecorder:
                 now = time.time()
                 self._rate_samples.append((now, self.bytes_written))
                 self._check_loss_burst(now)
+                # Before the standby checks, which block on the network: it
+                # uses their cached results.
+                self._check_step(now)
                 if len(self.candidates) > 1 and now >= next_standby:
                     next_standby = now + self.STANDBY_INTERVAL_SEC
                     for i in range(len(self.candidates)):
@@ -1997,6 +2232,9 @@ class StreamFailoverRecorder:
         if stream is None:
             return tail
         seen_failures: "collections.OrderedDict" = collections.OrderedDict()
+        # Reason for the next failed segment (see _SOURCE_REASON_RE). Held
+        # here, per FFmpeg process, and cleared when a failure takes it.
+        reason: Dict[str, str] = {}
 
         def pump():
             try:
@@ -2013,10 +2251,14 @@ class StreamFailoverRecorder:
                     if not line:
                         continue
                     if ffmpeg:
+                        if _SOURCE_REASON_RE.search(line):
+                            reason.update(why="source", at=str(time.time()))
+                        elif _SLOW_REASON_RE.search(line):
+                            reason.update(why="slow", at=str(time.time()))
                         level = _FFMPEG_LEVEL_RE.match(line)
                         if level and level.group(1) == "warning":
                             try:
-                                self._account_ffmpeg_warning(line, seen_failures)
+                                self._account_ffmpeg_warning(line, seen_failures, reason)
                             except Exception:
                                 # Counting is a diagnostic. Letting it raise
                                 # would end this loop, stop draining the pipe,
@@ -2037,7 +2279,8 @@ class StreamFailoverRecorder:
     def segments_lost(self) -> int:
         return self.segments_failed + self.segments_expired
 
-    def _account_ffmpeg_warning(self, line: str, seen: "collections.OrderedDict") -> None:
+    def _account_ffmpeg_warning(self, line: str, seen: "collections.OrderedDict",
+                                reason: Optional[Dict[str, str]] = None) -> None:
         """Count a lost segment reported in one FFmpeg warning line.
 
         A failed segment is keyed by playlist and sequence number: FFmpeg 6.1
@@ -2047,20 +2290,33 @@ class StreamFailoverRecorder:
         """
         failed = _SEGMENT_FAILED_RE.search(line)
         if failed:
+            # The reason belongs to this line even when it is a retry of a
+            # segment already counted: left in place it would be pinned on the
+            # next, unrelated failure.
+            why = "slow"
+            if reason:
+                if time.time() - float(reason.get("at") or 0) <= 30:
+                    why = reason.get("why", "slow")
+                reason.clear()
+            if why == "source":
+                self._source_fail_at = time.time()
             key = (failed.group(2), failed.group(1))
             if key in seen:
                 return
             seen[key] = None
             if len(seen) > self._MAX_TRACKED_FAILURES:
                 seen.popitem(last=False)
-            self._note_segment_loss(failed=1)
+            self._note_segment_loss(failed=1, slow=(why == "slow"))
             return
         expired = _SEGMENTS_EXPIRED_RE.search(line)
         if expired:
+            # FFmpeg fell behind the live window: the connection, unless it
+            # was busy retrying a segment the source broke.
+            slow = time.time() - self._source_fail_at > SOURCE_SHADOW_SEC
             self._note_segment_loss(
-                expired=min(int(expired.group(1)), _MAX_EXPIRED_PER_LINE))
+                expired=min(int(expired.group(1)), _MAX_EXPIRED_PER_LINE), slow=slow)
 
-    def _note_segment_loss(self, failed: int = 0, expired: int = 0) -> None:
+    def _note_segment_loss(self, failed: int = 0, expired: int = 0, slow: bool = False) -> None:
         """Count lost segments. Log the first at once, then at most once a minute.
 
         Called from the stderr pump thread. A source dropping one segment in
@@ -2074,6 +2330,8 @@ class StreamFailoverRecorder:
             now = time.time()
             for _ in range(failed + expired):
                 self._loss_times.append(now)
+            if slow:
+                self._slow_events.append(now)  # one per line: a freeze is one event
             if (self._loss_logged_at
                     and now - self._loss_logged_at < self.SEGMENT_LOSS_LOG_INTERVAL_SEC):
                 return
@@ -2190,12 +2448,23 @@ class StreamFailoverRecorder:
                 relay = None
                 try:
                     input_url = candidate.m3u8_url
-                    if candidate.needs_relay or candidate.png_wrapped or candidate.json_playlist:
+                    # Stepped down: record a lighter level of this playlist.
+                    # Always through the relay, which checks the level's own
+                    # contents for private addresses on every reload.
+                    level = self._capped_level(candidate)
+                    if level:
+                        self._log(f"Recording a lighter level of this stream "
+                                  f"({describe_level(level['kbps'], level['height'])}) "
+                                  "because the connection could not keep up.", "WARN")
+                    if (level or candidate.needs_relay or candidate.png_wrapped
+                            or candidate.json_playlist):
                         try:
-                            relay = PlaylistRelay(candidate.m3u8_url, self._relay_headers(candidate),
+                            relay = PlaylistRelay(level["url"] if level else candidate.m3u8_url,
+                                                  self._relay_headers(candidate),
                                                   unwrap_segments=candidate.png_wrapped)
                             input_url = relay.start()
                             why = "; ".join(filter(None, (
+                                "recording a lighter level" if level else "",
                                 "segments are video packed inside PNG images, unwrapping them"
                                 if candidate.png_wrapped else "",
                                 "playlist is a JSON segment list" if candidate.json_playlist else "",
@@ -2283,6 +2552,14 @@ class StreamFailoverRecorder:
             self._force_failover_flag = False
             manual_target = self._manual_target_index
             self._manual_target_index = None
+            # A step-down/up from the monitor. Dropped if the operator asked
+            # for something else or a failover already moved us on.
+            step = self._step_request
+            self._step_request = None
+            stepping = (step is not None and manual_target is None
+                        and step[0] == self.current_candidate_index)
+            if stepping:
+                manual_target = step[1]
 
             # A clean finish ends the recording -- unless the operator asked to
             # move, in which case honour that instead.
@@ -2393,12 +2670,14 @@ class StreamFailoverRecorder:
                     f"Cycling back to Candidate {next_index + 1} ({next_name}) "
                     f"after {delay:.0f}s{fruitless}...", "WARN",
                 )
+            elif stepping:
+                pass  # _check_step already said why, and it is not a failover
             else:
                 self._log(
                     f"Failing over to Candidate {next_index + 1} ({next_name})...",
                     "WARN",
                 )
-            if self.on_failover_callback:
+            if self.on_failover_callback and not stepping:
                 try:
                     self.on_failover_callback(self.recording_id, next_name)
                 except Exception:

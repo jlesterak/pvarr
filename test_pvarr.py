@@ -1142,6 +1142,54 @@ class FailoverLoopTestCase(unittest.TestCase):
             rec._recording_loop()
 
 
+class TestStepDownInTheLoop(FailoverLoopTestCase):
+    """The recording loop applies a monitor step: same candidate, lighter level,
+    through the relay, and no failover alert."""
+
+    def test_step_records_the_lighter_level_through_the_relay(self):
+        from unittest.mock import patch
+        roots, cmds, failovers = [], [], []
+
+        class FakeRelay:
+            def __init__(self, url, headers, unwrap_segments=False):
+                roots.append(url)
+
+            def start(self):
+                return "http://127.0.0.1:9/relay.m3u8"
+
+            def stop(self):
+                pass
+
+        def step(rec, candidate):
+            rec.status = "recording"
+            for i in range(4):
+                rec._slow_events.append(time.time() - i)
+            rec._check_step(time.time())
+            return StreamOutcome.INTERRUPTED
+
+        rec = self.make(["https://cdn.example/live/master.m3u8"], [step, True])
+        real_stream = rec._stream_ffmpeg_process
+        rec._stream_ffmpeg_process = lambda cmd, c: (cmds.append(cmd), real_stream(cmd, c))[1]
+
+        def detect(candidate):
+            candidate.m3u8_url = candidate.url
+            candidate.variants = [
+                {"url": "https://cdn.example/live/1080p.m3u8", "bandwidth": 6800000, "resolution": "1920x1080"},
+                {"url": "https://cdn.example/live/720p.m3u8", "bandwidth": 3800000, "resolution": "1280x720"}]
+            candidate.declared_kbps = 6800
+            return True
+        rec.detect_candidate_headers = detect
+        rec.on_failover_callback = lambda rid, name: failovers.append(name)
+        with patch("app.recorder.PlaylistRelay", FakeRelay), \
+                patch("app.recorder.is_private_url", return_value=False):
+            self.run_loop(rec)
+        self.assertEqual(roots, ["https://cdn.example/live/720p.m3u8"])
+        self.assertIn("https://cdn.example/live/master.m3u8", cmds[0])
+        self.assertIn("http://127.0.0.1:9/relay.m3u8", cmds[1])
+        self.assertEqual(failovers, [], "a step is not a failover")
+        self.assertEqual(rec.candidates[0].fail_count, 0)
+
+
 class TestRebroadcastRecorder(unittest.TestCase):
     """A channel captures like a recording but keeps nothing."""
 
@@ -11054,6 +11102,242 @@ class TestCommercialsWithCards(unittest.TestCase):
         text = Path(commercials.write_ffmeta([(100.0, 200.0)], 1000.0, path)).read_text()
         self.assertEqual(re.findall(r"title=(\w+)", text), ["Show", "Commercial", "Show"])
         self.assertIn("END=1000000", text)
+
+
+class TestStepDownOnSlowConnection(unittest.TestCase):
+    """Drop to a lighter stream only when the connection, not the source, is
+    losing segments; go back up after a quiet spell; stay down after a relapse."""
+
+    MASTER = "https://cdn.example/live/master.m3u8"
+
+    def make(self, n=1):
+        from app.recorder import StreamFailoverRecorder
+        urls = [f"https://page{i}.example/watch" for i in range(n)]
+        rec = StreamFailoverRecorder("s1", urls, "/tmp/x.ts", min_free_gb=0)
+        rec.status = "recording"
+        c = rec.candidates[0]
+        c.m3u8_url = self.MASTER
+        return rec
+
+    def levels(self, *kbps_heights):
+        return [{"url": f"https://cdn.example/live/{h}p.m3u8", "bandwidth": k * 1000,
+                 "resolution": f"{h * 16 // 9}x{h}"} for k, h in kbps_heights]
+
+    def slow(self, rec, n, at):
+        for i in range(n):
+            rec._slow_events.append(at - i)
+
+    def setUp(self):
+        from unittest.mock import patch
+        # No DNS in tests: *.example hosts are public.
+        p = patch("app.recorder.is_private_url", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # -- classification --------------------------------------------------
+
+    def _feed(self, rec, lines):
+        import collections
+        seen, reason = collections.OrderedDict(), {}
+        from app.recorder import _SLOW_REASON_RE, _SOURCE_REASON_RE
+        for line in lines:
+            if _SOURCE_REASON_RE.search(line):
+                reason.update(why="source", at=str(time.time()))
+            elif _SLOW_REASON_RE.search(line):
+                reason.update(why="slow", at=str(time.time()))
+            rec._account_ffmpeg_warning(line, seen, reason)
+
+    def test_timeout_failure_is_slow_404_is_source(self):
+        rec = self.make()
+        self._feed(rec, [
+            "[https @ 0x1] [warning] keepalive request failed for 'x' with error: 'Connection timed out' when opening url, retrying with new connection",
+            "[hls @ 0x2] [warning] Failed to open segment 7 of playlist 0",
+        ])
+        self.assertEqual(len(rec._slow_events), 1)
+        self._feed(rec, [
+            "[http @ 0x1] [warning] HTTP error 404 Not Found",
+            "[hls @ 0x2] [warning] Failed to open segment 8 of playlist 0",
+        ])
+        self.assertEqual(len(rec._slow_events), 1, "a 404 is the source, not the connection")
+        self.assertEqual(rec.segments_lost, 2)
+
+    def test_failure_without_a_reason_is_slow_refused_is_not(self):
+        # Real FFmpeg prints no reason for a segment that times out on a
+        # fresh connection (test_real_ffmpeg_wording).
+        rec = self.make()
+        self._feed(rec, ["[hls @ 0x2] [warning] Failed to open segment 9 of playlist 0"])
+        self.assertEqual(len(rec._slow_events), 1)
+        self._feed(rec, ["[tcp @ 0x1] [warning] Connection to tcp://h:443 failed: Connection refused",
+                         "[hls @ 0x2] [warning] Failed to open segment 10 of playlist 0"])
+        self.assertEqual(len(rec._slow_events), 1)
+
+    def test_expiry_is_slow_unless_it_follows_a_source_error(self):
+        rec = self.make()
+        exp = "[hls @ 0x2] [warning] skipping 3 segments ahead, expired from playlists"
+        self._feed(rec, [exp])
+        self.assertEqual(len(rec._slow_events), 1, "one line is one event, not three")
+        self._feed(rec, ["[http @ 0x1] [warning] HTTP error 404 Not Found",
+                         "[hls @ 0x2] [warning] Failed to open segment 20 of playlist 0", exp])
+        self.assertEqual(len(rec._slow_events), 1)
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg not installed")
+    def test_real_ffmpeg_wording(self):
+        """The reason patterns match what FFmpeg actually prints, driven by a
+        local source that 404s one segment and stalls another."""
+        import collections, http.server, subprocess, tempfile, threading
+        from app.recorder import _SLOW_REASON_RE, _SOURCE_REASON_RE
+        tmp = Path(tempfile.mkdtemp())
+        ff = check_deps.find_executable("ffmpeg")
+        subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x36:d=4",
+                        "-c:v", "libx264", "-g", "25", "-f", "hls", "-hls_time", "1",
+                        "-hls_list_size", "0", "-hls_segment_filename", str(tmp / "s%d.ts"),
+                        str(tmp / "p.m3u8")], check=True, capture_output=True, timeout=60)
+        segs = sorted(tmp.glob("s*.ts"))
+        self.assertGreaterEqual(len(segs), 3)
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"   # keep-alive, as a real CDN
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                name = self.path.strip("/")
+                if name == "s1.ts":
+                    self.send_error(404)
+                    return
+                if name == "s2.ts":
+                    time.sleep(4)   # past the shortened rw_timeout
+                    return
+                data = (tmp / name).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        rec = self.make()
+        cmd = rec._build_ffmpeg_cmd(f"http://127.0.0.1:{srv.server_port}/p.m3u8")
+        i = cmd.index("-rw_timeout")
+        cmd[i + 1] = "1500000"
+        cmd[cmd.index("pipe:1")] = "-"
+        cmd[cmd.index("-f", cmd.index("-c")) + 1] = "null"
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120).stderr
+        # Through the same classification the stderr pump applies: the 404'd
+        # segment is the source's, the stalled one the connection's.
+        self._feed(rec, [l for l in out.splitlines() if "[warning]" in l])
+        self.assertGreater(rec._source_fail_at, 0, out[-2000:])
+        self.assertEqual(rec.segments_failed, 2, out[-2000:])
+        self.assertEqual(len(rec._slow_events), 1, out[-2000:])
+
+    # -- choosing where to go --------------------------------------------
+
+    def test_steps_to_the_next_lower_level_of_the_same_playlist(self):
+        rec = self.make()
+        c = rec.candidates[0]
+        c.variants = self.levels((6800, 1080), (3800, 720), (1500, 480))
+        c.declared_kbps = 6800
+        self.slow(rec, 4, time.time())
+        rec._check_step(time.time())
+        self.assertEqual(rec._step_request, (0, 0, 3800))
+        self.assertEqual(c.max_kbps, 3800)
+        self.assertEqual(rec._capped_level(c)["height"], 720)
+        self.assertTrue(any("Switching to 720p, 3.8 Mbps" in l for l in rec.log_history))
+
+    def test_three_events_do_not_trigger(self):
+        rec = self.make()
+        rec.candidates[0].variants = self.levels((6800, 1080), (3800, 720))
+        self.slow(rec, 3, time.time())
+        rec._check_step(time.time())
+        self.assertIsNone(rec._step_request)
+
+    def test_level_on_another_host_is_never_used(self):
+        rec = self.make()
+        c = rec.candidates[0]
+        c.variants = self.levels((6800, 1080)) + [
+            {"url": "https://other.example/720p.m3u8", "bandwidth": 3800000, "resolution": "1280x720"}]
+        c.declared_kbps = 6800
+        self.slow(rec, 4, time.time())
+        rec._check_step(time.time())
+        self.assertIsNone(rec._step_request, "the cookie must not go to another host")
+        self.assertTrue(any("Nothing lighter" in l for l in rec.log_history))
+
+    def test_lighter_backup_must_be_a_different_alive_feed(self):
+        rec = self.make(3)
+        now = time.time()
+        rec.candidates[0].declared_kbps = 7000
+        mirror, other = rec.candidates[1], rec.candidates[2]
+        mirror.standby_m3u8 = self.MASTER          # same feed: no use
+        mirror.declared_kbps = 3000
+        other.standby_m3u8 = "https://edge.example/b/index.m3u8"
+        other.declared_kbps = 4000
+        for c in (mirror, other):
+            c.standby, c.standby_at = "alive", now
+        self.slow(rec, 4, now)
+        rec._check_step(now)
+        self.assertEqual(rec._step_request, (0, 2, None))
+
+    def test_backup_not_clearly_lighter_is_ignored(self):
+        rec = self.make(2)
+        now = time.time()
+        rec.candidates[0].declared_kbps = 7000
+        b = rec.candidates[1]
+        b.standby_m3u8, b.declared_kbps = "https://edge.example/b/index.m3u8", 6000
+        b.standby, b.standby_at = "alive", now
+        self.slow(rec, 4, now)
+        rec._check_step(now)
+        self.assertIsNone(rec._step_request)
+
+    # -- timing ------------------------------------------------------------
+
+    def test_losses_before_a_step_do_not_trigger_another(self):
+        rec = self.make()
+        c = rec.candidates[0]
+        c.variants = self.levels((6800, 1080), (3800, 720), (1500, 480))
+        c.declared_kbps = 6800
+        now = time.time()
+        self.slow(rec, 4, now)
+        rec._check_step(now)
+        rec._step_request = None   # the loop took it
+        rec._check_step(now + 10)
+        self.assertIsNone(rec._step_request)
+
+    def test_back_up_after_quiet_then_stays_down_after_relapse(self):
+        rec = self.make()
+        c = rec.candidates[0]
+        c.variants = self.levels((6800, 1080), (3800, 720))
+        c.declared_kbps = 6800
+        t = 1_000_000.0
+        self.slow(rec, 4, t)
+        rec._check_step(t)
+        rec._step_request = None
+        rec._check_step(t + 600)
+        self.assertIsNone(rec._step_request, "not quiet long enough")
+        rec._check_step(t + rec.STEP_UP_QUIET_SEC + 1)
+        self.assertEqual(rec._step_request, (0, 0, None))
+        self.assertIsNone(c.max_kbps)
+        rec._step_request = None
+        t2 = t + rec.STEP_UP_QUIET_SEC + 120
+        self.slow(rec, 4, t2)
+        rec._check_step(t2)
+        self.assertEqual(rec._step_request, (0, 0, 3800))
+        self.assertTrue(rec._stay_down)
+        rec._step_request = None
+        rec._check_step(t2 + 10 * rec.STEP_UP_QUIET_SEC)
+        self.assertIsNone(rec._step_request, "stays down after a relapse")
+
+    def test_insane_bandwidth_and_schemes_are_dropped(self):
+        from app.recorder import usable_variants
+        got = usable_variants(self.MASTER, [
+            {"url": "https://cdn.example/a.m3u8", "bandwidth": 10 ** 12},
+            {"url": "ftp://cdn.example/b.m3u8", "bandwidth": 1000000},
+            {"url": "https://cdn.example/c.m3u8", "bandwidth": None},
+            {"url": "https://cdn.example/d.m3u8", "bandwidth": 2000000, "resolution": "bogus"},
+        ])
+        self.assertEqual([v["url"] for v in got], ["https://cdn.example/d.m3u8"])
+        self.assertEqual(got[0]["height"], 0)
 
 
 if __name__ == "__main__":
