@@ -1018,13 +1018,13 @@ def _check_segment(
             # makes FFmpeg refuse the stream later, so name it now.
             note = (f"served as {ext} -- not a video extension, FFmpeg refuses "
                     "these by extension")
-        if ok and pngwrap.is_png(body):
-            # Video packed inside a PNG: only the whole image can say whether
+        if ok and pngwrap.is_wrapped(body):
+            # Video packed inside an image: only the whole image can say whether
             # it carries MPEG-TS, and the recorder must then unwrap it.
             full, data = _fetch(session, target, {k: v for k, v in probe_headers.items() if k != "Range"}, timeout,
                                 max_bytes=pngwrap.MAX_WRAPPED_BYTES)
             if full.ok and pngwrap.unwrap(data):
-                note = "PNG-wrapped MPEG-TS -- unwrapped by the relay"
+                note = "image-wrapped MPEG-TS -- unwrapped by the relay"
                 if flags is not None:
                     flags["wrapped"] = True
             else:
@@ -1053,7 +1053,7 @@ def _describe(result: Dict[str, Any]) -> str:
     if result.get("impersonate"):
         parts.append("playlist only served to a browser TLS profile (relayed)")
     if result.get("wrapped"):
-        parts.append("segments are PNG-wrapped video (unwrapped by the relay)")
+        parts.append("segments are image-wrapped video (unwrapped by the relay)")
     if result.get("segment_image"):
         parts.append("segments are images, not video — FFmpeg cannot record this")
     elif result["segment_ok"] is False:

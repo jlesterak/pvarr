@@ -15,7 +15,7 @@ from the CDN and the relay moves a few KB every few seconds.
 It is not an open proxy: it answers only for the playlist it was started with
 and for the variant/rendition playlists that playlist itself lists.
 
-Segments packaged inside PNG images (`app/pngwrap.py`) are the exception: with
+Segments packaged inside PNG or WebP images (`app/pngwrap.py`) are the exception: with
 `unwrap_segments` the relay also serves the segments, fetching each image and
 handing FFmpeg the MPEG-TS inside it. Then all of the video passes through
 here (a few Mbps on loopback, and an FFmpeg image decode per segment).
@@ -273,7 +273,7 @@ class PlaylistRelay:
             return 502, b""
         if status not in (200, 206) or not body:
             return status if status >= 400 else 502, b""
-        return 200, (pngwrap.unwrap(body) or body) if pngwrap.is_png(body) else body
+        return 200, (pngwrap.unwrap(body) or body) if pngwrap.is_wrapped(body) else body
 
     def start(self) -> str:
         """Bind an ephemeral loopback port and return the playlist's local URL."""

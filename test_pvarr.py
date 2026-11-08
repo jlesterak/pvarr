@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import struct
 import re
 import shutil
 import subprocess
@@ -10723,6 +10724,24 @@ class TestPngWrappedSegments(unittest.TestCase):
         self.assertIsNone(pngwrap.unwrap(b"\x89PNG\r\n\x1a\n" + b"\x01" * 5000))
         self.assertIsNone(pngwrap.unwrap(self.TS))
 
+    @staticmethod
+    def _webp_wrap(payload: bytes) -> bytes:
+        # A synthetic 42-byte WebP header (RIFF size covering the whole file),
+        # then the payload as is: the shape seen on 2026-11-07.
+        head = b"WEBPVP8L" + struct.pack("<I", 21) + b"\x2f" + b"\x00" * 21
+        return b"RIFF" + struct.pack("<I", len(head) + len(payload)) + head + payload
+
+    def test_webp_wrapped_ts_is_unwrapped_by_cutting_the_header(self):
+        from app import pngwrap
+        wrapped = self._webp_wrap(self.TS)
+        self.assertEqual(len(wrapped) - len(self.TS), 42)
+        self.assertTrue(pngwrap.is_wrapped(wrapped[:4096]))
+        self.assertEqual(pngwrap.unwrap(wrapped), self.TS)
+        # A real picture, or TS cut short of a whole packet, is not video.
+        self.assertIsNone(pngwrap.unwrap(self._webp_wrap(b"\x01" * 5000)))
+        self.assertIsNone(pngwrap.unwrap(self._webp_wrap(self.TS[:-5])))
+        self.assertFalse(pngwrap.is_wrapped(self.TS))
+
     def test_measure_counts_wrapped_segments_as_video(self):
         from unittest.mock import MagicMock, patch
         wrapped = _png_wrap(self.TS)
@@ -10741,6 +10760,7 @@ class TestPngWrappedSegments(unittest.TestCase):
     def test_probe_flags_wrapped_segments_and_refuses_plain_images(self):
         from unittest.mock import MagicMock, patch
         for segment, ok, wrapped in ((_png_wrap(self.TS), True, True),
+                                     (self._webp_wrap(self.TS), True, True),
                                      (_png_wrap(b"<html>" * 400), False, False)):
             def fetch(session, url, hdrs, timeout, max_bytes=0):
                 if max_bytes > 4096:    # the whole image, so no Range header

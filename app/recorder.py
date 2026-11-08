@@ -586,7 +586,7 @@ class CandidateStream:
         # The playlist is served only to a browser TLS profile, so FFmpeg
         # reads it through app.relay. Set by the probe on every connect.
         self.needs_relay: bool = False
-        # Segments are video packed inside PNG images (app.pngwrap): the relay
+        # Segments are video packed inside PNG/WebP images (app.pngwrap): the relay
         # serves FFmpeg the MPEG-TS inside them. Set by the probe on every connect.
         self.png_wrapped: bool = False
         # The playlist is a JSON segment list FFmpeg cannot read; the relay
@@ -2478,7 +2478,7 @@ class StreamFailoverRecorder:
                             input_url = relay.start()
                             why = "; ".join(filter(None, (
                                 "recording a lighter level" if level else "",
-                                "segments are video packed inside PNG images, unwrapping them"
+                                "segments are video packed inside images, unwrapping them"
                                 if candidate.png_wrapped else "",
                                 "playlist is a JSON segment list" if candidate.json_playlist else "",
                                 "playlist is only served to a browser TLS profile"

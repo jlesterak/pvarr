@@ -64,13 +64,16 @@ The same relay handles two packagings FFmpeg cannot read on its own:
 
 - **Segments packed inside PNG images.** Each segment is a real image whose
   pixels hold a gzip of ordinary MPEG-TS. The probe recognises the shape on the
-  first segment ("PNG-wrapped video") and the relay fetches each image, unpacks
+  first segment ("image-wrapped video") and the relay fetches each image, unpacks
   it and hands FFmpeg the MPEG-TS. Here the video itself passes through PVArr:
   a few Mbps on loopback and one short FFmpeg image decode per segment (about
   0.1 s on a desktop, several times that on a Raspberry Pi). To keep
   FFmpeg from waiting, the relay fetches the newest few segments as soon as the
   playlist lists them. An image that holds no video is reported as *images, not
   video* and is never picked.
+- **Segments packed inside WebP images.** Each segment is a short WebP header
+  followed by plain MPEG-TS. The relay cuts the header off; no decode, so no
+  extra CPU. Shown as "image-wrapped video", like the PNG case.
 - **Playlists delivered as JSON.** Some players never load the `.m3u8` their
   page names (it refuses every client) and build the playlist from a JSON list
   of segments instead. Next to an `.m3u8` in a player page, the probe also tries

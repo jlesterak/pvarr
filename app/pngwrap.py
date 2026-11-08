@@ -1,5 +1,5 @@
 """
-PNG-wrapped segments - PVArr
+PNG- and WebP-wrapped segments - PVArr
 
 Some sources serve each HLS segment as a real PNG image. The video is in the
 image's pixels: read as raw RGB(A) bytes, they hold a short marker, a 4-byte
@@ -11,6 +11,9 @@ Recognised by shape only: a PNG whose pixel bytes start with a gzip member,
 right after its length, that inflates to MPEG-TS. The image is decoded by the
 FFmpeg PVArr already ships (about 0.1 s per ~2.5 MB segment, outside Python's
 GIL); a pure-Python decode cost 0.4-1.8 s depending on the encoder's filters.
+
+Others serve a WebP file that is only a short header followed by plain
+MPEG-TS; that one is unwrapped by cutting the header off (`webp_ts`).
 """
 
 import struct
@@ -41,6 +44,33 @@ _CHANNELS = {2: 3, 6: 4}                 # PNG colour type -> bytes per pixel (8
 
 def is_png(data: bytes) -> bool:
     return data[:8] == PNG_SIGNATURE
+
+
+def is_webp(data: bytes) -> bool:
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def is_wrapped(data: bytes) -> bool:
+    """An image that may carry video: PNG or WebP (header only, so a short
+    prefix is enough). `unwrap` decides whether it really does."""
+    return is_png(data) or is_webp(data)
+
+
+def webp_ts(data: bytes) -> Optional[bytes]:
+    """The MPEG-TS appended to a WebP header, or None.
+
+    Some sources serve each segment as a WebP file whose RIFF chunk is only a
+    short header: the rest of the file, from a sync byte within the first
+    `_HEADER_SEARCH` bytes to the end, is plain MPEG-TS (whole 188-byte
+    packets). No decoding involved: the header is cut off.
+    """
+    if not is_webp(data) or len(data) > MAX_WRAPPED_BYTES:
+        return None
+    for at in range(12, min(_HEADER_SEARCH, len(data))):
+        if (len(data) - at) % 188 == 0 and len(data) - at >= 377 \
+                and data[at] == data[at + 188] == data[at + 376] == 0x47:
+            return data[at:]
+    return None
 
 
 def png_pixels(data: bytes) -> Optional[bytes]:
@@ -92,7 +122,9 @@ def png_pixels(data: bytes) -> Optional[bytes]:
 
 
 def unwrap(data: bytes) -> Optional[bytes]:
-    """The MPEG-TS carried in a PNG-wrapped segment, or None if it is not one."""
+    """The MPEG-TS carried in a PNG- or WebP-wrapped segment, or None if it is not one."""
+    if is_webp(data):
+        return webp_ts(data)
     pixels = png_pixels(data)
     if pixels is None:
         return None

@@ -248,7 +248,7 @@ def measure(res: Dict[str, Any], allow_private: bool = True,
                     out["note"] = "byte range not reached"
                     continue
             raw_len = len(data)     # as served: what timing and the size cap saw
-            if pngwrap.is_png(data):
+            if pngwrap.is_wrapped(data):
                 # Video packed inside an image; the relay unwraps it for FFmpeg.
                 inner = pngwrap.unwrap(data)
                 if inner:
