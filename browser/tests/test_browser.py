@@ -45,6 +45,9 @@ def pages(other: str) -> dict:
         "/json.html": "<html><body>" + fetch("/live/list.json") + "</body></html>",
         "/none.html": "<html><body><p>No stream here.</p></body></html>",
         "/lan.html": "<html><body>" + fetch("http://10.255.255.1/live/x.m3u8") + "</body></html>",
+        "/ws.html": "<html><body><script>new WebSocket('ws://10.255.255.1:9/live');</script></body></html>",
+        # Freezes its own main thread: every call into the page would wait forever.
+        "/hang.html": "<html><body><script>setTimeout(() => { for (;;) {} }, 50);</script></body></html>",
     }
 
 
@@ -97,6 +100,15 @@ class TestNetguard(unittest.TestCase):
         self.assertFalse(netguard.request_is_private("https://cdn.example/a.m3u8"))
         self.assertFalse(netguard.request_is_private("data:text/plain,hi"))
         self.assertFalse(netguard.request_is_private("http://127.0.0.1:9/x"))    # loopback allowed in tests
+
+    def test_trailing_dot_names(self):
+        os.environ["PVARR_BROWSER_ALLOW_LOOPBACK"] = "0"
+        try:
+            self.assertTrue(netguard.request_is_private("http://localhost.:8998/health"))
+            self.assertTrue(netguard.request_is_private("http://app.localhost./"))
+            self.assertIsNotNone(netguard.page_url_problem("http://LOCALHOST./"))
+        finally:
+            os.environ["PVARR_BROWSER_ALLOW_LOOPBACK"] = "1"
 
 
 class TestResolver(unittest.TestCase):
@@ -161,6 +173,24 @@ class TestResolver(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("private addresses blocked", out["note"])
 
+    def test_lan_websocket_is_blocked(self):
+        out = self.run_page("/ws.html", timeout=6)
+        self.assertFalse(out["ok"])
+        self.assertIn("private addresses blocked", out["note"])
+
+    def test_frozen_page_still_returns_in_time(self):
+        t0 = time.monotonic()
+        out = self.run_page("/hang.html", timeout=8)
+        self.assertFalse(out["ok"])
+        self.assertLess(time.monotonic() - t0, 8 + resolver_mod.CALL_LIMIT + 3)
+        # ...and the shared browser still works afterwards.
+        self.assertTrue(self.run_page("/xhr.html")["ok"])
+
+    def test_user_agent_names_the_running_version(self):
+        out = self.run_page("/xhr.html")
+        self.assertNotIn("Headless", out["user_agent"])
+        self.assertNotIn("Chrome/120.", out["user_agent"])
+
 
 class TestApi(unittest.TestCase):
     @classmethod
@@ -171,8 +201,15 @@ class TestApi(unittest.TestCase):
         cls.client = TestClient(app_mod.app)
 
     def setUp(self):
-        self.app_mod._cache.clear()
         self.app_mod._busy = 0
+
+    def fake_resolve(self, result=None, sleep=0.0):
+        async def fake(url, timeout):
+            await asyncio.sleep(sleep)
+            return dict(result or {})
+        real = self.app_mod.resolver.resolve
+        self.app_mod.resolver.resolve = fake
+        self.addCleanup(setattr, self.app_mod.resolver, "resolve", real)
 
     def test_refuses_bad_scheme_and_private_host(self):
         self.assertEqual(self.client.post("/resolve", json={"url": "file:///etc/passwd"}).status_code, 400)
@@ -187,22 +224,22 @@ class TestApi(unittest.TestCase):
         self.assertEqual(self.app_mod.clamp_timeout(0.1), 5.0)
         self.assertEqual(self.app_mod.clamp_timeout(None), 45.0)
 
-    def test_resolved_page_is_cached(self):
-        calls = []
+    def test_private_playlist_is_never_returned(self):
+        self.fake_resolve({"ok": True, "m3u8_url": "http://10.1.2.3/live.m3u8", "cookie": "c=1"})
+        out = self.client.post("/resolve", json={"url": "http://127.0.0.1:9/p"}).json()
+        self.assertFalse(out["ok"])
+        self.assertEqual((out["m3u8_url"], out["cookie"]), ("", ""))
+        self.assertIn("private", out["note"])
 
-        async def fake(url, timeout):
-            calls.append(url)
-            return {"ok": True, "m3u8_url": "https://cdn.example/a.m3u8"}
-        real = self.app_mod.resolver.resolve
-        self.app_mod.resolver.resolve = fake
-        try:
-            first = self.client.post("/resolve", json={"url": "http://127.0.0.1:9/p"}).json()
-            second = self.client.post("/resolve", json={"url": "http://127.0.0.1:9/p"}).json()
-        finally:
-            self.app_mod.resolver.resolve = real
-        self.assertEqual(len(calls), 1)
-        self.assertFalse(first["cached"])
-        self.assertTrue(second["cached"])
+    def test_hard_limit_frees_the_slot(self):
+        self.fake_resolve({"ok": True}, sleep=30)
+        self.app_mod.GRACE_SEC, grace = 0.5, self.app_mod.GRACE_SEC
+        self.addCleanup(setattr, self.app_mod, "GRACE_SEC", grace)
+        t0 = time.monotonic()
+        out = self.client.post("/resolve", json={"url": "http://127.0.0.1:9/p", "timeout": 5}).json()
+        self.assertLess(time.monotonic() - t0, 8)
+        self.assertFalse(out["ok"])
+        self.assertEqual(self.app_mod._busy, 0)
 
     def test_health(self):
         self.assertEqual(self.client.get("/health").json()["ok"], True)
