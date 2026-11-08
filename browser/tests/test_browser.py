@@ -97,6 +97,7 @@ class TestNetguard(unittest.TestCase):
         self.assertTrue(netguard.request_is_private("http://10.0.0.5/a.m3u8"))
         self.assertTrue(netguard.request_is_private("https://[fe80::1]/x"))
         self.assertTrue(netguard.request_is_private("ws://192.168.0.2:9000/"))
+        self.assertTrue(netguard.request_is_private("http://[64:ff9b::a00:5]/x"))   # NAT64 of 10.0.0.5
         self.assertFalse(netguard.request_is_private("https://cdn.example/a.m3u8"))
         self.assertFalse(netguard.request_is_private("data:text/plain,hi"))
         self.assertFalse(netguard.request_is_private("http://127.0.0.1:9/x"))    # loopback allowed in tests

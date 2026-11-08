@@ -23,8 +23,8 @@ Per request:
 Every browser call has its own short limit, because a page can freeze its own
 main thread and every call into it would wait forever; the caller adds an
 overall limit on top. One Chromium process is shared by all requests ("new
-headless" mode, which pages detect far less often than the old headless
-shell) and relaunched if it dies. Chromium runs without its own sandbox, as
+headless" mode, which resolved far more pages than the old headless shell
+in testing) and relaunched if it dies. Chromium runs without its own sandbox, as
 Playwright does by default: the container and its network isolation are the
 boundary (see docs/browser-sidecar.md).
 """
@@ -64,7 +64,8 @@ _BIGGEST_PLAYER = """() => {
 
 def user_agent(version: str) -> str:
     """A desktop Chrome UA naming the Chromium version actually running (the
-    headless default says "HeadlessChrome", which pages check for)."""
+    headless default says "HeadlessChrome", a version string desktop players
+    don't expect)."""
     major = (version or "120").split(".")[0]
     return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
             f"Chrome/{major}.0.0.0 Safari/537.36")

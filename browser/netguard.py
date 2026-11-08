@@ -30,7 +30,13 @@ def allow_loopback() -> bool:
     return os.environ.get("PVARR_BROWSER_ALLOW_LOOPBACK", "") == "1"
 
 
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
 def _private_ip(addr: "ipaddress._BaseAddress") -> bool:
+    # A NAT64 address carries an IPv4 one in its last 32 bits; judge that.
+    if isinstance(addr, ipaddress.IPv6Address) and addr in _NAT64:
+        addr = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
     if addr.is_loopback and allow_loopback():
         return False
     return not addr.is_global or addr.is_multicast
