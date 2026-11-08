@@ -4,6 +4,12 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-07
+
+### Added
+- Segments packed inside WebP images (a short WebP header followed by MPEG-TS) are recognised by the probe and unwrapped by the relay; no decode needed.
+- The mid-recording event-page re-check logs the links that gave no playlist (up to 20) on the recording's card.
+
 ## [0.16.0] - 2026-11-07
 
 ### Added
