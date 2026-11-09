@@ -960,8 +960,9 @@ class StreamFailoverRecorder:
         candidate.dns_blocked = bool(result.get("dns_blocked"))
         source = "probe"
         if not result.get("ok") and browser.worth_trying(result):
-            # The page loaded but holds no playlist: a player that builds it in
-            # JavaScript. Ask the browser sidecar (PVARR_BROWSER_URL), fresh on
+            # The page loaded but holds no playlist (and the probe's own yt-dlp
+            # pass found none): a player that builds it in JavaScript. Ask the
+            # browser sidecar (PVARR_BROWSER_URL), fresh on
             # every connect since playlist tokens expire. Stop abandons the wait.
             self._log(f"Probe found no playlist on {candidate.name}'s page; "
                       "asking the browser sidecar...")

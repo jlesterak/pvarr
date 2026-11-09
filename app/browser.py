@@ -182,8 +182,8 @@ def resolve(page_url: str, timeout: Optional[int] = None,
                 _down_until = time.monotonic() + DOWN_PAUSE_SEC
                 logger.warning("Browser sidecar unreachable %d times in a row; not asking it for %d s.",
                                _unreachable, DOWN_PAUSE_SEC)
-        else:
-            _unreachable = 0
+        elif answer.get("note") not in ("stopped", "out of time"):
+            _unreachable = 0        # only a real answer ends an unreachable streak
     m3u8 = answer.get("m3u8_url") or ""
     if not answer.get("ok") or not m3u8:
         if answer.get("note") not in ("stopped", "out of time") and not answer.get("unreachable") \
