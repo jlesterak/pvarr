@@ -77,3 +77,51 @@ jobs:
         run: |
           uid=$(docker run --rm pvarr:ci id -u)
           test "$uid" = "1000" || { echo "::error::app ran as uid $uid"; exit 1; }
+
+  # Optional browser sidecar (browser/): its own tests against local fixture
+  # pages with real Chromium, then the image build. Not published yet.
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the sidecar's dependencies and Chromium
+        run: |
+          pip install -r browser/requirements.txt httpx
+          python -m playwright install --with-deps chromium
+
+      - name: Sidecar tests
+        run: python -m unittest discover -s browser/tests -v
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the sidecar image
+        uses: docker/build-push-action@v6
+        with:
+          context: browser
+          load: true
+          tags: pvarr-browser:ci
+          cache-from: type=gha,scope=browser
+          cache-to: type=gha,mode=max,scope=browser
+
+      - name: The sidecar must not run as root
+        run: |
+          uid=$(docker run --rm pvarr-browser:ci id -u)
+          test "$uid" = "10001" || { echo "::error::sidecar ran as uid $uid"; exit 1; }
+
+      - name: The image must launch Chromium the way the sidecar does
+        run: |
+          docker run --rm pvarr-browser:ci python -c "
+          import asyncio
+          from playwright.async_api import async_playwright
+          async def main():
+              async with async_playwright() as p:
+                  b = await p.chromium.launch(headless=True, channel='chromium')
+                  print('chromium', b.version)
+                  await b.close()
+          asyncio.run(main())"

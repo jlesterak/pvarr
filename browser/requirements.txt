@@ -1,0 +1,5 @@
+# PVArr browser sidecar. Versions pinned: the Chromium build comes with the
+# Playwright version, and a page that resolves today must resolve tomorrow.
+playwright==1.63.0
+fastapi==0.141.1
+uvicorn==0.52.4
