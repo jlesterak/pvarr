@@ -19,10 +19,11 @@ through and nothing else. It exists for the test suite, whose fixture pages
 are served on 127.0.0.1; LAN addresses stay blocked even then.
 """
 
+import asyncio
 import ipaddress
 import os
 import socket
-from typing import Optional
+from typing import Dict, Optional
 from urllib.parse import urlsplit
 
 
@@ -84,3 +85,33 @@ def request_is_private(url: str) -> bool:
         return _private_ip(ipaddress.ip_address(host))
     except ValueError:
         return False
+
+
+async def request_is_private_resolved(url: str, cache: Dict[str, bool]) -> bool:
+    """request_is_private, plus host names: resolved (once per page, via
+    `cache`) and refused when any address is private. Without this a page
+    could reach a service by its Docker name -- PVArr itself shares a network
+    with the sidecar, and the holder's blackhole routes do not cover that
+    network. A name that does not resolve is let through: the request fails."""
+    if request_is_private(url):
+        return True
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https", "ws", "wss"):
+        return False
+    host = (parts.hostname or "").rstrip(".").lower()
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False            # a literal public IP: request_is_private passed it
+    except ValueError:
+        pass
+    if host not in cache:
+        try:
+            infos = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(host, None), 3)
+            cache[host] = any(_private_ip(ipaddress.ip_address(i[4][0].split("%")[0]))
+                              for i in infos)
+        except (OSError, UnicodeError, asyncio.TimeoutError, ValueError):
+            cache[host] = False
+    return cache[host]

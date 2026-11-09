@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+The optional browser sidecar (`browser/`, docs/browser-sidecar.md), seen from PVArr.
+
+Some players build the playlist URL in JavaScript, so the probe's HTML walk
+never sees it and the link stays "unresolved" (the probe marks exactly that
+case `fixable: devtools_m3u8`: page fetched, no playlist in it). When
+`PVARR_BROWSER_URL` is set, those links and only those are handed to the
+sidecar, which loads the page in Chromium and reports the playlist the page
+requested plus the headers it used. PVArr then checks that playlist with its
+own probe, exactly as it checks any other link: nothing the sidecar says is
+trusted without a real fetch.
+
+Unset, nothing here runs. Every failure (sidecar down, busy, slow, a bad
+answer) comes back as "nothing found" and never raises: the sidecar is a
+best-effort extra, never something a recording depends on. Each call runs on
+an abandoned-not-joined daemon thread, so a Stop or a container shutdown never
+waits for a page that is still loading.
+"""
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+from typing import Any, Dict, Optional
+
+import requests
+
+from app import probe
+
+logger = logging.getLogger("PVArrBrowser")
+
+# What the sidecar may spend on one page. The sidecar clamps to 5-60 s itself;
+# on live links resolved pages took 7-10 s and misses ran to ~33 s.
+DEFAULT_TIMEOUT_SEC = 30
+TIMEOUT_BOUNDS = (10, 60)
+# The sidecar answers within its timeout plus its own 15 s grace.
+CLIENT_GRACE_SEC = 20
+CONNECT_TIMEOUT_SEC = 3
+# The answer is a small JSON object; anything bigger is not one.
+MAX_ANSWER_BYTES = 64 * 1024
+FIELD_LIMITS = {"m3u8_url": 4096, "referer": 2048, "cookie": 8192, "user_agent": 512}
+# A page the browser found nothing on is not asked again for this long: every
+# failover lap would otherwise pay the full timeout again for the same answer.
+MISS_MEMO_SEC = 300
+# After this many calls in a row that could not reach the sidecar at all, it
+# is left alone for DOWN_PAUSE_SEC (one log line, not one per connect).
+DOWN_AFTER = 3
+DOWN_PAUSE_SEC = 300
+
+_lock = threading.Lock()
+_misses: Dict[str, float] = {}
+_unreachable = 0
+_down_until = 0.0
+_CTL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def browser_url() -> str:
+    """The sidecar's base URL, or "" when it is not configured."""
+    raw = (os.environ.get("PVARR_BROWSER_URL") or "").strip().rstrip("/")
+    if raw and not raw.lower().startswith(("http://", "https://")):
+        logger.warning("Ignoring PVARR_BROWSER_URL: it must start with http:// or https://")
+        return ""
+    return raw
+
+
+def browser_timeout() -> int:
+    """Seconds the sidecar may spend on one page (PVARR_BROWSER_TIMEOUT)."""
+    raw = os.environ.get("PVARR_BROWSER_TIMEOUT")
+    try:
+        value = int(float(raw)) if raw not in (None, "") else DEFAULT_TIMEOUT_SEC
+    except (ValueError, OverflowError):
+        logger.warning("Ignoring invalid PVARR_BROWSER_TIMEOUT=%r", raw)
+        value = DEFAULT_TIMEOUT_SEC
+    low, high = TIMEOUT_BOUNDS
+    return max(low, min(high, value))
+
+
+def worth_trying(probe_result: Dict[str, Any]) -> bool:
+    """True for the JavaScript-player case only: the probe fetched the page and
+    found no playlist in it. A dead playlist, a 404, a refused segment or a
+    DNS-blocked host never goes to the browser, so failover is not slowed."""
+    return (bool(browser_url())
+            and not probe_result.get("ok")
+            and probe_result.get("fixable") == "devtools_m3u8")
+
+
+def _clean_answer(answer: Any) -> Dict[str, Any]:
+    """Only the fields PVArr uses, as bounded single-line strings; a value
+    that could not go into a header safely is dropped, not passed on."""
+    if not isinstance(answer, dict):
+        return {"ok": False, "note": "the browser sidecar sent a malformed answer"}
+    out: Dict[str, Any] = {"ok": answer.get("ok") is True}
+    for key, limit in FIELD_LIMITS.items():
+        value = answer.get(key)
+        out[key] = value if isinstance(value, str) and len(value) <= limit and not _CTL.search(value) else ""
+    note = answer.get("note")
+    out["note"] = _CTL.sub(" ", note)[:200] if isinstance(note, str) else ""
+    return out
+
+
+def _ask_sidecar(base: str, page_url: str, timeout: int) -> Dict[str, Any]:
+    """POST /resolve. The sidecar's cleaned answer, or {"ok": False, "note": why,
+    "unreachable": bool}. Only the URL and a timeout are sent: never the
+    operator's cookie or User-Agent, which the page's JavaScript would see."""
+    try:
+        with requests.Session() as session:
+            session.trust_env = False   # no proxy settings may reroute this
+            with session.post(f"{base}/resolve", json={"url": page_url, "timeout": timeout},
+                              timeout=(CONNECT_TIMEOUT_SEC, timeout + CLIENT_GRACE_SEC),
+                              allow_redirects=False, stream=True) as resp:
+                if resp.status_code == 503:
+                    return {"ok": False, "note": "the browser sidecar is busy"}
+                if resp.status_code != 200:
+                    return {"ok": False, "note": f"the browser sidecar answered HTTP {resp.status_code}"}
+                body = resp.raw.read(MAX_ANSWER_BYTES + 1, decode_content=True)
+        if len(body) > MAX_ANSWER_BYTES:
+            return {"ok": False, "note": "the browser sidecar's answer was too large"}
+        return _clean_answer(json.loads(body))
+    except requests.Timeout:
+        return {"ok": False, "note": "the browser sidecar did not answer in time"}
+    except (requests.ConnectionError, OSError) as exc:
+        return {"ok": False, "unreachable": True,
+                "note": f"the browser sidecar could not be reached ({type(exc).__name__})"}
+    except Exception as exc:
+        return {"ok": False, "note": f"the browser sidecar sent a malformed answer ({type(exc).__name__})"}
+
+
+def _ask_abandonably(base: str, page_url: str, timeout: int,
+                     abort: Optional[threading.Event], deadline: Optional[float]) -> Dict[str, Any]:
+    """_ask_sidecar on a daemon thread, given up on (not joined) at `abort`
+    or `deadline` (time.monotonic()); the thread then ends on its own timeouts."""
+    box: Dict[str, Any] = {}
+    worker = threading.Thread(target=lambda: box.update(_ask_sidecar(base, page_url, timeout)),
+                              name="pvarr-browser", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        if abort is not None and abort.is_set():
+            return {"ok": False, "note": "stopped"}
+        if deadline is not None and time.monotonic() >= deadline:
+            return {"ok": False, "note": "out of time"}
+        worker.join(0.25)
+    return box or {"ok": False, "note": "no answer"}
+
+
+def resolve(page_url: str, timeout: Optional[int] = None,
+            abort: Optional[threading.Event] = None, deadline: Optional[float] = None,
+            probe_timeout: int = probe.DEFAULT_TIMEOUT) -> Dict[str, Any]:
+    """Ask the sidecar for the page's playlist, then verify it with the probe.
+
+    Returns a probe-shaped result (`probe.probe_stream`) with `via: "browser"`
+    and `input_url` the page; `ok` only when the probe confirmed the playlist.
+    `timeout` caps the sidecar's time on the page (default PVARR_BROWSER_TIMEOUT).
+    """
+    global _unreachable, _down_until
+    out: Dict[str, Any] = {"ok": False, "input_url": page_url, "m3u8_url": "", "via": "browser",
+                           "referer": "", "cookie": "", "message": ""}
+    base = browser_url()
+    if not base:
+        out["message"] = "The browser sidecar is not configured."
+        return out
+    now = time.monotonic()
+    with _lock:
+        for url in [u for u, t in _misses.items() if t <= now]:
+            del _misses[url]
+        if _misses.get(page_url, 0) > now:
+            out["message"] = "Browser: found no playlist on this page a few minutes ago; not asked again yet."
+            return out
+        if _down_until > now:
+            out["message"] = "Browser: the sidecar was unreachable; paused for a few minutes."
+            return out
+    started = time.monotonic()
+    answer = _ask_abandonably(base, page_url, min(timeout or browser_timeout(), browser_timeout()),
+                              abort, deadline)
+    took = time.monotonic() - started
+    with _lock:
+        if answer.get("unreachable"):
+            _unreachable += 1
+            if _unreachable >= DOWN_AFTER:
+                _down_until = time.monotonic() + DOWN_PAUSE_SEC
+                logger.warning("Browser sidecar unreachable %d times in a row; not asking it for %d s.",
+                               _unreachable, DOWN_PAUSE_SEC)
+        else:
+            _unreachable = 0
+    m3u8 = answer.get("m3u8_url") or ""
+    if not answer.get("ok") or not m3u8:
+        if answer.get("note") not in ("stopped", "out of time") and not answer.get("unreachable") \
+                and "busy" not in (answer.get("note") or ""):
+            with _lock:
+                _misses[page_url] = time.monotonic() + MISS_MEMO_SEC
+        out["message"] = f"Browser ({took:.0f} s): " + (answer.get("note") or "no playlist found") + "."
+        return out
+    # The page's JavaScript chose this URL. A public page may not lead PVArr
+    # into the LAN (the find_streams rule), checked before the probe fetches it.
+    try:
+        m3u8 = probe.clean_url(m3u8)
+    except probe.ProbeError:
+        out["message"] = "Browser: the page's playlist URL is not a web address; not used."
+        return out
+    if probe.is_private_url(m3u8) and not probe.is_private_url(page_url):
+        out["message"] = "Browser: the page's playlist is on a private address; not used."
+        return out
+    referer = answer.get("referer") or ""
+    try:
+        result = probe.probe_stream(
+            m3u8, referer=referer or None, user_agent=answer.get("user_agent") or None,
+            cookie=answer.get("cookie") or None, timeout=probe_timeout, use_ytdlp=False)
+    except Exception as exc:  # the probe must never sink a scan or a connect
+        out["message"] = f"Browser found a playlist, but probing it failed: {exc}"
+        return out
+    if result.get("m3u8_url") and probe.is_private_url(result["m3u8_url"]) \
+            and not probe.is_private_url(page_url):
+        out["message"] = "Browser: the page's playlist led to a private address; not used."
+        return out
+    result["via"] = "browser"
+    result["input_url"] = page_url
+    if not result.get("referer") and referer:
+        result["referer"] = referer
+    result["message"] = f"Browser ({took:.0f} s): " + (result.get("message") or "")
+    return result
+
+
+def _reset_for_tests() -> None:
+    global _unreachable, _down_until
+    with _lock:
+        _misses.clear()
+        _unreachable = 0
+        _down_until = 0.0

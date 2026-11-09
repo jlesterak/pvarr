@@ -11381,6 +11381,224 @@ class TestStepDownOnSlowConnection(unittest.TestCase):
         self.assertEqual(got[0]["height"], 0)
 
 
+
+class _FakeSidecar:
+    """A local stand-in for the browser sidecar's POST /resolve."""
+
+    def __init__(self, answer=None, status=200, delay=0.0):
+        import http.server
+        self.answer = answer or {"ok": False, "m3u8_url": "", "note": "no playlist request seen"}
+        self.status, self.delay, self.requests = status, delay, []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                fake.requests.append(json.loads(body or b"{}"))
+                time.sleep(fake.delay)
+                data = json.dumps(fake.answer).encode()
+                self.send_response(fake.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestBrowserSidecar(unittest.TestCase):
+    """PVArr's use of the optional browser sidecar (app/browser.py)."""
+
+    PAGE = "https://page.example/watch/1"
+    JS_PAGE = {"ok": False, "m3u8_url": "", "fixable": "devtools_m3u8",
+               "message": "No .m3u8 found on that page (HTTP 200)"}
+    GOOD = {"ok": True, "m3u8_url": "https://cdn.example/live.m3u8", "referer": "",
+            "user_agent": "UA/1", "cookie": "", "kind": "media", "segment_ok": True,
+            "message": "Media playlist."}
+
+    def setUp(self):
+        from app import browser
+        self.browser = browser
+        browser._reset_for_tests()
+        self.sidecars = []
+        self._env = os.environ.get("PVARR_BROWSER_URL")
+
+    def tearDown(self):
+        for s in self.sidecars:
+            s.close()
+        if self._env is None:
+            os.environ.pop("PVARR_BROWSER_URL", None)
+        else:
+            os.environ["PVARR_BROWSER_URL"] = self._env
+        self.browser._reset_for_tests()
+
+    def _sidecar(self, **kw):
+        s = _FakeSidecar(**kw)
+        self.sidecars.append(s)
+        os.environ["PVARR_BROWSER_URL"] = s.url
+        return s
+
+    def test_off_unless_configured_and_only_for_pages_without_a_playlist(self):
+        os.environ.pop("PVARR_BROWSER_URL", None)
+        self.assertFalse(self.browser.worth_trying(self.JS_PAGE))
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        self.assertTrue(self.browser.worth_trying(self.JS_PAGE))
+        # A dead playlist, a refused segment, a DNS-blocked host: not a JS player.
+        for res in ({"ok": False, "m3u8_url": "", "fixable": ""},
+                    {"ok": False, "m3u8_url": "https://cdn.example/a.m3u8", "fixable": "referer"},
+                    {"ok": False, "m3u8_url": "", "dns_blocked": True}):
+            self.assertFalse(self.browser.worth_trying(res), res)
+        os.environ["PVARR_BROWSER_URL"] = "ftp://sidecar.example"
+        self.assertFalse(self.browser.worth_trying(self.JS_PAGE))
+
+    def test_timeout_setting_is_bounded(self):
+        for raw, want in (("", 30), ("5", 10), ("45", 45), ("600", 60), ("junk", 30)):
+            with patch.dict(os.environ, {"PVARR_BROWSER_TIMEOUT": raw}):
+                self.assertEqual(self.browser.browser_timeout(), want, raw)
+
+    def test_found_playlist_is_verified_by_the_probe_with_the_frames_headers(self):
+        side = self._sidecar(answer={"ok": True, "m3u8_url": "https://cdn.example/live.m3u8",
+                                     "referer": "https://player.example/embed/1",
+                                     "user_agent": "UA/1", "cookie": "k=v"})
+        with patch("app.probe.probe_stream", return_value=dict(self.GOOD)) as probe_mock:
+            res = self.browser.resolve(self.PAGE)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["via"], "browser")
+        self.assertEqual(res["input_url"], self.PAGE)
+        self.assertEqual(res["referer"], "https://player.example/embed/1")
+        args, kwargs = probe_mock.call_args
+        self.assertEqual(args[0], "https://cdn.example/live.m3u8")
+        self.assertEqual(kwargs["referer"], "https://player.example/embed/1")
+        self.assertEqual(kwargs["cookie"], "k=v")
+        # Only the URL and a timeout go to the sidecar, never the operator's cookie.
+        self.assertEqual(set(side.requests[0]), {"url", "timeout"})
+
+    def test_private_playlist_from_a_public_page_is_refused_before_any_fetch(self):
+        self._sidecar(answer={"ok": True, "m3u8_url": "http://192.168.1.5/live.m3u8"})
+        with patch("app.probe.probe_stream") as probe_mock:
+            res = self.browser.resolve(self.PAGE)
+        self.assertFalse(res["ok"])
+        self.assertIn("private", res["message"])
+        probe_mock.assert_not_called()
+
+    def test_header_values_with_line_breaks_are_dropped(self):
+        self._sidecar(answer={"ok": True, "m3u8_url": "https://cdn.example/live.m3u8",
+                              "referer": "https://a.example/\r\nX-Evil: 1",
+                              "cookie": "a=b\nX: y", "user_agent": "UA\r\n"})
+        with patch("app.probe.probe_stream", return_value=dict(self.GOOD)) as probe_mock:
+            self.browser.resolve(self.PAGE)
+        kwargs = probe_mock.call_args.kwargs
+        self.assertIsNone(kwargs["referer"])
+        self.assertIsNone(kwargs["cookie"])
+        self.assertIsNone(kwargs["user_agent"])
+
+    def test_a_miss_is_remembered_but_busy_is_not(self):
+        side = self._sidecar(status=503)
+        self.assertFalse(self.browser.resolve(self.PAGE)["ok"])
+        self.assertFalse(self.browser.resolve(self.PAGE)["ok"])
+        self.assertEqual(len(side.requests), 2)        # busy: asked again
+        side.status = 200                               # now a real miss
+        self.assertFalse(self.browser.resolve(self.PAGE)["ok"])
+        res = self.browser.resolve(self.PAGE)
+        self.assertEqual(len(side.requests), 3)        # the miss was remembered
+        self.assertIn("not asked again", res["message"])
+
+    def test_unreachable_sidecar_is_paused_after_repeated_failures(self):
+        os.environ["PVARR_BROWSER_URL"] = "http://127.0.0.1:9"     # nothing listens
+        for n in range(self.browser.DOWN_AFTER):
+            self.assertIn("could not be reached", self.browser.resolve(f"{self.PAGE}{n}")["message"])
+        self.assertIn("paused", self.browser.resolve(self.PAGE + "x")["message"])
+
+    def test_stop_abandons_a_slow_sidecar_at_once(self):
+        self._sidecar(delay=5)
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        t0 = time.monotonic()
+        res = self.browser.resolve(self.PAGE, abort=stop)
+        self.assertLess(time.monotonic() - t0, 2)
+        self.assertFalse(res["ok"])
+
+    def test_find_asks_the_browser_only_when_it_came_up_short(self):
+        links = [f"https://l{i}.example/p" for i in range(8)]
+        working = {1: "https://a.example/1.m3u8", 2: "https://b.example/2.m3u8",
+                   3: "https://c.example/3.m3u8"}
+
+        def probe_fn(url):
+            i = links.index(url)
+            if i in working:
+                return {"ok": True, "m3u8_url": working[i], "segment_ok": True}
+            return dict(self.JS_PAGE)
+        asked = []
+
+        def second(url, deadline):
+            asked.append(url)
+            return {"ok": True, "m3u8_url": "https://d.example/b.m3u8", "segment_ok": True,
+                    "via": "browser", "message": "Browser: ok"}
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        out = aggregator.pick_first_working(links, probe_fn=probe_fn, workers=2, second_fn=second)
+        self.assertEqual(asked, [])                         # three picks, three sources: enough
+        self.assertEqual(len(out["picked"]), 3)
+
+        working.pop(2)
+        working.pop(3)
+        out = aggregator.pick_first_working(links, probe_fn=probe_fn, workers=2, second_fn=second)
+        # Page order, JavaScript pages only, and it stops once three work.
+        self.assertEqual(asked, [links[0], links[2]])
+        self.assertEqual(out["picked"][0]["url"], links[0])
+        self.assertEqual(out["picked"][0]["via"], "browser")
+        self.assertEqual(out["tried"][0]["status"], "working")
+
+    def test_find_tries_at_most_a_few_pages_one_at_a_time(self):
+        links = [f"https://l{i}.example/p" for i in range(10)]
+        asked, live, peak = [], [0], [0]
+
+        def second(url, deadline):
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+            asked.append(url)
+            time.sleep(0.01)
+            live[0] -= 1
+            return {"ok": False, "m3u8_url": "", "message": "Browser: no playlist found."}
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        out = aggregator.pick_first_working(links, probe_fn=lambda u: dict(self.JS_PAGE),
+                                            workers=3, second_fn=second)
+        self.assertEqual(asked, links[:aggregator.BROWSER_LINKS])
+        self.assertEqual(peak[0], 1)
+        self.assertEqual(out["tried"][0]["status"], "unresolved")
+
+    def test_connect_falls_back_to_the_browser_for_a_javascript_page(self):
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        rec = StreamFailoverRecorder("test-id", [self.PAGE], str(Path(tmp) / "out.ts"))
+        found = dict(self.GOOD, referer="https://player.example/embed/1", via="browser")
+        with patch("app.recorder.probe_stream", return_value=dict(self.JS_PAGE)), \
+                patch("app.browser.resolve", return_value=found) as resolve_mock:
+            self.assertTrue(rec._probe_candidate(rec.candidates[0]))
+        cand = rec.candidates[0]
+        self.assertEqual(cand.detect_source, "browser")
+        self.assertEqual(cand.m3u8_url, "https://cdn.example/live.m3u8")
+        self.assertEqual(cand.referer, "https://player.example/embed/1")
+        self.assertIs(resolve_mock.call_args.kwargs["abort"], rec._stop_event)
+
+        # A playlist that answered 403 is a dead stream: the browser is not asked.
+        dead = {"ok": False, "m3u8_url": "", "fixable": "referer", "message": "HTTP 403"}
+        with patch("app.recorder.probe_stream", return_value=dead), \
+                patch("app.browser.resolve") as resolve_mock:
+            self.assertFalse(rec._probe_candidate(rec.candidates[0]))
+        resolve_mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

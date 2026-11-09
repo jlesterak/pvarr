@@ -83,6 +83,32 @@ def _serve():
 
 
 class TestNetguard(unittest.TestCase):
+    def test_a_host_name_that_resolves_to_a_private_address_is_blocked(self):
+        # A page reaching a container by its Docker name (PVArr shares a
+        # network with the sidecar), not just by literal IP.
+        from unittest.mock import patch
+
+        async def fake_getaddrinfo(host, port):
+            ips = {"pvarr": "172.20.0.3", "cdn.example": "93.184.216.34"}
+            if host not in ips:
+                raise OSError("no such host")
+            return [(2, 1, 6, "", (ips[host], 0))]
+
+        async def check():
+            loop = asyncio.get_running_loop()
+            cache = {}
+            with patch.object(loop, "getaddrinfo", fake_getaddrinfo):
+                self.assertTrue(await netguard.request_is_private_resolved(
+                    "http://pvarr:8999/api/recordings/start", cache))
+                self.assertTrue(await netguard.request_is_private_resolved("ws://pvarr:8999/x", cache))
+                self.assertFalse(await netguard.request_is_private_resolved(
+                    "https://cdn.example/live.m3u8", cache))
+                self.assertFalse(await netguard.request_is_private_resolved(
+                    "https://nowhere.example/", cache))
+                self.assertFalse(await netguard.request_is_private_resolved("data:text/plain,x", cache))
+            self.assertEqual(cache, {"pvarr": True, "cdn.example": False, "nowhere.example": False})
+        asyncio.run(check())
+
     def test_page_urls(self):
         self.assertIsNotNone(netguard.page_url_problem("file:///etc/passwd"))
         self.assertIsNotNone(netguard.page_url_problem("javascript:alert(1)"))

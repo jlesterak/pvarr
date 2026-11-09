@@ -26,7 +26,7 @@ from typing import List, Optional, Callable, Dict, Any, Set, Tuple
 
 from app.check_deps import find_executable
 from app.logging_config import redact_url_secrets
-from app import quality, ytdlp
+from app import browser, quality, ytdlp
 from app.probe import DEFAULT_USER_AGENT, is_private_url, probe_stream
 from app.relay import PlaylistRelay
 
@@ -958,6 +958,18 @@ class StreamFailoverRecorder:
             return False
 
         candidate.dns_blocked = bool(result.get("dns_blocked"))
+        source = "probe"
+        if not result.get("ok") and browser.worth_trying(result):
+            # The page loaded but holds no playlist: a player that builds it in
+            # JavaScript. Ask the browser sidecar (PVARR_BROWSER_URL), fresh on
+            # every connect since playlist tokens expire. Stop abandons the wait.
+            self._log(f"Probe found no playlist on {candidate.name}'s page; "
+                      "asking the browser sidecar...")
+            found = browser.resolve(candidate.url, abort=self._stop_event)
+            if found.get("ok"):
+                result, source = found, "browser"
+            else:
+                self._log(f"{candidate.name}: {found.get('message', '')}", "WARN")
         if not result.get("ok"):
             candidate.last_error = result.get("message", "Probe failed")
             self._log(f"Probe found nothing playable for {candidate.name}: {candidate.last_error}", "WARN")
@@ -975,11 +987,12 @@ class StreamFailoverRecorder:
         if result.get("user_agent"):
             candidate.user_agent = result["user_agent"]
         candidate.detected = True
-        candidate.detect_source = "probe"
+        candidate.detect_source = source
         candidate.detect_note = result.get("message", "")
         required = result.get("headers_required") or ["none"]
         self._log(
-            f"Probe resolved {candidate.name}: {result.get('kind', 'playlist')}, "
+            f"{'Browser sidecar' if source == 'browser' else 'Probe'} resolved {candidate.name}: "
+            f"{result.get('kind', 'playlist')}, "
             f"headers {', '.join(required)}."
         )
         return True

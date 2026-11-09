@@ -35,7 +35,7 @@ import re
 import time
 from typing import Any, Dict, Set
 
-from netguard import request_is_private
+from netguard import request_is_private_resolved
 
 BLOCK_TYPES = {"image", "media", "font"}
 SEGMENT_RE = re.compile(r"\.(ts|m4s|aac|mp4|m4a|png|jpe?g|webp|gif)(\?|$)", re.I)
@@ -157,6 +157,7 @@ class Resolver:
         found = asyncio.Event()
         tasks: Set[asyncio.Future] = set()
         blocked_private = 0
+        dns_cache: Dict[str, bool] = {}
 
         def spawn(coro) -> None:
             task = asyncio.ensure_future(coro)
@@ -167,7 +168,7 @@ class Resolver:
             nonlocal blocked_private
             req = r.request
             try:
-                if request_is_private(req.url):
+                if await request_is_private_resolved(req.url, dns_cache):
                     blocked_private += 1
                     await r.abort()
                 elif ".m3u8" in req.url.lower():
@@ -181,7 +182,7 @@ class Resolver:
 
         async def web_socket(ws):
             nonlocal blocked_private
-            if request_is_private(ws.url):
+            if await request_is_private_resolved(ws.url, dns_cache):
                 blocked_private += 1
                 await ws.close()
             else:

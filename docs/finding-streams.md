@@ -166,7 +166,9 @@ Two cases genuinely need this:
 - **Referer the probe cannot guess** — a third site's URL, unrelated to either
   the page or the CDN.
 
-For pages that only assemble their m3u8 after running JavaScript, PVArr will
+For pages that only assemble their m3u8 after running JavaScript, the optional
+[browser sidecar](browser-sidecar.md) (`PVARR_BROWSER_URL`) loads the page in a
+real browser and hands the playlist it requested back to the probe. PVArr will
 also shell out to `detect-headers` from
 [hls-restream-proxy](https://github.com/pcruz1905/hls-restream-proxy) when it is
 installed (see [Requirements](installation.md#requirements)). It runs only after the built-in

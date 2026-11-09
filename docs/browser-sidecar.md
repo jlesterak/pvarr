@@ -1,4 +1,4 @@
-# Browser sidecar (experimental, not used by PVArr yet)
+# Browser sidecar (experimental)
 
 Many event-page links build their playlist URL in JavaScript, so PVArr's probe
 reports them as *unresolved*. The browser sidecar is a separate, optional
@@ -7,10 +7,35 @@ way a viewer would, and returns the playlist request it saw, with the Referer,
 Origin and Cookie the browser sent. PVArr's own probe then still decides how to
 record it (relay, image-wrapped segments, TLS client).
 
-**Status:** the container and its API exist and are tested; PVArr does not call
-it yet (planned: Find, the event-page re-check and connect will send unresolved
-links to it when `PVARR_BROWSER_URL` is set). Nothing is published to a
-registry yet; build it yourself to try it.
+**Status:** PVArr uses it when `PVARR_BROWSER_URL` is set (see
+[Using it from PVArr](#using-it-from-pvarr)). Nothing is published to a
+registry yet; build it yourself (`docker build -t pvarr-browser browser/`).
+
+## Using it from PVArr
+
+Set `PVARR_BROWSER_URL=http://pvarr-browser-net:8998` on PVArr (the Compose
+example below). Only links whose page loads but holds no playlist go to it; a
+dead playlist, a refused segment, a 404 or a DNS-blocked host never do.
+
+- **Find, scheduled scans and the event-page re-check:** only when the probe
+  came up short (fewer than three working links, or all from one source). Up
+  to 4 unresolved links, in page order, one at a time, at most 20 s each and
+  45 s in all, so a page check can take up to 45 s longer. A link it resolves
+  is logged `found by the browser sidecar` and ranked like any other.
+- **Connect (start and every failover):** a link whose page holds no playlist
+  is resolved in the browser again each time, since playlist tokens expire.
+  That costs 7-10 s when it works and up to `PVARR_BROWSER_TIMEOUT` (30 s)
+  when it does not; a page the browser found nothing on is not asked again for
+  5 minutes. The card log says `Browser sidecar resolved ...`.
+- PVArr's own probe checks every playlist the sidecar returns, with the
+  sidecar's Referer, User-Agent and Cookie, before using it. A playlist on a
+  private address from a public page is refused before anything fetches it.
+  Header values with line breaks or over a size limit are dropped.
+- PVArr sends the sidecar only the page URL, never your cookie or User-Agent.
+- If the sidecar is down, busy or slow, nothing changes: the link stays
+  unresolved. After 3 calls in a row that cannot reach it, PVArr leaves it
+  alone for 5 minutes. Stopping a recording or PVArr never waits for a page
+  that is still loading.
 
 ## API
 
@@ -42,11 +67,15 @@ names the Chromium version actually running. No site-specific code.
 
 ## Cost
 
-About 0.5 GB of RAM and most of one CPU core per open page, for 5-35 s. Idle
-it is about 70 MB until the first request, then about 200 MB with Chromium
-kept warm. The image is about 1.2-1.5 GB (Chromium and its libraries). On a
-host with 4 GB of RAM, or a Raspberry Pi, set `PVARR_BROWSER_MAX_PAGES=1` and
-`mem_limit: 1g`.
+0.3-0.9 GB of RAM and most of one CPU core per open page, for 5-35 s
+(measured on live pages: 7-10 s when it finds the playlist, ~33 s when it does
+not). Idle it is about 70 MB until the first request, then about 250 MB with
+Chromium kept warm. The image is about 1.8 GB (Chromium and its libraries).
+Two pages can need 1.8 GB, hence `mem_limit: 2g` in the example; on a host
+with 4 GB of RAM, or a Raspberry Pi, set `PVARR_BROWSER_MAX_PAGES=1` and
+`mem_limit: 1g`. Each page also loads the site's scripts over your internet
+link, so on a slow or shared uplink a page check during a recording competes
+with it.
 
 ## Security model (read before running it)
 
@@ -58,8 +87,14 @@ its network isolation, so **network isolation is required, not optional**:
 - The sidecar refuses page URLs on private addresses, refuses any browser
   request or WebSocket to a literal private, loopback or link-local IP,
   blocks service workers, and never returns a playlist on a private address.
-- What it cannot see from inside: a public name that resolves to a private
-  address, or a redirect to one. Only the network setup below stops those.
+- Host names are resolved too (once per page): a request to a name that
+  resolves to a private address is refused, so a page cannot reach PVArr by
+  its Docker name on the network they share (PVArr's API has no login).
+- What it cannot stop from inside: a name that answers with a public address
+  to the check and a private one to the browser a moment later (DNS
+  rebinding). Only the network setup below stops that, and the network PVArr
+  shares with the sidecar is not covered by its blackhole routes; keep only
+  PVArr and the sidecar on it.
 - The API has no authentication. Never publish port 8998, and put the sidecar
   on a network that only PVArr shares.
 - Keep the image current: the Chromium build changes only when the pinned
@@ -93,7 +128,7 @@ services:
     network_mode: "service:pvarr-browser-net"
     depends_on: [pvarr-browser-net]
     init: true                      # reaps Chromium's helper processes
-    mem_limit: 1536m
+    mem_limit: 2g
     pids_limit: 512
     read_only: true
     tmpfs: ["/tmp", "/home/browser:uid=10001,mode=0700"]
@@ -101,7 +136,9 @@ services:
     security_opt: [no-new-privileges:true]
 
   pvarr:
-    networks: [default, browser_in]
+    environment:
+      - PVARR_BROWSER_URL=http://pvarr-browser-net:8998
+    networks: [default, browser_in]   # use PVArr's existing network in place of default
 
 networks:
   browser_out: {}

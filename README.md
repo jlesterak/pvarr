@@ -102,6 +102,7 @@ PVArr emulates an HDHomeRun tuner. In Plex: **Settings → Live TV & DVR → Set
 | [Installation and configuration](docs/installation.md) | Compose, building from source, pinning versions, requirements, every environment variable |
 | [Finding the stream URL](docs/finding-streams.md) | How the probe works, what to paste, reading the probe trace, manual headers |
 | [Event pages and scheduling](docs/event-pages.md) | Finding three working streams from one page, pages that need your browser session, schedules |
+| [Browser sidecar](docs/browser-sidecar.md) | Optional container that resolves links whose player builds its playlist in JavaScript, and how to isolate it |
 | [FlareSolverr](docs/flaresolverr.md) | Optional helper for event pages that need a real browser, and how to keep it off your LAN |
 | [Plex, Jellyfin and Emby](docs/tuner.md) | Virtual tuner setup, what the guide shows, gaps at a failover |
 | [Commercial detection](docs/comskip.md) | comskip chapters or cuts, tuning and scoring an ini |

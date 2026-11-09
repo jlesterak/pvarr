@@ -137,6 +137,8 @@ def describe_picks(result: Optional[Dict[str, Any]]) -> str:
         host = urlsplit(str(pick.get("url") or "")).hostname or "?"
         q = pick.get("quality")
         text = f"#{n} {host} {quality.summary(q) if q else 'unranked'}".rstrip()
+        if pick.get("via") == "browser":
+            text += " (found by the browser sidecar)"
         # Same real feed as an earlier pick (quality.source_key): that backup
         # dies with it.
         key = quality.source_key(pick.get("m3u8_url") or "")

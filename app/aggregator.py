@@ -46,7 +46,7 @@ from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
 
-from app import eventinfo, probe, quality
+from app import browser, eventinfo, probe, quality
 
 logger = logging.getLogger("PVArrAggregator")
 
@@ -71,6 +71,13 @@ PROBE_WORKERS = 6
 # 8-second waits while working links further down are never reached.
 PROBE_TIMEOUT_SEC = 5
 PROBE_BUDGET_SEC = 60.0
+# Browser sidecar second look (PVARR_BROWSER_URL): links whose page had no
+# playlist, one at a time, BROWSER_PAGE_SEC each (resolved pages took 7-10 s
+# on live links), all within BROWSER_STAGE_SEC.
+BROWSER_LINKS = 4
+BROWSER_PAGE_SEC = 20
+BROWSER_STAGE_SEC = 45.0
+BROWSER_MIN_SLOT_SEC = 8
 # FlareSolverr usually loads a checked page in 10-20 s, but one took
 # ~71 s: 60 s failed it every time. Overridable by PVARR_FLARESOLVERR_TIMEOUT.
 DEFAULT_FLARESOLVERR_TIMEOUT_SEC = 120
@@ -441,8 +448,13 @@ def pick_first_working(
     gather: Optional[int] = None,
     measure_fn: Optional[Callable[[Dict[str, Any], float], Dict[str, Any]]] = None,
     gather_max: int = GATHER_MAX,
+    second_fn: Optional[Callable[[str, float], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Probe links concurrently; keep the first `pick` that work, in link order.
+
+    `second_fn(url, deadline)` (the browser sidecar, when configured) gets a
+    second look at links the probe found no playlist on, only if the probe
+    phase came up short; see _second_stage.
 
     With `measure_fn`, up to `gather` working links are collected the same
     way, measured one at a time within RANK_BUDGET_SEC, and the best `pick`
@@ -509,6 +521,9 @@ def pick_first_working(
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
+    if second_fn is not None and not (abort is not None and abort.is_set()):
+        _second_stage(links, results, second_fn, enough, abort)
+
     # Cut where the search may stop, not at whatever else finished probing
     # meanwhile: past `want`, that is at most the one link adding a source.
     found: List[int] = []
@@ -555,6 +570,7 @@ def pick_first_working(
             "referer": res.get("referer", ""),
             "user_agent": res.get("user_agent", ""),
             "impersonate": bool(res.get("impersonate")),
+            "via": res.get("via", ""),
             "message": message,
             **({"quality": q} if q else {}),
         })
@@ -582,6 +598,45 @@ def pick_first_working(
     summary = _source_summary(links, results, chosen, working, not_video, tried)
     return {"picked": picked, "tried": tried, "timed_out": timed_out, "sources": sources,
             "summary": summary}
+
+
+def _second_stage(links: List[str], results: Dict[int, Dict[str, Any]],
+                  second_fn: Callable[[str, float], Dict[str, Any]],
+                  enough: Callable[[List[int]], bool],
+                  abort: Optional[threading.Event]) -> None:
+    """The browser sidecar's look at links the probe found no playlist on.
+
+    Runs only when the probe phase came up short (fewer working links than
+    wanted, or all one source). One page at a time, in page order, at most
+    BROWSER_LINKS of them, under a hard BROWSER_STAGE_SEC wall clock: the
+    sidecar's second page slot stays free for a recording's failover, and the
+    event-page lock is held at most that much longer. A result replaces the
+    link's entry in `results` when it found a playlist (working, or failed --
+    an accurate "failed" beats "unresolved"), so ranking, source letters and
+    the summary treat it like any other link. Stops once enough work.
+    """
+    found = [i for i in range(len(links)) if i in results and _works(results[i])]
+    if enough(found):
+        return
+    stuck = [i for i in range(len(links))
+             if i in results and browser.worth_trying(results[i])][:BROWSER_LINKS]
+    deadline = time.monotonic() + BROWSER_STAGE_SEC
+    for i in stuck:
+        if abort is not None and abort.is_set():
+            return
+        if deadline - time.monotonic() < BROWSER_MIN_SLOT_SEC:
+            return
+        try:
+            res = second_fn(links[i], deadline)
+        except Exception as exc:  # a resolver bug must not sink the scan
+            logger.warning("Browser look at link %d failed: %s", i, exc)
+            continue
+        if res.get("m3u8_url"):
+            results[i] = res
+            if _works(res):
+                found = sorted(found + [i])
+                if enough(found):
+                    return
 
 
 def _source_summary(links: List[str], results: Dict[int, Dict[str, Any]], chosen: List[int],
@@ -771,8 +826,13 @@ def find_streams(
     if quality.enabled():
         def measure(res, deadline):
             return quality.measure(res, allow_private=allow_private, deadline=deadline)
+    second = None
+    if browser.browser_url():
+        def second(link, deadline):
+            return browser.resolve(link, timeout=BROWSER_PAGE_SEC, abort=abort,
+                                   deadline=deadline, probe_timeout=PROBE_TIMEOUT_SEC)
     chosen = pick_first_working(links, probe_fn=probe_fn, abort=abort,
-                                gather=GATHER, measure_fn=measure)
+                                gather=GATHER, measure_fn=measure, second_fn=second)
     result.update(picked=chosen["picked"], tried=chosen["tried"])
     result["ok"] = bool(chosen["picked"])
     n = len(chosen["picked"])
