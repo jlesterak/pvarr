@@ -21,6 +21,10 @@ COPY netguard.py resolver.py app.py ./
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin browser
 USER 10001
 
+LABEL org.opencontainers.image.source="https://github.com/jlesterak/pvarr" \
+      org.opencontainers.image.description="PVArr browser sidecar - optional resolver for JavaScript-player pages" \
+      org.opencontainers.image.licenses="Unlicense"
+
 EXPOSE 8998
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8998/health', timeout=4)"

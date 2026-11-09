@@ -4,6 +4,12 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-08
+
+### Added
+- Optional browser sidecar (`ghcr.io/jlesterak/pvarr-browser`, docs/browser-sidecar.md): a separate container that opens a page in headless Chromium and reports the playlist its player requested. With `PVARR_BROWSER_URL` set, PVArr sends it links whose page loads but holds no playlist: in Find, scheduled scans and the event-page re-check when the probe came up short (up to 4 links, one at a time, 45 s at most), and on connect. Every playlist it returns is checked by PVArr's own probe. Unset, nothing changes.
+- `PVARR_BROWSER_TIMEOUT` (default 30 s, 10-60): what the sidecar may spend on one page.
+
 ## [0.17.0] - 2026-11-07
 
 ### Added

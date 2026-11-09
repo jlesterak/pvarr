@@ -53,6 +53,14 @@ jobs:
   publish:
     needs: test
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The optional browser sidecar ships as its own package, same tags.
+        include:
+          - suffix: ""
+            context: .
+          - suffix: "-browser"
+            context: browser
     permissions:
       contents: read
       packages: write
@@ -64,7 +72,7 @@ jobs:
         id: tags
         run: |
           set -euo pipefail
-          image="ghcr.io/${{ github.repository }}"
+          image="ghcr.io/${{ github.repository }}${{ matrix.suffix }}"
           image="${image,,}"   # GHCR rejects uppercase in the image path
 
           sha=$(git rev-parse --short HEAD)
@@ -106,13 +114,13 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           # Reuse layers between runs so ffmpeg/pip aren't reinstalled each time.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=pvarr${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=pvarr${{ matrix.suffix }}
 
       - name: Summarise
         run: |

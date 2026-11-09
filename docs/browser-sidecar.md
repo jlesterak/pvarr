@@ -8,8 +8,9 @@ Origin and Cookie the browser sent. PVArr's own probe then still decides how to
 record it (relay, image-wrapped segments, TLS client).
 
 **Status:** PVArr uses it when `PVARR_BROWSER_URL` is set (see
-[Using it from PVArr](#using-it-from-pvarr)). Nothing is published to a
-registry yet; build it yourself (`docker build -t pvarr-browser browser/`).
+[Using it from PVArr](#using-it-from-pvarr)). Image:
+`ghcr.io/jlesterak/pvarr-browser` (amd64, same version tags as PVArr), or build
+it yourself (`docker build -t pvarr-browser browser/`).
 
 ## Using it from PVArr
 
@@ -122,7 +123,7 @@ services:
              do ip route add blackhole $$r; done; exec sleep infinity"
 
   pvarr-browser:
-    build: ./browser
+    image: ghcr.io/jlesterak/pvarr-browser:latest   # or build: ./browser
     container_name: pvarr-browser
     restart: unless-stopped
     network_mode: "service:pvarr-browser-net"
