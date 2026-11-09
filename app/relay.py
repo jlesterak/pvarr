@@ -296,7 +296,10 @@ class PlaylistRelay:
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # FFmpeg hung up mid-reply, e.g. it was stopped for a failover
 
             def log_message(self, *args):  # tokenised URLs stay out of the logs
                 pass
