@@ -69,6 +69,15 @@ MAX_CANDIDATES = 3
 WAITING, SEARCHING, STARTED, FAILED, MISSED = "waiting", "searching", "started", "failed", "missed"
 FINISHED_STATES = (STARTED, FAILED, MISSED)
 
+# The disk warning. Nothing is known about a stream before it is found, so a
+# scheduled recording is costed at a typical 1080p sports rate (2.7 GB an
+# hour); 720p feeds run nearer 4 Mbit/s, so this errs towards warning.
+ASSUMED_MBPS = 6.0
+# One notification per job, from this long before its start: late enough that
+# the free space is the space the game will get, early enough to act on.
+DISK_NOTIFY_LEAD_SEC = 20 * 60.0
+_GB = 1024 ** 3
+
 # Never returned by GET /api/schedules. A cf_clearance cookie is a live
 # credential and port 8999 has no authentication.
 _SECRET_FIELDS = ("agg_cookie", "stream_headers")
@@ -121,6 +130,37 @@ def decide(job: Dict[str, Any], now: float) -> str:
         return "missed"
     due_at = max(float(job["start_at"]), float(job.get("next_try_at") or 0.0))
     return "search" if now >= due_at else "wait"
+
+
+def expected_bytes(seconds: float, mbps: float = ASSUMED_MBPS) -> int:
+    """What a recording of this length writes at this stream rate."""
+    return int(max(0.0, float(seconds)) * max(0.0, float(mbps)) * 1e6 / 8)
+
+
+def disk_warning(need_bytes: int, floor_bytes: int, free_bytes: int, where: str,
+                 others: int = 0) -> Optional[str]:
+    """One sentence when `need_bytes` plus the kept-free floor will not fit.
+
+    `need_bytes` covers this job and the `others` that write to the same
+    volume before it (earlier schedules, recordings already running). No URL
+    and no team name: it goes into a notification as it is.
+    """
+    if need_bytes + floor_bytes <= free_bytes:
+        return None
+    what = "this recording" if others <= 0 else (
+        f"this recording and the {others} before it" if others > 1
+        else "this recording and the one before it")
+    floor = f" plus the {floor_bytes / _GB:g} GB kept free" if floor_bytes > 0 else ""
+    return (f"Low disk: {what} will need about {need_bytes / _GB:.1f} GB "
+            f"(estimated at {ASSUMED_MBPS:g} Mbit/s){floor}, and {free_bytes / _GB:.1f} GB "
+            f"is free on {where}. Free some space before the start; PVArr deletes nothing.")
+
+
+def disk_notify_due(job: Dict[str, Any], now: float) -> bool:
+    """Is this the moment to tell the operator about a job's disk warning?
+    Once per job, from DISK_NOTIFY_LEAD_SEC before the start until it starts."""
+    return (job.get("state") == WAITING and not job.get("disk_notified")
+            and now >= float(job["start_at"]) - DISK_NOTIFY_LEAD_SEC)
 
 
 def describe_picks(result: Optional[Dict[str, Any]]) -> str:

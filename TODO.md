@@ -114,9 +114,15 @@ Open, in order (each version still needs the sponsor's approval to ship):
   - **Team-name check** (warning only): compare the resolved page's title with the
     scheduled teams at connect and on the backup check. Covers the links the
     event-number rule cannot compare.
-  - **Disk warning before the game:** at schedule creation and 20 min before the
-    start, compare scheduled length x stream rate plus `PVARR_MIN_FREE_GB` with free
-    space; amber badge and one notification. Deletes nothing.
+  - [COMPLETED 2026-11-10] Disk warning before the game: a waiting job's length at an
+    assumed 6 Mbit/s (no stream is known yet), plus the jobs that start before it
+    and the time left on running recordings on the same volume, plus
+    `PVARR_MIN_FREE_GB`, against free space. Read on every list refresh (amber
+    line on the job, `disk_warning` in the API, so it shows at creation and clears
+    when space is freed); one notification per job from 20 min before the start.
+    Deletes and refuses nothing. Proof: `TestScheduleDiskWarning` (6 tests: the sum,
+    earlier jobs and a running recording counted, an unreadable volume, one
+    notification that survives a restart).
 - [PENDING] **v0.21: follow a team.**
   - A follow list; every 30 min the saved event-list pages are read (as the Events
     tab does) and a followed team's game gets a schedule, once, with 30 min kept

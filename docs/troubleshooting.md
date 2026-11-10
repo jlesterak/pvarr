@@ -43,7 +43,7 @@ with the exact `chown` command to run. Set `PUID`/`PGID` rather than `user:`.
 
 **FFmpeg not found.** Install it (`apt install ffmpeg`, `brew install ffmpeg`). The container already includes it.
 
-**Disk fills up.** Recordings are uncompressed TS and grow quickly — roughly 2.25 GB per hour at 5 Mbps. PVArr now aborts a recording when free space falls below `PVARR_MIN_FREE_GB` (default 5 GB) rather than filling the volume, keeping and post-processing whatever was captured; the session reports `aborted_no_space`. Still point `recordings/` at a large volume and prune on a schedule — the guard protects the host, it does not make room.
+**Disk fills up.** Recordings are uncompressed TS and grow quickly — roughly 2.25 GB per hour at 5 Mbps. PVArr now aborts a recording when free space falls below `PVARR_MIN_FREE_GB` (default 5 GB) rather than filling the volume, keeping and post-processing whatever was captured; the session reports `aborted_no_space`. Still point `recordings/` at a large volume and prune on a schedule — the guard protects the host, it does not make room. For scheduled recordings PVArr says so ahead of time: an amber **low disk** line on the waiting job and one notification 20 minutes before the start (see [Scheduling a recording](event-pages.md#scheduling-a-recording)).
 
 **Deleting or renaming a recording that is still running is refused (`409`).**
 Removing the file underneath a live recording does not fail and does not stop

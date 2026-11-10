@@ -9225,6 +9225,127 @@ class TestScheduleLoop(ScheduleServerTestCase):
 
 
 
+class TestScheduleDiskWarning(ScheduleServerTestCase):
+    """Roadmap v0.20: say before the game that the volume looks too small.
+    A warning only: nothing is refused and nothing is deleted."""
+
+    GB = 1024 ** 3
+
+    def free(self, gb):
+        import collections
+        from unittest.mock import patch
+        usage = collections.namedtuple("usage", "total used free")
+        return patch.object(self.server.shutil, "disk_usage",
+                            return_value=usage(500 * self.GB, 0, int(gb * self.GB)))
+
+    def job(self, start_in, hours, **kw):
+        now = time.time()
+        job = schedules.new_job(start_at=now + start_in, end_time=now + start_in + hours * 3600,
+                                agg_url="https://agg.example/e", team_a="A", team_b="B",
+                                url_primary="", url_backup1="", url_backup2="",
+                                stream_headers={}, **kw)
+        self.store.add(job)
+        return job
+
+    def test_the_sum_is_length_times_rate_plus_the_floor(self):
+        # 3 h at 6 Mbit/s is 8.1e9 bytes (7.5 GiB); with a 5 GB floor, 12.5.
+        self.assertEqual(schedules.expected_bytes(3 * 3600), 8_100_000_000)
+        need = schedules.expected_bytes(3 * 3600)
+        self.assertIsNone(schedules.disk_warning(need, 5 * self.GB, 13 * self.GB, "/rec"))
+        text = schedules.disk_warning(need, 5 * self.GB, 12 * self.GB, "/rec")
+        self.assertIn("7.5 GB", text)
+        self.assertIn("5 GB kept free", text)
+        self.assertIn("12.0 GB is free on /rec", text)
+        self.assertIn("deletes nothing", text)
+        self.assertIn("the one before it", schedules.disk_warning(need, 0, 1, "/rec", others=1))
+        self.assertNotIn("kept free", schedules.disk_warning(need, 0, 1, "/rec"))
+
+    def test_create_and_list_carry_the_warning_and_it_clears_when_space_is_freed(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "5"}), self.free(10):
+            r = self.client.post("/api/schedules", data=self.form(
+                start_at=time.time() + 7200, end_time=time.time() + 7200 + 3 * 3600))
+            self.assertEqual(r.status_code, 200, r.text)   # kept, not refused
+            self.assertIn("Low disk", r.json()["schedule"]["disk_warning"])
+            listed = self.client.get("/api/schedules").json()["schedules"]
+            self.assertIn("10.0 GB is free", listed[0]["disk_warning"])
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "5"}), self.free(40):
+            listed = self.client.get("/api/schedules").json()["schedules"]
+            self.assertIsNone(listed[0]["disk_warning"])
+        # Never stored: it is read from the disk each time.
+        self.assertNotIn("disk_warning", self.store.path.read_text())
+
+    def test_earlier_games_and_a_running_recording_count_against_the_same_volume(self):
+        from unittest.mock import patch
+        first = self.job(3600, 3)      # 7.5 GiB
+        second = self.job(7200, 3)     # 7.5 GiB more
+        radio = self.job(1800, 3, rebroadcast=True)   # writes no recording
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "0"}), self.free(10):
+            warnings = self.server._schedule_disk_warnings()
+        self.assertEqual(list(warnings), [second["id"]])
+        self.assertIn("the one before it", warnings[second["id"]])
+        self.assertNotIn(radio["id"], warnings)
+        # A recording already running with 2 h left at a measured 9 Mbit/s
+        # (7.5 GiB) takes the room the first game would have had.
+        running = MagicMock(is_running=True, is_rebroadcast=False,
+                            output_filepath=Path(self.tmp) / "now.ts")
+        running.seconds_remaining.return_value = 2 * 3600.0
+        running.rate_mbps.return_value = 9.0
+        self.server.active_recorders["r1"] = running
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "0"}), self.free(10):
+            warnings = self.server._schedule_disk_warnings()
+        self.assertEqual(set(warnings), {first["id"], second["id"]})
+        self.assertIn("the 2 before it", warnings[second["id"]])
+
+    def test_an_unreadable_volume_or_a_broken_recorder_gives_no_warning_and_no_error(self):
+        from unittest.mock import patch
+        self.job(3600, 3)
+        self.server.active_recorders["bad"] = MagicMock(
+            is_running=True, is_rebroadcast=False, output_filepath=None)
+        with patch.object(self.server.shutil, "disk_usage", side_effect=OSError("gone")):
+            self.assertEqual(self.server._schedule_disk_warnings(), {})
+            r = self.client.get("/api/schedules")
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.json()["schedules"][0]["disk_warning"])
+
+    def run_tick(self):
+        import asyncio
+
+        async def tick():
+            await asyncio.gather(*self.server._notify_low_disk(time.time()))
+        asyncio.run(tick())
+
+    def test_one_notification_twenty_minutes_before_and_never_again(self):
+        early = self.job(3600, 3)     # an hour out: badge only, no notification yet
+        soon = self.job(600, 3)       # inside the 20 minutes
+        with self.free(2):
+            self.run_tick()
+            self.assertEqual(self.notifier.send.call_count, 1)
+            title, body = self.notifier.send.call_args.args
+            self.assertIn("Low disk", title)
+            self.assertTrue(body.startswith("A vs B: Low disk"), body)
+            self.assertNotIn("agg.example", body)
+            self.assertTrue(soon["disk_notified"])
+            self.assertNotIn("disk_notified", early)
+            self.run_tick()
+            self.assertEqual(self.notifier.send.call_count, 1)
+        # Survives a restart: the flag is in the file.
+        again = schedules.ScheduleStore(self.store.path)
+        self.assertTrue(again.get(soon["id"])["disk_notified"])
+
+    def test_enough_space_at_twenty_minutes_is_asked_again_and_the_job_still_starts(self):
+        job = self.job(600, 1)
+        with self.free(100):
+            self.run_tick()
+        self.notifier.send.assert_not_called()
+        self.assertNotIn("disk_notified", job)
+        with self.free(1):
+            self.run_tick()     # space ran out since: still one notification
+        self.assertEqual(self.notifier.send.call_count, 1)
+        # The warning refuses nothing: the loop's decision is unchanged.
+        self.assertEqual(schedules.decide(job, job["start_at"] + 1), "search")
+
+
 class TestHealthSeesAWedgedSession(unittest.TestCase):
     """/api/status answered 200 for a session frozen for an hour, so the healthcheck never saw it."""
 

@@ -221,6 +221,18 @@ link filled in. Links that are dead, not video, blocked by your DNS or refused
 by a host that refuses everything are not listed. These links appear on the
 dashboard only, never in a notification.
 
+**Low disk.** A waiting job shows an amber **low disk** line when the volume
+looks too small for it: its length at an assumed 6 Mbit/s (about 2.7 GB an
+hour; nothing is known about the stream before it is found), plus the same
+for every scheduled recording that starts before it and the time left on
+recordings already running there (at their measured rate), plus
+`PVARR_MIN_FREE_GB`, against the free space right now. It is read afresh on
+every refresh, so it clears as soon as you make room. From 20 minutes before
+the start you get one notification per job if the warning still holds. It is
+a warning only: nothing is deleted, and the job starts as scheduled (and
+stops at the floor if the space does run out). Rebroadcast-only jobs write no
+recording and never warn.
+
 Why the page is checked at the start time and not when you schedule: stream
 links carry tokens that expire within hours, and most links on an event page
 only appear shortly before kick-off. The page address is the stable part.

@@ -180,6 +180,12 @@
                   <span class="text-slate-500" x-show="job.state === 'waiting' && job.next_try_at"
                         x-text="'Next try ' + timeLocal(job.next_try_at) + '.'"></span>
                 </div>
+                <!-- The volume looks too small for this recording and the
+                     ones before it (read fresh on every refresh). -->
+                <div class="text-[11px] text-amber-400" x-show="job.disk_warning">
+                  <span class="uppercase tracking-wider font-semibold px-1 rounded bg-amber-400/10">low disk</span>
+                  <span x-text="(job.disk_warning || '').replace(/^Low disk: (.)/, (m, c) => c.toUpperCase())"></span>
+                </div>
                 <div class="text-[11px] text-slate-500 font-mono truncate" x-show="job.agg_url"
                      x-text="job.agg_url + (job.agg_cookie_set ? '  (cookie set)' : '')"></div>
                 <!-- Links that failed in a way a person can fix by hand
@@ -1334,7 +1340,8 @@
               if (res.ok) {
                 ok++;
                 this.lists.selected[g.url] = false;
-                this.lists.results[g.url] = started ? 'Recording soon' : 'Scheduled ' + this.clockLocal(start);
+                this.lists.results[g.url] = (started ? 'Recording soon' : 'Scheduled ' + this.clockLocal(start))
+                  + ((data.schedule || {}).disk_warning ? ' (low disk: see Live Recorders)' : '');
               } else {
                 const d = data.detail;
                 this.lists.results[g.url] = 'Failed: ' + (Array.isArray(d) ? d.map(x => x.msg).join('; ') : (d || res.status));

@@ -1376,10 +1376,85 @@ async def _notify(title: str, body: str) -> None:
         logger.warning("Schedule notification failed: %s", exc)
 
 
+def _volume(directory: Path, seen: Dict[Path, Optional[Tuple[int, int, str]]]
+            ) -> Optional[Tuple[int, int, str]]:
+    """(device, free bytes, directory as shown) for where a recording would
+    land, or None when it cannot be read. A directory that does not exist yet
+    is created at start, so its nearest existing parent answers for it."""
+    if directory not in seen:
+        try:
+            probe_dir = directory
+            while not probe_dir.exists() and probe_dir != probe_dir.parent:
+                probe_dir = probe_dir.parent
+            seen[directory] = (os.stat(probe_dir).st_dev,
+                               shutil.disk_usage(probe_dir).free, str(directory))
+        except OSError:
+            seen[directory] = None
+    return seen[directory]
+
+
+def _schedule_disk_warnings(now: Optional[float] = None) -> Dict[str, str]:
+    """job id -> schedules.disk_warning() for every live job the volume looks
+    too small for. Read fresh on every call (a few statvfs), never stored, so
+    the badge goes away as soon as space is freed.
+
+    A job is costed with everything that writes to its volume before it: the
+    recordings running now (time left x their measured rate) and the live
+    jobs that start earlier. Rebroadcast jobs write no recording. An estimate
+    must never break the schedule list, so anything unreadable is left out.
+    """
+    now = time.time() if now is None else now
+    floor = int(_min_free_gb() * 1024 ** 3)
+    seen: Dict[Path, Optional[Tuple[int, int, str]]] = {}
+    need: Dict[int, int] = {}      # device -> bytes still to be written before/with this job
+    writers: Dict[int, int] = {}   # device -> how many recordings that is
+    for recorder in list(active_recorders.values()):
+        try:
+            if not recorder.is_running or recorder.is_rebroadcast:
+                continue
+            left = recorder.seconds_remaining()
+            volume = _volume(Path(recorder.output_filepath).parent, seen)
+            if not left or volume is None:
+                continue
+            rate = recorder.rate_mbps() or schedules.ASSUMED_MBPS
+            need[volume[0]] = need.get(volume[0], 0) + schedules.expected_bytes(left, rate)
+            writers[volume[0]] = writers.get(volume[0], 0) + 1
+        except Exception:
+            continue
+    out: Dict[str, str] = {}
+    dirs: Dict[str, Path] = {}
+    for job in schedule_store.all():   # soonest first
+        if job.get("state") not in (schedules.WAITING, schedules.SEARCHING) \
+                or job.get("rebroadcast"):
+            continue
+        try:
+            wanted = str(job.get("output_dir") or "")
+            if wanted not in dirs:
+                dirs[wanted] = _resolve_library_dir(wanted or None)
+            volume = _volume(dirs[wanted], seen)
+            length = float(job["end_time"]) - max(float(job["start_at"]), now)
+        except (HTTPException, KeyError, TypeError, ValueError):
+            continue
+        if volume is None:
+            continue
+        device, free, where = volume
+        need[device] = need.get(device, 0) + schedules.expected_bytes(length)
+        text = schedules.disk_warning(need[device], floor, free, where, writers.get(device, 0))
+        writers[device] = writers.get(device, 0) + 1
+        if text:
+            out[str(job["id"])] = text
+    return out
+
+
+def _schedule_view(job: Dict[str, Any], warnings: Dict[str, str]) -> Dict[str, Any]:
+    return dict(schedules.public_view(job), disk_warning=warnings.get(str(job["id"])))
+
+
 @app.get("/api/schedules")
 async def list_schedules():
     """Every scheduled job, soonest first. Cookies are withheld, as everywhere."""
-    return {"schedules": [schedules.public_view(j) for j in schedule_store.all()]}
+    warnings = _schedule_disk_warnings()
+    return {"schedules": [_schedule_view(j, warnings) for j in schedule_store.all()]}
 
 
 @app.post("/api/schedules")
@@ -1464,7 +1539,9 @@ async def create_schedule(
                 _schedule_label(job), start_at - now)
     _wake_scheduler()
     # False when /config is not writable: the job runs, but a restart loses it.
-    return {"status": "success", "schedule": schedules.public_view(job),
+    # `disk_warning` is set when the volume looks too small for it; the job is
+    # kept all the same (the operator has until the start to make room).
+    return {"status": "success", "schedule": _schedule_view(job, _schedule_disk_warnings()),
             "persistent": schedule_store.enabled}
 
 
@@ -1528,6 +1605,7 @@ async def _run_due_schedules() -> List["asyncio.Task"]:
     if schedules.prune(schedule_store.jobs, time.time()):
         schedule_store.save()
     started: List[asyncio.Task] = []
+    started.extend(_notify_low_disk(time.time()))
     for job in schedule_store.all():
         job_id = job["id"]
         if job_id in _schedule_tasks:
@@ -1549,6 +1627,30 @@ async def _run_due_schedules() -> List["asyncio.Task"]:
             schedule_store.save()
             started.append(_track_schedule_task(job_id, _run_schedule(job)))
     return started
+
+
+def _notify_low_disk(now: float) -> List["asyncio.Task"]:
+    """Tell the operator, once per job, that the volume looks too small for a
+    recording about to start (schedules.disk_notify_due). The disk is only
+    read when some job is inside that window and has not been announced."""
+    due = [j for j in schedule_store.all() if schedules.disk_notify_due(j, now)]
+    if not due:
+        return []
+    warnings = _schedule_disk_warnings(now)
+    tasks: List[asyncio.Task] = []
+    for job in due:
+        text = warnings.get(str(job["id"]))
+        if not text:
+            continue   # asked again next tick: space can still run out before the start
+        job["disk_notified"] = True
+        logger.warning("Schedule %s (%s): %s", job["id"], _schedule_label(job), text)
+        # Its own key: a job's entry in _schedule_tasks is what keeps the
+        # loop from starting its scan twice, and this must not hold that up.
+        tasks.append(_track_schedule_task(f"{job['id']}:disk", _notify(
+            "PVArr — Low disk before a scheduled recording", f"{_schedule_label(job)}: {text}")))
+    if tasks:
+        schedule_store.save()
+    return tasks
 
 
 def _track_schedule_task(job_id: str, coro) -> "asyncio.Task":
