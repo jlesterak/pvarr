@@ -4,6 +4,14 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-09
+
+### Added
+- Time without data on the recording card, in the finish log line and in the finish notification (from one minute): every gap of more than 12 s in which the file got nothing new, across failovers, so a recording that keeps freezing no longer reads "0 lost".
+- Stall measurement: an attempt that saw stalls of 8 s or more logs their lengths when PVArr leaves the source, and a recording ends with one line per source (count, median, longest). Measurement only; the freeze timer is unchanged.
+- A backup whose playlist sits on the same provider host and path as the stream being recorded but carries a different event number is skipped and marked wrong game on its own. The backup check and the event-page re-check refuse it too. Dates and timestamps in a path never count as event numbers.
+- The Referer a feed last delivered data with is remembered for the rest of the recording and reused when a later connect to the same feed finds none. A Referer the probe chose is never replaced.
+
 ## [0.18.0] - 2026-11-08
 
 ### Added
