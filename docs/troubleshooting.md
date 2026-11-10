@@ -72,6 +72,11 @@ container its own DNS in compose:
       - 9.9.9.9
 ```
 
+The [browser sidecar](browser-sidecar.md) resolves names on its own, through
+its holder container, so it needs the same `dns:` entry there. Without it a
+page that plays in your browser finds nothing in the sidecar, and the miss
+reads `request(s) to N host(s) blocked by DNS`.
+
 PVArr reaches FlareSolverr by container name, which Docker resolves itself, so
 this is safe unless you point `PLEX_URL`/`EMBY_URL` at a local-only hostname
 (use an IP or `extra_hosts:` then). Listing your Pi-hole as a second server

@@ -9,7 +9,9 @@ no site.
 Per request:
   1. A fresh browser context (no shared cookies or storage), audio muted,
      1280x720, service workers blocked, images/fonts/media blocked (a playlist
-     request never is), requests and WebSockets to private addresses refused.
+     request never is), requests and WebSockets to private addresses refused
+     (a host the DNS server answers 0.0.0.0 for is counted apart, so a miss
+     caused by a DNS blocklist says so).
   2. Every response in every frame is watched; the first one whose body is an
      HLS playlist (`#EXTM3U`) or a JSON segment list wins, and that request's
      own Referer / Origin / Cookie are kept.
@@ -35,7 +37,7 @@ import re
 import time
 from typing import Any, Dict, Set
 
-from netguard import request_is_private_resolved
+from netguard import host_of, request_is_private_resolved
 
 BLOCK_TYPES = {"image", "media", "font"}
 SEGMENT_RE = re.compile(r"\.(ts|m4s|aac|mp4|m4a|png|jpe?g|webp|gif)(\?|$)", re.I)
@@ -157,7 +159,16 @@ class Resolver:
         found = asyncio.Event()
         tasks: Set[asyncio.Future] = set()
         blocked_private = 0
+        blocked_dns = 0
         dns_cache: Dict[str, bool] = {}
+        dns_blocked: Set[str] = set()       # hosts the resolver answers 0.0.0.0 for
+
+        def count_blocked(url: str) -> None:
+            nonlocal blocked_private, blocked_dns
+            if host_of(url) in dns_blocked:
+                blocked_dns += 1
+            else:
+                blocked_private += 1
 
         def spawn(coro) -> None:
             task = asyncio.ensure_future(coro)
@@ -165,11 +176,10 @@ class Resolver:
             task.add_done_callback(lambda t: (tasks.discard(t), t.cancelled() or t.exception()))
 
         async def route(r):
-            nonlocal blocked_private
             req = r.request
             try:
-                if await request_is_private_resolved(req.url, dns_cache):
-                    blocked_private += 1
+                if await request_is_private_resolved(req.url, dns_cache, dns_blocked):
+                    count_blocked(req.url)
                     await r.abort()
                 elif ".m3u8" in req.url.lower():
                     await r.continue_()
@@ -181,9 +191,8 @@ class Resolver:
                 pass        # the context closed under it
 
         async def web_socket(ws):
-            nonlocal blocked_private
-            if await request_is_private_resolved(ws.url, dns_cache):
-                blocked_private += 1
+            if await request_is_private_resolved(ws.url, dns_cache, dns_blocked):
+                count_blocked(ws.url)
                 await ws.close()
             else:
                 ws.connect_to_server()
@@ -258,8 +267,13 @@ class Resolver:
                 # Chromium so its memory comes back.
                 await _limited(self._browser_ready(relaunch=True), 20)
         if not out["ok"] and not out["note"]:
-            out["note"] = "no playlist request seen" + (
-                f" ({blocked_private} request(s) to private addresses blocked)" if blocked_private else "")
+            why = []
+            if blocked_dns:
+                why.append(f"{blocked_dns} request(s) to {len(dns_blocked)} host(s) blocked by DNS: the "
+                           "sidecar's DNS server answers 0.0.0.0 for them, give it another one")
+            if blocked_private:
+                why.append(f"{blocked_private} request(s) to private addresses blocked")
+            out["note"] = "no playlist request seen" + (f" ({'; '.join(why)})" if why else "")
         out["elapsed"] = round(time.monotonic() - t0, 1)
         return out
 

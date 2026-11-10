@@ -82,7 +82,26 @@ Done from the earlier roadmap:
 
 Open, in order (each version still needs the sponsor's approval to ship):
 
-- [PENDING] **v0.20: discovery that keeps up.**
+- [IN PROGRESS] **v0.20: discovery that keeps up.**
+  - [COMPLETED 2026-11-09] Why a miss takes about 33 s, measured. It is the sidecar's
+    own schedule (an 8 s first wait, then three nudge rounds of about 8 s), the same
+    for every page. All 19 hits logged over three nights came within 13.4 s, after
+    no nudge or one. So there is no cheap early exit worth building; the gain is in
+    what gets asked and in which order (the budget and ordering items below).
+  - [COMPLETED 2026-11-09] Found by that measurement: on the test host 4 of 7 misses
+    were not misses at all. The sidecar's holder container resolved names through
+    the network's filtering DNS server, which answers `0.0.0.0` for some stream
+    hosts, and the sidecar refused those requests as private addresses (PVArr itself
+    had been given another DNS server weeks earlier; the holder, added later, had
+    not). With a `dns:` entry on the holder the same 12 links went from 5 resolved
+    to 9, the four former misses in 6-8 s. Fix in the software: such a request is
+    still refused but counted apart, a miss says "N request(s) to M host(s) blocked
+    by DNS: ... give it another one", and a page the sidecar refuses reports the
+    reason on the card instead of "HTTP 400". Docs: `docs/browser-sidecar.md` "DNS",
+    `docs/troubleshooting.md`. Proof: `test_a_host_the_dns_server_answers_zero_for_is_reported_as_dns_blocked`,
+    `test_a_miss_caused_by_a_dns_blocklist_says_so` (real Chromium), `test_a_refused_page_says_why`.
+    The three sidecar measurement nights ran with this handicap, so its real yield
+    is higher than the go/no-go figures.
   - Sidecar budget by situation. Before a game (a scheduled check, or Find with
     nothing recording): every unresolved link up to 12, two pages at a time, 3 min
     in all. During a recording: as today (4 links, 45 s, one page). Two pages
@@ -90,7 +109,6 @@ Open, in order (each version still needs the sponsor's approval to ship):
   - Likeliest link first: remember per link host whether the browser resolved it
     (count, last time) in a small file in the config folder and try those first.
     Learned from the operator's own results; nothing is shipped with PVArr.
-  - Find out why a miss takes about 33 s before changing any limit.
   - **Team-name check** (warning only): compare the resolved page's title with the
     scheduled teams at connect and on the backup check. Covers the links the
     event-number rule cannot compare.

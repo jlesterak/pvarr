@@ -11461,6 +11461,20 @@ class TestBrowserSidecar(unittest.TestCase):
         os.environ["PVARR_BROWSER_URL"] = "ftp://sidecar.example"
         self.assertFalse(self.browser.worth_trying(self.JS_PAGE))
 
+    def test_a_refused_page_says_why(self):
+        # The sidecar refuses a page whose host its own DNS server blocks; the
+        # reason must reach the card, cleaned and bounded, not just "HTTP 400".
+        self._sidecar(status=400, answer={"detail": "blocked by DNS: the sidecar's DNS server answers 0.0.0.0\r\nfor this host"})
+        with patch.object(self.browser.probe, "probe_stream") as probed:
+            out = self.browser.resolve(self.PAGE)
+        self.assertFalse(out["ok"])
+        self.assertIn("refused the page (blocked by DNS: the sidecar's DNS server answers 0.0.0.0", out["message"])
+        self.assertNotRegex(out["message"], r"[\r\n]")
+        probed.assert_not_called()
+        self.browser._reset_for_tests()
+        self._sidecar(status=400, answer={"detail": ["not", "a", "string"]})
+        self.assertIn("refused the page (no reason given)", self.browser.resolve(self.PAGE)["message"])
+
     def test_timeout_setting_is_bounded(self):
         for raw, want in (("", 30), ("5", 10), ("45", 45), ("600", 60), ("junk", 30)):
             with patch.dict(os.environ, {"PVARR_BROWSER_TIMEOUT": raw}):

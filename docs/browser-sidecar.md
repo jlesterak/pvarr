@@ -118,6 +118,7 @@ services:
     restart: unless-stopped
     cap_add: [NET_ADMIN]
     networks: [browser_out, browser_in]
+    # dns: [9.9.9.10]     # only if your network's DNS server filters hosts; see "DNS" below
     command: >
       sh -c "for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16;
              do ip route add blackhole $$r; done; exec sleep infinity"
@@ -151,6 +152,17 @@ Before relying on it, check from inside the sidecar that the LAN is
 unreachable (`docker exec pvarr-browser python -c "import urllib.request;
 urllib.request.urlopen('http://192.168.1.1', timeout=3)"` must fail). If the
 holder restarts, recreate the sidecar too, since it loses the namespace.
+
+**DNS.** The sidecar resolves names through the holder container, which by
+default uses the host's DNS server. If that server filters hosts (a network-wide
+ad or tracker blocklist answers `0.0.0.0` for them), a page that plays in your
+own browser can find nothing here: the player's requests go to hosts the
+sidecar cannot resolve. The miss then reads `N request(s) to M host(s) blocked
+by DNS` on the recording card and in Find, and a refused page reads `the
+browser sidecar refused the page (blocked by DNS ...)`. Give the holder
+container a `dns:` entry with a server that does not filter, as PVArr itself
+may already have (see [Troubleshooting](troubleshooting.md)); then recreate
+the holder and the sidecar. The private-address rules are unchanged by this.
 
 The host itself is still reachable through the `browser_out` bridge's
 gateway, so every port the host publishes on `0.0.0.0` (PVArr's included) is

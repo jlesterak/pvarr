@@ -4,6 +4,9 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- Browser sidecar: a request to a host its DNS server answers `0.0.0.0` for (a network-wide blocklist) is still refused, but a miss now says "blocked by DNS" and how many hosts, instead of "private addresses"; a page the sidecar refuses reports the reason on the card instead of "HTTP 400". docs/browser-sidecar.md explains giving the sidecar another DNS server.
+
 ## [0.19.0] - 2026-11-09
 
 ### Added

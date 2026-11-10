@@ -14,6 +14,12 @@ because this image does not contain PVArr:
   redirect to one, is not seen here, which is why the docs make network
   isolation of the container a requirement.
 
+A resolver that answers 0.0.0.0 (or ::) for a name is a DNS blocklist, not a
+LAN address. Such a request is refused all the same, but it is reported as
+"blocked by DNS": on a network whose resolver filters hosts, that is why a page
+that plays in the operator's browser finds nothing here, and the cure is
+another DNS server for the sidecar, not a firewall change.
+
 `PVARR_BROWSER_ALLOW_LOOPBACK=1` lets loopback (127.0.0.0/8, ::1, localhost)
 through and nothing else. It exists for the test suite, whose fixture pages
 are served on 127.0.0.1; LAN addresses stay blocked even then.
@@ -23,7 +29,7 @@ import asyncio
 import ipaddress
 import os
 import socket
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from urllib.parse import urlsplit
 
 
@@ -48,6 +54,19 @@ def _localhost(host: str) -> bool:
     return (host == "localhost" or host.endswith(".localhost")) and not allow_loopback()
 
 
+DNS_BLOCKED = "blocked by DNS: the sidecar's DNS server answers 0.0.0.0 for this host"
+
+
+def host_of(url: str) -> str:
+    """The URL's host as the checks below key it: lower case, no trailing dot."""
+    return (urlsplit(url).hostname or "").rstrip(".").lower()
+
+
+def _sinkholed(addresses) -> bool:
+    """Every answer is the unspecified address: a blocklisting resolver."""
+    return bool(addresses) and all(a.is_unspecified for a in addresses)
+
+
 def page_url_problem(url: str) -> Optional[str]:
     """Why this page URL is refused, or None if it may be opened."""
     if not isinstance(url, str) or len(url) > 4096:
@@ -68,6 +87,8 @@ def page_url_problem(url: str) -> Optional[str]:
         except (OSError, UnicodeError):
             return None     # does not resolve: the page load will simply fail
         addresses = [ipaddress.ip_address(i[4][0].split("%")[0]) for i in infos]
+        if _sinkholed(addresses):
+            return DNS_BLOCKED
     if any(_private_ip(a) for a in addresses):
         return "private address"
     return None
@@ -87,12 +108,15 @@ def request_is_private(url: str) -> bool:
         return False
 
 
-async def request_is_private_resolved(url: str, cache: Dict[str, bool]) -> bool:
+async def request_is_private_resolved(url: str, cache: Dict[str, bool],
+                                      dns_blocked: Optional[Set[str]] = None) -> bool:
     """request_is_private, plus host names: resolved (once per page, via
     `cache`) and refused when any address is private. Without this a page
     could reach a service by its Docker name -- PVArr itself shares a network
     with the sidecar, and the holder's blackhole routes do not cover that
-    network. A name that does not resolve is let through: the request fails."""
+    network. A name that does not resolve is let through: the request fails.
+    A name the resolver answers only 0.0.0.0 / :: for is refused too and its
+    host added to `dns_blocked`, so the caller can report it as what it is."""
     if request_is_private(url):
         return True
     parts = urlsplit(url)
@@ -110,8 +134,10 @@ async def request_is_private_resolved(url: str, cache: Dict[str, bool]) -> bool:
         try:
             infos = await asyncio.wait_for(
                 asyncio.get_running_loop().getaddrinfo(host, None), 3)
-            cache[host] = any(_private_ip(ipaddress.ip_address(i[4][0].split("%")[0]))
-                              for i in infos)
+            addresses = [ipaddress.ip_address(i[4][0].split("%")[0]) for i in infos]
+            cache[host] = any(_private_ip(a) for a in addresses)
+            if dns_blocked is not None and _sinkholed(addresses):
+                dns_blocked.add(host)
         except (OSError, UnicodeError, asyncio.TimeoutError, ValueError):
             cache[host] = False
     return cache[host]

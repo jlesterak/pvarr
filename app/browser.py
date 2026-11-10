@@ -113,6 +113,15 @@ def _ask_sidecar(base: str, page_url: str, timeout: int) -> Dict[str, Any]:
                               allow_redirects=False, stream=True) as resp:
                 if resp.status_code == 503:
                     return {"ok": False, "note": "the browser sidecar is busy"}
+                if resp.status_code == 400:
+                    # A refused page URL; the reason (a host the sidecar's DNS
+                    # blocks, a private address) is the useful part.
+                    try:
+                        detail = json.loads(resp.raw.read(MAX_ANSWER_BYTES, decode_content=True)).get("detail")
+                    except Exception:
+                        detail = None
+                    why = _CTL.sub(" ", detail)[:150] if isinstance(detail, str) and detail else "no reason given"
+                    return {"ok": False, "note": f"the browser sidecar refused the page ({why})"}
                 if resp.status_code != 200:
                     return {"ok": False, "note": f"the browser sidecar answered HTTP {resp.status_code}"}
                 body = resp.raw.read(MAX_ANSWER_BYTES + 1, decode_content=True)

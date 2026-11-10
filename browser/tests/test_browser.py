@@ -45,6 +45,7 @@ def pages(other: str) -> dict:
         "/json.html": "<html><body>" + fetch("/live/list.json") + "</body></html>",
         "/none.html": "<html><body><p>No stream here.</p></body></html>",
         "/lan.html": "<html><body>" + fetch("http://10.255.255.1/live/x.m3u8") + "</body></html>",
+        "/dnsblocked.html": "<html><body>" + fetch("http://blocked.example/live/x.m3u8") + "</body></html>",
         "/ws.html": "<html><body><script>new WebSocket('ws://10.255.255.1:9/live');</script></body></html>",
         # Freezes its own main thread: every call into the page would wait forever.
         "/hang.html": "<html><body><script>setTimeout(() => { for (;;) {} }, 50);</script></body></html>",
@@ -108,6 +109,32 @@ class TestNetguard(unittest.TestCase):
                 self.assertFalse(await netguard.request_is_private_resolved("data:text/plain,x", cache))
             self.assertEqual(cache, {"pvarr": True, "cdn.example": False, "nowhere.example": False})
         asyncio.run(check())
+
+    def test_a_host_the_dns_server_answers_zero_for_is_reported_as_dns_blocked(self):
+        # A blocklisting resolver answers 0.0.0.0 / :: for a host. Still
+        # refused, but named for what it is; a LAN address never is.
+        from unittest.mock import patch
+
+        async def fake_getaddrinfo(host, port):
+            ips = {"blocked.example": ["0.0.0.0", "::"], "pvarr": ["172.20.0.3"],
+                   "half.example": ["0.0.0.0", "93.184.216.34"]}
+            return [(2, 1, 6, "", (ip, 0)) for ip in ips[host]]
+
+        async def check():
+            loop = asyncio.get_running_loop()
+            cache, blocked = {}, set()
+            with patch.object(loop, "getaddrinfo", fake_getaddrinfo):
+                for url in ("https://Blocked.example./live.m3u8", "http://pvarr:8999/", "https://half.example/x"):
+                    self.assertTrue(await netguard.request_is_private_resolved(url, cache, blocked), url)
+            self.assertEqual(blocked, {"blocked.example"})
+            self.assertEqual(netguard.host_of("https://Blocked.example./live.m3u8"), "blocked.example")
+        asyncio.run(check())
+
+        zero = [(2, 1, 6, "", ("0.0.0.0", 0))]
+        with patch.object(netguard.socket, "getaddrinfo", return_value=zero):
+            self.assertEqual(netguard.page_url_problem("https://blocked.example/watch"), netguard.DNS_BLOCKED)
+        with patch.object(netguard.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]):
+            self.assertEqual(netguard.page_url_problem("https://lan.example/watch"), "private address")
 
     def test_page_urls(self):
         self.assertIsNotNone(netguard.page_url_problem("file:///etc/passwd"))
@@ -199,6 +226,23 @@ class TestResolver(unittest.TestCase):
         out = self.run_page("/lan.html", timeout=6)
         self.assertFalse(out["ok"])
         self.assertIn("private addresses blocked", out["note"])
+        self.assertNotIn("DNS", out["note"])
+
+    def test_a_miss_caused_by_a_dns_blocklist_says_so(self):
+        from unittest.mock import patch
+        real = self.loop.getaddrinfo
+
+        async def fake_getaddrinfo(host, port, **kw):
+            if host == "blocked.example":
+                return [(2, 1, 6, "", ("0.0.0.0", 0))]
+            return await real(host, port, **kw)
+
+        with patch.object(self.loop, "getaddrinfo", fake_getaddrinfo):
+            out = self.run_page("/dnsblocked.html", timeout=6)
+        self.assertFalse(out["ok"])
+        self.assertIn("1 host(s) blocked by DNS", out["note"])
+        self.assertNotIn("private addresses", out["note"])
+        self.assertLessEqual(len(out["note"]), 200)     # PVArr keeps 200 characters of a note
 
     def test_lan_websocket_is_blocked(self):
         out = self.run_page("/ws.html", timeout=6)
