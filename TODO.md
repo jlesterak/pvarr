@@ -38,10 +38,30 @@ Everything finished is in the private notes log (phases 1-33, through v0.11.0) a
   tests (`TestWrongGame`, plus the `/failover` route saving or refusing the mark) and a live run on a dev instance: marked on candidate 1, candidate 2 (a mirror on
   another edge host) was skipped, candidate 3 recorded, and the mark was in the saved session.
 
-## Roadmap (sponsor-approved 2026-11-05)
-Capture, failover and the timeline are solid; the losses now come from discovery
-(JavaScript players PVArr cannot resolve, the wrong game), backups that are one
-feed behind several links, and a thin WAN. In order:
+## Roadmap to v1.0 (sponsor-approved 2026-11-09; replaces the 2026-11-05 roadmap)
+Re-ranked after five game nights, three daily link checks and three measurement
+nights for the browser sidecar. What they showed:
+- Within one week six link families that the plain probe could read began to need
+  the browser, and one event page had 21 links with none readable without it. The
+  sidecar's limit (4 links, 45 s, one page at a time) is now what holds discovery
+  back; a miss runs about 33 s, so two misses use the whole budget.
+- Freezes cost more than lost segments: 6-20 freeze failovers a game at about 25 s
+  each, against 4-25 lost segments.
+- A wrong game was recorded on three of five nights.
+- The recording volume was close to full before four of five games.
+
+**v1.0 means hands-off on the sponsor's test host** (sponsor, 2026-11-09):
+1. Follow a team works end to end: a followed team's game is scheduled, resolved,
+   recorded and ended without anyone touching it.
+2. Ten scheduled games in a row, each with at least 97% of the programme present
+   (time without data plus lost segments at most 3% of the scheduled length), no
+   wrong-game minutes and no manual switch, mark, restart or hand-captured link. A
+   miss resets the count and gets an entry here.
+3. Names frozen: env vars, API routes (`docs/api.md`), session and schedule file
+   formats. The README says what v1.0 promises.
+4. No open item where data was lost for an unknown reason.
+
+Done from the earlier roadmap:
 
 - [COMPLETED] **Quick wins** (2026-11-05, released in v0.15.1). "N real sources" badge (amber when every backup is
   one feed); standby checks probe each backup every 90 s on a copy (no segment fetch) and
@@ -56,21 +76,67 @@ feed behind several links, and a thin WAN. In order:
   first (target: >=70% of JavaScript-player links resolved); Architecture + Security
   review before merge; isolated like FlareSolverr (own network, no LAN egress).
   Detailed plan kept in the private notes; first step is measuring a link corpus.
-  Shipped in v0.18.0 (2026-11-08); the go/no-go on its measured hit rate is still open.
-- [PENDING] **Follow a team.** Auto-schedule from a public schedule; end a recording
-  a few minutes after the game's status reads final (status only, never score or
-  clock, never shown), so overtime is never cut; resolve at T-20, record from T-5.
-- [PENDING] **Fewer gaps without more bandwidth.** Refetch a failed segment from a
-  mirror of the same feed (same `source_key`); drop to a lower variant of the same
-  feed on repeated expired segments, back up when headroom returns.
-- [PENDING] **Gap map** per recording (where, how long, which source) on the Library card.
-- [PENDING] **Team-name check** (warning only) from the resolved page title/text.
+  Shipped in v0.18.0 (2026-11-08). Go/no-go closed 2026-11-09: over three game nights it
+  found 2, 1 and 3 new recordable sources, resolved links took a median of 6-10 s, and no
+  page peaked over 1 GB. All three criteria passed on every night.
+
+Open, in order (each version still needs the sponsor's approval to ship):
+
+- [PENDING] **v0.20: discovery that keeps up.**
+  - Sidecar budget by situation. Before a game (a scheduled check, or Find with
+    nothing recording): every unresolved link up to 12, two pages at a time, 3 min
+    in all. During a recording: as today (4 links, 45 s, one page). Two pages
+    measured up to 1.8 GB, inside the documented 2 GB limit.
+  - Likeliest link first: remember per link host whether the browser resolved it
+    (count, last time) in a small file in the config folder and try those first.
+    Learned from the operator's own results; nothing is shipped with PVArr.
+  - Find out why a miss takes about 33 s before changing any limit.
+  - **Team-name check** (warning only): compare the resolved page's title with the
+    scheduled teams at connect and on the backup check. Covers the links the
+    event-number rule cannot compare.
+  - **Disk warning before the game:** at schedule creation and 20 min before the
+    start, compare scheduled length x stream rate plus `PVARR_MIN_FREE_GB` with free
+    space; amber badge and one notification. Deletes nothing.
+- [PENDING] **v0.21: follow a team.**
+  - A follow list; every 30 min the saved event-list pages are read (as the Events
+    tab does) and a followed team's game gets a schedule, once, with 30 min kept
+    after the end by default.
+  - Resolve 20 min before, record from 5 min before.
+  - End on final (opt-in, after a design review): ask a public scoreboard for the
+    game's status near the scheduled end and stop a few minutes after it reads
+    final, so overtime is never cut. Status only: never score or clock, nothing
+    stored, logged or shown. If the lookup fails, the scheduled end plus the kept
+    time applies. This would be PVArr's first outside call at run time, so it stays
+    off unless switched on and the README says so.
+- [PENDING] **v0.22: fewer and visible gaps.**
+  - Decide the freeze timer from at least three games of stall logs.
+  - Measure where the ~25 s of a failover goes; if connecting dominates, reuse the
+    playlist and headers the 90 s backup check already resolved.
+  - **Gap map** per recording (where, how long, which source) on the Library card.
+  - Refetch a failed segment from a mirror of the same feed (same `source_key`),
+    only where PVArr fetches the segments itself (the relay); build it only if
+    segment loss is still above about 1% of a programme after the items above. The
+    other half of the old "fewer gaps" item, stepping down to a lighter level,
+    shipped in v0.16.0 and still waits for its first field proof.
+- [PENDING] **v0.23: release candidate.** The review follow-ups under "DNS-blocked
+  sources" (`init: true`, healthcheck `start_period`, a rebroadcast channel that does
+  not come back after a clean restart, a partial `.mp4` after a killed remux, comskip
+  under `nice`); remove `detect-headers`, which the sidecar supersedes; prove that a
+  restart mid-recording resolves its links again through the sidecar; freeze and
+  document the names; README "How it differs"; close or archive the stale open
+  items further down.
+- [PENDING] **v1.0.0** when the four criteria hold. The ten-game count starts with
+  the first game recorded on v0.21.
 
 Not pursuing: stitching different broadcasts together, scorebug OCR, site-specific
-code, DRM, a built-in player, transcoding, a bookmarklet (the sidecar covers it).
+code, DRM, a built-in player, transcoding, a bookmarklet (the sidecar covers it),
+an arm64 image (until someone asks), sending every recording through the relay
+(an architecture change for a small gain).
 
 ## Longer-term candidates
-- A retention/cleanup policy for old recordings on disk.
+- A retention/cleanup policy for old recordings on disk. Not planned: the full
+  volumes seen so far were other data on the host, which the disk warning in v0.20
+  covers without deleting anything.
 - Integration coverage for the notification webhooks (currently mocks only).
 
 ---
@@ -304,4 +370,4 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   - PVArr integration (2026-11-08, `app/browser.py`): only links the probe marks `devtools_m3u8` (page fetched, no playlist in it) go to the sidecar; a dead playlist, a 404 or a DNS-blocked host never do, so failover is not slowed. Find/scheduled scan/re-check: only when the probe phase came up short, up to 4 links in page order, one page at a time (the second sidecar slot stays free for failover connects), 20 s each, 45 s in all, inside the existing abort; a resolved link replaces its probe result, so ranking, source letters and summary are unchanged. Connect (and the fresh-link check before a re-check swap): the probe (which runs yt-dlp itself when installed), then the browser. Every returned playlist is re-probed with the frame's Referer/UA/Cookie; a private playlist from a public page is refused before any fetch; header values with control characters or over a size cap are dropped; only the URL goes to the sidecar, never the operator's cookie. The call runs on an abandoned daemon thread so Stop and shutdown never wait for it; a page that gave nothing is not asked again for 5 min; 3 unreachable calls in a row pause it for 5 min.
   - Design review (architect/security/devops) folded in, including one real hole: the sidecar blocked only literal private IPs, so a page could reach PVArr's unauthenticated API by its Docker name on the network they share. The sidecar now resolves host names (once per page) and refuses private ones; DNS rebinding stays a documented residual. Compose example: `mem_limit` 2g (two pages measured up to 1.8 GB), `PVARR_BROWSER_URL` on PVArr.
   - Proof: 11 PVArr tests with a fake sidecar (off unless configured, only for JS pages, timeout bounds, frame headers used and only URL+timeout sent, private playlist refused with no fetch, CRLF values dropped, miss remembered but busy not, unreachable pause, Stop abandons a slow call in under 2 s, Find asks only when short and in page order, at most 4 pages one at a time, connect falls back and a 403 playlist does not) + 1 sidecar test (a Docker-name host resolving private is blocked); 901 + 20 green. End to end: test PVArr + sidecar container on a live JavaScript-player page: connect said "Browser sidecar resolved" in 8 s, 1-minute recording 7 MB, 0 segments lost.
-  - Released by sponsor decision after 2 of 3 planned measurement nights; the third is still collected for the record. Open: an arm64 sidecar image (needs a native arm64 runner; PVArr's own image is amd64 too).
+  - Released by sponsor decision after 2 of 3 planned measurement nights; the third (2026-11-09) passed as well, see the roadmap. Open: an arm64 sidecar image (needs a native arm64 runner; PVArr's own image is amd64 too).
