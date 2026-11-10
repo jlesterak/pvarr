@@ -11751,6 +11751,66 @@ class TestEventNumberMismatch(unittest.TestCase):
         rec._on_first_data(rec.candidates[1])
         self.assertEqual(rec._other_event(self.A), ("123456", "123457"))
 
+class TestRefererMemory(unittest.TestCase):
+    """A feed that delivered data with a Referer gets it back on a reconnect
+    whose probe found none (seen: a segment host started wanting one mid-game,
+    and a failover back to it started without)."""
+
+    URL = "https://cdn.example/live/feed.m3u8"
+
+    def make(self):
+        rec = StreamFailoverRecorder("s1", ["https://p1.example/a", "https://p2.example/b"],
+                                     "/tmp/x.ts", min_free_gb=0)
+        first = rec.candidates[0]
+        first.m3u8_url, first.referer = self.URL + "?tok=1", "https://player.example/embed"
+        rec._on_first_data(first)
+        return rec
+
+    def test_reused_in_ffmpeg_and_relay_headers(self):
+        from app.recorder import CandidateStream
+        rec = self.make()
+        fresh = CandidateStream("https://p3.example/c")
+        fresh.m3u8_url = self.URL + "?tok=2"
+        rec._reuse_referer(fresh)
+        self.assertEqual(fresh.referer, "https://player.example/embed")
+        self.assertEqual(rec._relay_headers(fresh)["Referer"], "https://player.example/embed")
+        cmd = " ".join(rec._build_ffmpeg_cmd(fresh.m3u8_url, fresh.referer, fresh.user_agent))
+        self.assertIn("Referer: https://player.example/embed", cmd)
+
+    def test_probe_choice_kept_and_other_feeds_untouched(self):
+        from app.recorder import CandidateStream
+        rec = self.make()
+        own = CandidateStream("https://p3.example/c")
+        own.m3u8_url, own.referer = self.URL, "https://other.example/"
+        rec._reuse_referer(own)
+        self.assertEqual(own.referer, "https://other.example/")
+        other = CandidateStream("https://p4.example/d")
+        other.m3u8_url = "https://elsewhere.example/live/feed.m3u8"
+        rec._reuse_referer(other)
+        self.assertEqual(other.referer, "")
+
+    def test_connect_applies_it_after_detection(self):
+        from unittest.mock import patch
+        rec = self.make()
+        rec.candidates = [rec.candidates[1]]
+        rec.max_cycles = 1
+        seen = []
+
+        def detect(c):
+            c.m3u8_url, c.referer = self.URL + "?tok=3", ""
+            return True
+
+        def stream(cmd, c):
+            seen.append(c.referer)
+            return StreamOutcome.FAILED
+        with patch.object(rec, "detect_candidate_headers", side_effect=detect), \
+                patch.object(rec, "_stream_ffmpeg_process", side_effect=stream), \
+                patch.object(rec, "start_proxy", return_value="http://127.0.0.1:1/x"), \
+                patch.object(rec, "stop_proxy"), \
+                patch.object(rec, "_failover_delay", return_value=0):
+            rec._recording_loop()
+        self.assertTrue(seen and all(r == "https://player.example/embed" for r in seen), seen)
+
 
 
 if __name__ == "__main__":

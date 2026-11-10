@@ -888,6 +888,11 @@ class StreamFailoverRecorder:
         # with another number is another event (seen: a failover onto a
         # different game served by the same provider host).
         self._event_anchor: Dict[str, str] = {}
+        # Per feed (quality.source_key): the Referer an attempt delivered data
+        # with. A host can start wanting one mid-recording while its playlist
+        # still answers without, so a reconnect whose probe found none (often
+        # a fresh link from the event page) starts with this one instead.
+        self._good_referers: Dict[str, str] = {}
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -1862,6 +1867,19 @@ class StreamFailoverRecorder:
         event = quality.event_number(candidate.m3u8_url)
         if event and event[0] not in self._event_anchor and not self.is_wrong_source(candidate):
             self._event_anchor[event[0]] = event[1]
+        key = self._candidate_key(candidate)
+        if key and candidate.referer:
+            self._good_referers[key] = candidate.referer
+
+    def _reuse_referer(self, candidate: CandidateStream) -> None:
+        """Give a candidate the Referer its feed last delivered data with, when
+        its own detection found none. A Referer the probe chose is kept."""
+        if candidate.referer:
+            return
+        remembered = self._good_referers.get(self._candidate_key(candidate))
+        if remembered:
+            candidate.referer = remembered
+            self._log(f"{candidate.name}: reusing the Referer that worked for this source earlier.")
 
     def _other_event(self, m3u8_url: str) -> Optional[Tuple[str, str]]:
         """(its number, the recording's number) when this playlist is on the
@@ -2555,6 +2573,7 @@ class StreamFailoverRecorder:
 
             # 1. Detect headers
             self.detect_candidate_headers(candidate)
+            self._reuse_referer(candidate)
 
             # A source this network's DNS refuses to name is dead from here:
             # retrying it, or routing it through the proxy, asks the same
