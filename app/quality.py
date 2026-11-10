@@ -374,6 +374,53 @@ def source_key(m3u8_url: str) -> str:
     return f"{host}{f':{port}' if port else ''}{path}"
 
 
+# A run of 5+ digits standing on its own in a playlist path ("/event-123456/",
+# "/live/123456.m3u8"); digits inside a token ("aB3k123456x") do not count.
+_EVENT_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])(\d{5,})(?![A-Za-z0-9])")
+# A number this close to now is an expiry or timestamp, not an event.
+_TIMESTAMP_WINDOW_SEC = 30 * 86400
+
+
+def _looks_like_timestamp(digits: str, now: float) -> bool:
+    if len(digits) in (9, 10):
+        return abs(int(digits) - now) < _TIMESTAMP_WINDOW_SEC
+    if len(digits) == 13:
+        return abs(int(digits) / 1000 - now) < _TIMESTAMP_WINDOW_SEC
+    return False
+
+
+def event_number(m3u8_url: str, now: Optional[float] = None) -> Optional[Tuple[str, str]]:
+    """(template, number) when a playlist path carries one event number.
+
+    Some providers serve every event from one host with the event's number
+    in the path (`cdn1.example/hls/event-123456/index.m3u8`). Two playlists
+    with the same template -- host with its digits removed, as source_key()
+    does, plus the path with the number replaced by "#" -- but different
+    numbers are different events. Only a path with exactly one such number
+    counts; a number that reads as a timestamp (a signed URL's expiry) is
+    ignored, since it differs on every visit. Generic URL rule, no site list.
+    """
+    parts = urlsplit(m3u8_url or "")
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None
+    now = time.time() if now is None else now
+    path = re.sub(r"/[A-Za-z0-9_-]{32,}(?=/)", "", parts.path)
+    runs = [m for m in _EVENT_NUMBER_RE.finditer(path)
+            if not _looks_like_timestamp(m.group(1), now)]
+    if len(runs) != 1:
+        return None
+    run = runs[0]
+    if not _is_ip(host):
+        host = re.sub(r"\d+", "", host)
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    template = f"{host}{f':{port}' if port else ''}{path[:run.start()]}#{path[run.end():]}"
+    return template, run.group(1)
+
+
 def source_letters(m3u8_urls: List[str]) -> List[str]:
     """A letter per playlist URL naming its real feed (source_key), in order of
     first appearance: mirrors of one origin share a letter. "" where the URL is

@@ -883,6 +883,11 @@ class StreamFailoverRecorder:
         # attempt's list, (seconds, ended_in_freeze), is reported when it ends.
         self._stalls: Dict[str, List[float]] = {}
         self._attempt_stalls: List[Tuple[float, bool]] = []
+        # Per playlist template (quality.event_number): the event number of the
+        # first stream on it that delivered data. A backup on the same template
+        # with another number is another event (seen: a failover onto a
+        # different game served by the same provider host).
+        self._event_anchor: Dict[str, str] = {}
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -1586,7 +1591,7 @@ class StreamFailoverRecorder:
 
     def _next_candidate_index(self) -> int:
         """The next candidate in cycle order that a standby check has not seen
-        dead (or on the wrong game). If every other one has, plain next: never
+        dead (or on the wrong game, by mark or by event number). If every other one has, plain next: never
         worse than before the checks existed."""
         n = len(self.candidates)
         here = self.current_candidate_index
@@ -1614,7 +1619,8 @@ class StreamFailoverRecorder:
             state = "dead"
         else:
             copy.m3u8_url = result.get("m3u8_url") or ""
-            state = "wrong_game" if self.is_wrong_source(copy) else "alive"
+            state = ("wrong_game" if self.is_wrong_source(copy)
+                     or self._other_event(copy.m3u8_url) else "alive")
             # Feeds the step-down's choice of a lighter backup (no download).
             levels = usable_variants(copy.m3u8_url, result.get("variants") or [])
             live.declared_kbps = levels[0]["kbps"] if levels else None
@@ -1851,6 +1857,24 @@ class StreamFailoverRecorder:
         return quality.source_key(candidate.m3u8_url or (
             candidate.url if ".m3u8" in candidate.url.lower() else ""))
 
+    def _on_first_data(self, candidate: CandidateStream) -> None:
+        """An attempt delivered its first bytes: this stream really plays."""
+        event = quality.event_number(candidate.m3u8_url)
+        if event and event[0] not in self._event_anchor and not self.is_wrong_source(candidate):
+            self._event_anchor[event[0]] = event[1]
+
+    def _other_event(self, m3u8_url: str) -> Optional[Tuple[str, str]]:
+        """(its number, the recording's number) when this playlist is on the
+        same template as a stream already recorded but carries another event
+        number; None otherwise, including when either has no number."""
+        event = quality.event_number(m3u8_url)
+        if not event:
+            return None
+        anchor = self._event_anchor.get(event[0])
+        if anchor is None or anchor == event[1]:
+            return None
+        return event[1], anchor
+
     def is_wrong_source(self, candidate: CandidateStream) -> bool:
         key = self._candidate_key(candidate)
         return bool(key) and key in self.wrong_sources
@@ -1873,6 +1897,10 @@ class StreamFailoverRecorder:
             self._log("Wrong-game mark refused: this stream's playlist is not known yet.", "WARN")
             return None
         self.wrong_sources.add(key)
+        # The anchor came from this very stream: it was never the right event.
+        event = quality.event_number(current.m3u8_url)
+        if event and self._event_anchor.get(event[0]) == event[1]:
+            del self._event_anchor[event[0]]
         same = [c for c in self.candidates if self._candidate_key(c) == key]
         for c in same:
             c.fail_count += 1
@@ -2201,6 +2229,8 @@ class StreamFailoverRecorder:
                             and now - last_write_time >= self.STALL_LOG_SEC):
                         self._attempt_stalls.append((now - last_write_time, False))
                     self._account_no_data(now)
+                    if not written_for_this_session:
+                        self._on_first_data(candidate)
                     out_f.write(chunk)
                     out_f.flush()
                     tail.append(chunk)
@@ -2542,6 +2572,19 @@ class StreamFailoverRecorder:
                 candidate.fail_count += 1
                 self._log(f"{candidate.name} plays the stream marked as the wrong game. "
                           "Skipping it.", "WARN")
+                outcome = StreamOutcome.FAILED
+            # Same provider template as the stream being recorded, another
+            # event number: another game. Marked like the operator's Wrong
+            # Game, so its mirrors and the re-check leave it alone too.
+            elif (other := self._other_event(candidate.m3u8_url)):
+                skip = True
+                key = self._candidate_key(candidate)
+                if key:
+                    self.wrong_sources.add(key)
+                candidate.fail_count += 1
+                self._log(f"{candidate.name} plays event {other[0]} on the same provider; "
+                          f"this recording is on event {other[1]}. Treating it as the "
+                          "wrong game and skipping it.", "WARN")
                 outcome = StreamOutcome.FAILED
 
             # 2. Attempt Direct Mode (Direct FFmpeg with -headers)
@@ -2887,6 +2930,11 @@ class StreamFailoverRecorder:
             return False
         if self.is_wrong_source(fresh):
             self._log("A fresh event-page link plays the stream marked as the wrong game; "
+                      "not using it.", "WARN")
+            return False
+        other = self._other_event(fresh.m3u8_url)
+        if other:
+            self._log(f"A fresh event-page link plays event {other[0]}, not {other[1]}; "
                       "not using it.", "WARN")
             return False
         return True

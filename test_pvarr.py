@@ -11670,6 +11670,88 @@ class TestNoDataAndStalls(unittest.TestCase):
         self.assertEqual(format_duration(250), "4 min 10 s")
         self.assertEqual(format_duration(3780), "1 h 3 min")
 
+class TestEventNumberMismatch(unittest.TestCase):
+    """A backup on the same provider template with another event number is
+    another game: skipped and marked, avoided by failover, refused as a fresh
+    link. Seen: a failover onto a different game from the same host."""
+
+    A = "https://cdn1.example/hls/event-123456/index.m3u8?st=tok"
+    B = "https://cdn4.example/hls/event-123457/index.m3u8"
+
+    def test_helper(self):
+        from app.quality import event_number as ev
+        now = 1_800_000_000
+        self.assertEqual(ev(self.A, now), ("cdn.example/hls/event-#/index.m3u8", "123456"))
+        self.assertEqual(ev(self.B, now)[0], ev(self.A, now)[0])
+        self.assertIsNone(ev("https://a.example/live/c316/index.m3u8", now), "under 5 digits")
+        self.assertIsNone(ev("https://a.example/123456/654321.m3u8", now), "two numbers")
+        self.assertIsNone(ev("https://a.example/aB3k123456x/index.m3u8", now), "inside a token")
+        self.assertIsNone(ev(f"https://a.example/s/{now + 3600}/index.m3u8", now), "an expiry")
+        self.assertIsNone(ev(f"https://a.example/s/{(now - 60) * 1000}/i.m3u8", now), "ms timestamp")
+        # A signed path's expiry stays in the template, so two visits are
+        # never compared: no false wrong game.
+        t1 = ev(f"https://a.example/s/{now + 60}/111111.m3u8", now)
+        t2 = ev(f"https://a.example/s/{now + 90}/222222.m3u8", now)
+        self.assertNotEqual(t1[0], t2[0])
+        self.assertNotEqual(ev("https://other.example/hls/event-123457/index.m3u8", now)[0],
+                            ev(self.A, now)[0], "another host is not compared")
+
+    def make(self):
+        rec = StreamFailoverRecorder("s1", ["https://p1.example/a", "https://p2.example/b"],
+                                     "/tmp/x.ts", min_free_gb=0)
+        rec.candidates[0].m3u8_url = self.A
+        rec._on_first_data(rec.candidates[0])
+        return rec
+
+    def test_anchor_and_mismatch(self):
+        rec = self.make()
+        self.assertEqual(rec._other_event(self.B), ("123457", "123456"))
+        self.assertIsNone(rec._other_event(self.A.replace("cdn1", "cdn7")), "a mirror")
+        self.assertIsNone(rec._other_event("https://x.example/hls/event-999999/index.m3u8"))
+        self.assertIsNone(rec._other_event("https://cdn1.example/live/index.m3u8"))
+
+    def test_connect_skips_and_marks_it(self):
+        from unittest.mock import patch
+        rec = self.make()
+        rec.max_cycles = 1
+        rec.current_candidate_index = 1
+
+        def detect(c):
+            c.m3u8_url = self.B
+            return True
+        with patch.object(rec, "detect_candidate_headers", side_effect=detect), \
+                patch.object(rec, "_stream_ffmpeg_process") as stream, \
+                patch.object(rec, "_failover_delay", return_value=0):
+            rec.candidates = [rec.candidates[1]]
+            rec.current_candidate_index = 0
+            rec._recording_loop()
+        stream.assert_not_called()
+        self.assertTrue(rec.is_wrong_source(rec.candidates[0]))
+        self.assertTrue(any("plays event 123457" in m for m in rec.log_history))
+
+    def test_standby_and_fresh_link(self):
+        from unittest.mock import patch
+        rec = self.make()
+        with patch("app.recorder.probe_stream", return_value={"ok": True, "m3u8_url": self.B}):
+            self.assertEqual(rec.check_standby(1), "wrong_game")
+        rec.auto_probe = True
+
+        def probe(c):
+            c.m3u8_url = self.B
+            return True
+        with patch.object(rec, "_probe_candidate", side_effect=probe):
+            self.assertFalse(rec.fresh_link_plays("https://p3.example/c"))
+
+    def test_wrong_game_mark_on_the_anchor_clears_it(self):
+        rec = self.make()
+        rec.current_candidate_index = 0
+        rec.mark_wrong_game()
+        self.assertIsNone(rec._other_event(self.B))
+        rec.candidates[1].m3u8_url = self.B
+        rec._on_first_data(rec.candidates[1])
+        self.assertEqual(rec._other_event(self.A), ("123456", "123457"))
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
