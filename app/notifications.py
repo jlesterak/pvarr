@@ -140,13 +140,17 @@ class NotificationManager:
         )
 
     def notify_recording_finished(self, session_id: str, filename: str, size_mb: float,
-                                  segments_lost: int = 0):
+                                  segments_lost: int = 0, no_data_sec: float = 0.0):
         body = f"Session: {session_id}\nFile: {filename}\nSize: {size_mb} MB"
         # Said here because this is the message someone reads before deciding
         # whether to watch: a file with gaps looks complete in the library.
         if isinstance(segments_lost, int) and segments_lost > 0:
             body += (f"\n⚠️ {segments_lost} stream segment(s) lost — the recording "
                      "has gaps of a few seconds where the source failed to deliver.")
+        if isinstance(no_data_sec, (int, float)) and no_data_sec >= 60:
+            from app.recorder import format_duration
+            body += (f"\n⚠️ {format_duration(no_data_sec)} without data — freezes and "
+                     "failovers left that much of the event out of the file.")
         self.send("PVArr — Recording Finished ✅", body)
         self.trigger_media_server_refresh()
 

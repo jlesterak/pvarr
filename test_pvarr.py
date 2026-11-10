@@ -11599,6 +11599,79 @@ class TestBrowserSidecar(unittest.TestCase):
         resolve_mock.assert_not_called()
 
 
+
+class TestNoDataAndStalls(unittest.TestCase):
+    """Time without data is counted across failovers and shown; stalls are
+    measured per source. A recording that froze 20 times in 25 min, a third
+    of its bytes missing, used to read "0 lost"."""
+
+    def make(self):
+        rec = StreamFailoverRecorder("s1", ["https://a.example/1.m3u8"], "/tmp/x.ts",
+                                     min_free_gb=0)
+        rec.is_running = True
+        return rec
+
+    def test_long_gaps_count_whole_short_ones_not_at_all(self):
+        rec = self.make()
+        for t in (100.0, 106.0, 112.0):      # normal segment pacing
+            rec._account_no_data(t)
+        self.assertEqual(rec.no_data_sec, 0.0)
+        rec._account_no_data(142.0)          # a freeze plus a failover: 30 s
+        rec._account_no_data(148.0)
+        self.assertEqual(rec.no_data_sec, 30.0)
+        self.assertEqual(rec.no_data_seconds(now=150.0), 30.0)
+
+    def test_open_gap_shows_while_running(self):
+        rec = self.make()
+        rec._account_no_data(100.0)
+        self.assertEqual(rec.no_data_seconds(now=125.0), 25.0)
+        self.assertEqual(rec.no_data_seconds(now=105.0), 0.0)
+        rec.is_running = False
+        self.assertEqual(rec.no_data_seconds(now=125.0), 0.0)
+
+    def test_status_carries_it(self):
+        rec = self.make()
+        rec._account_no_data(100.0)
+        rec._account_no_data(160.0)
+        rec.is_running = False   # synthetic times: no open gap against the real clock
+        self.assertEqual(rec.get_status_summary()["no_data_sec"], 60.0)
+
+    def test_stalls_logged_per_attempt_and_summarised(self):
+        rec = self.make()
+        rec._attempt_stalls = [(9.2, False), (14.0, False), (15.0, True)]
+        rec._report_stalls(rec.candidates[0])
+        line = [m for m in rec.log_history if "Stalls on" in m][-1]
+        self.assertIn("3 (8 s or more), longest 15 s: 9, 14, 15 (freeze)", line)
+        self.assertEqual(rec._attempt_stalls, [])
+        rec._attempt_stalls = [(8.0, False)]
+        rec._report_stalls(rec.candidates[0])
+        self.assertEqual(rec._stall_summary(),
+                         [f"Stalls on {rec.candidates[0].name}: 4, median 12 s, longest 15 s."])
+
+    def test_freeze_on_the_capture_path_is_recorded_as_a_stall(self):
+        from unittest.mock import patch
+        tmp = tempfile.mkdtemp(prefix="pvarr-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        rec = StreamFailoverRecorder("s1", ["http://a/1.m3u8"], str(Path(tmp) / "o.ts"),
+                                     freeze_timeout_sec=0, min_free_gb=0)
+        rec.READ_POLL_SEC = 0.01
+        rec.STARTUP_GRACE_SEC = 0
+        proc = _FakeProc([b"x" * 188], None)
+        try:
+            with patch("app.recorder.subprocess.Popen", return_value=proc):
+                rec._stream_ffmpeg_process(["ffmpeg"], rec.candidates[0])
+        finally:
+            proc.close()
+        self.assertTrue(any("(freeze)" in m for m in rec.log_history), rec.log_history[-5:])
+
+    def test_format_duration(self):
+        from app.recorder import format_duration
+        self.assertEqual(format_duration(45), "45 s")
+        self.assertEqual(format_duration(250), "4 min 10 s")
+        self.assertEqual(format_duration(3780), "1 h 3 min")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 

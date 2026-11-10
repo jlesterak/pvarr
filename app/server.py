@@ -728,6 +728,7 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
         notifier.notify_recording_finished(
             recording_id, final.name, size,
             segments_lost=getattr(recorder, "segments_lost", 0) if recorder else 0,
+            no_data_sec=getattr(recorder, "no_data_sec", 0.0) if recorder else 0.0,
         )
         # Genuinely finished: a later restart must not try to resume it.
         session_store.remove(recording_id)

@@ -393,6 +393,18 @@ SOURCE_SHADOW_SEC = 10.0
 _MAX_EXPIRED_PER_LINE = 10000
 
 
+def format_duration(seconds: float) -> str:
+    """'45 s', '4 min 10 s', '1 h 3 min' for log lines and notifications."""
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total} s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} min {secs} s" if secs else f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+
 def url_for_log(url: Optional[str], limit: int = 70) -> str:
     """A URL shortened for a log line, redacted *before* it is cut.
 
@@ -859,6 +871,18 @@ class StreamFailoverRecorder:
         # feed is skipped too -- the case that made "switch to the backup"
         # land on the same wrong game.
         self.wrong_sources: Set[str] = set()
+        # Time the file got nothing new: every gap between writes longer than
+        # NO_DATA_GAP_SEC, counted whole and across failovers (freeze wait,
+        # switch, reconnect). Lost segments miss this: a recording that froze
+        # 20 times in 25 min, a third of its bytes missing, read "0 lost".
+        self.no_data_sec: float = 0.0
+        self._last_data_at: Optional[float] = None
+        # Stall measurement, no behaviour attached: every gap of STALL_LOG_SEC
+        # or more inside an attempt that had started, by source name, so the
+        # freeze timer can be judged from real stall lengths. The current
+        # attempt's list, (seconds, ended_in_freeze), is reported when it ends.
+        self._stalls: Dict[str, List[float]] = {}
+        self._attempt_stalls: List[Tuple[float, bool]] = []
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -1542,6 +1566,11 @@ class StreamFailoverRecorder:
     # -- monitor: standby checks, stream rate, loss alert ------------------
 
     STANDBY_INTERVAL_SEC = 90.0
+    # A gap between writes longer than this is time without data. Above normal
+    # segment pacing (one 6-10 s segment arrives in a burst, then nothing).
+    NO_DATA_GAP_SEC = 12.0
+    # Stalls this long or longer are logged (measurement only).
+    STALL_LOG_SEC = 8.0
     MONITOR_TICK_SEC = 10.0
     LOSS_BURST_COUNT = 3
     LOSS_BURST_WINDOW_SEC = 300.0
@@ -2031,11 +2060,54 @@ class StreamFailoverRecorder:
         discontinuity would survive the fix.
         """
         tail = _TailBuffer()
+        self._attempt_stalls = []
         try:
             return self._capture_ffmpeg_output(ffmpeg_cmd, candidate, tail)
         finally:
             self._advance_timeline(tail)
             self._flush_segment_loss()
+            self._report_stalls(candidate)
+
+    def _account_no_data(self, now: float) -> None:
+        """A write at `now`: count the gap since the last one if it was long."""
+        if self._last_data_at is not None:
+            gap = now - self._last_data_at
+            if gap > self.NO_DATA_GAP_SEC:
+                self.no_data_sec += gap
+        self._last_data_at = now
+
+    def no_data_seconds(self, now: Optional[float] = None) -> float:
+        """Time without data so far, including a gap still open while running."""
+        total = self.no_data_sec
+        if self.is_running and self._last_data_at is not None:
+            gap = (time.time() if now is None else now) - self._last_data_at
+            if gap > self.NO_DATA_GAP_SEC:
+                total += gap
+        return round(total, 1)
+
+    def _report_stalls(self, candidate: CandidateStream) -> None:
+        """Log the stalls of the attempt that just ended (measurement only)."""
+        stalls, self._attempt_stalls = self._attempt_stalls, []
+        if not stalls:
+            return
+        self._stalls.setdefault(candidate.name, []).extend(sec for sec, _ in stalls)
+        lengths = ", ".join(f"{sec:.0f}" + (" (freeze)" if froze else "")
+                            for sec, froze in stalls)
+        self._log(f"Stalls on {candidate.name} this attempt: {len(stalls)} "
+                  f"({self.STALL_LOG_SEC:.0f} s or more), longest "
+                  f"{max(sec for sec, _ in stalls):.0f} s: {lengths}")
+
+    def _stall_summary(self) -> List[str]:
+        """One line per source that stalled: count, median and longest."""
+        lines = []
+        for name, secs in self._stalls.items():
+            ordered = sorted(secs)
+            mid = len(ordered) // 2
+            median = (ordered[mid] if len(ordered) % 2
+                      else (ordered[mid - 1] + ordered[mid]) / 2)
+            lines.append(f"Stalls on {name}: {len(ordered)}, median {median:.0f} s, "
+                         f"longest {ordered[-1]:.0f} s.")
+        return lines
 
     def _advance_timeline(self, tail: "_TailBuffer") -> None:
         """Move `_timeline_offset` to the end of the segment just captured.
@@ -2124,13 +2196,18 @@ class StreamFailoverRecorder:
                             at_eof = True  # FFmpeg closed the pipe
 
                 if chunk:
+                    now = time.time()
+                    if (written_for_this_session
+                            and now - last_write_time >= self.STALL_LOG_SEC):
+                        self._attempt_stalls.append((now - last_write_time, False))
+                    self._account_no_data(now)
                     out_f.write(chunk)
                     out_f.flush()
                     tail.append(chunk)
                     len_chunk = len(chunk)
                     self.bytes_written += len_chunk
                     written_for_this_session += len_chunk
-                    last_write_time = time.time()
+                    last_write_time = now
                     # Checked on the write path, where the space is actually
                     # being consumed. Rate-limited internally.
                     if not self._disk_space_ok():
@@ -2179,6 +2256,7 @@ class StreamFailoverRecorder:
                             f"No data from {candidate.name} in the first "
                             f"{idle_budget}s; giving up on this attempt", "ERROR")
                         return finish(StreamOutcome.FAILED)
+                    self._attempt_stalls.append((float(idle_budget), True))
                     self._log(f"Stream freeze detected! No data received for {idle_budget}s", "ERROR")
                     return finish(StreamOutcome.INTERRUPTED)
 
@@ -2750,6 +2828,10 @@ class StreamFailoverRecorder:
         self.is_running = False
         self.stop_time = time.time()
         lost = f", {self.segments_lost} stream segments lost" if self.segments_lost else ""
+        if self.no_data_sec:
+            lost += f", {format_duration(self.no_data_sec)} without data"
+        for line in self._stall_summary():
+            self._log(line)
         self._log(f"Recorder finished. Total recorded: {self.get_filesize_mb():.2f} MB ({self.bytes_written} bytes){lost}")
 
     def get_elapsed_seconds(self) -> float:
@@ -2871,6 +2953,9 @@ class StreamFailoverRecorder:
             "segments_lost": self.segments_lost,
             "segments_failed": self.segments_failed,
             "segments_expired": self.segments_expired,
+            # Seconds the file got nothing new (freezes, failovers), so a
+            # starved recording shows even when no segment was reported lost.
+            "no_data_sec": self.no_data_seconds(),
             "free_disk_gb": (
                 round(free / 1024 ** 3, 2) if (free := self.free_bytes()) is not None else None
             ),

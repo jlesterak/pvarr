@@ -321,6 +321,10 @@
                       class="text-[11px] block text-amber-400 font-mono"
                       :title="'The source failed to deliver these: ' + session.segments_failed + ' would not download, ' + session.segments_expired + ' expired before FFmpeg reached them. Each is a gap of a few seconds in picture and sound. A climbing count means this source is unreliable.'"
                       x-text="session.segments_lost + (session.segments_lost === 1 ? ' segment lost' : ' segments lost')"></span>
+                <span x-show="session.no_data_sec > 0"
+                      class="text-[11px] block text-amber-400 font-mono"
+                      title="Time the file got nothing new: freezes, failovers and reconnects. The event went on, so this much of it is missing from the recording."
+                      x-text="'⚠ ' + formatGap(session.no_data_sec) + ' without data'"></span>
               </div>
               <!-- Captured is the recorder's own counter. It and On Disk must
                    agree; when they do not, bytes are going somewhere the file
@@ -426,6 +430,10 @@
                         x-show="session.segments_lost > 0"
                         :title="session.segments_lost + ' stream segments lost: gaps of a few seconds in this recording'"
                         x-text="'⚠ ' + session.segments_lost"></span>
+                  <span class="text-xs font-mono text-amber-400 shrink-0"
+                        x-show="session.no_data_sec > 0"
+                        :title="formatGap(session.no_data_sec) + ' without data: freezes and failovers left this much of the event out of the file'"
+                        x-text="'⚠ ' + formatGap(session.no_data_sec)"></span>
                   <span class="text-xs capitalize shrink-0" :class="statusTextClass(session)"
                         x-text="prettyStatus(session.status)"></span>
                   <span class="text-slate-500 shrink-0 text-[10px]"
@@ -1423,6 +1431,14 @@
           // single successful recording.
           if (s.is_rebroadcast || s.status !== 'recording') return false;
           return (s.bytes_written || 0) > 1048576 && (s.filesize_mb || 0) === 0;
+        },
+
+        formatGap(sec) {
+          const t = Math.round(sec || 0);
+          if (t < 60) return t + ' s';
+          const m = Math.floor(t / 60), s = t % 60;
+          if (m < 60) return m + ' min' + (s ? ' ' + s + ' s' : '');
+          return Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
         },
 
         formatSeconds(sec) {
