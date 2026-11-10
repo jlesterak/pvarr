@@ -382,11 +382,13 @@ _TIMESTAMP_WINDOW_SEC = 30 * 86400
 
 
 def _looks_like_timestamp(digits: str, now: float) -> bool:
-    if len(digits) in (9, 10):
-        return abs(int(digits) - now) < _TIMESTAMP_WINDOW_SEC
-    if len(digits) == 13:
-        return abs(int(digits) / 1000 - now) < _TIMESTAMP_WINDOW_SEC
-    return False
+    """A Unix time near now (s, ms or us), or a calendar date (YYYYMMDD):
+    both change between visits or across midnight, so neither names an event."""
+    if len(digits) == 8:
+        year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:])
+        return 2000 <= year <= 2099 and 1 <= month <= 12 and 1 <= day <= 31
+    scale = {9: 1, 10: 1, 13: 1_000, 16: 1_000_000}.get(len(digits))
+    return scale is not None and abs(int(digits) / scale - now) < _TIMESTAMP_WINDOW_SEC
 
 
 def event_number(m3u8_url: str, now: Optional[float] = None) -> Optional[Tuple[str, str]]:

@@ -11688,6 +11688,10 @@ class TestEventNumberMismatch(unittest.TestCase):
         self.assertIsNone(ev("https://a.example/aB3k123456x/index.m3u8", now), "inside a token")
         self.assertIsNone(ev(f"https://a.example/s/{now + 3600}/index.m3u8", now), "an expiry")
         self.assertIsNone(ev(f"https://a.example/s/{(now - 60) * 1000}/i.m3u8", now), "ms timestamp")
+        self.assertIsNone(ev(f"https://a.example/s/{now * 1_000_000 + 5}/i.m3u8", now), "us timestamp")
+        self.assertIsNone(ev("https://a.example/replay/20261109/a.m3u8", now), "a date")
+        self.assertEqual(ev("https://a.example/hls/40187304/a.m3u8", now)[1], "40187304",
+                         "8 digits that are not a date still count")
         # A signed path's expiry stays in the template, so two visits are
         # never compared: no false wrong game.
         t1 = ev(f"https://a.example/s/{now + 60}/111111.m3u8", now)
