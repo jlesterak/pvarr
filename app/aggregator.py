@@ -36,12 +36,13 @@ can take about two minutes before the minute of probing starts.
 
 import logging
 import os
+import queue
 import re
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -72,12 +73,21 @@ PROBE_WORKERS = 6
 PROBE_TIMEOUT_SEC = 5
 PROBE_BUDGET_SEC = 60.0
 # Browser sidecar second look (PVARR_BROWSER_URL): links whose page had no
-# playlist, one at a time, BROWSER_PAGE_SEC each (resolved pages took 7-10 s
-# on live links), all within BROWSER_STAGE_SEC.
+# playlist, one at a time while recording (wider when idle, below),
+# BROWSER_PAGE_SEC each (resolved pages took 7-10 s on live links), all within
+# BROWSER_STAGE_SEC.
 BROWSER_LINKS = 4
 BROWSER_PAGE_SEC = 20
 BROWSER_STAGE_SEC = 45.0
 BROWSER_MIN_SLOT_SEC = 8
+# With nothing recording (`idle`) the sidecar has no failover to keep a page
+# slot free for and nobody is waiting on the event-page lock, so the look goes
+# wider: more links, two pages at a time, a longer wall clock. On live pages
+# every hit came within 14 s and a miss costs the full BROWSER_PAGE_SEC, so 12
+# links two at a time fit in about two minutes.
+BROWSER_LINKS_IDLE = 12
+BROWSER_STAGE_IDLE_SEC = 180.0
+BROWSER_PARALLEL_IDLE = 2
 # FlareSolverr usually loads a checked page in 10-20 s, but one took
 # ~71 s: 60 s failed it every time. Overridable by PVARR_FLARESOLVERR_TIMEOUT.
 DEFAULT_FLARESOLVERR_TIMEOUT_SEC = 120
@@ -449,12 +459,14 @@ def pick_first_working(
     measure_fn: Optional[Callable[[Dict[str, Any], float], Dict[str, Any]]] = None,
     gather_max: int = GATHER_MAX,
     second_fn: Optional[Callable[[str, float], Dict[str, Any]]] = None,
+    idle: bool = False,
 ) -> Dict[str, Any]:
     """Probe links concurrently; keep the first `pick` that work, in link order.
 
     `second_fn(url, deadline)` (the browser sidecar, when configured) gets a
     second look at links the probe found no playlist on, only if the probe
-    phase came up short; see _second_stage.
+    phase came up short; see _second_stage. `idle` (nothing is recording)
+    widens that look.
 
     With `measure_fn`, up to `gather` working links are collected the same
     way, measured one at a time within RANK_BUDGET_SEC, and the best `pick`
@@ -522,7 +534,11 @@ def pick_first_working(
         pool.shutdown(wait=False, cancel_futures=True)
 
     if second_fn is not None and not (abort is not None and abort.is_set()):
-        _second_stage(links, results, second_fn, enough, abort)
+        if idle:
+            _second_stage(links, results, second_fn, enough, abort, limit=BROWSER_LINKS_IDLE,
+                          stage_sec=BROWSER_STAGE_IDLE_SEC, parallel=BROWSER_PARALLEL_IDLE)
+        else:
+            _second_stage(links, results, second_fn, enough, abort)
 
     # Cut where the search may stop, not at whatever else finished probing
     # meanwhile: past `want`, that is at most the one link adding a source.
@@ -603,34 +619,59 @@ def pick_first_working(
 def _second_stage(links: List[str], results: Dict[int, Dict[str, Any]],
                   second_fn: Callable[[str, float], Dict[str, Any]],
                   enough: Callable[[List[int]], bool],
-                  abort: Optional[threading.Event]) -> None:
+                  abort: Optional[threading.Event],
+                  limit: int = BROWSER_LINKS, stage_sec: float = BROWSER_STAGE_SEC,
+                  parallel: int = 1) -> None:
     """The browser sidecar's look at links the probe found no playlist on.
 
     Runs only when the probe phase came up short (fewer working links than
-    wanted, or all one source). One page at a time, in page order, at most
-    BROWSER_LINKS of them, under a hard BROWSER_STAGE_SEC wall clock: the
-    sidecar's second page slot stays free for a recording's failover, and the
-    event-page lock is held at most that much longer. A result replaces the
-    link's entry in `results` when it found a playlist (working, or failed --
-    an accurate "failed" beats "unresolved"), so ranking, source letters and
-    the summary treat it like any other link. Stops once enough work.
+    wanted, or all one source). During a recording: one page at a time, at
+    most BROWSER_LINKS of them, under a hard BROWSER_STAGE_SEC wall clock, so
+    the sidecar's second page slot stays free for a recording's failover and
+    the event-page lock is held at most that much longer. With nothing
+    recording the caller passes the wider `limit`, `stage_sec` and `parallel`.
+
+    Order: hosts the browser resolved before come first, hosts that keep
+    missing last (browser.host_rank), page order otherwise; the cut to `limit`
+    is made after sorting. A result replaces the link's entry in `results`
+    when it found a playlist (working, or failed -- an accurate "failed" beats
+    "unresolved"), so ranking, source letters and the summary treat it like
+    any other link. Stops once enough work; a page still loading then is left
+    to end on its own limit (daemon thread, result dropped).
     """
     found = [i for i in range(len(links)) if i in results and _works(results[i])]
     if enough(found):
         return
-    stuck = [i for i in range(len(links))
-             if i in results and browser.worth_trying(results[i])][:BROWSER_LINKS]
-    deadline = time.monotonic() + BROWSER_STAGE_SEC
-    for i in stuck:
-        if abort is not None and abort.is_set():
-            return
-        if deadline - time.monotonic() < BROWSER_MIN_SLOT_SEC:
-            return
+    stuck = [i for i in range(len(links)) if i in results and browser.worth_trying(results[i])]
+    stuck.sort(key=lambda i: browser.host_rank(links[i]))       # stable: page order within a rank
+    todo = deque(stuck[:max(0, limit)])
+    deadline = time.monotonic() + stage_sec
+    finished: "queue.Queue[Tuple[int, Dict[str, Any]]]" = queue.Queue()
+    running = 0
+
+    def look(i: int) -> None:
         try:
             res = second_fn(links[i], deadline)
         except Exception as exc:  # a resolver bug must not sink the scan
             logger.warning("Browser look at link %d failed: %s", i, exc)
+            res = {}
+        finished.put((i, res if isinstance(res, dict) else {}))
+
+    while todo or running:
+        if abort is not None and abort.is_set():
+            return
+        out_of_time = deadline - time.monotonic() < BROWSER_MIN_SLOT_SEC
+        while todo and running < max(1, parallel) and not out_of_time:
+            threading.Thread(target=look, args=(todo.popleft(),), name="pvarr-browser-look",
+                             daemon=True).start()
+            running += 1
+        if not running:
+            return
+        try:
+            i, res = finished.get(timeout=0.25)
+        except queue.Empty:
             continue
+        running -= 1
         if res.get("m3u8_url"):
             results[i] = res
             if _works(res):
@@ -772,11 +813,14 @@ def find_streams(
     abort: Optional[threading.Event] = None,
     fs_retry: bool = False,
     exclude: Iterable[str] = (),
+    idle: bool = False,
 ) -> Dict[str, Any]:
     """The whole job: aggregator URL in, up to three working candidates out.
 
     `exclude` skips links already in hand, so a re-check during a recording
     looks further down the page instead of finding the same three again.
+    `idle` says nothing is recording, which lets the browser sidecar look at
+    more of the page (see _second_stage).
     """
     result: Dict[str, Any] = {"ok": False, "page": {}, "links_found": 0,
                               "picked": [], "tried": [], "message": ""}
@@ -832,7 +876,7 @@ def find_streams(
             return browser.resolve(link, timeout=BROWSER_PAGE_SEC, abort=abort,
                                    deadline=deadline, probe_timeout=PROBE_TIMEOUT_SEC)
     chosen = pick_first_working(links, probe_fn=probe_fn, abort=abort,
-                                gather=GATHER, measure_fn=measure, second_fn=second)
+                                gather=GATHER, measure_fn=measure, second_fn=second, idle=idle)
     result.update(picked=chosen["picked"], tried=chosen["tried"])
     result["ok"] = bool(chosen["picked"])
     n = len(chosen["picked"])

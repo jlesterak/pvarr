@@ -9034,7 +9034,7 @@ class TestScheduleLoop(ScheduleServerTestCase):
         find, start = self.run_pass(find=find)
         from unittest.mock import ANY
         find.assert_called_once_with("https://agg.example/e", cookie="cf_clearance=c",
-                                     user_agent="UA", abort=ANY)
+                                     user_agent="UA", abort=ANY, idle=True)
         kwargs = start.call_args.kwargs
         self.assertEqual(kwargs["candidates"], ["https://p/1", "https://p/2", "https://m/1.m3u8"])
         self.assertEqual(kwargs["end_time"], job["end_time"])
@@ -9097,6 +9097,25 @@ class TestScheduleLoop(ScheduleServerTestCase):
         self.assertIn("disk full", job["message"])
         self.notifier.send.assert_called_once()
 
+    def test_the_wide_browser_look_is_off_while_recording_or_for_a_scan_override(self):
+        import asyncio
+        seen = []
+
+        def find(url, cookie=None, user_agent=None, abort=None, **extra):
+            seen.append(extra)
+            return {"ok": False}
+
+        async def go(**kw):
+            return await self.server._scan_in_daemon_thread("t", "https://agg.example/e", None, None, **kw)
+
+        running = MagicMock(is_running=True)
+        with patch.object(self.server.aggregator, "find_streams", find):
+            asyncio.run(go())
+            with patch.dict(self.server.active_recorders, {"r": running}, clear=True):
+                asyncio.run(go())
+            asyncio.run(go(scan=find))
+        self.assertEqual(seen, [{"idle": True}, {}, {}])
+
     def test_window_already_closed_is_missed_without_checking(self):
         job = self.due(start_at=time.time() - 7200, end_time=time.time() - 60)
         find, start = self.run_pass()
@@ -9107,7 +9126,7 @@ class TestScheduleLoop(ScheduleServerTestCase):
     def test_cancelled_during_the_check_never_starts(self):
         job = self.due(url_primary="https://m/1.m3u8")
 
-        def find(url, cookie=None, user_agent=None, abort=None):
+        def find(url, cookie=None, user_agent=None, abort=None, idle=False):
             self.store.remove(job["id"])
             return {"ok": True, "picked": [{"url": "https://p/1"}]}
 
@@ -9144,7 +9163,7 @@ class TestScheduleLoop(ScheduleServerTestCase):
         quick = self.due(team_a="Quick", agg_url="", url_primary="https://m/q.m3u8")
         release = th.Event()
 
-        def find(url, cookie=None, user_agent=None, abort=None):
+        def find(url, cookie=None, user_agent=None, abort=None, idle=False):
             release.wait(5)
             return {"ok": True, "picked": [{"url": "https://p/1"}]}
 
@@ -9178,7 +9197,7 @@ class TestScheduleLoop(ScheduleServerTestCase):
         job = self.due()
         release = th.Event()
 
-        def find(url, cookie=None, user_agent=None, abort=None):
+        def find(url, cookie=None, user_agent=None, abort=None, idle=False):
             release.wait(5)
             return {"ok": True, "picked": [{"url": "https://p/1"}]}
 
@@ -11589,6 +11608,85 @@ class TestBrowserSidecar(unittest.TestCase):
         self.assertEqual(asked, links[:aggregator.BROWSER_LINKS])
         self.assertEqual(peak[0], 1)
         self.assertEqual(out["tried"][0]["status"], "unresolved")
+
+    def test_idle_find_looks_at_more_pages_two_at_a_time(self):
+        links = [f"https://l{i}.example/p" for i in range(15)]
+        asked, live, peak, lock = [], [0], [0], threading.Lock()
+
+        def second(url, deadline):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                asked.append(url)
+            time.sleep(0.05)
+            with lock:
+                live[0] -= 1
+            return {"ok": False, "m3u8_url": "", "message": "Browser: no playlist found."}
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        aggregator.pick_first_working(links, probe_fn=lambda u: dict(self.JS_PAGE),
+                                      workers=3, second_fn=second, idle=True)
+        self.assertEqual(sorted(asked), sorted(links[:aggregator.BROWSER_LINKS_IDLE]))
+        self.assertEqual(peak[0], aggregator.BROWSER_PARALLEL_IDLE)
+        # Stop is honoured between pages, and nothing is asked once enough work.
+        asked.clear()
+        stop = threading.Event()
+        stop.set()
+        aggregator.pick_first_working(links, probe_fn=lambda u: dict(self.JS_PAGE),
+                                      workers=3, second_fn=second, idle=True, abort=stop)
+        self.assertEqual(asked, [])
+
+    def test_the_browser_is_asked_about_the_likeliest_host_first(self):
+        links = [f"https://l{i}.example/p" for i in range(8)]
+        memo = self.browser.host_memo()
+        memo.record(links[5], True)             # resolved before: first
+        memo.record(links[0], False)
+        memo.record(links[0], False)            # keeps missing: last
+        asked = []
+
+        def second(url, deadline):
+            asked.append(url)
+            return {"ok": False, "m3u8_url": "", "message": "Browser: no playlist found."}
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        aggregator.pick_first_working(links, probe_fn=lambda u: dict(self.JS_PAGE),
+                                      workers=3, second_fn=second)
+        self.assertEqual(asked, [links[5], links[1], links[2], links[3]])
+        # Three misses in a row since its last hit: no longer first.
+        for _ in range(3):
+            memo.record(links[5], False)
+        self.assertEqual(self.browser.host_rank(links[5]), (2, 0.0))
+
+    def test_host_memory_survives_a_restart_and_never_raises(self):
+        path = Path(os.environ["PVARR_CONFIG_DIR"]) / "browser-hosts.json"
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        path.unlink(missing_ok=True)
+        # Only a page the browser really looked at counts: a refusal does not.
+        self._sidecar(status=400, answer={"detail": "private address"})
+        self.browser.resolve("https://refused.example/p")
+        self.assertFalse(path.exists())
+        self.browser._reset_for_tests()
+        self._sidecar()                         # "no playlist request seen"
+        self.browser.resolve("https://Miss.example./p")
+        side = self._sidecar(answer={"ok": True, "m3u8_url": "https://cdn.example/live.m3u8"})
+        with patch.object(self.browser.probe, "probe_stream", return_value=dict(self.GOOD)):
+            self.browser.resolve("https://hit.example/p")
+        self.assertEqual(len(side.requests), 1)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.browser._reset_for_tests()         # a restart: read back from disk
+        self.assertEqual(self.browser.host_rank("https://hit.example/other")[0], 0)
+        self.assertEqual(self.browser.host_memo().hosts["miss.example"]["streak"], 1)
+        self.assertEqual(self.browser.host_rank("https://new.example/p"), (1, 0.0))
+        for junk in ("not json", "[]", '{"schema": 99, "hosts": {"hit.example": {"ok": 5}}}',
+                     '[' * 100000,
+                     '{"schema": 1, "hosts": {"bad host": {"ok": 1}, "x.example": "nope", "y.example": {"ok": "1e999"}}}'):
+            path.write_text(junk)
+            self.browser._reset_for_tests()
+            self.assertEqual(self.browser.host_rank("https://hit.example/p"), (1, 0.0), junk)
+            self.assertNotIn("bad host", self.browser.host_memo().hosts)
+        # The oldest hosts are forgotten past the cap.
+        memo = self.browser.host_memo()
+        for i in range(self.browser.MAX_HOSTS + 5):
+            memo.record(f"https://h{i}.example/p", False)
+        self.assertLessEqual(len(memo.hosts), self.browser.MAX_HOSTS)
 
     def test_connect_falls_back_to_the_browser_for_a_javascript_page(self):
         os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"

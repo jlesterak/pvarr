@@ -19,10 +19,18 @@ example below). Only links whose page loads but holds no playlist go to it; a
 dead playlist, a refused segment, a 404 or a DNS-blocked host never do.
 
 - **Find, scheduled scans and the event-page re-check:** only when the probe
-  came up short (fewer than three working links, or all from one source). Up
-  to 4 unresolved links, in page order, one at a time, at most 20 s each and
-  45 s in all, so a page check can take up to 45 s longer. A link it resolves
-  is logged `found by the browser sidecar` and ranked like any other.
+  came up short (fewer than three working links, or all from one source).
+  During a recording: up to 4 unresolved links, one at a time, at most 20 s
+  each and 45 s in all, so a page check can take up to 45 s longer. With
+  nothing recording: up to 12 links, two pages at a time, 3 min in all (two
+  pages measured up to 1.8 GB, inside the 2 GB limit). A link it resolves is
+  logged `found by the browser sidecar` and ranked like any other.
+- **Which link first:** PVArr remembers, per link host, how often the browser
+  found a playlist there and asks the likeliest hosts first; hosts that missed
+  twice in a row go last, the rest keep page order. The memory is a small file,
+  `browser-hosts.json` in the config folder (up to 300 hosts, host names and
+  counts only), learned from your own results; nothing ships with PVArr. If the
+  folder is not writable it is kept for the run only and a warning is logged.
 - **Connect (start and every failover):** a link whose page holds no playlist
   is resolved in the browser again each time, since playlist tokens expire.
   That costs 7-10 s when it works and up to `PVARR_BROWSER_TIMEOUT` (30 s)

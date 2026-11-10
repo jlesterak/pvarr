@@ -102,13 +102,15 @@ Open, in order (each version still needs the sponsor's approval to ship):
     `test_a_miss_caused_by_a_dns_blocklist_says_so` (real Chromium), `test_a_refused_page_says_why`.
     The three sidecar measurement nights ran with this handicap, so its real yield
     is higher than the go/no-go figures.
-  - Sidecar budget by situation. Before a game (a scheduled check, or Find with
+  - [COMPLETED 2026-11-10] Sidecar budget by situation. Before a game (a scheduled check, or Find with
     nothing recording): every unresolved link up to 12, two pages at a time, 3 min
     in all. During a recording: as today (4 links, 45 s, one page). Two pages
-    measured up to 1.8 GB, inside the documented 2 GB limit.
-  - Likeliest link first: remember per link host whether the browser resolved it
+    measured up to 1.8 GB, inside the documented 2 GB limit. Proof: `test_idle_find_looks_at_more_pages_two_at_a_time`,
+    `test_the_wide_browser_look_is_off_while_recording_or_for_a_scan_override`; independent validator ran edge cases (abort, raising resolver, concurrency cap 2, deadline).
+  - [COMPLETED 2026-11-10] Likeliest link first: remember per link host whether the browser resolved it
     (count, last time) in a small file in the config folder and try those first.
     Learned from the operator's own results; nothing is shipped with PVArr.
+    Proof: `test_the_browser_is_asked_about_the_likeliest_host_first`, `test_host_memory_survives_a_restart_and_never_raises` (hostile files ignored, validator found a deeply nested file escaped the loader; fixed).
   - **Team-name check** (warning only): compare the resolved page's title with the
     scheduled teams at connect and on the backup check. Covers the links the
     event-number rule cannot compare.

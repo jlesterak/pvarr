@@ -4,6 +4,10 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- Browser sidecar, nothing recording: a scan looks at up to 12 unresolved links, two pages at a time, within 3 min (during a recording it stays at 4 links, one page, 45 s).
+- The browser's results are remembered per link host in `browser-hosts.json` (config folder), and the likeliest hosts are asked first; hosts that keep missing go last.
+
 ### Changed
 - Browser sidecar: a request to a host its DNS server answers `0.0.0.0` for (a network-wide blocklist) is still refused, but a miss now says "blocked by DNS" and how many hosts, instead of "private addresses"; a page the sidecar refuses reports the reason on the card instead of "HTTP 400". docs/browser-sidecar.md explains giving the sidecar another DNS server.
 

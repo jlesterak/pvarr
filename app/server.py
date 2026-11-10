@@ -1577,6 +1577,10 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
     """
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
+    # Nothing recording or rebroadcasting: the browser sidecar may look at
+    # more of the page (aggregator._second_stage). Decided once, as the scan
+    # starts; only find_streams takes it.
+    idle = scan is None and not any(r.is_running for r in active_recorders.values())
 
     def _deliver(setter, value):
         if not future.done():
@@ -1587,6 +1591,8 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
             extra = {"fs_retry": True} if fs_retry else {}
             if exclude:
                 extra["exclude"] = list(exclude)
+            if idle:
+                extra["idle"] = True
             outcome = (scan or aggregator.find_streams)(
                 agg_url, cookie=cookie, user_agent=user_agent,
                 abort=cleanup.shutting_down, **extra,
