@@ -386,6 +386,10 @@
                   <span x-show="cand.fail_count > 0" class="text-amber-500/80"
                         x-text="'⚠ ' + cand.fail_count"></span>
                   <span x-show="cand.wrong_game" class="text-fuchsia-400/90">wrong game</span>
+                  <!-- Team-name check: the link's page title names another
+                       game. A warning only; the operator decides. -->
+                  <span x-show="cand.other_game && !cand.wrong_game" class="text-amber-400"
+                        :title="'Its page is titled: ' + cand.other_game + '. It may be another game; Wrong game marks it.'">other game?</span>
                   <!-- Standby check on a backup: green answers, red does not. -->
                   <span x-show="(idx + 1) !== session.current_candidate && cand.standby && cand.standby !== 'wrong_game'"
                         class="w-1.5 h-1.5 rounded-full"

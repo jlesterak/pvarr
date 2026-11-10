@@ -34,7 +34,7 @@ import tempfile
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 DATA_FILE = Path(__file__).resolve().parent / "data" / "teams.json"
 MAX_SUGGESTIONS = 15
@@ -225,6 +225,32 @@ def find_team(name: str) -> List[tuple]:
     if not name or len(name) > 100:   # no team name is this long
         return []
     return list(_names_by_fold().get(_fold(name), []))
+
+
+@lru_cache(maxsize=256)
+def team_spellings(name: str) -> Tuple[frozenset, frozenset]:
+    """(names, codes) the snapshot has for the team(s) `name` may mean.
+
+    `name` is matched, after folding, against full names, nicknames,
+    abbreviations and TEAM_ALIASES. `names` are folded ("colorado avalanche",
+    "avalanche", "colorado", "avs"); `codes` are upper-case abbreviations
+    ("COL"). A nickname or code shared by several teams returns them all.
+    Empty when the snapshot does not know the name.
+    """
+    key = _fold(name)
+    names: set = set()
+    codes: set = set()
+    if not key or len(name) > 100:
+        return frozenset(), frozenset()
+    for teams in load_snapshot().get("leagues", {}).values():
+        for row in teams:
+            full, abbr, location, nickname = (list(row) + ["", "", "", ""])[:4]
+            aliases = TEAM_ALIASES.get(full, [])
+            if key in {_fold(x) for x in (full, nickname, abbr, *aliases) if x}:
+                names.update(_fold(x) for x in (full, nickname, location, *aliases) if x)
+                if abbr:
+                    codes.add(str(abbr).upper())
+    return frozenset(names), frozenset(codes)
 
 
 # --------------------------------------------------------------------------

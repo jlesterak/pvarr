@@ -15,6 +15,7 @@ longer be the first thing anyone has to do.
 
 import base64
 import binascii
+import html
 import ipaddress
 import json
 import logging
@@ -109,6 +110,27 @@ _REFERER_PARAMS = ("referer", "referrer", "origin", "ref")
 
 class ProbeError(ValueError):
     """The input could not be used as a stream URL at all."""
+
+
+_TITLE_RE = re.compile(rb"<title[^>]*>(.{0,2000}?)</title>", re.I | re.S)
+_OG_TITLE_RE = re.compile(
+    rb"""<meta[^>]{0,200}?property=["']og:title["'][^>]{0,200}?content=["']([^"'<>]{0,500})["']""",
+    re.I)
+PAGE_TITLE_MAX = 200
+
+
+def page_title(body: bytes) -> str:
+    """The page's <title> (or og:title) as one bounded line, "" if none.
+
+    Read from the first 64 KB only. Used to compare with the scheduled teams
+    (eventinfo.title_verdict); never shown unprocessed.
+    """
+    head = (body or b"")[:65536]
+    match = _TITLE_RE.search(head) or _OG_TITLE_RE.search(head)
+    if not match:
+        return ""
+    text = html.unescape(match.group(1).decode("utf-8", "replace"))
+    return " ".join(re.sub(r"[\x00-\x1f\x7f]+", " ", text).split())[:PAGE_TITLE_MAX]
 
 
 def clean_url(raw: str) -> str:
@@ -668,6 +690,8 @@ def probe_stream(
         "dns_blocked": False,
         "m3u8_url": "",
         "page_url": "",
+        # <title> of the page link, when the link was a page: page_title().
+        "page_title": "",
         "referer": "",
         "user_agent": user_agent or DEFAULT_USER_AGENT,
         "cookie": "",
@@ -749,6 +773,7 @@ def probe_stream(
         if _is_playlist_body(body):
             playlists = [resp.url]
         else:
+            result["page_title"] = page_title(body)
             page_url, playlists = _follow_embeds(
                 page_session, resp.url, body, page_headers, timeout, result["attempts"],
                 allow_private=is_private_url(target))

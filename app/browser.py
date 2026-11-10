@@ -46,7 +46,8 @@ CLIENT_GRACE_SEC = 20
 CONNECT_TIMEOUT_SEC = 3
 # The answer is a small JSON object; anything bigger is not one.
 MAX_ANSWER_BYTES = 64 * 1024
-FIELD_LIMITS = {"m3u8_url": 4096, "referer": 2048, "cookie": 8192, "user_agent": 512}
+FIELD_LIMITS = {"m3u8_url": 4096, "referer": 2048, "cookie": 8192, "user_agent": 512,
+                "page_title": 200}
 # A page the browser found nothing on is not asked again for this long: every
 # failover lap would otherwise pay the full timeout again for the same answer.
 MISS_MEMO_SEC = 300
@@ -358,6 +359,9 @@ def resolve(page_url: str, timeout: Optional[int] = None,
         return out
     result["via"] = "browser"
     result["input_url"] = page_url
+    # The probe saw only the playlist; the title is the page's, as the browser
+    # rendered it (for the team-name check).
+    result["page_title"] = answer.get("page_title") or ""
     if not result.get("referer") and referer:
         result["referer"] = referer
     result["message"] = f"Browser ({took:.0f} s): " + (result.get("message") or "")

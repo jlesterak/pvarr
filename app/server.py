@@ -878,6 +878,8 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         ring=ring,
         channel_name=record.get("channel_name") or None,
         end_time=record.get("end_time"),
+        expected_teams=((record.get("naming") or {}).get("team_a", ""),
+                        (record.get("naming") or {}).get("team_b", "")),
         max_hours=record.get("max_hours", _max_hours()),
     )
     if record.get("started_at"):

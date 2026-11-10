@@ -183,6 +183,65 @@ def _split_vs(text: str, backed: bool = False) -> Optional[Tuple[str, str]]:
     return None
 
 
+# --- Team-name check: does a link's page title name the scheduled game? ----
+# Form defaults and blanks: with these there is nothing to compare against.
+_NO_TEAM = {"", "teama", "teamb", "team a", "team b", "tbd", "unknown"}
+# Words too common in team names to tell two teams apart.
+_COMMON_WORDS = {"the", "and", "city", "united", "state", "new", "los", "las", "san", "santa",
+                 "saint", "bay", "club", "real", "team", "north", "south", "east", "west",
+                 "university", "college", "sporting", "athletic", "national"}
+_NAMES_A_GAME = re.compile(r"\s(?:vs\.?|v\.?|@)\s", re.I)
+MAX_TITLE = 200
+MAX_TITLE_SHOWN = 80
+
+
+def _team_marks(team: str) -> Tuple[set, set]:
+    """(words, codes) that count as naming `team` in a title."""
+    names, codes = tags.team_spellings(team)
+    words = {w for text in (tags._fold(team), *names) for w in text.split()
+             if len(w) >= 3 and w not in _COMMON_WORDS}
+    return words, set(codes)
+
+
+def title_verdict(title: str, team_a: str, team_b: str) -> str:
+    """What a page title says about the game it plays, against the scheduled teams.
+
+    "ok"     it names a scheduled team (a word of its name, city or nickname,
+             or its abbreviation in capitals);
+    "other"  it names a game ("A vs B", "A @ B", or a full team name from the
+             bundled table) and neither scheduled team;
+    ""       no opinion: no title, no scheduled teams, or a title that names
+             no game ("Player", a site slogan, an anti-bot page).
+
+    Lenient on purpose, since it only ever warns: a title sharing a city with
+    a scheduled team passes. Sports the table does not cover are judged on
+    "vs" alone.
+    """
+    title = (title or "")[:MAX_TITLE]
+    folded = tags._fold(title).split()
+    teams = [t for t in (team_a, team_b) if tags._fold(t or "") not in _NO_TEAM]
+    if not folded or not teams:
+        return ""
+    capitals = set(re.findall(r"\b[A-Z]{2,5}\b", title))
+    for team in teams:
+        words, codes = _team_marks(team)
+        if words & set(folded) or codes & capitals:
+            return "ok"
+    if _NAMES_A_GAME.search(title):
+        return "other"
+    for n in range(2, MAX_TEAM_WORDS + 1):
+        for i in range(len(folded) - n + 1):
+            if tags.find_team(" ".join(folded[i:i + n])):
+                return "other"
+    return ""
+
+
+def title_for_display(title: str) -> str:
+    """A page title fit for the card log: one line, bounded, and with every
+    digit removed, so a title that carries a score cannot show it."""
+    return " ".join(re.sub(r"[\d\x00-\x1f\x7f]+", " ", (title or "")[:MAX_TITLE]).split())[:MAX_TITLE_SHOWN]
+
+
 def _trim_to_team(name: str) -> Tuple[str, str]:
     """('Philadelphia Flyers', 'Hockey') from 'Philadelphia Flyers Hockey' when
     the shorter form is a known team; otherwise (name, '')."""

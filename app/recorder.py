@@ -26,7 +26,7 @@ from typing import List, Optional, Callable, Dict, Any, Set, Tuple
 
 from app.check_deps import find_executable
 from app.logging_config import redact_url_secrets
-from app import browser, quality, ytdlp
+from app import browser, eventinfo, quality, ytdlp
 from app.probe import DEFAULT_USER_AGENT, is_private_url, probe_stream
 from app.relay import PlaylistRelay
 
@@ -626,6 +626,10 @@ class CandidateStream:
         # Declared bitrate of this feed's best level, from its last probe or
         # standby check; None when the playlist does not say.
         self.declared_kbps: Optional[int] = None
+        # Team-name check: this link's page title (digits removed) when it
+        # names a game other than the scheduled one; "" otherwise. A warning
+        # only. See StreamFailoverRecorder._note_title.
+        self.other_game: str = ""
 
     def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
         """Serialise this candidate.
@@ -655,6 +659,7 @@ class CandidateStream:
             "json_playlist": self.json_playlist,
             "fail_count": self.fail_count,
             "dns_blocked": self.dns_blocked,
+            "other_game": self.other_game,
             "last_error": self.last_error,
         }
         if include_secrets:
@@ -727,8 +732,15 @@ class StreamFailoverRecorder:
         min_free_gb: Optional[float] = None,
         end_time: Optional[float] = None,
         max_hours: Optional[float] = None,
+        expected_teams: Optional[Tuple[str, str]] = None,
     ):
         self.recording_id = recording_id
+        # The two teams this recording was named for, for the team-name check
+        # (_note_title). None switches the check off.
+        self.expected_teams: Optional[Tuple[str, str]] = (
+            (str(expected_teams[0] or ""), str(expected_teams[1] or ""))
+            if expected_teams and len(expected_teams) == 2 else None)
+        self._title_alerted = False
         # Per-URL header overrides from the dashboard's "advanced" fields, keyed
         # by URL rather than position so an empty backup slot cannot shift them
         # onto the wrong candidate.
@@ -993,6 +1005,7 @@ class StreamFailoverRecorder:
 
         candidate.dns_blocked = bool(result.get("dns_blocked"))
         source = "probe"
+        title = result.get("page_title") or ""
         if not result.get("ok") and browser.worth_trying(result):
             # The page loaded but holds no playlist (and the probe's own yt-dlp
             # pass found none): a player that builds it in JavaScript. Ask the
@@ -1003,6 +1016,7 @@ class StreamFailoverRecorder:
             found = browser.resolve(candidate.url, abort=self._stop_event)
             if found.get("ok"):
                 result, source = found, "browser"
+                title = found.get("page_title") or title
             else:
                 self._log(f"{candidate.name}: {found.get('message', '')}", "WARN")
         if not result.get("ok"):
@@ -1030,6 +1044,7 @@ class StreamFailoverRecorder:
             f"{result.get('kind', 'playlist')}, "
             f"headers {', '.join(required)}."
         )
+        self._note_title(candidate, title, recording=True)
         return True
 
     def _resolve_via_ytdlp(self, candidate: CandidateStream) -> bool:
@@ -1629,6 +1644,7 @@ class StreamFailoverRecorder:
             # Feeds the step-down's choice of a lighter backup (no download).
             levels = usable_variants(copy.m3u8_url, result.get("variants") or [])
             live.declared_kbps = levels[0]["kbps"] if levels else None
+            self._note_title(live, result.get("page_title") or "", recording=False)
         before = self.standby_state(live)
         if copy.m3u8_url:
             live.standby_m3u8 = copy.m3u8_url
@@ -1880,6 +1896,40 @@ class StreamFailoverRecorder:
         if remembered:
             candidate.referer = remembered
             self._log(f"{candidate.name}: reusing the Referer that worked for this source earlier.")
+
+    def _note_title(self, candidate: CandidateStream, title: str, recording: bool) -> None:
+        """Team-name check, a warning only: compare a link's page title with
+        the teams this recording was named for (eventinfo.title_verdict).
+
+        Covers the links the event-number rule cannot compare. Never changes
+        what is recorded or the failover order: a title is the page's own
+        claim, and it can be stale or generic. One card-log line per change
+        and, when it is the stream about to be recorded (`recording`), one
+        notification per recording. A title with no opinion leaves the last
+        verdict standing. The title is shown with its digits removed and is
+        never put in the notification.
+        """
+        if not self.expected_teams or not title:
+            return
+        try:
+            verdict = eventinfo.title_verdict(title, *self.expected_teams)
+            shown = eventinfo.title_for_display(title) if verdict == "other" else ""
+        except Exception:   # a title must never cost a connect
+            return
+        if not verdict:
+            return
+        before, candidate.other_game = candidate.other_game, shown
+        game = " vs ".join(t for t in self.expected_teams if t)
+        if shown and shown != before:
+            self._log(f'{candidate.name}: its page is titled "{shown}", which does not name '
+                      f"{game}. It may be another game; press Wrong game if it is.", "WARN")
+            if recording and not self._title_alerted:
+                self._title_alerted = True
+                self._alert("PVArr — This may be the wrong game",
+                            f"{candidate.name}'s page does not name {game}. Check the "
+                            "recording and mark it Wrong game if it is another game.")
+        elif before and not shown:
+            self._log(f"{candidate.name}: its page names {game} again.")
 
     def _other_event(self, m3u8_url: str) -> Optional[Tuple[str, str]]:
         """(its number, the recording's number) when this playlist is on the

@@ -4782,6 +4782,29 @@ class TestProbeFollowsTheEmbedChain(ProbeTestCase):
         self.assertEqual(sent[self.PLAYER], "https://embed.example/")
 
 
+class TestProbeReportsThePageTitle(ProbeTestCase):
+    """The title of the page link goes into the result (for the team-name
+    check); a playlist pasted directly has none."""
+
+    def handler(self, url, headers):
+        if url == "https://front.example/watch/1":
+            return FakeResponse(url, 200, b"<html><title>Home vs Away - site.example</title>"
+                                          b'<script>var s = "https://cdn.example/hls/a.m3u8";</script>')
+        if url == "https://cdn.example/hls/a.m3u8":
+            return FakeResponse(url, 200, MEDIA_PLAYLIST)
+        if url.endswith(".ts"):
+            return FakeResponse(url, 200, b"\x47" * 512)
+        return FakeResponse(url, 404, b"")
+
+    def test_title_of_a_page_link_and_none_for_a_playlist(self):
+        result = self.probe(self.handler, "https://front.example/watch/1", use_ytdlp=False)
+        self.assertTrue(result["ok"], result["message"])
+        self.assertEqual(result["page_title"], "Home vs Away - site.example")
+        direct = self.probe(self.handler, "https://cdn.example/hls/a.m3u8", use_ytdlp=False)
+        self.assertTrue(direct["ok"], direct["message"])
+        self.assertEqual(direct["page_title"], "")
+
+
 class TestProbeRetriesWithABrowserTlsProfile(ProbeTestCase):
     """Phase 18: an origin that serves its playlist only to a browser TLS
     profile. Plain clients get 403 whatever the headers; segments need only
@@ -9223,6 +9246,142 @@ class TestScheduleLoop(ScheduleServerTestCase):
         self.assertEqual(job["state"], "waiting")
         self.assertIn('"waiting"', self.store.path.read_text())
 
+
+
+class TestTeamNameCheck(FailoverLoopTestCase):
+    """Roadmap v0.20: a link's page title is compared with the teams the
+    recording was named for. A warning only, for the wrong-game cases the
+    event-number rule cannot compare (a wrong game was recorded on three of
+    five nights)."""
+
+    URLS = ["https://a.example/watch/1", "https://b.example/watch/2"]
+    TEAMS = ("Nashville Predators", "Colorado Avalanche")
+
+    def test_verdicts(self):
+        from app import eventinfo
+        a, b = self.TEAMS
+        cases = {
+            "Predators vs Avalanche Live Stream - site.example": "ok",
+            "Nashville at Colorado": "ok",                       # cities only
+            "NSH @ COL": "ok",                                   # abbreviations in capitals
+            "Avs vs Preds": "ok",                                # a known alias
+            "LEAGUE : Buffalo Bills vs Minnesota Vikings": "other",
+            "site.example : Edmonton Oilers - Anaheim Ducks": "other",   # no "vs": known teams
+            "EDM @ ANA": "other",
+            "Just a moment...": "",
+            "Player 3 HD": "",
+            "Watch sports free - the best streams": "",
+            "Oilers - Ducks": "",          # nicknames and a dash: not sure enough to warn
+            "": "",
+        }
+        for title, want in cases.items():
+            with self.subTest(title):
+                self.assertEqual(eventinfo.title_verdict(title, a, b), want)
+        # Lenient by design: a shared city passes.
+        self.assertEqual(eventinfo.title_verdict("Colorado Rockies vs Dodgers", a, b), "ok")
+        # Nothing to compare against: the form's defaults, blanks.
+        for names in (("TeamA", "TeamB"), ("", ""), (None, None)):
+            self.assertEqual(eventinfo.title_verdict("Oilers vs Ducks", *names), "")
+        # One real name is enough to judge by.
+        self.assertEqual(eventinfo.title_verdict("Oilers vs Ducks", "Avalanche", "TeamB"), "other")
+        # A sport the table does not know is judged on "vs" alone.
+        self.assertEqual(eventinfo.title_verdict("Alpha FC v Beta FC", "Gamma Town", "Delta"), "other")
+        self.assertEqual(eventinfo.title_verdict("Gamma Town v Beta FC", "Gamma Town", "Delta"), "ok")
+
+    def test_a_shown_title_carries_no_digits(self):
+        from app import eventinfo
+        shown = eventinfo.title_for_display("Oilers 3 - 2 Ducks (OT 4:12)\x07\n" + "x" * 300)
+        self.assertNotRegex(shown, r"[\d\x00-\x1f]")
+        self.assertTrue(shown.startswith("Oilers - Ducks (OT : )"))
+        self.assertLessEqual(len(shown), eventinfo.MAX_TITLE_SHOWN)
+
+    def test_the_probe_reports_the_page_title_bounded_and_on_one_line(self):
+        from app import probe
+        self.assertEqual(probe.page_title(b"<html><TITLE>\n A &amp; B \x07 live </title>"), "A & B live")
+        self.assertEqual(probe.page_title(b'<meta property="og:title" content="A vs B">'), "A vs B")
+        self.assertEqual(probe.page_title(b"<p>no title</p>"), "")
+        self.assertEqual(probe.page_title(b"<title>" + b"x" * 5000 + b"</title>"), "")
+        self.assertEqual(len(probe.page_title(b"<title>" + b"y" * 1500 + b"</title>")),
+                         probe.PAGE_TITLE_MAX)
+
+    def test_the_sidecar_title_is_passed_on_only_when_clean(self):
+        from app import browser
+        ok = browser._clean_answer({"ok": True, "m3u8_url": "https://c.example/x.m3u8",
+                                    "page_title": "A vs B"})
+        self.assertEqual(ok["page_title"], "A vs B")
+        for bad in ("x" * 201, "A\nB", 7):
+            self.assertEqual(browser._clean_answer({"ok": True, "page_title": bad})["page_title"], "")
+
+    def answer(self, title):
+        return {"ok": True, "m3u8_url": "https://c.example/live/index.m3u8", "page_title": title}
+
+    def connect(self, rec, index, title):
+        from unittest.mock import patch
+        with patch("app.recorder.probe_stream", return_value=self.answer(title)):
+            return rec._probe_candidate(rec.candidates[index])
+
+    def test_connect_warns_once_and_notifies_once_per_recording(self):
+        alerts = []
+        rec = self.make(self.URLS, [], expected_teams=self.TEAMS,
+                        on_alert_callback=lambda *a: alerts.append(a))
+        self.assertTrue(self.connect(rec, 0, "Edmonton Oilers 3 - 2 Anaheim Ducks | site.example"))
+        first = rec.candidates[0]
+        self.assertEqual(first.other_game, "Edmonton Oilers - Anaheim Ducks | site.example")
+        self.assertEqual(first.to_dict()["other_game"], first.other_game)
+        warned = [l for l in rec.log_history if "may be another game" in l]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("Nashville Predators vs Colorado Avalanche", warned[0])
+        self.assertNotRegex(warned[0].split("titled", 1)[1], r"\d")
+        self.assertEqual(len(alerts), 1)
+        _, title, body = alerts[0]
+        self.assertIn("wrong game", title)
+        self.assertNotIn("Oilers", body)          # no page text in a notification
+        self.assertNotIn("site.example", body)
+        # The same title again (every failover lap re-probes): nothing new.
+        self.connect(rec, 0, "Edmonton Oilers 4 - 2 Anaheim Ducks | site.example")
+        self.connect(rec, 1, "Oilers vs Ducks")   # another link, same recording
+        self.assertEqual(len([l for l in rec.log_history if "may be another game" in l]), 2)
+        self.assertEqual(len(alerts), 1)
+
+    def test_it_only_warns(self):
+        rec = self.make(self.URLS + ["https://c.example/watch/3"], [], expected_teams=self.TEAMS)
+        self.connect(rec, 1, "Oilers vs Ducks")
+        self.assertTrue(rec.candidates[1].other_game)
+        # Failover order and the wrong-game mark are untouched.
+        self.assertEqual(rec._next_candidate_index(), 1)
+        self.assertFalse(rec.is_wrong_source(rec.candidates[1]))
+        self.assertEqual(rec.wrong_sources, set())
+
+    def test_backup_check_marks_without_notifying_and_a_right_title_clears_it(self):
+        from unittest.mock import patch
+        alerts = []
+        rec = self.make(self.URLS, [], expected_teams=self.TEAMS,
+                        on_alert_callback=lambda *a: alerts.append(a))
+        backup = rec.candidates[1]
+        with patch("app.recorder.probe_stream", return_value=self.answer("Oilers vs Ducks")):
+            self.assertEqual(rec.check_standby(1), "alive")     # still usable
+        self.assertEqual(backup.other_game, "Oilers vs Ducks")
+        self.assertEqual(alerts, [])
+        # A title with no opinion (an anti-bot page) leaves the verdict standing.
+        with patch("app.recorder.probe_stream", return_value=self.answer("Just a moment...")):
+            rec.check_standby(1)
+        self.assertEqual(backup.other_game, "Oilers vs Ducks")
+        with patch("app.recorder.probe_stream",
+                   return_value=self.answer("Predators vs Avalanche")):
+            rec.check_standby(1)
+        self.assertEqual(backup.other_game, "")
+        self.assertTrue(any("names Nashville Predators vs Colorado Avalanche again" in l
+                            for l in rec.log_history))
+
+    def test_off_without_real_team_names_and_a_bad_title_never_costs_a_connect(self):
+        from unittest.mock import patch
+        for teams in (None, ("TeamA", "TeamB")):
+            rec = self.make(self.URLS, [], expected_teams=teams)
+            self.assertTrue(self.connect(rec, 0, "Oilers vs Ducks"))
+            self.assertEqual(rec.candidates[0].other_game, "")
+        rec = self.make(self.URLS, [], expected_teams=self.TEAMS)
+        with patch("app.recorder.eventinfo.title_verdict", side_effect=RuntimeError("boom")):
+            self.assertTrue(self.connect(rec, 0, "Oilers vs Ducks"))
 
 
 class TestScheduleDiskWarning(ScheduleServerTestCase):

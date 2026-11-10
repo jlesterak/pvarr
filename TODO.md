@@ -111,9 +111,18 @@ Open, in order (each version still needs the sponsor's approval to ship):
     (count, last time) in a small file in the config folder and try those first.
     Learned from the operator's own results; nothing is shipped with PVArr.
     Proof: `test_the_browser_is_asked_about_the_likeliest_host_first`, `test_host_memory_survives_a_restart_and_never_raises` (hostile files ignored, validator found a deeply nested file escaped the loader; fixed).
-  - **Team-name check** (warning only): compare the resolved page's title with the
-    scheduled teams at connect and on the backup check. Covers the links the
-    event-number rule cannot compare.
+  - [COMPLETED 2026-11-10, awaiting design review and independent validation] Team-name
+    check (warning only): the page title of a link (from the probe, or the browser
+    sidecar when it resolved the link) is compared with the recording's two teams
+    at connect and on the backup check. "ok" when it names either team (a word of
+    its name, city or nickname, or its abbreviation in capitals); "other" when it
+    names a game (vs/@, or a full team name from the bundled table) and neither;
+    otherwise no opinion. "other" marks the source (amber on the card), logs one
+    line and, at connect, notifies once per recording. It changes nothing else.
+    Known limits: a title sharing a city with a scheduled team passes; nicknames
+    joined by a dash alone give no opinion. Shown titles have digits removed.
+    Proof: `TestTeamNameCheck` (8 tests), `TestProbeReportsThePageTitle`. Not yet
+    seen on a live game.
   - [COMPLETED 2026-11-10] Disk warning before the game: a waiting job's length at an
     assumed 6 Mbit/s (no stream is known yet), plus the jobs that start before it
     and the time left on running recordings on the same volume, plus

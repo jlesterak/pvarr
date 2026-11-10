@@ -6,6 +6,7 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ### Added
 - Browser sidecar, nothing recording: a scan looks at up to 12 unresolved links, two pages at a time, within 3 min (during a recording it stays at 4 links, one page, 45 s).
+- Team-name check (warning only): at connect and on the backup check, a link's page title is compared with the teams the recording was named for. A title that names another game ("A vs B", or full team names from the bundled table) and neither of yours puts an amber **other game?** on that source (`other_game` on the candidate in the API), one line in the card log and, for the stream being recorded, one notification per recording. Nothing is skipped or stopped; **Wrong game** remains your call. Shown titles have their digits removed. Off when the teams are left at the form's defaults.
 - Low-disk warning for scheduled recordings: a waiting job shows an amber **low disk** line (and `disk_warning` in `GET`/`POST /api/schedules`) when its length at an assumed 6 Mbit/s, plus the scheduled recordings before it and the time left on running ones, plus `PVARR_MIN_FREE_GB`, exceeds the free space; one notification per job from 20 minutes before the start. Warning only: nothing is deleted or refused.
 - The browser's results are remembered per link host in `browser-hosts.json` (config folder), and the likeliest hosts are asked first; hosts that keep missing go last.
 
