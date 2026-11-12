@@ -1917,15 +1917,20 @@ class StreamFailoverRecorder:
         verdict standing. The title is shown with its numerals removed and is
         never put in the notification.
         """
-        if not self.expected_teams or not title:
+        if not self.expected_teams:
             return
         try:
-            verdict = eventinfo.title_verdict(title, *self.expected_teams)
+            verdict = eventinfo.title_verdict(title, *self.expected_teams) if title else ""
             shown = eventinfo.title_for_display(title) if verdict == "other" else ""
         except Exception:   # a title must never cost a connect
             return
         if not verdict:
-            return
+            # No title this time (or one with no opinion): the last verdict
+            # stands, and a mark that stands still gets its notification
+            # when the recording moves on to this link.
+            if not (recording and candidate.other_game):
+                return
+            shown = candidate.other_game
         before, candidate.other_game = candidate.other_game, shown
         game = " vs ".join(t for t in self.expected_teams if t)
         if shown:

@@ -163,6 +163,9 @@ Open, in order (each version still needs the sponsor's approval to ship):
       (in `test_host_memory_survives_a_restart_and_never_raises`).
     - A backup already marked by the 90 s check sent no notification when the
       recording moved to it. `test_a_backup_marked_by_the_check_notifies_when_the_recording_moves_to_it`.
+    - Found by the independent validator: a marked backup whose connect got
+      no title at all (the browser gave none in time) was recorded without the
+      notification. A standing mark now notifies (same test).
     - Notifications were sent on the recording thread, between probing a link
       and starting FFmpeg: now on their own thread.
     - The sidecar's refusal reason is cleaned of control and format characters
@@ -171,6 +174,10 @@ Open, in order (each version still needs the sponsor's approval to ship):
       `PVARR_MIN_FREE_GB` guard always has); the host memory is rewritten on
       every browser result (small file); the sidecar does not cancel a page
       PVArr has stopped waiting for (bounded by the trimmed page time).
+  - [PENDING] Brittle test found while checking each commit: `TestFreezeFailover.test_a_freeze_moves_straight_to_the_backup`
+    errors when run on its own (its fake FFmpeg launcher meets a command without `-i`), at v0.19.0 too, and
+    failed once in a full run on a host under heavy disk load. It passes in a normal full run. Make it stand
+    alone or drop it.
 - [PENDING] **v0.21: follow a team.**
   - A follow list; every 30 min the saved event-list pages are read (as the Events
     tab does) and a followed team's game gets a schedule, once, with 30 min kept

@@ -9445,6 +9445,19 @@ class TestTeamNameCheck(FailoverLoopTestCase):
         self.connect(rec, 1, "Oilers vs Ducks")                      # and again: nothing new
         self.assertEqual(len(alerts), 1)
         self.assertEqual(len([l for l in rec.log_history if "may be another game" in l]), 2)
+        # Found by the independent validator: the connect that lands on a
+        # marked backup may get no title at all (the browser gave none in
+        # time). The mark stands, so the notification must still go out.
+        alerts.clear()
+        rec = self.make(self.URLS, [], expected_teams=self.TEAMS,
+                        on_alert_callback=lambda *a: alerts.append(a))
+        with patch("app.recorder.probe_stream", return_value=self.answer("Oilers vs Ducks")):
+            rec.check_standby(1)
+        self.assertTrue(self.connect(rec, 1, ""))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(rec.candidates[1].other_game, "Oilers vs Ducks")
+        self.assertTrue(self.connect(rec, 0, ""))                    # an unmarked link: nothing
+        self.assertEqual(len(alerts), 1)
 
     def test_a_busy_sidecar_is_asked_once_more_at_connect(self):
         # Design review 2026-11-11: a page check that has just ended can still
