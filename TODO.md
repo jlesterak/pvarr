@@ -82,7 +82,7 @@ Done from the earlier roadmap:
 
 Open, in order (each version still needs the sponsor's approval to ship):
 
-- [IN PROGRESS] **v0.20: discovery that keeps up.**
+- [COMPLETED] **v0.20: discovery that keeps up.** Released in v0.20.0 (2026-11-12).
   - [COMPLETED 2026-11-09] Why a miss takes about 33 s, measured. It is the sidecar's
     own schedule (an 8 s first wait, then three nudge rounds of about 8 s), the same
     for every page. All 19 hits logged over three nights came within 13.4 s, after

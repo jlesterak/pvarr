@@ -4,6 +4,8 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-12
+
 ### Added
 - Browser sidecar, nothing recording: a scan looks at up to 12 unresolved links, two pages at a time, within 3 min (during a recording it stays at 4 links, one page, 45 s). A scheduled recording that already has a working link keeps the 45 s limit so its start is not held back; the look drops to one page once a recording starts; a link the sidecar was too busy for is asked again; a page gets no more time than the look has left.
 - Team-name check (warning only): at connect and on the backup check, a link's page title is compared with the teams the recording was named for. A title that names another game ("A vs B", or full team names from the bundled table) and neither of yours puts an amber **other game?** on that source (`other_game` on the candidate in the API), one line in the card log and, for the stream being recorded, one notification per recording. Nothing is skipped or stopped; **Wrong game** remains your call. Shown titles have their numerals removed (any script, superscripts, Roman-numeral and circled characters, date signs), and `POST /api/probe` does not return the title. A backup already marked by the 90-second check notifies when the recording moves on to it. Off when the teams are left at the form's defaults.
