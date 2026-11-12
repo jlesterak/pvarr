@@ -874,8 +874,12 @@ def _launch_session(record: Dict[str, Any], port: int) -> StreamFailoverRecorder
         freeze_timeout_sec=record.get("freeze_timeout_sec", 60),
         on_completion_callback=_on_complete,
         on_failover_callback=_on_failover,
-        on_alert_callback=lambda rec_id, title, body: notifier.send(
-            title, f"Session: {rec_id}\n{body}"),
+        # On its own thread: a recorder raises alerts from its recording and
+        # monitor threads (one of them between probing a link and starting
+        # FFmpeg), and delivery can take seconds per target on a slow line.
+        on_alert_callback=lambda rec_id, title, body: threading.Thread(
+            target=notifier.send, args=(title, f"Session: {rec_id}\n{body}"),
+            name="pvarr-alert", daemon=True).start(),
         header_overrides=record.get("header_overrides") or {},
         min_free_gb=record.get("min_free_gb", DEFAULT_MIN_FREE_GB),
         ring=ring,
