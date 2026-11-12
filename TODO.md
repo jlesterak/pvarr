@@ -111,7 +111,7 @@ Open, in order (each version still needs the sponsor's approval to ship):
     (count, last time) in a small file in the config folder and try those first.
     Learned from the operator's own results; nothing is shipped with PVArr.
     Proof: `test_the_browser_is_asked_about_the_likeliest_host_first`, `test_host_memory_survives_a_restart_and_never_raises` (hostile files ignored, validator found a deeply nested file escaped the loader; fixed).
-  - [COMPLETED 2026-11-10, awaiting design review and independent validation] Team-name
+  - [COMPLETED 2026-11-10, design review 2026-11-10 and 2026-11-11] Team-name
     check (warning only): the page title of a link (from the probe, or the browser
     sidecar when it resolved the link) is compared with the recording's two teams
     at connect and on the backup check. "ok" when it names either team (a word of
@@ -120,18 +120,57 @@ Open, in order (each version still needs the sponsor's approval to ship):
     otherwise no opinion. "other" marks the source (amber on the card), logs one
     line and, at connect, notifies once per recording. It changes nothing else.
     Known limits: a title sharing a city with a scheduled team passes; nicknames
-    joined by a dash alone give no opinion. Shown titles have digits removed.
-    Proof: `TestTeamNameCheck` (8 tests), `TestProbeReportsThePageTitle`. Not yet
-    seen on a live game.
+    joined by a dash alone give no opinion; a generic title with " @ " or " v "
+    can be flagged; a resume after a restart can notify once more; links resolved
+    by yt-dlp carry no title. Shown titles have every numeral removed.
+    Proof: `TestTeamNameCheck`, `TestProbeReportsThePageTitle`, and a dev-instance
+    run against a loopback stream with synthetic pages. Not yet seen on a live game.
   - [COMPLETED 2026-11-10] Disk warning before the game: a waiting job's length at an
     assumed 6 Mbit/s (no stream is known yet), plus the jobs that start before it
     and the time left on running recordings on the same volume, plus
     `PVARR_MIN_FREE_GB`, against free space. Read on every list refresh (amber
     line on the job, `disk_warning` in the API, so it shows at creation and clears
     when space is freed); one notification per job from 20 min before the start.
-    Deletes and refuses nothing. Proof: `TestScheduleDiskWarning` (6 tests: the sum,
+    Deletes and refuses nothing. Proof: `TestScheduleDiskWarning` (the sum,
     earlier jobs and a running recording counted, an unreadable volume, one
-    notification that survives a restart).
+    notification that survives a restart, a volume that does not answer).
+  - [COMPLETED 2026-11-11] Design review of the whole version (Architect, Security,
+    DevOps), two passes. What it changed, each with a test:
+    - A page title could still show a score through characters that only look
+      like numbers (superscripts, circled and Roman numerals, then date and unit
+      signs): the shown title now drops every character that is a numeral or
+      normalises to one. Checked against every Unicode code point.
+      `test_a_shown_title_carries_no_numeral_of_any_kind_and_no_format_characters`.
+      `POST /api/probe` no longer returns the title.
+    - The disk read ran on the request path: a network mount that had gone away
+      would have frozen the dashboard and the scheduler, and after a first fix
+      could still have held a container stop. It now runs on a daemon thread, one
+      at a time, 2 s at most for the caller that started it, none for the rest.
+      `test_a_volume_that_does_not_answer_costs_two_seconds_not_the_server`.
+    - The wide browser look could hold a scheduled start back by minutes when
+      working links were already in hand (all one feed): then it keeps the 45 s
+      limit. `test_a_waiting_start_with_a_working_link_gets_the_short_look`.
+    - The wide look used both sidecar pages even after a recording had started,
+      and a one-page sidecar answered "busy" to half its links, which were then
+      dropped: one page once something records, a busy link is asked again, a
+      page gets no more time than the look has left, and a connect asks a busy
+      sidecar once more. `test_the_wide_look_drops_to_one_page_once_a_recording_starts`,
+      `test_a_busy_sidecar_costs_no_link_its_look`,
+      `test_a_page_gets_no_more_time_than_the_look_has_left`,
+      `test_a_busy_sidecar_is_asked_once_more_at_connect`.
+    - A miss caused by a DNS blocklist counted against the link's host and kept
+      it at the back of the queue after the DNS was fixed: no longer counted
+      (in `test_host_memory_survives_a_restart_and_never_raises`).
+    - A backup already marked by the 90 s check sent no notification when the
+      recording moved to it. `test_a_backup_marked_by_the_check_notifies_when_the_recording_moves_to_it`.
+    - Notifications were sent on the recording thread, between probing a link
+      and starting FFmpeg: now on their own thread.
+    - The sidecar's refusal reason is cleaned of control and format characters
+      before it reaches the card. `test_a_refused_page_says_why`.
+    - Accepted, not changed: the low-disk text says GB for what is GiB (as the
+      `PVARR_MIN_FREE_GB` guard always has); the host memory is rewritten on
+      every browser result (small file); the sidecar does not cancel a page
+      PVArr has stopped waiting for (bounded by the trimmed page time).
 - [PENDING] **v0.21: follow a team.**
   - A follow list; every 30 min the saved event-list pages are read (as the Events
     tab does) and a followed team's game gets a schedule, once, with 30 min kept
