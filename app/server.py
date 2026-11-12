@@ -1398,10 +1398,14 @@ def _volume(directory: Path, seen: Dict[Path, Optional[Tuple[int, int, str]]]
     return seen[directory]
 
 
-def _schedule_disk_warnings(now: Optional[float] = None) -> Dict[str, str]:
+def _schedule_disk_warnings(now: Optional[float] = None,
+                            jobs: Optional[List[Dict[str, Any]]] = None,
+                            recorders: Optional[List[Any]] = None) -> Dict[str, str]:
     """job id -> schedules.disk_warning() for every live job the volume looks
     too small for. Read fresh on every call (a few statvfs), never stored, so
-    the badge goes away as soon as space is freed.
+    the badge goes away as soon as space is freed. Blocking: the server calls
+    it through _disk_warnings(), which passes `jobs` and `recorders` as they
+    were on the event loop. With no job to warn about the disk is not read.
 
     A job is costed with everything that writes to its volume before it: the
     recordings running now (time left x their measured rate) and the live
@@ -1409,17 +1413,24 @@ def _schedule_disk_warnings(now: Optional[float] = None) -> Dict[str, str]:
     must never break the schedule list, so anything unreadable is left out.
     """
     now = time.time() if now is None else now
+    jobs = [j for j in (schedule_store.all() if jobs is None else jobs)   # soonest first
+            if j.get("state") in (schedules.WAITING, schedules.SEARCHING)
+            and not j.get("rebroadcast")]
+    if not jobs:
+        return {}
     floor = int(_min_free_gb() * 1024 ** 3)
     seen: Dict[Path, Optional[Tuple[int, int, str]]] = {}
     need: Dict[int, int] = {}      # device -> bytes still to be written before/with this job
     writers: Dict[int, int] = {}   # device -> how many recordings that is
-    for recorder in list(active_recorders.values()):
+    for recorder in (list(active_recorders.values()) if recorders is None else recorders):
         try:
             if not recorder.is_running or recorder.is_rebroadcast:
                 continue
             left = recorder.seconds_remaining()
+            if not left or left <= 0:   # no end set, or past it: nothing to count
+                continue
             volume = _volume(Path(recorder.output_filepath).parent, seen)
-            if not left or volume is None:
+            if volume is None:
                 continue
             rate = recorder.rate_mbps() or schedules.ASSUMED_MBPS
             need[volume[0]] = need.get(volume[0], 0) + schedules.expected_bytes(left, rate)
@@ -1428,10 +1439,7 @@ def _schedule_disk_warnings(now: Optional[float] = None) -> Dict[str, str]:
             continue
     out: Dict[str, str] = {}
     dirs: Dict[str, Path] = {}
-    for job in schedule_store.all():   # soonest first
-        if job.get("state") not in (schedules.WAITING, schedules.SEARCHING) \
-                or job.get("rebroadcast"):
-            continue
+    for job in jobs:
         try:
             wanted = str(job.get("output_dir") or "")
             if wanted not in dirs:
@@ -1440,7 +1448,7 @@ def _schedule_disk_warnings(now: Optional[float] = None) -> Dict[str, str]:
             length = float(job["end_time"]) - max(float(job["start_at"]), now)
         except (HTTPException, KeyError, TypeError, ValueError):
             continue
-        if volume is None:
+        if volume is None or length <= 0:   # a window already closed writes nothing
             continue
         device, free, where = volume
         need[device] = need.get(device, 0) + schedules.expected_bytes(length)
@@ -1451,6 +1459,59 @@ def _schedule_disk_warnings(now: Optional[float] = None) -> Dict[str, str]:
     return out
 
 
+# How long a request waits for the disk before it answers without warnings.
+DISK_READ_TIMEOUT_SEC = 2.0
+_disk_read: Optional["asyncio.Future"] = None
+
+
+async def _disk_warnings(now: Optional[float] = None) -> Dict[str, str]:
+    """_schedule_disk_warnings() without the event loop waiting on the disk.
+
+    The dashboard asks every 3 s, and statvfs on a network mount that has gone
+    away can block for minutes: read inline it would freeze every request and
+    the scheduler with it. So the read runs on a thread, one at a time, and a
+    the caller that started it waits DISK_READ_TIMEOUT_SEC at most. While a
+    read is stuck every other caller gets no warnings at once (never a second
+    stuck thread, and the scheduler is not held up before a start); the list
+    itself always answers. A daemon thread, not asyncio.to_thread: the default
+    executor's threads are joined when the interpreter exits, so a read stuck
+    on a dead mount would hold a container stop until Docker killed it.
+    """
+    global _disk_read
+    loop = asyncio.get_running_loop()
+    if _disk_read is not None and not _disk_read.done() and _disk_read.get_loop() is loop:
+        return {}   # a read is already stuck: its first caller did the waiting
+    task = _disk_read = loop.create_future()
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())   # never "never retrieved"
+    jobs, recorders = schedule_store.all(), list(active_recorders.values())
+
+    def _deliver(setter, value):
+        if not task.done():
+            setter(value)
+
+    def _read():
+        try:
+            outcome, setter = _schedule_disk_warnings(now, jobs, recorders), task.set_result
+        except BaseException as exc:
+            outcome, setter = exc, task.set_exception
+        try:
+            loop.call_soon_threadsafe(_deliver, setter, outcome)
+        except RuntimeError:
+            pass  # loop already closed: shutting down, nobody is waiting
+
+    threading.Thread(target=_read, name="pvarr-disk-read", daemon=True).start()
+    await asyncio.wait({task}, timeout=DISK_READ_TIMEOUT_SEC)
+    if not task.done():
+        logger.warning("Low-disk check: the recording volume did not answer in %g s; "
+                       "no disk warnings until it does.", DISK_READ_TIMEOUT_SEC)
+        return {}
+    try:
+        return task.result()
+    except Exception as exc:   # an estimate must never break the schedule list
+        logger.debug("Low-disk check failed: %s", exc)
+        return {}
+
+
 def _schedule_view(job: Dict[str, Any], warnings: Dict[str, str]) -> Dict[str, Any]:
     return dict(schedules.public_view(job), disk_warning=warnings.get(str(job["id"])))
 
@@ -1458,7 +1519,7 @@ def _schedule_view(job: Dict[str, Any], warnings: Dict[str, str]) -> Dict[str, A
 @app.get("/api/schedules")
 async def list_schedules():
     """Every scheduled job, soonest first. Cookies are withheld, as everywhere."""
-    warnings = _schedule_disk_warnings()
+    warnings = await _disk_warnings()
     return {"schedules": [_schedule_view(j, warnings) for j in schedule_store.all()]}
 
 
@@ -1546,7 +1607,7 @@ async def create_schedule(
     # False when /config is not writable: the job runs, but a restart loses it.
     # `disk_warning` is set when the volume looks too small for it; the job is
     # kept all the same (the operator has until the start to make room).
-    return {"status": "success", "schedule": _schedule_view(job, _schedule_disk_warnings()),
+    return {"status": "success", "schedule": _schedule_view(job, await _disk_warnings()),
             "persistent": schedule_store.enabled}
 
 
@@ -1610,7 +1671,7 @@ async def _run_due_schedules() -> List["asyncio.Task"]:
     if schedules.prune(schedule_store.jobs, time.time()):
         schedule_store.save()
     started: List[asyncio.Task] = []
-    started.extend(_notify_low_disk(time.time()))
+    started.extend(await _notify_low_disk(time.time()))
     for job in schedule_store.all():
         job_id = job["id"]
         if job_id in _schedule_tasks:
@@ -1634,14 +1695,14 @@ async def _run_due_schedules() -> List["asyncio.Task"]:
     return started
 
 
-def _notify_low_disk(now: float) -> List["asyncio.Task"]:
+async def _notify_low_disk(now: float) -> List["asyncio.Task"]:
     """Tell the operator, once per job, that the volume looks too small for a
     recording about to start (schedules.disk_notify_due). The disk is only
     read when some job is inside that window and has not been announced."""
     due = [j for j in schedule_store.all() if schedules.disk_notify_due(j, now)]
     if not due:
         return []
-    warnings = _schedule_disk_warnings(now)
+    warnings = await _disk_warnings(now)
     tasks: List[asyncio.Task] = []
     for job in due:
         text = warnings.get(str(job["id"]))

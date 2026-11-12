@@ -9512,11 +9512,71 @@ class TestScheduleDiskWarning(ScheduleServerTestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIsNone(r.json()["schedules"][0]["disk_warning"])
 
+    def test_no_waiting_job_means_the_disk_is_not_read(self):
+        # Design review 2026-11-10: the dashboard asks every 3 s.
+        from unittest.mock import patch
+        self.job(1800, 3, rebroadcast=True)
+        running = MagicMock(is_running=True, is_rebroadcast=False,
+                            output_filepath=Path(self.tmp) / "now.ts")
+        running.seconds_remaining.return_value = 3600.0
+        self.server.active_recorders["r1"] = running
+        with patch.object(self.server.shutil, "disk_usage") as usage, \
+                patch.object(self.server.os, "stat") as stat:
+            self.assertEqual(self.client.get("/api/schedules").status_code, 200)
+            usage.assert_not_called()
+            stat.assert_not_called()
+
+    def test_a_recording_with_no_time_left_and_a_closed_window_are_not_counted(self):
+        from unittest.mock import patch
+        over = MagicMock(is_running=True, is_rebroadcast=False,
+                         output_filepath=Path(self.tmp) / "over.ts")
+        over.seconds_remaining.return_value = -30.0     # past its end, finishing up
+        self.server.active_recorders["r1"] = over
+        job = self.job(3600, 3)
+        with patch.dict(os.environ, {"PVARR_MIN_FREE_GB": "0"}), self.free(5):
+            text = self.server._schedule_disk_warnings()[job["id"]]
+        self.assertIn("this recording will need", text)   # not "and the one before it"
+
+    def test_a_volume_that_does_not_answer_costs_two_seconds_not_the_server(self):
+        # Design review 2026-11-10: statvfs on a network mount that has gone
+        # away blocks for minutes; read inline it froze every request and the
+        # scheduler. Now one read waits on a thread and callers go without.
+        import asyncio
+        import threading
+        from unittest.mock import patch
+        self.job(3600, 3)
+        release, calls = threading.Event(), []
+
+        def stuck(path):
+            calls.append(path)
+            release.wait(10)
+            raise OSError("stale file handle")
+
+        async def ask():
+            try:
+                began = time.monotonic()
+                first = await self.server._disk_warnings()
+                second = await self.server._disk_warnings()   # while the first read is stuck
+                return first, second, time.monotonic() - began
+            finally:
+                release.set()
+
+        with patch.object(self.server.shutil, "disk_usage", side_effect=stuck), \
+                patch.object(self.server, "DISK_READ_TIMEOUT_SEC", 0.2):
+            first, second, took = asyncio.run(ask())
+        self.assertEqual((first, second), ({}, {}))
+        self.assertEqual(len(calls), 1)     # never a second stuck thread
+        self.assertLess(took, 2.0)
+        # A daemon thread: the default executor's threads are joined at
+        # exit, so a stuck read there would hold a container stop.
+        stuck_threads = [t for t in threading.enumerate() if t.name == "pvarr-disk-read"]
+        self.assertTrue(all(t.daemon for t in stuck_threads))
+
     def run_tick(self):
         import asyncio
 
         async def tick():
-            await asyncio.gather(*self.server._notify_low_disk(time.time()))
+            await asyncio.gather(*(await self.server._notify_low_disk(time.time())))
         asyncio.run(tick())
 
     def test_one_notification_twenty_minutes_before_and_never_again(self):

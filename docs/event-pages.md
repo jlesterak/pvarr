@@ -262,6 +262,14 @@ a warning only: nothing is deleted, and the job starts as scheduled (and
 stops at the floor if the space does run out). Rebroadcast-only jobs write no
 recording and never warn.
 
+The estimate has limits. It assumes earlier recordings are still on the
+volume when this one runs (moving them off in between makes it pessimistic).
+Folders count as one volume when the system reports one device for them, so
+btrfs subvolumes or a pooled mount (mergerfs) that share space are costed
+apart and can under-warn. A volume that does not answer within 2 seconds (a
+network mount that has gone away) shows no warning at all rather than
+holding up the list; the container log says so once.
+
 Why the page is checked at the start time and not when you schedule: stream
 links carry tokens that expire within hours, and most links on an event page
 only appear shortly before kick-off. The page address is the stable part.
