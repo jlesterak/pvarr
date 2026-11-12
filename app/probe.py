@@ -112,7 +112,10 @@ class ProbeError(ValueError):
     """The input could not be used as a stream URL at all."""
 
 
-_TITLE_RE = re.compile(rb"<title[^>]*>(.{0,2000}?)</title>", re.I | re.S)
+# Bounded on purpose: with an open-ended pattern a page of repeated "<title"
+# cost a second of regex time per probe, and the regex engine holds the
+# interpreter lock while it runs.
+_TITLE_RE = re.compile(rb"<title(?:\s[^>]{0,200})?>([^<]{0,2000})</title>", re.I)
 _OG_TITLE_RE = re.compile(
     rb"""<meta[^>]{0,200}?property=["']og:title["'][^>]{0,200}?content=["']([^"'<>]{0,500})["']""",
     re.I)

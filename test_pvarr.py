@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -5265,6 +5266,16 @@ class TestProbeRoute(ServerTestCase):
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()["ok"])
 
+    def test_probe_endpoint_keeps_the_page_title_to_itself(self):
+        # The title is for the recorder's team-name check; a page's title can
+        # carry a score and the form has no use for it.
+        from unittest.mock import patch
+        fake = {"ok": True, "m3u8_url": "https://cdn.example/x.m3u8", "page_title": "A 3 - 1 B"}
+        with patch("app.server.probe_stream", return_value=fake):
+            r = self.client.post("/api/probe", data={"url": "https://front.example/watch/1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("page_title", r.json())
+
     def test_probe_passes_referer_hint(self):
         from unittest.mock import patch
         with patch("app.server.probe_stream", return_value={"ok": False}) as probe:
@@ -9294,6 +9305,40 @@ class TestTeamNameCheck(FailoverLoopTestCase):
         self.assertNotRegex(shown, r"[\d\x00-\x1f]")
         self.assertTrue(shown.startswith("Oilers - Ducks (OT : )"))
         self.assertLessEqual(len(shown), eventinfo.MAX_TITLE_SHOWN)
+
+    def test_a_shown_title_carries_no_numeral_of_any_kind_and_no_format_characters(self):
+        # Design review 2026-11-10: "\d" let superscript, circled and Roman
+        # numeral characters through, so a score could still reach the card.
+        from app import eventinfo
+        for score in ("\u00b3-\u00b9", "\u2462-\u2460", "\u2162-\u2160", "\uff13-\uff11",
+                      "\u0663-\u0661", "\u00bd", "\u2078\u2083", "3\ufe0f\u20e3", "\U0001f51f",
+                      "\u4e09-\u4e00"):
+            with self.subTest(score):
+                self.assertEqual(eventinfo.title_for_display(f"Oilers {score} Ducks"),
+                                 "Oilers - Ducks" if "-" in score else "Oilers Ducks")
+        # Design review 2026-11-11: compatibility characters that only look
+        # like numbers (day, month and hour signs, squared units) have no
+        # numeric value and passed; they are normalised to digits first.
+        for score in ("\u33e2 - \u33e0", "\u32c2-\u32c0", "\u335b - \u3359", "\u33a1"):
+            with self.subTest(score):
+                shown = eventinfo.title_for_display(f"Oilers {score} Ducks")
+                self.assertNotRegex(unicodedata.normalize("NFKC", shown), r"\d")
+                self.assertTrue(shown.startswith("Oilers") and shown.endswith("Ducks"))
+        # Right-to-left overrides, line separators and escapes cannot reorder
+        # or split the log line; accented names are untouched.
+        self.assertEqual(eventinfo.title_for_display("\u202eOilers\u2028vs\x1b[31m\u200fDucks\u202c"),
+                         "Oilers vs [ m Ducks")
+        self.assertEqual(eventinfo.title_for_display("Montr\u00e9al vs Z\u00fcrich"), "Montr\u00e9al vs Z\u00fcrich")
+
+    def test_a_page_of_repeated_title_tags_costs_no_regex_time(self):
+        # Design review 2026-11-10: the open-ended pattern took about a second
+        # on this body, with the interpreter lock held, on every probe.
+        from app import probe
+        for body in (b"<title" * 11000, b"<title>" * 9400, b"<title " + b"a" * 65000):
+            began = time.monotonic()
+            self.assertEqual(probe.page_title(body), "")
+            self.assertLess(time.monotonic() - began, 0.4)
+        self.assertEqual(probe.page_title(b'<title data-x="1">A vs B</title>'), "A vs B")
 
     def test_the_probe_reports_the_page_title_bounded_and_on_one_line(self):
         from app import probe

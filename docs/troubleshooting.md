@@ -31,6 +31,8 @@ run as root. The entrypoint fixes this automatically on startup — you will see
 in your compose file, the entrypoint cannot fix anything and will instead exit
 with the exact `chown` command to run. Set `PUID`/`PGID` rather than `user:`.
 
+**A source shows an amber "other game?".** The title of that link's page names a game (an "A vs B", or two team names PVArr knows) and neither of the teams you entered. PVArr keeps recording and changes nothing: watch a minute of the recording and press **Wrong game** if it is another game, or ignore it if the page simply has a generic or stale title. Hover the marker for the title (numerals removed, so no score shows). Details: [A source whose page names another game](event-pages.md#a-source-whose-page-names-another-game).
+
 **`403` from the upstream.** A required header is missing. Re-run the URL through `POST /api/probe` (or just re-paste it into Add Recording) — the message names the status the origin returned. If the probe reports *segments rejected*, the stream is session gated: copy the `Cookie` request header from DevTools into the manual header fields.
 
 **Tuner doesn't appear in Plex/Emby.** Confirm the media server can reach PVArr (`curl http://<pvarr-host>:8999/live/playlist.m3u`). The playlist is empty when nothing is recording — start a recording first.

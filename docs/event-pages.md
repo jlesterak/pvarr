@@ -118,6 +118,35 @@ A recording started with something in the **Event page** box (whether or not you
 
 A cookie that has expired since you pasted it (Cloudflare's last hours, not days) means the re-check falls back to FlareSolverr if you run it, or finds nothing; the card log says so. The cookie is kept in the session file under `/config` (readable only by PVArr's user) so a restart can carry on; it is never returned by the API. A re-checked link can occasionally be the wrong channel, as with **Find**: it is only used once the current source dies, and the card says when a slot was swapped.
 
+### A source whose page names another game
+
+An event page can list a link that plays, but plays a different game. Each
+time PVArr connects to a source, and on the 90-second check of the backups, it
+compares the title of the link's page with **Team A** and **Team B**:
+
+- The title names either team (a word of its name, city or nickname, or its
+  abbreviation in capitals): fine, nothing is shown.
+- The title names a game ("A vs B", "A @ B", or a full team name from the
+  offline team list) and neither of your teams: the source gets an amber
+  **other game?** on the card (hover for the title), one line in the card log
+  and, when it is the stream being recorded, one notification per recording.
+- Anything else ("Player", a site name, no title): no opinion, nothing changes.
+
+It is a warning only. PVArr keeps recording and keeps the failover order,
+because a page title is the page's own claim and can be generic or out of
+date; **Wrong game** on the card is still how you tell it to leave a feed for
+good. The check is lenient: a title that shares a city with one of your teams
+passes, and sports the team list does not cover are judged on "vs" alone.
+Titles are shown with their numerals removed (digits of any script,
+superscripts, Roman-numeral and circled characters, date signs) and the
+notification carries no page text, so a score in a title cannot reach you.
+The check is off when the teams are left at the form's defaults, and it has
+nothing to compare for a link that is a bare playlist URL or one resolved by
+yt-dlp (no page title). A title that only reads like a game ("Live: City @
+home") can be flagged too; that is the price of a check that needs no site
+list. After a restart resumes the recording the notification can come once
+more.
+
 ### Reading the game from the page
 
 **Read game** (next to Find) fetches the page once, checks no links, and

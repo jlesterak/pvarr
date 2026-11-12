@@ -626,7 +626,7 @@ class CandidateStream:
         # Declared bitrate of this feed's best level, from its last probe or
         # standby check; None when the playlist does not say.
         self.declared_kbps: Optional[int] = None
-        # Team-name check: this link's page title (digits removed) when it
+        # Team-name check: this link's page title (numerals removed) when it
         # names a game other than the scheduled one; "" otherwise. A warning
         # only. See StreamFailoverRecorder._note_title.
         self.other_game: str = ""
@@ -1905,8 +1905,9 @@ class StreamFailoverRecorder:
         what is recorded or the failover order: a title is the page's own
         claim, and it can be stale or generic. One card-log line per change
         and, when it is the stream about to be recorded (`recording`), one
-        notification per recording. A title with no opinion leaves the last
-        verdict standing. The title is shown with its digits removed and is
+        notification per recording (per run: a resume after a restart may send
+        it once more). A title with no opinion leaves the last
+        verdict standing. The title is shown with its numerals removed and is
         never put in the notification.
         """
         if not self.expected_teams or not title:
@@ -1920,15 +1921,20 @@ class StreamFailoverRecorder:
             return
         before, candidate.other_game = candidate.other_game, shown
         game = " vs ".join(t for t in self.expected_teams if t)
-        if shown and shown != before:
-            self._log(f'{candidate.name}: its page is titled "{shown}", which does not name '
-                      f"{game}. It may be another game; press Wrong game if it is.", "WARN")
-            if recording and not self._title_alerted:
+        if shown:
+            # The notification is for the stream being recorded: a backup
+            # marked by the 90 s check sends it when the recording moves on to
+            # it, although its title is no longer news by then.
+            alert = recording and not self._title_alerted
+            if shown != before or alert:
+                self._log(f'{candidate.name}: its page is titled "{shown}", which does not name '
+                          f"{game}. It may be another game; press Wrong game if it is.", "WARN")
+            if alert:
                 self._title_alerted = True
                 self._alert("PVArr — This may be the wrong game",
                             f"{candidate.name}'s page does not name {game}. Check the "
                             "recording and mark it Wrong game if it is another game.")
-        elif before and not shown:
+        elif before:
             self._log(f"{candidate.name}: its page names {game} again.")
 
     def _other_event(self, m3u8_url: str) -> Optional[Tuple[str, str]]:

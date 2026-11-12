@@ -22,6 +22,7 @@ as before.
 import json
 import re
 import time
+import unicodedata
 from collections import deque
 from datetime import datetime
 from html.parser import HTMLParser
@@ -193,6 +194,9 @@ _COMMON_WORDS = {"the", "and", "city", "united", "state", "new", "los", "las", "
 _NAMES_A_GAME = re.compile(r"\s(?:vs\.?|v\.?|@)\s", re.I)
 MAX_TITLE = 200
 MAX_TITLE_SHOWN = 80
+# Keycap numbers, which Unicode does not file under numbers: the "ten"
+# keycap, and the box and emoji selector a digit keycap is built from.
+_KEYCAPS = "\U0001F51F\u20E3\uFE0F\uFE0E"
 
 
 def _team_marks(team: str) -> Tuple[set, set]:
@@ -238,8 +242,25 @@ def title_verdict(title: str, team_a: str, team_b: str) -> str:
 
 def title_for_display(title: str) -> str:
     """A page title fit for the card log: one line, bounded, and with every
-    digit removed, so a title that carries a score cannot show it."""
-    return " ".join(re.sub(r"[\d\x00-\x1f\x7f]+", " ", (title or "")[:MAX_TITLE]).split())[:MAX_TITLE_SHOWN]
+    numeral removed, so a title that carries a score cannot show it.
+
+    "Numeral" is anything Unicode gives a numeric value or a number category:
+    digits of every script, superscripts, circled and Roman-numeral characters,
+    fractions. Control and format characters go too (line separators, ANSI
+    escapes, right-to-left overrides), so a title cannot reorder or break the
+    log line it is quoted in.
+    """
+    def keep(char: str) -> bool:
+        category = unicodedata.category(char)
+        return not (category[0] in "NC" or category in ("Zl", "Zp")
+                    or unicodedata.numeric(char, None) is not None or char in _KEYCAPS)
+    def shows_no_number(char: str) -> bool:
+        # Compatibility characters that only look like numbers (the CJK day,
+        # month and hour signs, squared unit signs) carry no numeric value of
+        # their own; their NFKC form spells out the digits they show.
+        return keep(char) and all(keep(c) for c in unicodedata.normalize("NFKC", char))
+    kept = "".join(c if shows_no_number(c) else " " for c in (title or "")[:MAX_TITLE])
+    return " ".join(kept.split())[:MAX_TITLE_SHOWN]
 
 
 def _trim_to_team(name: str) -> Tuple[str, str]:

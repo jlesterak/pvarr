@@ -540,6 +540,9 @@ async def probe_url(url: str = Form(...), referer: Optional[str] = Form(None)):
     if len(url) > 4096:
         raise HTTPException(status_code=400, detail="URL is too long")
     result = await asyncio.to_thread(probe_stream, url.strip(), referer=(referer or None))
+    # The page's own title is for the recorder's team-name check only. It can
+    # carry a score, and nothing here shows it.
+    result.pop("page_title", None)
     return JSONResponse(content=result)
 
 
