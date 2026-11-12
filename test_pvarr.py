@@ -9068,7 +9068,8 @@ class TestScheduleLoop(ScheduleServerTestCase):
         find, start = self.run_pass(find=find)
         from unittest.mock import ANY
         find.assert_called_once_with("https://agg.example/e", cookie="cf_clearance=c",
-                                     user_agent="UA", abort=ANY, idle=True)
+                                     user_agent="UA", abort=ANY, idle=True,
+                                     still_idle=ANY, start_waiting=True)
         kwargs = start.call_args.kwargs
         self.assertEqual(kwargs["candidates"], ["https://p/1", "https://p/2", "https://m/1.m3u8"])
         self.assertEqual(kwargs["end_time"], job["end_time"])
@@ -9148,7 +9149,16 @@ class TestScheduleLoop(ScheduleServerTestCase):
             with patch.dict(self.server.active_recorders, {"r": running}, clear=True):
                 asyncio.run(go())
             asyncio.run(go(scan=find))
-        self.assertEqual(seen, [{"idle": True}, {}, {}])
+        # Idle: wide, and asked again before each page (a recording may start).
+        self.assertEqual([sorted(e) for e in seen], [["idle", "still_idle"], [], []])
+        self.assertTrue(seen[0]["still_idle"]())
+        with patch.dict(self.server.active_recorders, {"r": running}, clear=True):
+            self.assertFalse(seen[0]["still_idle"]())
+        # A scheduled job's scan says a start is waiting on it.
+        seen.clear()
+        with patch.object(self.server.aggregator, "find_streams", find):
+            asyncio.run(go(start_waiting=True))
+        self.assertTrue(seen[0].get("start_waiting"))
 
     def test_window_already_closed_is_missed_without_checking(self):
         job = self.due(start_at=time.time() - 7200, end_time=time.time() - 60)
@@ -9160,7 +9170,7 @@ class TestScheduleLoop(ScheduleServerTestCase):
     def test_cancelled_during_the_check_never_starts(self):
         job = self.due(url_primary="https://m/1.m3u8")
 
-        def find(url, cookie=None, user_agent=None, abort=None, idle=False):
+        def find(url, cookie=None, user_agent=None, abort=None, **extra):
             self.store.remove(job["id"])
             return {"ok": True, "picked": [{"url": "https://p/1"}]}
 
@@ -9197,7 +9207,7 @@ class TestScheduleLoop(ScheduleServerTestCase):
         quick = self.due(team_a="Quick", agg_url="", url_primary="https://m/q.m3u8")
         release = th.Event()
 
-        def find(url, cookie=None, user_agent=None, abort=None, idle=False):
+        def find(url, cookie=None, user_agent=None, abort=None, **extra):
             release.wait(5)
             return {"ok": True, "picked": [{"url": "https://p/1"}]}
 
@@ -9231,7 +9241,7 @@ class TestScheduleLoop(ScheduleServerTestCase):
         job = self.due()
         release = th.Event()
 
-        def find(url, cookie=None, user_agent=None, abort=None, idle=False):
+        def find(url, cookie=None, user_agent=None, abort=None, **extra):
             release.wait(5)
             return {"ok": True, "picked": [{"url": "https://p/1"}]}
 
@@ -9417,6 +9427,40 @@ class TestTeamNameCheck(FailoverLoopTestCase):
         self.assertEqual(backup.other_game, "")
         self.assertTrue(any("names Nashville Predators vs Colorado Avalanche again" in l
                             for l in rec.log_history))
+
+    def test_a_backup_marked_by_the_check_notifies_when_the_recording_moves_to_it(self):
+        # Design review 2026-11-10: the notification hung on the title being
+        # new, so a backup already marked by the 90 s check was recorded
+        # without one.
+        from unittest.mock import patch
+        alerts = []
+        rec = self.make(self.URLS, [], expected_teams=self.TEAMS,
+                        on_alert_callback=lambda *a: alerts.append(a))
+        with patch("app.recorder.probe_stream", return_value=self.answer("Oilers vs Ducks")):
+            rec.check_standby(1)
+        self.assertEqual(alerts, [])
+        self.assertTrue(self.connect(rec, 1, "Oilers vs Ducks"))     # the failover lands on it
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(len([l for l in rec.log_history if "may be another game" in l]), 2)
+        self.connect(rec, 1, "Oilers vs Ducks")                      # and again: nothing new
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(len([l for l in rec.log_history if "may be another game" in l]), 2)
+
+    def test_a_busy_sidecar_is_asked_once_more_at_connect(self):
+        # Design review 2026-11-11: a page check that has just ended can still
+        # hold every sidecar page for some seconds; "busy" at connect went
+        # straight on to a failed connect and a failover at the start.
+        from unittest.mock import patch
+        rec = self.make(self.URLS, [], expected_teams=self.TEAMS)
+        rec.BROWSER_BUSY_WAIT_SEC = 0.01
+        js_page = {"ok": False, "m3u8_url": "", "fixable": "devtools_m3u8", "message": "no playlist"}
+        busy = {"ok": False, "m3u8_url": "", "message": "Browser (0 s): the browser sidecar is busy."}
+        with patch("app.recorder.probe_stream", return_value=js_page), \
+                patch("app.recorder.browser.worth_trying", return_value=True), \
+                patch("app.recorder.browser.resolve",
+                      side_effect=[busy, dict(self.answer("Player"), via="browser")]) as asked:
+            self.assertTrue(rec._probe_candidate(rec.candidates[0]))
+        self.assertEqual(asked.call_count, 2)
 
     def test_off_without_real_team_names_and_a_bad_title_never_costs_a_connect(self):
         from unittest.mock import patch
@@ -11875,6 +11919,11 @@ class TestBrowserSidecar(unittest.TestCase):
         self.assertIn("refused the page (blocked by DNS: the sidecar's DNS server answers 0.0.0.0", out["message"])
         self.assertNotRegex(out["message"], r"[\r\n]")
         probed.assert_not_called()
+        # Escapes, line separators and right-to-left overrides from a sidecar
+        # that has been taken over cannot break or reorder the card line.
+        self.browser._reset_for_tests()
+        self._sidecar(status=400, answer={"detail": "a\x9b31m\u2028b\u202ec\u200f"})
+        self.assertIn("refused the page (a 31m b c)", self.browser.resolve(self.PAGE)["message"])
         self.browser._reset_for_tests()
         self._sidecar(status=400, answer={"detail": ["not", "a", "string"]})
         self.assertIn("refused the page (no reason given)", self.browser.resolve(self.PAGE)["message"])
@@ -12020,6 +12069,88 @@ class TestBrowserSidecar(unittest.TestCase):
                                       workers=3, second_fn=second, idle=True, abort=stop)
         self.assertEqual(asked, [])
 
+    def test_a_waiting_start_with_a_working_link_gets_the_short_look(self):
+        # Design review 2026-11-11: a scheduled scan runs at the start time. With
+        # working links in hand (all one feed) the wide look held the start
+        # back for minutes; it now keeps the short budget. With nothing
+        # working yet the wide look stays, since there is nothing to start.
+        links = [f"https://l{i}.example/p" for i in range(15)]
+        asked, budgets = [], []
+
+        def second(url, deadline):
+            asked.append(url)
+            budgets.append(deadline - time.monotonic())
+            return {"ok": False, "m3u8_url": "", "message": "Browser: no playlist found."}
+
+        def probe(url):     # link 0 plays, the rest are JavaScript players
+            return dict(self.GOOD) if url == links[0] else dict(self.JS_PAGE)
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        aggregator.pick_first_working(links, probe_fn=probe, workers=3, second_fn=second,
+                                      idle=True, start_waiting=True)
+        self.assertEqual(len(asked), aggregator.BROWSER_LINKS)
+        self.assertLessEqual(max(budgets), aggregator.BROWSER_STAGE_SEC)
+        asked.clear()
+        aggregator.pick_first_working(links, probe_fn=lambda u: dict(self.JS_PAGE), workers=3,
+                                      second_fn=second, idle=True, start_waiting=True)
+        self.assertEqual(len(asked), aggregator.BROWSER_LINKS_IDLE)
+        asked.clear()       # a manual Find has no start waiting: wide either way
+        aggregator.pick_first_working(links, probe_fn=probe, workers=3, second_fn=second, idle=True)
+        self.assertEqual(len(asked), aggregator.BROWSER_LINKS_IDLE)
+
+    def test_the_wide_look_drops_to_one_page_once_a_recording_starts(self):
+        # Design review 2026-11-11: two pages are all the sidecar has, so a
+        # recording that started during the look found none free.
+        links = [f"https://l{i}.example/p" for i in range(8)]
+        live, peaks, lock, idle = [0], [], threading.Lock(), [True]
+
+        def second(url, deadline):
+            with lock:
+                live[0] += 1
+                peaks.append(live[0])
+            time.sleep(0.05)
+            if len(peaks) >= 2:
+                idle[0] = False         # a recording starts after the first pair
+            with lock:
+                live[0] -= 1
+            return {"ok": False, "m3u8_url": "", "message": "Browser: no playlist found."}
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        aggregator.pick_first_working(links, probe_fn=lambda u: dict(self.JS_PAGE), workers=3,
+                                      second_fn=second, idle=True, still_idle=lambda: idle[0])
+        self.assertEqual(len(peaks), 8)
+        self.assertEqual(max(peaks[:2]), 2)
+        self.assertEqual(max(peaks[3:]), 1)
+
+    def test_a_page_gets_no_more_time_than_the_look_has_left(self):
+        # Design review 2026-11-11: a page started late in the look kept its
+        # sidecar page open up to 20 s past the end, into the recording's start.
+        now = time.monotonic()
+        self.assertEqual(aggregator._page_timeout(now + 100), aggregator.BROWSER_PAGE_SEC)
+        self.assertIn(aggregator._page_timeout(now + 9.5), (8, 9))
+        self.assertEqual(aggregator._page_timeout(now - 3), 5)
+
+    def test_a_busy_sidecar_costs_no_link_its_look(self):
+        # Design review 2026-11-11: a sidecar set to one page answered "busy"
+        # to every second request of the two-at-a-time look, and those links
+        # were dropped unseen (about half the page).
+        links = [f"https://l{i}.example/p" for i in range(6)]
+        looked, live, lock = [], [0], threading.Lock()
+
+        def second(url, deadline):
+            with lock:
+                if live[0] >= 1:        # a one-page sidecar
+                    return {"ok": False, "m3u8_url": "",
+                            "message": "Browser (0 s): the browser sidecar is busy."}
+                live[0] += 1
+            time.sleep(0.05)
+            with lock:
+                live[0] -= 1
+                looked.append(url)
+            return {"ok": False, "m3u8_url": "", "message": "Browser: no playlist found."}
+        os.environ["PVARR_BROWSER_URL"] = "http://sidecar.example:8998"
+        aggregator.pick_first_working(links, probe_fn=lambda u: dict(self.JS_PAGE), workers=3,
+                                      second_fn=second, idle=True)
+        self.assertEqual(sorted(looked), sorted(links))
+
     def test_the_browser_is_asked_about_the_likeliest_host_first(self):
         links = [f"https://l{i}.example/p" for i in range(8)]
         memo = self.browser.host_memo()
@@ -12047,6 +12178,15 @@ class TestBrowserSidecar(unittest.TestCase):
         # Only a page the browser really looked at counts: a refusal does not.
         self._sidecar(status=400, answer={"detail": "private address"})
         self.browser.resolve("https://refused.example/p")
+        self.assertFalse(path.exists())
+        self.browser._reset_for_tests()
+        # Nor does a miss on a page whose requests a DNS blocklist stopped:
+        # the playlist may be on one of those hosts (found on a live night:
+        # four of seven misses were the DNS server, not the page).
+        self._sidecar(answer={"ok": False, "note": "no playlist request seen (18 request(s) to 2 "
+                              "host(s) blocked by DNS: the sidecar's DNS server answers 0.0.0.0 "
+                              "for them, give it another one)"})
+        self.assertIn("blocked by DNS", self.browser.resolve("https://filtered.example/p")["message"])
         self.assertFalse(path.exists())
         self.browser._reset_for_tests()
         self._sidecar()                         # "no playlist request seen"

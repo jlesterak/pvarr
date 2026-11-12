@@ -56,10 +56,11 @@ which runs the same check first when no stream link has been entered. PVArr:
    not video, failed (a playlist was found but its segments were refused),
    unresolved (no playlist found, usually a player built in JavaScript) and
    not checked. With the [browser sidecar](browser-sidecar.md) set up and
-   fewer than three working links (or all from one source), up to 4
-   unresolved links get a second look in a real browser: during a recording
+   fewer than three working links (or all from one source), unresolved
+   links get a second look in a real browser: during a recording
    up to 4, one at a time, 45 s at most in all; with nothing recording up to
-   12, two at a time, 3 min at most; one it resolves is marked `found by the browser sidecar`
+   12, two at a time, 3 min at most (a scheduled recording that already has
+   a working link keeps to 4 links and 45 s, so its start is not held back); one it resolves is marked `found by the browser sidecar`
    in the log and treated like any other link. Each link in the list carries its source letter, and the
    list marks each `same source as pick N`. A link whose sampled segments
    are all something other than video (an image, an HTML page) is never

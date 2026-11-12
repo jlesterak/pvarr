@@ -1014,6 +1014,11 @@ class StreamFailoverRecorder:
             self._log(f"Probe found no playlist on {candidate.name}'s page; "
                       "asking the browser sidecar...")
             found = browser.resolve(candidate.url, abort=self._stop_event)
+            if browser.was_busy(found) and not self._stop_event.wait(self.BROWSER_BUSY_WAIT_SEC):
+                # Every sidecar page was taken (a page check just ended, or
+                # is still running). A page frees within seconds, and going
+                # on without the playlist costs a failed connect.
+                found = browser.resolve(candidate.url, abort=self._stop_event)
             if found.get("ok"):
                 result, source = found, "browser"
                 title = found.get("page_title") or title
@@ -1690,6 +1695,8 @@ class StreamFailoverRecorder:
     # spell. A step-up that loses again soon stays down for good.
 
     STEP_DOWN_EVENTS = 4
+    # One wait before asking a busy browser sidecar a second time at connect.
+    BROWSER_BUSY_WAIT_SEC = 6.0
     STEP_WINDOW_SEC = 300.0
     STEP_UP_QUIET_SEC = 1200.0
     RELAPSE_SEC = 600.0

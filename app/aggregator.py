@@ -460,13 +460,20 @@ def pick_first_working(
     gather_max: int = GATHER_MAX,
     second_fn: Optional[Callable[[str, float], Dict[str, Any]]] = None,
     idle: bool = False,
+    start_waiting: bool = False,
+    still_idle: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Probe links concurrently; keep the first `pick` that work, in link order.
 
     `second_fn(url, deadline)` (the browser sidecar, when configured) gets a
     second look at links the probe found no playlist on, only if the probe
     phase came up short; see _second_stage. `idle` (nothing is recording)
-    widens that look.
+    widens that look, with two exceptions. `start_waiting` says a scheduled
+    recording starts as soon as this returns: with a working link already in
+    hand the look keeps the short wall clock, so the start is not held back
+    minutes for the chance of a second source. `still_idle()` is asked before
+    each page: once a recording has started meanwhile, one page at a time, so
+    its failover finds a free page in the sidecar.
 
     With `measure_fn`, up to `gather` working links are collected the same
     way, measured one at a time within RANK_BUDGET_SEC, and the best `pick`
@@ -534,9 +541,14 @@ def pick_first_working(
         pool.shutdown(wait=False, cancel_futures=True)
 
     if second_fn is not None and not (abort is not None and abort.is_set()):
-        if idle:
+        in_hand = any(_works(r) for r in results.values())
+        if idle and start_waiting and in_hand:
+            _second_stage(links, results, second_fn, enough, abort,
+                          parallel=BROWSER_PARALLEL_IDLE, still_idle=still_idle)
+        elif idle:
             _second_stage(links, results, second_fn, enough, abort, limit=BROWSER_LINKS_IDLE,
-                          stage_sec=BROWSER_STAGE_IDLE_SEC, parallel=BROWSER_PARALLEL_IDLE)
+                          stage_sec=BROWSER_STAGE_IDLE_SEC, parallel=BROWSER_PARALLEL_IDLE,
+                          still_idle=still_idle)
         else:
             _second_stage(links, results, second_fn, enough, abort)
 
@@ -616,12 +628,20 @@ def pick_first_working(
             "summary": summary}
 
 
+def _page_timeout(deadline: float) -> int:
+    """Seconds the sidecar may spend on one page: no longer than the look has
+    left. The sidecar keeps a page open for its whole timeout whether or not
+    PVArr still waits, and a recording starting next needs that page slot."""
+    return max(5, min(BROWSER_PAGE_SEC, int(deadline - time.monotonic())))
+
+
 def _second_stage(links: List[str], results: Dict[int, Dict[str, Any]],
                   second_fn: Callable[[str, float], Dict[str, Any]],
                   enough: Callable[[List[int]], bool],
                   abort: Optional[threading.Event],
                   limit: int = BROWSER_LINKS, stage_sec: float = BROWSER_STAGE_SEC,
-                  parallel: int = 1) -> None:
+                  parallel: int = 1,
+                  still_idle: Optional[Callable[[], bool]] = None) -> None:
     """The browser sidecar's look at links the probe found no playlist on.
 
     Runs only when the probe phase came up short (fewer working links than
@@ -629,7 +649,9 @@ def _second_stage(links: List[str], results: Dict[int, Dict[str, Any]],
     most BROWSER_LINKS of them, under a hard BROWSER_STAGE_SEC wall clock, so
     the sidecar's second page slot stays free for a recording's failover and
     the event-page lock is held at most that much longer. With nothing
-    recording the caller passes the wider `limit`, `stage_sec` and `parallel`.
+    recording the caller passes the wider `limit`, `stage_sec` and `parallel`;
+    `still_idle()` going false (a recording started during the look) brings
+    it back to one page at a time.
 
     Order: hosts the browser resolved before come first, hosts that keep
     missing last (browser.host_rank), page order otherwise; the cut to `limit`
@@ -648,6 +670,8 @@ def _second_stage(links: List[str], results: Dict[int, Dict[str, Any]],
     deadline = time.monotonic() + stage_sec
     finished: "queue.Queue[Tuple[int, Dict[str, Any]]]" = queue.Queue()
     running = 0
+    crowded = False
+    asked_again: set = set()
 
     def look(i: int) -> None:
         try:
@@ -661,7 +685,13 @@ def _second_stage(links: List[str], results: Dict[int, Dict[str, Any]],
         if abort is not None and abort.is_set():
             return
         out_of_time = deadline - time.monotonic() < BROWSER_MIN_SLOT_SEC
-        while todo and running < max(1, parallel) and not out_of_time:
+        pages = 1 if crowded else max(1, parallel)
+        if pages > 1 and still_idle is not None:
+            try:
+                pages = pages if still_idle() else 1
+            except Exception:
+                pages = 1
+        while todo and running < pages and not out_of_time:
             threading.Thread(target=look, args=(todo.popleft(),), name="pvarr-browser-look",
                              daemon=True).start()
             running += 1
@@ -672,6 +702,14 @@ def _second_stage(links: List[str], results: Dict[int, Dict[str, Any]],
         except queue.Empty:
             continue
         running -= 1
+        if browser.was_busy(res) and i not in asked_again:
+            # The sidecar had no page free (it is set to one page, or one from
+            # an earlier scan is still open): this link got no look. Ask it
+            # again, once, and keep to one page from here on.
+            asked_again.add(i)
+            crowded = True
+            todo.appendleft(i)
+            continue
         if res.get("m3u8_url"):
             results[i] = res
             if _works(res):
@@ -814,13 +852,16 @@ def find_streams(
     fs_retry: bool = False,
     exclude: Iterable[str] = (),
     idle: bool = False,
+    start_waiting: bool = False,
+    still_idle: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """The whole job: aggregator URL in, up to three working candidates out.
 
     `exclude` skips links already in hand, so a re-check during a recording
     looks further down the page instead of finding the same three again.
     `idle` says nothing is recording, which lets the browser sidecar look at
-    more of the page (see _second_stage).
+    more of the page; `start_waiting` and `still_idle` rein that in (see
+    pick_first_working).
     """
     result: Dict[str, Any] = {"ok": False, "page": {}, "links_found": 0,
                               "picked": [], "tried": [], "message": ""}
@@ -873,10 +914,11 @@ def find_streams(
     second = None
     if browser.browser_url():
         def second(link, deadline):
-            return browser.resolve(link, timeout=BROWSER_PAGE_SEC, abort=abort,
+            return browser.resolve(link, timeout=_page_timeout(deadline), abort=abort,
                                    deadline=deadline, probe_timeout=PROBE_TIMEOUT_SEC)
     chosen = pick_first_working(links, probe_fn=probe_fn, abort=abort,
-                                gather=GATHER, measure_fn=measure, second_fn=second, idle=idle)
+                                gather=GATHER, measure_fn=measure, second_fn=second, idle=idle,
+                                start_waiting=start_waiting, still_idle=still_idle)
     result.update(picked=chosen["picked"], tried=chosen["tried"])
     result["ok"] = bool(chosen["picked"])
     n = len(chosen["picked"])

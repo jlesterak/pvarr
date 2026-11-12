@@ -23,11 +23,18 @@ dead playlist, a refused segment, a 404 or a DNS-blocked host never do.
   During a recording: up to 4 unresolved links, one at a time, at most 20 s
   each and 45 s in all, so a page check can take up to 45 s longer. With
   nothing recording: up to 12 links, two pages at a time, 3 min in all (two
-  pages measured up to 1.8 GB, inside the 2 GB limit). A link it resolves is
+  pages measured up to 1.8 GB, inside the 2 GB limit). Two things rein the
+  wide look in: a scheduled recording that already has a working link keeps
+  to 4 links and 45 s (it starts when the check ends), and once a recording
+  has started the look goes on one page at a time, leaving a page free for
+  its failover. A sidecar set to one page (`PVARR_BROWSER_MAX_PAGES=1`) gets
+  one page at a time too: a link it was too busy for is asked again. A link it resolves is
   logged `found by the browser sidecar` and ranked like any other.
 - **Which link first:** PVArr remembers, per link host, how often the browser
-  found a playlist there and asks the likeliest hosts first; hosts that missed
-  twice in a row go last, the rest keep page order. The memory is a small file,
+  found a playlist there and asks the likeliest hosts first; a host that never
+  resolved and missed twice in a row goes last (one that resolved before, after
+  three misses in a row), the rest keep page order. A miss on a page whose
+  requests were blocked by DNS is not counted: it says nothing about the page. The memory is a small file,
   `browser-hosts.json` in the config folder (up to 300 hosts, host names and
   counts only), learned from your own results; nothing ships with PVArr. If the
   folder is not writable it is kept for the run only and a warning is logged.
@@ -35,7 +42,8 @@ dead playlist, a refused segment, a 404 or a DNS-blocked host never do.
   is resolved in the browser again each time, since playlist tokens expire.
   That costs 7-10 s when it works and up to `PVARR_BROWSER_TIMEOUT` (30 s)
   when it does not; a page the browser found nothing on is not asked again for
-  5 minutes. The card log says `Browser sidecar resolved ...`.
+  5 minutes. If every sidecar page is taken at that moment, PVArr waits a few
+  seconds and asks once more. The card log says `Browser sidecar resolved ...`.
 - PVArr's own probe checks every playlist the sidecar returns, with the
   sidecar's Referer, User-Agent and Cookie, before using it. A playlist on a
   private address from a public page is refused before anything fetches it.
@@ -132,7 +140,7 @@ services:
              do ip route add blackhole $$r; done; exec sleep infinity"
 
   pvarr-browser:
-    image: ghcr.io/jlesterak/pvarr-browser:latest   # or build: ./browser
+    image: ghcr.io/jlesterak/pvarr-browser:${PVARR_TAG:-latest}   # same version as PVArr; or build: ./browser
     container_name: pvarr-browser
     restart: unless-stopped
     network_mode: "service:pvarr-browser-net"

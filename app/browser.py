@@ -26,6 +26,7 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit
@@ -215,6 +216,24 @@ def _remember(page_url: str, found: bool) -> None:
         logger.debug("Could not record the browser's result for a host", exc_info=True)
 
 
+BUSY_NOTE = "the browser sidecar is busy"
+
+
+def was_busy(result: Dict[str, Any]) -> bool:
+    """True when resolve() got no look at the page because every sidecar page
+    slot was taken."""
+    return BUSY_NOTE in str((result or {}).get("message") or "")
+
+
+def _one_line(text: str) -> str:
+    """Text from the sidecar fit for a card-log line: control and format
+    characters (escapes, line and paragraph separators, right-to-left
+    overrides) become spaces, runs of space collapse."""
+    return " ".join("".join(
+        " " if unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") else c
+        for c in text).split())
+
+
 def _clean_answer(answer: Any) -> Dict[str, Any]:
     """Only the fields PVArr uses, as bounded single-line strings; a value
     that could not go into a header safely is dropped, not passed on."""
@@ -240,7 +259,7 @@ def _ask_sidecar(base: str, page_url: str, timeout: int) -> Dict[str, Any]:
                               timeout=(CONNECT_TIMEOUT_SEC, timeout + CLIENT_GRACE_SEC),
                               allow_redirects=False, stream=True) as resp:
                 if resp.status_code == 503:
-                    return {"ok": False, "note": "the browser sidecar is busy"}
+                    return {"ok": False, "note": BUSY_NOTE}
                 if resp.status_code == 400:
                     # A refused page URL; the reason (a host the sidecar's DNS
                     # blocks, a private address) is the useful part.
@@ -248,7 +267,8 @@ def _ask_sidecar(base: str, page_url: str, timeout: int) -> Dict[str, Any]:
                         detail = json.loads(resp.raw.read(MAX_ANSWER_BYTES, decode_content=True)).get("detail")
                     except Exception:
                         detail = None
-                    why = _CTL.sub(" ", detail)[:150] if isinstance(detail, str) and detail else "no reason given"
+                    why = _one_line(detail[:600])[:150] if isinstance(detail, str) else ""
+                    why = why or "no reason given"
                     return {"ok": False, "note": f"the browser sidecar refused the page ({why})"}
                 if resp.status_code != 200:
                     return {"ok": False, "note": f"the browser sidecar answered HTTP {resp.status_code}"}
@@ -329,8 +349,12 @@ def resolve(page_url: str, timeout: Optional[int] = None,
                 _misses[page_url] = time.monotonic() + MISS_MEMO_SEC
             # Only a page the browser really looked at counts against its
             # host: a refused page (HTTP 400, e.g. blocked by DNS) or an error
-            # answer says nothing about what the browser would have found.
-            if (answer.get("note") or "").startswith("no playlist request seen"):
+            # answer says nothing about what the browser would have found. Nor
+            # does a miss on a page whose requests the DNS server blocked: the
+            # playlist may sit on one of those hosts, and counting it would
+            # keep the page at the back of the queue after the DNS is fixed.
+            note = answer.get("note") or ""
+            if note.startswith("no playlist request seen") and "blocked by DNS" not in note:
                 _remember(page_url, False)
         out["message"] = f"Browser ({took:.0f} s): " + (answer.get("note") or "no playlist found") + "."
         return out

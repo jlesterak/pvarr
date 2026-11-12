@@ -1732,7 +1732,8 @@ def _track_schedule_task(job_id: str, coro) -> "asyncio.Task":
 
 def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
                            user_agent: Optional[str], fs_retry: bool = False,
-                           scan=None, exclude: Iterable[str] = ()) -> "asyncio.Future":
+                           scan=None, exclude: Iterable[str] = (),
+                           start_waiting: bool = False) -> "asyncio.Future":
     """Run aggregator.find_streams (or `scan`, same signature) on a daemon
     thread; its result as a Future. `exclude` is passed on to find_streams.
 
@@ -1746,9 +1747,13 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
     # Nothing recording or rebroadcasting: the browser sidecar may look at
-    # more of the page (aggregator._second_stage). Decided once, as the scan
-    # starts; only find_streams takes it.
-    idle = scan is None and not any(r.is_running for r in active_recorders.values())
+    # more of the page (aggregator._second_stage). Decided as the scan starts
+    # and asked again before each page (a recording can start meanwhile);
+    # only find_streams takes it. `start_waiting`: a scheduled recording
+    # starts on this result, so the wide look is for when nothing works yet.
+    def nothing_running() -> bool:
+        return not any(r.is_running for r in list(active_recorders.values()))
+    idle = scan is None and nothing_running()
 
     def _deliver(setter, value):
         if not future.done():
@@ -1760,7 +1765,9 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
             if exclude:
                 extra["exclude"] = list(exclude)
             if idle:
-                extra["idle"] = True
+                extra.update(idle=True, still_idle=nothing_running)
+                if start_waiting:
+                    extra["start_waiting"] = True
             outcome = (scan or aggregator.find_streams)(
                 agg_url, cookie=cookie, user_agent=user_agent,
                 abort=cleanup.shutting_down, **extra,
@@ -1927,7 +1934,7 @@ async def _run_schedule(job: Dict[str, Any]) -> None:
                 try:
                     result = await _scan_in_daemon_thread(
                         job_id, job["agg_url"], job.get("agg_cookie") or None,
-                        job.get("agg_user_agent") or None)
+                        job.get("agg_user_agent") or None, start_waiting=True)
                 finally:
                     _aggregate_holder = None
     except asyncio.CancelledError:
