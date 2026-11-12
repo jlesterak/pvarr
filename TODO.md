@@ -176,42 +176,10 @@ an arm64 image (until someone asks), sending every recording through the relay
 
 ---
 
-## Phase 17: Library organisation  (BUILT 2026-10-24, released in v0.11.1)
-
-`PVARR_LIBRARY_DIR` moves a finished recording to
-`<dir>/<Sport>/Season <year>/<Sport> - S<year>E<NN> - <A> vs <B>.mp4`. See
-README "Organising finished recordings" and CHANGELOG [0.11.1]. Season is
-the recording's calendar year (sponsor decision), so an NFL season splits across
-two folders.
-
-Proven by: unit and HTTP tests (traversal, symlink, sibling-prefix, concurrency,
-cross-mount refusal, ordering of the finish pipeline; the guard tests were
-mutation-checked to fail when the guard is removed), and a real-ffmpeg run in a
-scratch folder (two remuxed games organised as E01/E02, a crash-recovery record
-finalised as E03, nothing left marked as finishing).
-
-- [COMPLETED 2026-10-31, owner confirmed] Confirm Plex indexes the tree as intended (Personal Media Shows
-  agent) on the next real recording, with the library inside the recordings
-  volume.
-- Deliberately not built: a library on a separate mount (refused with a message,
-  never copied), .nfo sidecars, a sports-database lookup, retro-tagging the
-  existing library, a category-folder setting.
-
-## Direct-mode extension refusal (fixed and released in v0.11.1, 2026-10-25)
-A live game recorded 0 bytes for 10 minutes: every candidate's playlist listed
-byte-range segments on `.image` URLs. The segments were real MPEG-TS (sync bytes
-at the range offset, plain GET works), but direct mode refused them. Proven by
-running the container's ffmpeg against the live playlist: refused with no flags,
-clean with `-extension_picky 0 -allowed_extensions ALL`. Fix: relax the
-extension check on every path, test updated. Hot-patched into the running
-container and a new session recorded cleanly (0 lost segments in the first minute).
-- [COMPLETED] The hls-proxy fallback also failed every segment for this source
-  class, for two reasons found by running the container's proxy against the live
-  playlist: it answered 403 "Unknown upstream host" for segments on a different
-  host than the playlist, and it ignored the Range header, returning whole files
-  where the playlist asked for byte ranges. Both fixed by a build-time patch of
-  the pinned proxy (`scripts/patch-hls-proxy.py`, fails the build if stale).
-  Proven: ffmpeg through the patched proxy recorded valid h264/aac at 720p.
+## Completed before 2026-10-28 (detail: CHANGELOG and `docs/release-notes/`)
+- [COMPLETED] Library organisation, `PVARR_LIBRARY_DIR` (2026-10-24, v0.11.1). Season = calendar year (sponsor decision), so an NFL season splits across two folders. Not built on purpose: a library on a separate mount, .nfo sidecars, a sports-database lookup, retro-tagging, a category-folder setting. Plex indexing confirmed by the owner 2026-10-31.
+- [COMPLETED] Direct-mode extension refusal and hls-proxy cross-host/Range fixes for byte-range `.image` segments (2026-10-25, v0.11.1; `scripts/patch-hls-proxy.py`).
+- [COMPLETED] Episode titles missing in Plex: remux writes `<Team A> vs <Team B>` as the title tag and the chapter write keeps it (2026-10-26, v0.11.2; `test_title_tag_survives_remux_and_chapters`).
 
 ## DNS-blocked sources (fixed 2026-10-25, released in v0.11.2)
 After a container recreate, a live source's segment CDN began resolving to
@@ -234,11 +202,6 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   - Fix (2026-11-04, released in v0.14.2): `resume_sessions` now resumes and discards first and returns the records to finalise; `_finalise_in_background` runs them one at a time on a daemon thread after the server is up (the same `_finalise_orphan` path: remux, organise, notify, commercial detection). Their files are marked as finishing at once, so delete and rename refuse them while they wait; the path check is repeated before each; a shutdown stops it between recordings, and an unfinished record stays on disk for the next boot. On shutdown `stop_all` first marks each still-capturing session `interrupted_by: "shutdown"` (saved before anything is killed); a resume of a marked session costs no attempt, up to 10 per recording, and the mark is cleared when it resumes. A crash or a SIGKILL before the mark still counts. Design review (Architect, Security, DevOps): go with changes; the marking-before-kill, the early file protection, the repeated path check and the cap came from it.
   - Proof: `test_boot_resumes_first_and_finalises_in_the_background`, `test_shutdown_marks_only_sessions_still_capturing`, `test_a_clean_restart_does_not_spend_a_resume_attempt`, `test_a_crash_still_counts_and_free_resumes_are_capped` (all fail on the old code).
 - [PENDING] Follow-ups from that review, not done (each is a Docker/Compose or subprocess change for the sponsor to decide): `init: true` (or tini) so PID 1 reaps children; remux and comskip children are not in the process registry, so a shutdown leaves them to die with the container (outside a container they can outlive PVArr); run comskip under `nice`/`ionice` and cap concurrent remux/comskip runs; the compose file's healthcheck sets no `start_period` (the image's is 10 s), which matters less now the server comes up before finalising. Also seen: a rebroadcast channel's session is removed before the shutdown check in `_on_complete`, so a channel does not come back after a clean restart although `resume_decision` says it should; and a remux killed part-way leaves a partial `.mp4` the next attempt may name around.
-
-## Episode titles missing in Plex (fixed 2026-10-26, released in v0.11.2)
-- Symptom: with the README's Plex setup (TV Shows, Personal Media Shows agent) every organised recording showed as "Episode 1" or a date. That agent reads episode titles only from the container's title tag; PVArr wrote none, and the comskip chapter write (`-map_metadata 1`) replaced the file's tags with the chapter file's (none).
-- Fix: the remux writes `<Team A> vs <Team B>` as the title (`library.episode_title`, same sanitising as the filename; no tag when the form named no teams); the chapter write keeps input 0's tags.
-- Proof: `test_title_tag_survives_remux_and_chapters` (real ffmpeg: remux with a title, write a chapter, ffprobe shows both); it fails with the old `-map_metadata 1`.
 
 ## Real-source counts; non-video and byte-range segments (fixed 2026-10-28, released in v0.12.0)
 - Symptom: a page check reported "3 working streams from 2 independent sources" while every recordable link on the page was one feed; the counts covered only the three picks. Its pick 1 was a playlist whose segments are real images (video drawn into the pixels, decoded by the site's player): FFmpeg found no stream in it, and the recording spent each failover cycling through it and its mirror. Separately, the byte-range item below.
