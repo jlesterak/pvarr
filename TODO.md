@@ -362,6 +362,13 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   FFmpeg a longer rolling window -- video still goes straight from the CDN.
   Architecture change -> sponsor decision.
 
+## Commercial marking lost to a shutdown (fixed 2026-11-13, unreleased)
+- [COMPLETED] A host shutdown 43 minutes into the commercial detection of a three-and-a-half-hour recording left it without chapter marks, and the next start did not redo them. Cause: the session record was removed before detection began, so nothing remembered the marking was owed. The same shutdown waited its whole 20 s budget on that recorder and logged that a `.ts` was left un-remuxed, although the finished file was already in the library.
+  - Fix: with detection on, the record stays at `stage="commercials"` until the marking has run to its end; boot runs only that step for such a record (no remux, move or notification), counts each start and gives up after three unfinished runs. A shutdown does not wait for a recorder that is only marking. A stale hidden chapter copy is removed before a redo.
+  - Proof: 11 tests; the 7 written first all failed on the old code. End to end in a throwaway offline container on the released image with this code mounted in: stopped during comskip on a two-hour synthetic file, the stop took 0.5 s and the record stayed (`stage: commercials`, one attempt); the next start logged the redo, wrote the chapters and cleared the record.
+  - Design review (architect/security/devops) folded in: a marking that would begin while the process is already stopping is not started and not counted; the shutdown wait re-checks every half second, so a remux that hands over to the marking mid-wait releases it; the shutdown note is not written for a recorder that is only marking (it could bring back a record just removed); a damaged attempt count in a record is read as zero; a repeated run does not add a second ad-statistics row.
+  - [PENDING] From that review, not done: a clean stop counts as an unfinished run like a crash does (nothing on disk tells them apart; the limit is three for that reason); scratch directories of a killed run stay in the container's temp folder until it is recreated (small in chapters mode, full-size parts in cut mode); comskip is not run under `nice` and is still outside the process registry (see the review follow-ups under "DNS-blocked sources"); a boot redo and a recording that finishes at the same time can run two detections at once.
+
 ## Open items carried from completed phases
 
 *From "v0.2.1 validated on the test server (2026-08-31)":*

@@ -871,6 +871,9 @@ class StreamFailoverRecorder:
         self.stop_reason: str = "operator"
 
         self._thread: Optional[threading.Thread] = None
+        # Set by the server once the recording is finished and announced and
+        # only commercial detection is left on the completion thread.
+        self.only_marking = False
         self._ffmpeg_process: Optional[subprocess.Popen] = None
         self._proxy_process: Optional[subprocess.Popen] = None
         self._force_failover_flag: bool = False
@@ -2061,13 +2064,23 @@ class StreamFailoverRecorder:
         interpreter exit killed it mid-remux, which is why every container stop
         left an un-remuxed .ts behind.
 
+        Commercial detection is the exception: it is up to an hour, the
+        recording is already finished and announced by then, and the session
+        record makes the next start run it again. A shutdown does not wait.
+
         Returns True if the thread finished within the timeout.
         """
         thread = self._thread
-        if thread is None or not thread.is_alive():
-            return True
-        thread.join(timeout)
-        return not thread.is_alive()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        # In short slices: the remux can hand over to the marking while a
+        # shutdown is already waiting here.
+        while True:
+            if self.only_marking or thread is None or not thread.is_alive():
+                return True
+            remaining = 0.5 if deadline is None else min(0.5, deadline - time.monotonic())
+            if remaining <= 0:
+                return False
+            thread.join(remaining)
 
     def _build_ffmpeg_cmd(
         self, stream_url: str, referer: str = "", user_agent: str = "",

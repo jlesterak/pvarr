@@ -180,6 +180,27 @@ def detect(video_path: str, timeout: int = DEFAULT_TIMEOUT_SEC) -> Optional[Dict
         return None
 
 
+def _chapter_copy_path(source: Path) -> Path:
+    """The hidden temp file apply_chapters() writes beside a recording."""
+    return source.with_name(f".{source.stem}.chapters{source.suffix}")
+
+
+def discard_stale_chapter_copy(video_path: str) -> None:
+    """Remove a chapter copy left by a run that was killed part-way.
+
+    It is a full-size hidden copy of the recording; apply_chapters() only
+    removes its own when it gets to the end. Called before a run starts,
+    never during one.
+    """
+    stale = _chapter_copy_path(Path(video_path))
+    try:
+        if stale.is_file():
+            stale.unlink()
+            logger.info("Removed an unfinished chapter copy left beside %s.", Path(video_path).name)
+    except OSError as exc:
+        logger.warning("Could not remove %s: %s", stale.name, exc)
+
+
 def apply_chapters(video_path: str, ffmeta_path: str) -> bool:
     """Write comskip's chapters into the file, without re-encoding.
 
@@ -206,7 +227,7 @@ def apply_chapters(video_path: str, ffmeta_path: str) -> bool:
             needed / 1024 ** 3, CHAPTER_FREE_MARGIN_BYTES / 1024 ** 3)
         return False
     ffmpeg = find_executable("ffmpeg") or "ffmpeg"
-    tmp = source.with_name(f".{source.stem}.chapters{source.suffix}")
+    tmp = _chapter_copy_path(source)
     cmd = [
         ffmpeg, "-y",
         "-i", str(source),
@@ -458,6 +479,13 @@ def record_stats(video_path: str, breaks: List[Tuple[float, float]],
     path = _stats_path(stats_dir)
     try:
         new = not path.exists()
+        if not new:
+            # A run killed after this row but before its chapters were written
+            # is run again; the second row would count the recording twice.
+            with open(path, newline="", encoding="utf-8") as f:
+                if any(row[1:3] == [Path(video_path).name, str(round(duration))]
+                       for row in csv.reader(f)):
+                    return path
         with open(path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if new:

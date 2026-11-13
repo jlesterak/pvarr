@@ -80,7 +80,7 @@ def stop_all(active_recorders_ref: dict, timeout: float,
         all_done = False
         logger.warning(
             "Recorder %s did not finish post-processing within the shutdown "
-            "budget; its .ts is left on disk un-remuxed.", rec_id,
+            "budget; the next start finishes it.", rec_id,
         )
     return all_done
 

@@ -4,6 +4,11 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- Commercial detection that a shutdown or crash cut short is run again at the next start, in the background. Before, the recording stayed without chapter marks for good: the session was forgotten before the marking began. The recording is not remuxed, moved or announced a second time; after three unfinished runs it is left unmarked and the log says so. A run that is repeated does not add a second row to the ad statistics.
+- A shutdown no longer waits (up to `PVARR_SHUTDOWN_TIMEOUT`) for a recording whose only remaining work is commercial detection, and no longer logs that its `.ts` was left un-remuxed when the finished file was already in place.
+- An unfinished hidden chapter copy (`.<name>.chapters.<ext>`) left beside a recording by a killed run is removed before the marking is run again.
+
 ## [0.20.0] - 2026-11-12
 
 ### Added

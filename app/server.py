@@ -693,7 +693,14 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
     deliberate, and each step leaves something a retry can pick up:
 
       remux -> record the remuxed path (stage="remuxed") -> organise ->
-      notify -> forget the session -> commercial detection
+      notify -> commercial detection (stage="commercials") -> forget the session
+
+    With commercial detection off the session is forgotten straight after the
+    notification. With it on, the record stays until the marking is done: it
+    is up to an hour of work, and a shutdown part-way used to leave a
+    recording unmarked for good because nothing remembered it was owed. A
+    record that arrives here already at stage="commercials" (from boot) gets
+    the marking only -- it is remuxed, filed and announced already.
 
     A crash after the remux used to leave an .mp4 nobody ever announced,
     because the next boot saw no .ts and discarded the session. Saving the
@@ -707,6 +714,9 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
     for p in marked:
         _finishing_paths[p] = recording_id
     try:
+        if record.get("stage") == "commercials":
+            _mark_commercials(record, source, recorder)
+            return source
         final = source
         if source.suffix.lower() == ".ts":
             result = remux_recording(str(source), target_format="mp4", delete_source=True,
@@ -733,28 +743,88 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
             segments_lost=getattr(recorder, "segments_lost", 0) if recorder else 0,
             no_data_sec=getattr(recorder, "no_data_sec", 0.0) if recorder else 0.0,
         )
-        # Genuinely finished: a later restart must not try to resume it.
-        session_store.remove(recording_id)
-
-        # Commercial detection runs last, deliberately. It is 20-40 minutes of
-        # CPU on a three-hour recording, and the file is already remuxed, in
-        # the library and announced -- so this only ever adds chapters to
-        # something the operator can already watch. Off by default; failure
-        # here changes nothing about the recording.
-        try:
-            outcome = commercials.process(str(final))
-            if outcome.get("ran"):
-                logger.info(
-                    "Commercial detection on %s: %s breaks found (%s from break cards), chapters %s.",
-                    final.name, outcome["breaks"], outcome.get("card_breaks", 0),
-                    "written" if outcome["applied"] else "not written",
-                )
-        except Exception as exc:
-            logger.warning("Commercial detection failed for %s: %s", final.name, exc)
+        if not commercials.enabled():
+            # Genuinely finished: a later restart must not try to resume it.
+            session_store.remove(recording_id)
+            return final
+        # Finished as a recording, but the marking is still owed. Saved first,
+        # so a shutdown or crash during it leaves the next boot something to
+        # pick up.
+        record["output_filepath"] = str(final)
+        record["stage"] = "commercials"
+        session_store.save(record)
+        _mark_commercials(record, final, recorder)
         return final
     finally:
         for p in marked:
             _finishing_paths.pop(p, None)
+
+
+# A recording whose marking was started this many times without finishing is
+# left unmarked. Without a limit, a file that takes the process down during the
+# marking would do so again on every boot. A clean stop part-way counts like a
+# crash (nothing tells the two apart afterwards), hence three rather than two:
+# a nightly power-off and an image update can both land on one recording.
+COMMERCIALS_MAX_ATTEMPTS = 3
+
+
+def _mark_commercials(record: Dict[str, Any], final: Path, recorder: Any = None) -> None:
+    """Commercial detection, the last step, and the only one that can be redone.
+
+    It runs last deliberately. It is 20-60 minutes of CPU on a three-hour
+    recording, and the file is already remuxed, in the library and announced
+    -- so this only ever adds chapters to something the operator can already
+    watch. Failure here changes nothing about the recording.
+
+    The session record (stage="commercials") is removed once the marking has
+    run to its end, whatever it found. If the process is going away instead,
+    the record stays and the next boot runs the marking again from the start.
+    Each start is counted in the record first, so a recording that keeps
+    being interrupted is given up on rather than retried for ever.
+    """
+    recording_id = record["id"]
+    if recorder is not None:
+        # Nothing left that a shutdown should wait for (see stop_all).
+        recorder.only_marking = True
+    if cleanup.shutting_down.is_set():
+        # The recording finished while the process was already stopping. Not
+        # started and not counted: an hour of work has no chance now.
+        logger.info("Shutting down: commercial detection on %s is left for the next start.",
+                    final.name)
+        return
+    try:
+        attempts = max(0, int(record.get("commercials_attempts") or 0))
+    except (TypeError, ValueError, OverflowError):
+        attempts = 0
+    if attempts >= COMMERCIALS_MAX_ATTEMPTS:
+        logger.warning(
+            "Commercial detection on %s was interrupted %s times; leaving it unmarked.",
+            final.name, attempts)
+        session_store.remove(recording_id)
+        return
+    record["commercials_attempts"] = attempts + 1
+    session_store.save(record)
+    if attempts:
+        logger.info("Commercial detection on %s was interrupted; running it again.", final.name)
+    try:
+        commercials.discard_stale_chapter_copy(str(final))
+        outcome = commercials.process(str(final))
+        if outcome.get("ran"):
+            logger.info(
+                "Commercial detection on %s: %s breaks found (%s from break cards), chapters %s.",
+                final.name, outcome["breaks"], outcome.get("card_breaks", 0),
+                "written" if outcome["applied"] else "not written",
+            )
+    except Exception as exc:
+        logger.warning("Commercial detection failed for %s: %s", final.name, exc)
+    if cleanup.shutting_down.is_set():
+        # Rare: a stop usually ends the process before detection returns.
+        # If it did return, it may have been cut short, so "no breaks found"
+        # proves nothing. Left for the next boot, which runs it again.
+        logger.info("Shutting down: commercial detection on %s is left for the next start.",
+                    final.name)
+        return
+    session_store.remove(recording_id)
 
 
 def _organise(record: Dict[str, Any], final: Path,
@@ -933,7 +1003,11 @@ def _mark_interrupted_by_shutdown(rec_id: str, recorder: Any) -> None:
     """
     record = getattr(recorder, "session_record", None)
     if not isinstance(record, dict) or record.get("rebroadcast") \
-            or getattr(recorder, "is_running", False) is not True:
+            or getattr(recorder, "is_running", False) is not True \
+            or getattr(recorder, "only_marking", False) is True:
+        # only_marking: the recording itself is finished (is_running stays
+        # true until the completion work returns); there is nothing to resume,
+        # and saving here could bring back a record the marking just removed.
         return
     record["interrupted_by"] = "shutdown"
     session_store.save(record)
@@ -1003,7 +1077,10 @@ def _finalise_orphan(record: Dict[str, Any]) -> None:
     except Exception as exc:
         logger.error("Could not finalise orphaned recording %s: %s", recording_id, exc)
     finally:
-        session_store.remove(recording_id)
+        # Kept only when a shutdown cut the commercial detection short: the
+        # next boot runs that step again.
+        if not (record.get("stage") == "commercials" and cleanup.shutting_down.is_set()):
+            session_store.remove(recording_id)
 
 
 def _session_path_allowed(record: Dict[str, Any]) -> bool:

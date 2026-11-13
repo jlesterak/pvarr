@@ -326,7 +326,9 @@ def resume_decision(
     # Remuxed but not yet announced or organised when the process died. There
     # is no .ts left to append to, so reconnecting is impossible; the finished
     # file just needs the rest of the finish pipeline.
-    if record.get("stage") in ("remuxed", "organised"):
+    # "commercials": finished and announced too; only the commercial marking
+    # was cut short, and the finish pipeline runs just that step.
+    if record.get("stage") in ("remuxed", "organised", "commercials"):
         return "finalise"
 
     if attempts_so_far(record, stat.st_mtime) >= attempt_limit:

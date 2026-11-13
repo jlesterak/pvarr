@@ -10865,7 +10865,8 @@ class TestOrganisedLibraryOverHttp(ServerTestCase):
 
 
 class TestFinishRecordingPipeline(ServerTestCase):
-    """remux -> save remuxed path -> organise -> notify -> forget -> comskip."""
+    """remux -> save remuxed path -> organise -> notify -> forget (comskip off;
+    with it on, see TestCommercialMarkingSurvivesARestart)."""
 
     def _run(self, record_name="2026-10-24_NFL_Bears_vs_Packers_1080p", src_suffix=".ts",
              library_on=True, remux_ok=True):
@@ -10901,12 +10902,12 @@ class TestFinishRecordingPipeline(ServerTestCase):
             final = server._finish_recording(record, str(src))
         return final, calls, record
 
-    def test_the_order_is_remux_save_organise_notify_forget_comskip(self):
+    def test_the_order_is_remux_save_organise_notify_forget(self):
         final, calls, record = self._run()
         self.assertEqual(final.name, "NFL - S2026E01 - Bears vs Packers.mp4")
         self.assertEqual(calls[0], "remux")
         self.assertEqual(calls[1][0:3:2], ("save", "remuxed"))           # the remuxed path, before organising
-        self.assertEqual(calls[-3:], [("notify", final.name), "remove", ("comskip", str(final))])
+        self.assertEqual(calls[-2:], [("notify", final.name), "remove"])
         self.assertEqual(record["output_filepath"], str(final))
 
     def test_without_a_library_the_file_stays_flat(self):
@@ -10962,7 +10963,8 @@ class TestFinishRecordingPipeline(ServerTestCase):
         src.write_bytes(b"x")
         record = {"id": "r1", "output_filepath": str(src),
                   "naming": {"sport": "NFL", "team_a": "Bears", "team_b": "Packers"}}
-        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": str(Path(self.tmp) / "Sports")}), \
+        with patch.dict(os.environ, {"PVARR_LIBRARY_DIR": str(Path(self.tmp) / "Sports"),
+                                     "PVARR_COMSKIP": "1"}), \
              patch.object(server, "session_store", MagicMock()), \
              patch.object(server, "notifier", MagicMock()), \
              patch.object(server.commercials, "process", side_effect=during_comskip):
@@ -11055,6 +11057,168 @@ class TestFinishRecordingPipeline(ServerTestCase):
             self.assertEqual((rows[0]["league"], rows[0]["title"]), ("NFL", "Bears vs Packers"))
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestCommercialMarkingSurvivesARestart(ServerTestCase):
+    """A shutdown during commercial detection used to leave a recording
+    unmarked for good: the session was forgotten before the marking began."""
+
+    def _finish(self, record, src, process=None, shutting_down=False, recorder=None):
+        from unittest.mock import MagicMock, patch
+        server = self.server
+        calls = []
+        store, notifier = MagicMock(), MagicMock()
+        store.save.side_effect = lambda r: calls.append(
+            ("save", r.get("stage"), r.get("commercials_attempts")))
+        store.remove.side_effect = lambda rid: calls.append("remove")
+        notifier.notify_recording_finished.side_effect = lambda *a, **k: calls.append("notify")
+
+        def fake_process(path):
+            calls.append(("comskip", path))
+            if process:
+                process()
+            return {}
+
+        server.cleanup.shutting_down.clear()
+        self.addCleanup(server.cleanup.shutting_down.clear)
+        if shutting_down:
+            process = server.cleanup.shutting_down.set
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
+             patch.object(server, "remux_recording",
+                          side_effect=lambda *a, **k: calls.append("remux") or {"status": "failed"}), \
+             patch.object(server, "_organise",
+                          side_effect=lambda rec, final, r: calls.append("organise") or final), \
+             patch.object(server, "session_store", store), \
+             patch.object(server, "notifier", notifier), \
+             patch.object(server.commercials, "process", side_effect=fake_process):
+            os.environ.pop("PVARR_LIBRARY_DIR", None)
+            final = server._finish_recording(record, str(src), recorder)
+        return final, calls
+
+    def _file(self, name="2026-10-24_NFL_Bears_vs_Packers_720p.mp4"):
+        src = Path(self.tmp) / name
+        src.write_bytes(b"footage")
+        return src
+
+    def test_the_session_is_kept_through_the_marking_and_forgotten_after(self):
+        src = self._file()
+        final, calls = self._finish({"id": "r1", "output_filepath": str(src)}, src)
+        i = calls.index(("comskip", str(final)))
+        self.assertIn(("save", "commercials", 1), calls[:i])     # saved before the marking
+        self.assertNotIn("remove", calls[:i])                    # and not forgotten before it
+        self.assertEqual(calls[-1], "remove")
+
+    def test_a_shutdown_during_the_marking_keeps_the_session(self):
+        src = self._file()
+        record = {"id": "r1", "output_filepath": str(src)}
+        _, calls = self._finish(record, src, shutting_down=True)
+        self.assertNotIn("remove", calls)
+        self.assertEqual(record["stage"], "commercials")
+        from app.sessions import resume_decision
+        self.assertEqual(resume_decision(record), "finalise")
+
+    def test_at_boot_only_the_marking_is_run_again(self):
+        src = self._file()
+        record = {"id": "r1", "output_filepath": str(src), "stage": "commercials",
+                  "commercials_attempts": 1}
+        final, calls = self._finish(record, src)
+        self.assertEqual(final, src)
+        for step in ("remux", "organise", "notify"):
+            self.assertNotIn(step, calls)
+        self.assertEqual(calls, [("save", "commercials", 2), ("comskip", str(src)), "remove"])
+
+    def test_a_recording_interrupted_three_times_is_left_unmarked(self):
+        src = self._file()
+        record = {"id": "r1", "output_filepath": str(src), "stage": "commercials",
+                  "commercials_attempts": 3}
+        _, calls = self._finish(record, src)
+        self.assertEqual(calls, ["remove"])
+        self.assertTrue(src.exists())
+
+    def test_a_damaged_attempt_count_does_not_stop_the_marking(self):
+        for bad in ("abc", -1000000, [1], float("inf")):
+            src = self._file()
+            record = {"id": "r1", "output_filepath": str(src), "stage": "commercials",
+                      "commercials_attempts": bad}
+            _, calls = self._finish(record, src)
+            self.assertEqual(calls, [("save", "commercials", 1), ("comskip", str(src)), "remove"])
+
+    def test_a_marking_that_would_start_during_a_shutdown_is_not_counted(self):
+        src = self._file()
+        record = {"id": "r1", "output_filepath": str(src), "stage": "commercials",
+                  "commercials_attempts": 1}
+        self.server.cleanup.shutting_down.set()
+        self.addCleanup(self.server.cleanup.shutting_down.clear)
+        from unittest.mock import patch
+        with patch.object(self.server.commercials, "process") as process, \
+             patch.object(self.server, "session_store") as store:
+            self.server._mark_commercials(record, src)
+        process.assert_not_called()
+        store.remove.assert_not_called()
+        self.assertEqual(record["commercials_attempts"], 1)
+
+    def test_the_recorder_is_flagged_before_the_marking_and_not_without_it(self):
+        from unittest.mock import MagicMock
+        src = self._file()
+        rec = MagicMock()
+        rec.only_marking = False
+        seen = []
+        self._finish({"id": "r1", "output_filepath": str(src)}, src, recorder=rec,
+                     process=lambda: seen.append(rec.only_marking))
+        self.assertEqual(seen, [True])
+        # Its shutdown note is skipped too: there is nothing to resume.
+        rec.is_running, rec.session_record = True, {"id": "r1"}
+        self.server._mark_interrupted_by_shutdown("r1", rec)
+        self.assertNotIn("interrupted_by", rec.session_record)
+
+    def test_a_second_run_does_not_count_the_recording_twice_in_the_stats(self):
+        from unittest.mock import patch
+        from app import commercials
+        src = self._file("game.mp4")
+        with patch.object(commercials, "media_duration", return_value=7200.0):
+            for _ in range(2):
+                path = commercials.record_stats(str(src), [(60.0, 180.0)], "chapters",
+                                                stats_dir=Path(self.tmp))
+        self.assertEqual(len(path.read_text().splitlines()), 2)      # header + one row
+
+    def test_an_orphan_cut_short_by_shutdown_stays_for_the_next_boot(self):
+        from unittest.mock import MagicMock, patch
+        server = self.server
+        src = self._file()
+        record = {"id": "r1", "output_filepath": str(src), "stage": "commercials"}
+        store = MagicMock()
+        server.cleanup.shutting_down.clear()
+        self.addCleanup(server.cleanup.shutting_down.clear)
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
+             patch.object(server, "session_store", store), \
+             patch.object(server.commercials, "process",
+                          side_effect=lambda p: server.cleanup.shutting_down.set() or {}):
+            server._finalise_orphan(record)
+        store.remove.assert_not_called()
+
+    def test_a_shutdown_does_not_wait_for_the_marking(self):
+        from app.recorder import StreamFailoverRecorder
+        from app.cleanup import stop_all
+        rec = StreamFailoverRecorder("r1", ["http://a.example/x.m3u8"],
+                                     str(Path(self.tmp) / "x.ts"))
+        release = threading.Event()
+        rec._thread = threading.Thread(target=release.wait, daemon=True)
+        rec._thread.start()
+        self.addCleanup(release.set)
+        self.assertFalse(rec.wait_until_finished(0.05))          # still working: waited for
+        rec.only_marking = True
+        started = time.monotonic()
+        self.assertTrue(stop_all({"r1": rec}, timeout=5))
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_a_chapter_copy_left_by_a_killed_run_is_removed(self):
+        from app import commercials
+        src = self._file("game.mp4")
+        stale = Path(self.tmp) / ".game.chapters.mp4"
+        stale.write_bytes(b"half a copy")
+        commercials.discard_stale_chapter_copy(str(src))
+        self.assertFalse(stale.exists())
+        self.assertTrue(src.exists())
 
 
 class TestHlsProxyPatch(unittest.TestCase):
