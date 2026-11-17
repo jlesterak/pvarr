@@ -222,10 +222,13 @@ an arm64 image (until someone asks), sending every recording through the relay
 
 ---
 
-## Completed before 2026-10-28 (detail: CHANGELOG and `docs/release-notes/`)
+## Completed before 2026-11-02 (detail: CHANGELOG and `docs/release-notes/`)
 - [COMPLETED] Library organisation, `PVARR_LIBRARY_DIR` (2026-10-24, v0.11.1). Season = calendar year (sponsor decision), so an NFL season splits across two folders. Not built on purpose: a library on a separate mount, .nfo sidecars, a sports-database lookup, retro-tagging, a category-folder setting. Plex indexing confirmed by the owner 2026-10-31.
 - [COMPLETED] Direct-mode extension refusal and hls-proxy cross-host/Range fixes for byte-range `.image` segments (2026-10-25, v0.11.1; `scripts/patch-hls-proxy.py`).
 - [COMPLETED] Episode titles missing in Plex: remux writes `<Team A> vs <Team B>` as the title tag and the chapter write keeps it (2026-10-26, v0.11.2; `test_title_tag_survives_remux_and_chapters`).
+- [COMPLETED] Real-source counts and non-video links: a link whose sampled segments are all non-video is never picked, the page check counts independent sources (a letter per feed), and byte-range segments are measured at their range (2026-10-28, v0.12.0; `test_not_video_is_never_picked_and_the_page_is_summarised`, `test_measure_reads_the_video_at_the_byte_range`).
+- [COMPLETED] Extend a running recording: `POST /api/recordings/{id}/end`, card buttons +15m/+30m/+1h/Edit, Events tab "Keep 0/15/30/60 min after" (2026-11-01, v0.13.0). Not built: editing a waiting schedule's end.
+- [COMPLETED] Schedules that find no stream say why: `miss_kind`/`fixable` badges (not listed yet, blocked, page error, no stream) and up to five fixable links with a hint and Record manually (2026-11-01, v0.13.0).
 
 ## DNS-blocked sources (fixed 2026-10-25, released in v0.11.2)
 After a container recreate, a live source's segment CDN began resolving to
@@ -249,13 +252,6 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   - Proof: `test_boot_resumes_first_and_finalises_in_the_background`, `test_shutdown_marks_only_sessions_still_capturing`, `test_a_clean_restart_does_not_spend_a_resume_attempt`, `test_a_crash_still_counts_and_free_resumes_are_capped` (all fail on the old code).
 - [PENDING] Follow-ups from that review, not done (each is a Docker/Compose or subprocess change for the sponsor to decide): `init: true` (or tini) so PID 1 reaps children; remux and comskip children are not in the process registry, so a shutdown leaves them to die with the container (outside a container they can outlive PVArr); run comskip under `nice`/`ionice` and cap concurrent remux/comskip runs; the compose file's healthcheck sets no `start_period` (the image's is 10 s), which matters less now the server comes up before finalising. Also seen: a rebroadcast channel's session is removed before the shutdown check in `_on_complete`, so a channel does not come back after a clean restart although `resume_decision` says it should; and a remux killed part-way leaves a partial `.mp4` the next attempt may name around.
 
-## Real-source counts; non-video and byte-range segments (fixed 2026-10-28, released in v0.12.0)
-- Symptom: a page check reported "3 working streams from 2 independent sources" while every recordable link on the page was one feed; the counts covered only the three picks. Its pick 1 was a playlist whose segments are real images (video drawn into the pixels, decoded by the site's player): FFmpeg found no stream in it, and the recording spent each failover cycling through it and its mirror. Separately, the byte-range item below.
-- Byte ranges: `quality.measure` fetched the whole file for EXT-X-BYTERANGE segments packed inside a non-video file and saw the wrapper's header, so those sources were picked unmeasured. Now it requests the range (and slices it out when a server ignores Range).
-- Fix: a link whose every sampled segment is not video is never picked (`status: not_video`). The page check reports every link's status and a source letter shared by mirrors of one feed, with counts in `summary` and the result line; a re-check logs the same for the rest of the page. `/api/status` gives each candidate its letter and the session `distinct_sources`/`unknown_sources`; the card shows them.
-- Proof: `test_not_video_is_never_picked_and_the_page_is_summarised`, `test_measure_reads_the_video_at_the_byte_range` (Range honoured and ignored), `test_segments_that_are_all_images_are_not_video`, `test_byterange_segments_parse_with_and_without_offset`, `test_status_counts_real_sources_behind_the_candidates`. Mutation-checked: removing the exclusion, the Range header or the whole-file slice each fails a test.
-- [COMPLETED 2026-11-02] The single-URL probe sniffed only bytes 0-2047 and could call an image-only stream "resolved". A PNG first segment is now fetched whole: video packed inside is unwrapped (next section), an image without video fails the check with "segments are images, not video". Byte ranges in the single-URL probe are still not sliced.
-
 ## PNG-wrapped segments and JSON segment-list playlists (built 2026-11-02, released in v0.14.0)
 - Symptom: a live game recorded 0 bytes for 21 minutes ("Output file #0 does not contain any stream"). Its event page had 24 links and none recordable: the five that resolved were one feed whose segments are PNG images (the page check called two "working" and three "not video", by sampling luck); seven more, provider A's mirrors, answered 403 to every header combination; twelve build their player in JavaScript. Sponsor: "we used to easily get three, now one at best."
 - Cause, measured on live segments: the images' pixels hold a short marker, a 4-byte length and a gzip of plain MPEG-TS; three decoded segments gave 15 s of clean 720p H.264/AAC. Provider A packs its segments the same way and now serves its playlist as a JSON segment list behind a tokenised URL in the player page; the `.m3u8` the page names refuses everyone.
@@ -271,6 +267,7 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
   - JSON lists without sequence numbers, and URLs with whitespace or control characters, are refused. The browser-TLS fetch built its body with `bytes +=` (~1 s per 6 MB); now a bytearray.
   - Proof: `test_a_segment_older_than_the_cache_is_still_served`, `test_a_playlist_blip_serves_the_last_good_copy_but_a_refusal_does_not`, `test_relay_never_reads_a_non_web_url`, bomb and no-sequence cases added to the refusal tests; the eviction and stale-playlist tests fail when their fix is reverted.
 - Same evening, the remaining links: one more independent source was readable without a browser. Its link's page answered 403 to the plain client and 200 to a browser TLS profile (no challenge), and its player listed six playlists, the first answering 504 on every segment and the fifth serving video at 3.8x real-time. The probe stopped at the 403, and from the player kept the first playlist that loaded. Now: a page refused with 401/403 is fetched once more with the browser TLS profile (embeds walked with it), and a playlist whose segment check did not pass is kept only as a fallback while the rest of the player's playlists are tried. Proof: `TestProbeFindsTheWorkingPlaylist` (two tests fail on the old probe; the fallback guard passes on both). Live, same night: the link resolved past the 403, skipped three playlists whose segments timed out and picked the fourth: 720p30, 3.1 Mbps, 8x real-time, a third independent source. The probe took 35 s, most of it those timeouts.
+- [COMPLETED 2026-11-02] The single-URL probe sniffed only bytes 0-2047 and could call an image-only stream "resolved". A PNG first segment is now fetched whole: video packed inside is unwrapped (above), an image without video fails the check with "segments are images, not video". Byte ranges in the single-URL probe are still not sliced.
 - [PENDING] If an upstream re-signs segment URLs on every reload, each reload looks like new segments: up to four extra image fetches and cache churn. Not seen yet; keying on the path alone could merge distinct segments, so it waits for a real case.
 - [PENDING] Live page check showing both providers picked as independent sources, and a full game recorded on them.
 
@@ -303,17 +300,6 @@ reported 14 of 36 links as blocked by DNS and recorded from the one that worked.
 - Symptom: a men's basketball game added from the Events tab was scheduled as NCAAF. Both schools play football and basketball; the page's league label ("NCAAB") was not a known alias, so `eventinfo._event` fell back to the first league the two teams share, which is football in catalogue order.
 - Fix: "ncaab", "cbb" and "ncaa basketball" are aliases of NCAAM; when the label names no league, a word in the URL path may (`_league_in_url`); a sport word in the label or URL ("basketball") narrows the shared leagues to that sport. A hint still wins only if both teams play in that league.
 - Proof: `test_college_league_follows_the_label_or_url_not_the_first_sport_both_schools_play` (three cases fail on the old code; no-hint and wrong-league guards pass on both). The live schedule was re-created as NCAAM by hand.
-
-## Extend a running recording (built 2026-11-01, released in v0.13.0)
-- Ask: games run long and the only fix was a second recording; the Events tab had "start early" but nothing for running late.
-- Built: `POST /api/recordings/{id}/end` (`add_minutes` from the current end, or exact `end_time`), saved to the session record so a resume keeps it. Card buttons **+15m / +30m / +1h / Edit**; Events tab **Keep 0/15/30/60 min after** (default 0, today's behaviour).
-- Proof: `test_extend_adds_to_the_current_end_and_persists_it`, `test_extend_without_a_deadline_counts_from_now`, `test_end_edit_refuses_past_far_and_stopped`.
-- Not built: editing a *waiting* schedule's end (cancel and reschedule).
-
-## Schedules that find no stream look like errors (built 2026-11-01, released in v0.13.0)
-- Symptom: a schedule whose page check found nothing kept the blue **WAITING** badge, reading as "not time yet"; the reason was only in the grey message.
-- Built: on a miss the job stores `miss_kind` and `fixable`; the badge shows **not listed yet** (amber), **blocked**, **page error** or **no stream** (red). The probe tags failures a person can rescue (`probe.fixable_kind`: JS-built player, 403 wanting a cookie/referer, rejected token); the row lists up to five with a hint and **Record manually**. Find's link list marks them "(fixable by hand)". Notifications unchanged: no links.
-- Proof: `test_miss_kind_matches_the_reason`, `test_only_refusals_a_person_can_fix_are_marked_fixable`, `test_fixable_links_keep_only_tagged_links_with_a_hint`, `test_a_miss_records_its_kind_and_the_fixable_links_but_never_notifies_them`, plus asserts added to the aggregator summary and DevTools-message tests.
 
 ## Segment loss investigation
 
