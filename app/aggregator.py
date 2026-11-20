@@ -442,6 +442,24 @@ def _probe_one(url: str) -> Dict[str, Any]:
     return probe.probe_stream(url, use_ytdlp=False, timeout=PROBE_TIMEOUT_SEC)
 
 
+WRONG_GAME_NOTE = "plays a stream marked as the wrong game"
+
+
+def _rejecting(fn: Callable[..., Dict[str, Any]], rejected: set) -> Callable[..., Dict[str, Any]]:
+    """Wrap a probe (or the browser look) so a result on a rejected feed comes
+    back as not working, flagged `wrong_game`. Everything downstream (enough,
+    the browser stage, ranking, the summary) then treats it as it should
+    without knowing about rejection."""
+    def wrapped(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        res = fn(*args, **kwargs)
+        if (isinstance(res, dict) and res.get("ok")
+                and quality.source_key(res.get("m3u8_url", "")) in rejected):
+            res = {**res, "ok": False, "wrong_game": True, "fixable": "",
+                   "message": WRONG_GAME_NOTE}
+        return res
+    return wrapped
+
+
 def _works(res: Dict[str, Any]) -> bool:
     # A playlist whose segments were refused would fail the moment FFmpeg
     # starts; it does not count as working.
@@ -738,13 +756,16 @@ def _source_summary(links: List[str], results: Dict[int, Dict[str, Any]], chosen
             return "not_video"
         if _works(res):
             return "working"
+        if res.get("wrong_game"):
+            return "wrong_game"
         return "failed" if res.get("m3u8_url") else "unresolved"
 
     order = list(chosen) + [i for i in working if i not in chosen]
     order += [i for i in range(len(links)) if i not in order]
     urls = [(results.get(i) or {}).get("m3u8_url", "") for i in order]
     letter = dict(zip(order, quality.source_letters(urls)))
-    counts = {k: 0 for k in ("working", "not_video", "failed", "unresolved", "not_checked")}
+    counts = {k: 0 for k in ("working", "not_video", "wrong_game", "failed", "unresolved",
+                             "not_checked")}
     groups: Dict[str, Dict[str, Any]] = {}
     for i in order:
         st = status(i)
@@ -788,7 +809,8 @@ def summary_text(summary: Dict[str, Any]) -> str:
                      + (f" ({mirrors})" if mirrors else ""))
     else:
         parts.append("none working")
-    for key, label in (("not_video", "not video"), ("failed", "failed"),
+    for key, label in (("not_video", "not video"), ("wrong_game", "on the wrong game"),
+                       ("failed", "failed"),
                        ("unresolved", "unresolved"), ("not_checked", "not checked")):
         if summary.get(key):
             parts.append(f"{summary[key]} {label}")
@@ -854,11 +876,15 @@ def find_streams(
     idle: bool = False,
     start_waiting: bool = False,
     still_idle: Optional[Callable[[], bool]] = None,
+    reject_sources: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """The whole job: aggregator URL in, up to three working candidates out.
 
     `exclude` skips links already in hand, so a re-check during a recording
     looks further down the page instead of finding the same three again.
+    `reject_sources` are feeds (quality.source_key) the operator marked as the
+    wrong game: a link playing one never counts as working, so the search,
+    the browser look included, goes on for a feed that is not marked.
     `idle` says nothing is recording, which lets the browser sidecar look at
     more of the page; `start_waiting` and `still_idle` rein that in (see
     pick_first_working).
@@ -916,6 +942,11 @@ def find_streams(
         def second(link, deadline):
             return browser.resolve(link, timeout=_page_timeout(deadline), abort=abort,
                                    deadline=deadline, probe_timeout=PROBE_TIMEOUT_SEC)
+    rejected = {k for k in reject_sources if k}
+    if rejected:
+        probe_fn = _rejecting(probe_fn, rejected)
+        if second is not None:
+            second = _rejecting(second, rejected)
     chosen = pick_first_working(links, probe_fn=probe_fn, abort=abort,
                                 gather=GATHER, measure_fn=measure, second_fn=second, idle=idle,
                                 start_waiting=start_waiting, still_idle=still_idle)

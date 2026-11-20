@@ -2912,7 +2912,7 @@ class TestStaticRoutes(ServerTestCase):
         self.server.active_recorders["rs2"] = rec
         seen = {}
 
-        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=()):
+        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=(), **kw):
             seen.update(url=url, cookie=cookie, exclude=list(exclude))
             fut = asyncio.get_running_loop().create_future()
             fut.set_result({"picked": [{"url": "http://fresh.example/9"}]})
@@ -2947,7 +2947,7 @@ class TestStaticRoutes(ServerTestCase):
                               "event_page": {"url": "https://events.example/e"}}
         self.server.active_recorders["rs5"] = rec
 
-        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=()):
+        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=(), **kw):
             fut = asyncio.get_running_loop().create_future()
             fut.set_result({"picked": [{"url": "http://dud.example/1"},
                                        {"url": "http://good.example/2"}]})
@@ -2989,7 +2989,7 @@ class TestStaticRoutes(ServerTestCase):
                               "event_page": {"url": "https://events.example/e"}}
         self.server.active_recorders["rs6"] = rec
 
-        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=()):
+        def fake_scan(name, url, cookie, user_agent, fs_retry=False, exclude=(), **kw):
             fut = asyncio.get_running_loop().create_future()
             fut.set_result({"picked": [{"url": "http://fresh.example/9"}]})
             return fut
@@ -7924,6 +7924,20 @@ class TestStandbyAndAlerts(FailoverLoopTestCase):
         self.assertEqual(live.m3u8_url, "http://b.example/old.m3u8")
         self.assertEqual(live.standby_m3u8, "http://b.example/new.m3u8")
 
+    def test_all_candidates_rejected(self):
+        rec = self.make(self.URLS, [])
+        self.assertFalse(rec.all_candidates_rejected(), "nothing marked")
+        for i, c in enumerate(rec.candidates):
+            c.m3u8_url = f"http://feed{i % 2}.example/live.m3u8"
+        rec.wrong_sources = {quality.source_key("http://feed0.example/live.m3u8")}
+        self.assertFalse(rec.all_candidates_rejected(), "one feed still unmarked")
+        rec.wrong_sources.add(quality.source_key("http://feed1.example/live.m3u8"))
+        self.assertTrue(rec.all_candidates_rejected())
+        rec.candidates[1].url, rec.candidates[1].m3u8_url = "http://page.example/watch", ""
+        self.assertFalse(rec.all_candidates_rejected(), "an unknown feed might be fine")
+        rec.candidates[1].standby_m3u8 = "http://feed1.example/live.m3u8"
+        self.assertTrue(rec.all_candidates_rejected(), "a standby check's playlist counts")
+
     def test_standby_never_calls_a_browser_only_page_dead(self):
         # Field bug: a backup whose page only the browser sidecar can resolve
         # failed every light standby probe, was marked "dead", and failover
@@ -8796,6 +8810,48 @@ class TestAggregatorSSRF(unittest.TestCase):
                                           exclude=links[:2] + [links[2] + "/"])
         self.assertEqual([p["url"] for p in out["picked"]], links[25:28])
         self.assertFalse(set(probed) & set(links[:3]), "held links are not probed again")
+
+    def test_rejected_feeds_do_not_stop_the_browser_look(self):
+        # Field case (2026-11-19): every link the probe could read played one
+        # of two feeds, one marked as the wrong game, so the re-check counted
+        # them as enough and never asked the browser about the JavaScript
+        # links -- three of which played the right game on a third feed.
+        from unittest.mock import patch
+        wrong = [f"https://w{i}.example/p/{i}" for i in range(4)]
+        other = [f"https://o{i}.example/p/{i}" for i in range(4)]
+        js = ["https://js.example/watch/1"]
+        links = wrong + other + js
+        page = "".join(f'<a href="{u}">x</a>' for u in links)
+        feed_a = {**GOOD, "m3u8_url": "https://edge1.a.example/hls/59.m3u8"}
+        feed_b = {**GOOD, "m3u8_url": "https://b.example/live/10/index.m3u8"}
+        feed_c = {**GOOD, "m3u8_url": "https://c.example/secure/team/index.m3u8"}
+
+        def probe_fn(url):
+            if url in wrong:
+                return dict(feed_a)
+            if url in other:
+                return dict(feed_b)
+            return {"ok": False, "fixable": "devtools_m3u8", "message": "no playlist"}
+
+        asked = []
+
+        def resolve(link, **kw):
+            asked.append(link)
+            return dict(feed_c)
+
+        fetched = {"ok": True, "url": "https://1.1.1.1/event/1", "html": page, "via": "plain",
+                   "status": 200, "challenged": False, "attempts": [], "message": ""}
+        reject = {quality.source_key(feed_a["m3u8_url"]), quality.source_key(feed_b["m3u8_url"])}
+        with patch.object(aggregator, "fetch_page", return_value=fetched), \
+                patch.dict(os.environ, {"PVARR_RANK_STREAMS": "0"}), \
+                patch.object(aggregator.browser, "browser_url", return_value="http://side.example"), \
+                patch.object(aggregator.browser, "resolve", side_effect=resolve):
+            out = aggregator.find_streams("https://1.1.1.1/event/1", probe_fn=probe_fn,
+                                          reject_sources=reject)
+        self.assertEqual(asked, js, "the browser looked at the JavaScript link")
+        self.assertEqual([p["url"] for p in out["picked"]], js)
+        self.assertEqual(out["summary"]["wrong_game"], 8)
+        self.assertIn("8 on the wrong game", aggregator.summary_text(out["summary"]))
 
 
 class TestAggregateEndpoint(ServerTestCase):

@@ -1814,9 +1814,13 @@ def _track_schedule_task(job_id: str, coro) -> "asyncio.Task":
 def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
                            user_agent: Optional[str], fs_retry: bool = False,
                            scan=None, exclude: Iterable[str] = (),
-                           start_waiting: bool = False) -> "asyncio.Future":
+                           start_waiting: bool = False,
+                           reject_sources: Iterable[str] = (),
+                           wide: bool = False) -> "asyncio.Future":
     """Run aggregator.find_streams (or `scan`, same signature) on a daemon
-    thread; its result as a Future. `exclude` is passed on to find_streams.
+    thread; its result as a Future. `exclude` and `reject_sources` are passed
+    on to find_streams. `wide`: the browser look goes as wide as with nothing
+    recording (a re-check whose recording has no usable stream left).
 
     Used by scheduled scans and the manual Find alike. Not asyncio.to_thread: that worker belongs to the default executor, which
     is joined when the interpreter exits, so a stop during a scan waited out
@@ -1845,7 +1849,13 @@ def _scan_in_daemon_thread(name: str, agg_url: str, cookie: Optional[str],
             extra = {"fs_retry": True} if fs_retry else {}
             if exclude:
                 extra["exclude"] = list(exclude)
-            if idle:
+            if reject_sources:
+                extra["reject_sources"] = sorted(reject_sources)
+            if wide and not idle:
+                # Kept wide throughout: the one recording running has no
+                # usable stream, so there is no failover to leave a page for.
+                extra["idle"] = True
+            elif idle:
                 extra.update(idle=True, still_idle=nothing_running)
                 if start_waiting:
                     extra["start_waiting"] = True
@@ -1909,7 +1919,12 @@ async def _rescan_event_page(recording_id: str, manual: bool) -> None:
                 result = await _scan_in_daemon_thread(
                     f"rescan-{recording_id}", page["url"], page.get("cookie") or None,
                     page.get("user_agent") or None,
-                    exclude=[c.url for c in recorder.candidates])
+                    exclude=[c.url for c in recorder.candidates],
+                    # Links on a feed marked as the wrong game never count as
+                    # found, so the browser look runs for a feed that is not;
+                    # and goes wide when every candidate is on such a feed.
+                    reject_sources=set(recorder.wrong_sources),
+                    wide=recorder.all_candidates_rejected())
             finally:
                 _aggregate_holder = None
         if (result or {}).get("picked"):

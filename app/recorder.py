@@ -1974,6 +1974,18 @@ class StreamFailoverRecorder:
         key = self._candidate_key(candidate)
         return bool(key) and key in self.wrong_sources
 
+    def all_candidates_rejected(self) -> bool:
+        """Every candidate plays a feed marked as the wrong game (by its last
+        connect, or failing that its last standby check). A candidate whose
+        feed is not known yet might be fine, so it keeps this False."""
+        if not self.wrong_sources or not self.candidates:
+            return False
+        for c in self.candidates:
+            key = self._candidate_key(c) or quality.source_key(c.standby_m3u8)
+            if not key or key not in self.wrong_sources:
+                return False
+        return True
+
     def mark_wrong_game(self) -> Optional[str]:
         """The operator says the stream being recorded is the wrong game.
 
