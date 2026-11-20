@@ -4,6 +4,13 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-11-19
+
+### Fixed
+- The event-page re-check of a running recording no longer counts links playing a stream marked as the wrong game as found, so the browser sidecar's look still runs for an unmarked one; the summary counts them ("N on the wrong game"). When every source of the recording is marked, the look is as wide as with nothing recording.
+- The 90-second backup check leaves a backup that only the browser sidecar can open as unknown instead of "not answering", so failover no longer skips it.
+- WebP-wrapped MPEG-TS segments with up to 16 pad bytes after the last packet are unwrapped instead of refused as images.
+
 ## [0.20.1] - 2026-11-13
 
 ### Fixed
