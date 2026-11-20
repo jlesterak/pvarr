@@ -38,6 +38,7 @@ DECODE_TIMEOUT_SEC = 10
 # The marker before the payload is short; looking further would only invite
 # false hits inside ordinary image data.
 _HEADER_SEARCH = 64
+_MAX_TAIL_PAD = 16
 _GZIP_MAGIC = b"\x1f\x8b\x08"
 _CHANNELS = {2: 3, 6: 4}                 # PNG colour type -> bytes per pixel (8-bit)
 
@@ -67,9 +68,13 @@ def webp_ts(data: bytes) -> Optional[bytes]:
     if not is_webp(data) or len(data) > MAX_WRAPPED_BYTES:
         return None
     for at in range(12, min(_HEADER_SEARCH, len(data))):
-        if (len(data) - at) % 188 == 0 and len(data) - at >= 377 \
+        # A few pad bytes after the last packet are trimmed (one source ends
+        # every segment with one); a tail near a whole packet is a cut-off
+        # file, not padding, and is refused.
+        pad = (len(data) - at) % 188
+        if pad <= _MAX_TAIL_PAD and len(data) - at >= 377 \
                 and data[at] == data[at + 188] == data[at + 376] == 0x47:
-            return data[at:]
+            return data[at:len(data) - pad]
     return None
 
 

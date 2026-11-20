@@ -11441,6 +11441,9 @@ class TestPngWrappedSegments(unittest.TestCase):
         self.assertIsNone(pngwrap.unwrap(self._webp_wrap(b"\x01" * 5000)))
         self.assertIsNone(pngwrap.unwrap(self._webp_wrap(self.TS[:-5])))
         self.assertFalse(pngwrap.is_wrapped(self.TS))
+        # Field case (2026-11-19): a source pads every segment with one byte
+        # after the last packet. Trimmed, not refused as "not video".
+        self.assertEqual(pngwrap.unwrap(self._webp_wrap(self.TS + b"\x00")), self.TS)
 
     def test_measure_counts_wrapped_segments_as_video(self):
         from unittest.mock import MagicMock, patch
