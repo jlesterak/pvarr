@@ -1643,7 +1643,13 @@ class StreamFailoverRecorder:
                                   check_segment=False, use_ytdlp=False)
         except Exception:
             result = {"ok": False}
-        if not result.get("ok"):
+        if browser.worth_trying(result):
+            # The page loaded but only a browser can find its playlist. This
+            # light check never drives the sidecar, so it cannot tell: record
+            # "unknown" ("") rather than "dead", which would make failover
+            # skip a backup that may be the only good one.
+            state = ""
+        elif not result.get("ok"):
             state = "dead"
         else:
             copy.m3u8_url = result.get("m3u8_url") or ""
@@ -1657,7 +1663,7 @@ class StreamFailoverRecorder:
         if copy.m3u8_url:
             live.standby_m3u8 = copy.m3u8_url
         live.standby, live.standby_at = state, time.time()
-        if before and before != state:
+        if before and state and before != state:
             word = {"alive": "is answering again", "dead": "is not answering",
                     "wrong_game": "plays the stream marked as the wrong game"}[state]
             self._log(f"Standby check: {live.name} {word}.", "WARN" if state != "alive" else "INFO")

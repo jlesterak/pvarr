@@ -7924,6 +7924,25 @@ class TestStandbyAndAlerts(FailoverLoopTestCase):
         self.assertEqual(live.m3u8_url, "http://b.example/old.m3u8")
         self.assertEqual(live.standby_m3u8, "http://b.example/new.m3u8")
 
+    def test_standby_never_calls_a_browser_only_page_dead(self):
+        # Field bug: a backup whose page only the browser sidecar can resolve
+        # failed every light standby probe, was marked "dead", and failover
+        # skipped it -- though it was the only stream of the right game.
+        from unittest.mock import patch
+        rec = self.make(self.URLS, [])
+        rec.current_candidate_index = 0
+        rec.candidates[2].standby, rec.candidates[2].standby_at = "wrong_game", time.time()
+        js_page = {"ok": False, "fixable": "devtools_m3u8"}
+        with patch("app.recorder.probe_stream", return_value=js_page), \
+                patch("app.browser.browser_url", return_value="http://sidecar.example"):
+            self.assertEqual(rec.check_standby(1), "")
+        self.assertEqual(rec.standby_state(rec.candidates[1]), "")
+        self.assertEqual(rec._next_candidate_index(), 1)
+        # Without a sidecar the page really is unusable to us: still "dead".
+        with patch("app.recorder.probe_stream", return_value=js_page), \
+                patch("app.browser.browser_url", return_value=""):
+            self.assertEqual(rec.check_standby(1), "dead")
+
     def test_monitor_survives_a_failing_check(self):
         from unittest.mock import patch
         rec = self.make(self.URLS, [])
