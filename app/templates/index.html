@@ -118,8 +118,10 @@
       <div class="flex items-center space-x-2 sm:space-x-4">
         <!-- Phones: the pill hides and the buttons keep only their icons. -->
         <div class="hidden sm:flex px-3 py-1 rounded-md text-xs font-medium items-center space-x-2 bg-slate-800 border border-slate-700">
-          <span class="w-2 h-2 rounded-full" :class="liveSessions.length > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"></span>
-          <span x-text="liveSessions.length > 0 ? liveSessions.length + ' Active Stream(s)' : 'System Idle'"></span>
+          <span class="w-2 h-2 rounded-full" :class="liveSessions.length > 0 ? 'bg-emerald-400 animate-pulse' : (postProcessing.length > 0 ? 'bg-amber-400 animate-pulse' : 'bg-slate-500')"></span>
+          <span x-text="liveSessions.length > 0
+            ? liveSessions.length + ' Active Stream(s)' + (postProcessing.length > 0 ? ', ' + postProcessing.length + ' processing' : '')
+            : (postProcessing.length > 0 ? 'Processing ' + postProcessing.length + ' recording(s)' : 'System Idle')"></span>
         </div>
 
         <button @click="openEvents()" title="Events" class="px-3 sm:px-4 py-2 rounded-lg text-sm font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition flex items-center space-x-2">
@@ -214,7 +216,25 @@
         </div>
       </template>
 
-      <template x-if="activeSessions.length === 0">
+      <!-- Remux, library move and commercial detection outlive the recorder
+           (and a recording finished at boot never had one), so they are listed
+           here or the page would look idle while FFmpeg/comskip run. -->
+      <template x-if="postProcessing.length > 0">
+        <div class="arr-card rounded-xl p-4 mb-6 border border-amber-500/30">
+          <div class="flex items-center space-x-2 text-sm font-semibold text-amber-300 mb-2">
+            <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+            <span>Still processing</span>
+          </div>
+          <template x-for="job in postProcessing" :key="job.id">
+            <div class="flex flex-wrap items-baseline justify-between gap-x-4 text-xs py-1 border-t border-slate-800 first:border-t-0">
+              <span class="text-slate-200 break-all" x-text="job.file"></span>
+              <span class="text-slate-400 whitespace-nowrap" x-text="postStepLabel(job.step) + ' · ' + formatSeconds(Math.max(0, Math.floor(Date.now() / 1000 - job.since)))"></span>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <template x-if="activeSessions.length === 0 && postProcessing.length === 0">
         <div class="arr-card rounded-xl p-12 text-center space-y-4">
           <div class="w-12 h-12 rounded-full bg-slate-800 text-slate-400 mx-auto flex items-center justify-center">
             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
@@ -983,6 +1003,7 @@
         activeTab: 'active',
         openNewModal: false,
         activeSessions: [],
+        postProcessing: [],
         expandedFinished: {},
         libraryFiles: [],
         adStats: null,
@@ -1063,7 +1084,11 @@
         get liveSessions() {
           return this.activeSessions.filter(s => s.is_running);
         },
-        get finishedSessions() {
+        postStepLabel(step) {
+          return ({ queued: 'Queued', remuxing: 'Remuxing (FFmpeg)', organising: 'Moving to library',
+                    commercials: 'Marking commercials (comskip)' })[step] || step;
+        },
+                get finishedSessions() {
           return this.activeSessions.filter(s => !s.is_running);
         },
 
@@ -1466,6 +1491,7 @@
             const res = await fetch('/api/status');
             const data = await res.json();
             this.activeSessions = data.sessions || [];
+            this.postProcessing = data.post_processing || [];
             this.activeSessions.forEach(session => {
               if (session.is_running && !this.sseConnections[session.id]) {
                 this.connectSSE(session.id);

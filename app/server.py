@@ -248,6 +248,24 @@ def _resolve_library_dir(dir_path: Optional[str]) -> Path:
 
 _finishing_paths: Dict[Path, str] = {}
 
+# What post-processing is doing, per recording id, for /api/status. Without it
+# the dashboard said "System Idle" while a remux or an hour of comskip ran,
+# because a finished recorder is no longer running and a boot-finalised one
+# has no recorder at all. Written from worker threads; single dict operations
+# are atomic under the GIL and readers take a copy.
+_post_jobs: Dict[str, Dict[str, Any]] = {}
+
+
+def _post_step(recording_id: str, path: Any, step: str) -> None:
+    """Record that `recording_id` is now at `step` (queued, remuxing, organising, commercials)."""
+    _post_jobs[recording_id] = {"id": recording_id, "file": Path(str(path)).name,
+                                "step": step, "since": time.time()}
+
+
+def post_processing_jobs() -> List[Dict[str, Any]]:
+    """Recordings still being finished, oldest first."""
+    return sorted((dict(j) for j in list(_post_jobs.values())), key=lambda j: j["since"])
+
 
 def _active_output_paths() -> Dict[Path, str]:
     """Files a live recorder is currently writing to, mapped to session id.
@@ -430,7 +448,11 @@ async def get_system_status():
         "version": __version__,
         "active_count": len([r for r in active_recorders.values() if r.is_running]),
         "total_sessions": len(sessions),
-        "sessions": sessions
+        "sessions": sessions,
+        # Remux, library move and commercial detection still running (or
+        # queued at boot) after capture ended. The dashboard is only idle
+        # when this and active_count are both empty.
+        "post_processing": post_processing_jobs(),
     }
 
 
@@ -715,10 +737,12 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
         _finishing_paths[p] = recording_id
     try:
         if record.get("stage") == "commercials":
+            _post_step(recording_id, source, "commercials")
             _mark_commercials(record, source, recorder)
             return source
         final = source
         if source.suffix.lower() == ".ts":
+            _post_step(recording_id, source, "remuxing")
             result = remux_recording(str(source), target_format="mp4", delete_source=True,
                                      title=library.episode_title(record.get("naming") or {}))
             if result.get("status") == "success" and result.get("output_filepath"):
@@ -732,6 +756,7 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
         if recorder is not None:
             recorder.final_filepath = final
 
+        _post_step(recording_id, final, "organising")
         final = _organise(record, final, recorder)
         # Protected through commercial detection too, which rewrites it in place.
         _finishing_paths[final.resolve()] = recording_id
@@ -753,9 +778,11 @@ def _finish_recording(record: Dict[str, Any], filepath: str,
         record["output_filepath"] = str(final)
         record["stage"] = "commercials"
         session_store.save(record)
+        _post_step(recording_id, final, "commercials")
         _mark_commercials(record, final, recorder)
         return final
     finally:
+        _post_jobs.pop(recording_id, None)
         for p in marked:
             _finishing_paths.pop(p, None)
 
@@ -1039,6 +1066,7 @@ def _finalise_in_background(records: List[Dict[str, Any]]) -> Optional[threading
             continue
         _finishing_paths[p] = record.get("id", "?")
         marked.append(p)
+        _post_step(record.get("id", "?"), p, "queued")
 
     def _run() -> None:
         try:
@@ -1046,15 +1074,19 @@ def _finalise_in_background(records: List[Dict[str, Any]]) -> Optional[threading
                 rid = record.get("id", "?")
                 if cleanup.shutting_down.is_set():
                     logger.info("Shutting down: session %s is left for the next boot to finalise.", rid)
+                    _post_jobs.pop(rid, None)
                     continue
                 # Checked again: an earlier recording may have taken an hour.
                 if not _session_path_allowed(record):
                     logger.warning("Not finalising session %s: its output path is outside the "
                                    "permitted recording directories.", rid)
                     session_store.remove(rid)
+                    _post_jobs.pop(rid, None)
                     continue
                 _finalise_orphan(record)
         finally:
+            for record in records:
+                _post_jobs.pop(record.get("id", "?"), None)
             for p in marked:
                 _finishing_paths.pop(p, None)
 

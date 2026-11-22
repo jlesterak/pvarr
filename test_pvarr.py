@@ -11047,6 +11047,27 @@ class TestFinishRecordingPipeline(ServerTestCase):
         self.assertIn(seen["path"], seen["paths"])
         self.assertEqual(server._finishing_paths, {})
 
+    def test_status_reports_post_processing_until_it_ends(self):
+        """The dashboard said "System Idle" while comskip ran for an hour."""
+        from unittest.mock import MagicMock, patch
+        server = self.server
+        seen = {}
+
+        def during_comskip(path):
+            seen["jobs"] = self.client.get("/api/status").json()["post_processing"]
+            return {}
+
+        src = Path(self.tmp) / "2026-10-24_NFL_Bears_vs_Packers_1080p.mp4"
+        src.write_bytes(b"x")
+        record = {"id": "r1", "output_filepath": str(src), "naming": {}}
+        with patch.dict(os.environ, {"PVARR_COMSKIP": "1"}), \
+             patch.object(server, "session_store", MagicMock()), \
+             patch.object(server, "notifier", MagicMock()), \
+             patch.object(server.commercials, "process", side_effect=during_comskip):
+            server._finish_recording(record, str(src))
+        self.assertEqual([(j["id"], j["step"]) for j in seen["jobs"]], [("r1", "commercials")])
+        self.assertEqual(self.client.get("/api/status").json()["post_processing"], [])
+
     def test_boot_resumes_first_and_finalises_in_the_background(self):
         """Boot ran commercial detection inline: the server came up ~7 min
         late and a resumable session waited behind a finalise."""
