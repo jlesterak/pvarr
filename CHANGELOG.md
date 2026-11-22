@@ -4,6 +4,8 @@ All notable changes to PVArr are listed here, in [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-11-22
+
 ### Fixed
 - The dashboard no longer says "System Idle" while a finished recording is still being remuxed, moved to the library or scanned for commercials (FFmpeg/comskip can run for up to an hour after capture, or after a restart). The header shows "Processing N recording(s)" and the Live Recorders tab lists each one with its step and elapsed time; `/api/status` carries the same list as `post_processing`.
 
